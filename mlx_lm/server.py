@@ -1427,7 +1427,7 @@ class ResponseGenerator:
                 if (
                     captured.get("reusable")
                     and covered == cache_offset
-                    and 0 < covered < len(cache_key)
+                    and 0 < covered <= len(cache_key)
                 ):
                     sidecar = MTPAPCSidecar(captured["state"], covered)
                 else:
