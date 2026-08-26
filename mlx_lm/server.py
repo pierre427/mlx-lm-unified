@@ -930,6 +930,14 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
+        # The internal MTP engine owns a target cache plus a separate draft-head
+        # cache and exact speculative rollback. BatchGenerator does not carry
+        # that second state. This service is configured for one decode lane, so
+        # route every request through the single-stream admission path whenever
+        # self-MTP is enabled; ineligible requests still fail closed to plain
+        # generate_step there.
+        if getattr(self.cli_args, "self_mtp", False):
+            return False
         if args.seed is not None:
             return False
         # Prompt-lookup speculative decoding runs on the single-stream path.

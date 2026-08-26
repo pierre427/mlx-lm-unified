@@ -176,6 +176,14 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertEqual(long["window_size"], 2048)
         self.assertEqual(long["sink_size"], 4)
 
+    def test_enabled_self_mtp_forces_single_stream_server_path(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            is_batchable=True, cli_args=self.cli
+        )
+        request_args = types.SimpleNamespace(seed=None, prompt_lookup_ngram=0)
+        self.assertFalse(generator._is_batchable(request_args))
+
 
 class DummyModelProvider:
     def __init__(self, with_draft=False):
