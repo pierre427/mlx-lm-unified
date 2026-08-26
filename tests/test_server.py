@@ -1145,6 +1145,56 @@ class TestLogitBiasValidation(unittest.TestCase):
         self.assertEqual(handler.logit_bias, {5: 2.0, 7: -1.5, 9: 0.25})
 
 
+class TestSingleModelMode(unittest.TestCase):
+    @staticmethod
+    def _handler(requested_model):
+        handler = TestLogitBiasValidation._handler(requested_model=requested_model)
+        handler.response_generator = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                single_model=True,
+                model="configured-model",
+            )
+        )
+        return handler
+
+    def test_only_default_or_configured_model_is_admitted(self):
+        self._handler("default_model").validate_model_parameters()
+        self._handler("configured-model").validate_model_parameters()
+        with self.assertRaisesRegex(ValueError, "only admits"):
+            self._handler("another-model").validate_model_parameters()
+
+    def test_models_endpoint_only_advertises_configured_model(self):
+        handler = APIHandler.__new__(APIHandler)
+        handler.path = "/v1/models"
+        handler.created = 123
+        handler.wfile = io.BytesIO()
+        handler.response_generator = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                single_model=True,
+                model="configured-model",
+                allowed_origins=["*"],
+            )
+        )
+        handler._set_completion_headers = lambda *_args, **_kwargs: None
+        handler.end_headers = lambda: None
+        with patch("mlx_lm.server.scan_cache_dir") as scan_cache:
+            handler.handle_models_request()
+        scan_cache.assert_not_called()
+        self.assertEqual(
+            json.loads(handler.wfile.getvalue()),
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "configured-model",
+                        "object": "model",
+                        "created": 123,
+                    }
+                ],
+            },
+        )
+
+
 class TestKVBudgetProbeFailure(unittest.TestCase):
     def test_probe_failure_reaches_requester_and_thread_survives(self):
         """A probe error must be delivered to the requesting queue, and the

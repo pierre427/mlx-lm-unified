@@ -1521,6 +1521,17 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("xtc_probability", float, min_val=0, max_val=1)
         self._validate("xtc_threshold", float, min_val=0, max_val=1)
         self._validate("requested_model", str)
+        if getattr(self.response_generator.cli_args, "single_model", False):
+            configured = self.response_generator.cli_args.model
+            allowed = {"default_model", configured}
+            configured_path = Path(configured)
+            if configured_path.exists():
+                allowed.add(str(configured_path.resolve()))
+            if self.requested_model not in allowed:
+                raise ValueError(
+                    "This server only admits its configured model: "
+                    f"{configured}"
+                )
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
@@ -1960,6 +1971,26 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
 
+        configured_model = self.response_generator.cli_args.model
+        if getattr(self.response_generator.cli_args, "single_model", False):
+            model_path = Path(configured_model)
+            model_id = (
+                str(model_path.resolve()) if model_path.exists() else configured_model
+            )
+            response = {
+                "object": "list",
+                "data": [
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": self.created,
+                    }
+                ],
+            }
+            self.wfile.write(json.dumps(response).encode())
+            self.wfile.flush()
+            return
+
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
         parts = self.path.split("/")
@@ -1993,8 +2024,8 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
-        if self.response_generator.cli_args.model:
-            model_path = Path(self.response_generator.cli_args.model)
+        if configured_model:
+            model_path = Path(configured_model)
             if model_path.exists():
                 model_id = str(model_path.resolve())
                 models.append(
@@ -2074,6 +2105,14 @@ def setup_arg_parser():
         "--model",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
+    )
+    parser.add_argument(
+        "--single-model",
+        action="store_true",
+        help=(
+            "Advertise and admit only --model. This prevents a request from "
+            "dynamically loading another locally cached model."
+        ),
     )
     parser.add_argument(
         "--adapter-path",
