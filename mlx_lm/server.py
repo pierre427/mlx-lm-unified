@@ -1430,6 +1430,15 @@ class ResponseGenerator:
                     and 0 < covered < len(cache_key)
                 ):
                     sidecar = MTPAPCSidecar(captured["state"], covered)
+                else:
+                    logging.warning(
+                        "Self-MTP APC sidecar not reusable: captured=%s "
+                        "covered=%d target_offset=%d cache_key=%d",
+                        captured.get("reusable"),
+                        covered,
+                        cache_offset,
+                        len(cache_key),
+                    )
             if isinstance(self.prompt_cache, AutomaticPrefixCache):
                 self.prompt_cache.insert_cache(
                     self.model_provider.model_key,

@@ -1694,7 +1694,11 @@ def stream_generate(
         if mtp_safe
         else wired_limit(model, [generation_stream])
     )
-    with limit_context:
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(limit_context)
+        close_token_generator = getattr(token_generator, "close", None)
+        if close_token_generator is not None:
+            stack.callback(close_token_generator)
         tic = time.perf_counter()
         # max_tokens=0 (or a generator that yields nothing) must not reach
         # the final response, which reads the loop variables.
