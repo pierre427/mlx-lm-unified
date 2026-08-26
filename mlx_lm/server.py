@@ -735,6 +735,21 @@ def _self_mtp_config(
     return config
 
 
+def _discard_small_sidecarless_apc_hit_for_mtp(
+    cli_args, model, cached_prompt_tokens, mtp_sidecar
+):
+    """Prefer MTP over a trivial APC hit that cannot restore draft state."""
+    retain_minimum = getattr(
+        cli_args, "self_mtp_apc_retain_min_prompt_tokens", 64
+    )
+    return bool(
+        getattr(cli_args, "self_mtp", False)
+        and getattr(model, "mtp", None) is not None
+        and mtp_sidecar is None
+        and 0 < cached_prompt_tokens < retain_minimum
+    )
+
+
 def _segment_by_state(sm_state, text):
     """Advance a ``TextStateMachine`` one character at a time so emitted text is
     attributed to the state it was actually produced in, rather than to the
@@ -1324,6 +1339,21 @@ class ResponseGenerator:
                 )
                 mtp_sidecar = None
             ctx.prompt_cache_count = len(prompt) - len(rest)
+            if _discard_small_sidecarless_apc_hit_for_mtp(
+                self.cli_args,
+                model,
+                ctx.prompt_cache_count,
+                mtp_sidecar,
+            ):
+                logging.info(
+                    "Discarding small sidecar-less APC hit (%d tokens) to "
+                    "preserve self-MTP admission",
+                    ctx.prompt_cache_count,
+                )
+                cache = None
+                rest = prompt
+                mtp_sidecar = None
+                ctx.prompt_cache_count = 0
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -2505,6 +2535,16 @@ def setup_arg_parser():
         help=(
             "Enable --self-mtp-window-size only at or above this full prompt "
             "length (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-apc-retain-min-prompt-tokens",
+        type=int,
+        default=64,
+        help=(
+            "Retain a sidecar-less APC hit only when it saves at least this "
+            "many prompt tokens; smaller hits are discarded so self-MTP can "
+            "run (default: 64)."
         ),
     )
     parser.add_argument(

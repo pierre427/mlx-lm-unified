@@ -21,6 +21,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     SamplingArguments,
+    _discard_small_sidecarless_apc_hit_for_mtp,
     _make_sampler,
     _measure_kv_cost,
     _configure_process_wired_limit,
@@ -122,6 +123,24 @@ class TestSelfMTPAdmission(unittest.TestCase):
             kv_bits=None,
         )
         self.model = types.SimpleNamespace(mtp=object())
+
+    def test_small_sidecarless_apc_hit_yields_to_mtp(self):
+        self.cli.self_mtp_apc_retain_min_prompt_tokens = 64
+        self.assertTrue(
+            _discard_small_sidecarless_apc_hit_for_mtp(
+                self.cli, self.model, 1, None
+            )
+        )
+        self.assertFalse(
+            _discard_small_sidecarless_apc_hit_for_mtp(
+                self.cli, self.model, 64, None
+            )
+        )
+        self.assertFalse(
+            _discard_small_sidecarless_apc_hit_for_mtp(
+                self.cli, self.model, 1, object()
+            )
+        )
 
     @staticmethod
     def args(*, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, xtc=0.0):
