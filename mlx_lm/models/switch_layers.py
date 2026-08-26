@@ -16,15 +16,20 @@ def _mlx_version_tuple():
         return (0, 0)
 
 
-# mlx < 0.32 Metal mishandles the ragged tail tile in the sorted
-# gather_qmm/gather_mm path when the flattened row count exceeds 32768 and is
-# not a multiple of 64: expert outputs for most rows come out wrong (silent
-# MoE corruption at long single-shot prefill, e.g. gpt-oss rambling at 32k
-# context). Verified fixed in mlx 0.32.0.dev builds. On affected cores we pad
-# the sorted rows up to a multiple of 64 (duplicating the last row, which
-# keeps the indices sorted); _scatter_unsort gathers only the original rows,
-# so the padding never reaches the output.
-_SORTED_GATHER_TAIL_BUG = _mlx_version_tuple() < (0, 32)
+# Metal mishandles the ragged tail tile in the sorted gather_qmm/gather_mm
+# path when the flattened row count exceeds 32768 and is not a multiple of
+# 64: expert outputs for most rows come out wrong (silent MoE corruption at
+# long single-shot prefill, e.g. gpt-oss rambling at 32k context). Only the
+# mxfp4 manifestation was fixed in 0.32.0; the affine 4/8-bit NAX variant
+# (affine_gather_qmm_rhs_nax short row index, upstream mlx#3922) reproduces
+# on 0.32.0.dev20260708 on M5 (re-verified 2026-08-26: rel err 0.68 at
+# 32772 rows vs exact at 32768). The pad guard is therefore unconditional:
+# pad the sorted rows up to a multiple of 64 (duplicating the last row,
+# which keeps the indices sorted); _scatter_unsort gathers only the
+# original rows, so the padding never reaches the output. Measured net
+# faster than unpadded at the trigger sizes, so there is no cost to
+# keeping it on everywhere.
+_SORTED_GATHER_TAIL_BUG = True
 
 
 def _gather_sort(x, indices):
