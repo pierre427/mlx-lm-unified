@@ -1,10 +1,15 @@
 # Copyright © 2026 Apple Inc.
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
+from mlx_lm import utils
 from mlx_lm.models.qwen4_exp import (
     GatedResidual,
     Model,
@@ -120,6 +125,43 @@ class TestQwen4Exp(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 5, args.vocab_size))
         self.assertEqual(cache[3].offset, 5)
         self.assertEqual(cache[1][3].shape, (1, args.ngram_size - 1))
+
+    def test_q4_quantizes_ple_as_independent_group_32_shards(self):
+        args = tiny_args(ple_layer_ids=[2], ple_embed_dim=128)
+        config = {"model_type": "qwen4_exp", "text_config": args.__dict__}
+        model = Model(ModelArgs.from_dict(config))
+        model, config = utils.quantize_model(model, config, 64, 4)
+
+        ngram_embedding = (
+            model.language_model.model.layers[1].ple.ple_embedding.ngram_embedding
+        )
+        for index in range(args.split_ngram_parts):
+            shard = getattr(ngram_embedding, f"shard_{index}")
+            self.assertIsInstance(shard, nn.QuantizedEmbedding)
+            self.assertEqual(shard.group_size, 32)
+            self.assertEqual(shard.bits, 4)
+
+        weights = dict(tree_flatten(model.parameters()))
+        prefix = (
+            "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+        )
+        self.assertNotIn(f"{prefix}.weight", weights)
+        for index in range(args.split_ngram_parts):
+            self.assertIn(f"{prefix}.shard_{index}.weight", weights)
+            self.assertIn(f"{prefix}.shard_{index}.scales", weights)
+            self.assertIn(f"{prefix}.shard_{index}.biases", weights)
+
+        self.assertEqual(
+            config["quantization"][f"{prefix}.shard_0"]["group_size"], 32
+        )
+
+        with TemporaryDirectory() as directory:
+            utils.save_model(directory, model)
+            utils.save_config(config, Path(directory) / "config.json")
+            reloaded, _ = utils.load_model(Path(directory))
+            logits = reloaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+            mx.eval(logits)
+            self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
     def test_raw_moe_weights_are_split_for_switch_glu(self):
         args = tiny_args()

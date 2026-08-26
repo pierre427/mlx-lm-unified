@@ -671,10 +671,11 @@ class TextModel(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            # Keep the file-backed PLE rows independently addressable.  A
-            # quantized monolith would force a 102 GB concatenate first.
+            # Quantize each 160-wide PLE shard independently.  Group 32 is
+            # required because 160 is not divisible by the global group 64;
+            # the 128 modules remain separately file-backed at lookup time.
             if ".ple_embedding.ngram_embedding.shard_" in path:
-                return False
+                return {"group_size": 32, "bits": 4, "mode": "affine"}
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
             return True
