@@ -1270,6 +1270,21 @@ class ResponseGenerator:
                 cached_prompt_tokens=ctx.prompt_cache_count,
                 prompt_tokens=len(prompt),
             )
+            if self_mtp is not None:
+                logging.info(
+                    "Self-MTP admitted: prompt=%d cached=0 k=%d window=%s sink=%s",
+                    len(prompt),
+                    self_mtp["num_draft"],
+                    self_mtp.get("window_size", "native"),
+                    self_mtp.get("sink_size", "native"),
+                )
+            elif getattr(self.cli_args, "self_mtp", False):
+                reason = (
+                    "APC target-cache hit without matching MTP state"
+                    if ctx.prompt_cache_count
+                    else "request sampling/speculation regime"
+                )
+                logging.info("Self-MTP bypassed: %s", reason)
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
