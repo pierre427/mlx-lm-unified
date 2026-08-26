@@ -10,6 +10,7 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from mlx_lm import utils
+from mlx_lm.generate import _merge_caches
 from mlx_lm.models.qwen4_exp import (
     GatedResidual,
     Model,
@@ -101,6 +102,30 @@ class TestQwen4Exp(unittest.TestCase):
         # The incomplete block tail is always included for its own query.
         self.assertTrue(bool(np.asarray(sparse)[0, 0, 8, 8]))
         self.assertFalse(bool(np.asarray(sparse)[0, 0, 3, 4]))
+
+    def test_qsa_cache_survives_server_batch_merge_and_extract(self):
+        args = tiny_args(ple_layer_ids=[2])
+        model = TextModel(args)
+        batch_cache = _merge_caches([model.make_cache()])
+
+        first = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=batch_cache)
+        second = model(mx.array([[4]], dtype=mx.int32), cache=batch_cache)
+        mx.eval(first, second)
+
+        qsa = batch_cache[3]
+        self.assertEqual(qsa.index_keys.shape, (1, 4, args.indexer_head_dim))
+        extracted = [cache.extract(0) for cache in batch_cache]
+        self.assertIsInstance(extracted[3], QSAKVCache)
+        self.assertEqual(
+            extracted[3].index_keys.shape, (1, 4, args.indexer_head_dim)
+        )
+
+        remerged = _merge_caches([extracted])
+        third = model(mx.array([[5]], dtype=mx.int32), cache=remerged)
+        mx.eval(third)
+        self.assertEqual(
+            remerged[3].index_keys.shape, (1, 5, args.indexer_head_dim)
+        )
 
     def test_release_config_counts_sixteen_ngram_heads(self):
         args = TextModelArgs(
