@@ -676,41 +676,7 @@ def adaptive_pld_generate_step(
                 "mtp_state requires mtp_tail=True and a model with an MTP head"
             )
         persistent = True
-        mtp_cache, restored_seed_h = mtp_state
-        # The sidecar must cover EXACTLY the cached prefix: prefix_len - 1
-        # teacher-forced pairs (h_i, t_{i+1}) plus the trunk hidden of the
-        # last cached token. Accepting a missing tail hidden would skip the
-        # boundary pair (last cached hidden -> first uncached token) in the
-        # prefill below, leaving the MTP cache one position behind (wrong
-        # RoPE positions) and silently collapsing restored-MTP acceptance —
-        # so validate BEFORE either cache is mutated. prefix_len comes from
-        # the attention layers' offsets (recurrent ArraysCache tracks none).
-        prefix_len = max((getattr(c, "offset", 0) for c in cache), default=0)
-        mtp_offset = max((getattr(c, "offset", 0) for c in mtp_cache), default=0)
-        if prefix_len > 0:
-            if restored_seed_h is None:
-                raise ValueError(
-                    "mtp_state with a non-empty prompt_cache prefix requires "
-                    "prev_tail_hidden (the trunk hidden of the last cached "
-                    "token); without it the boundary pair is skipped and the "
-                    "MTP cache drafts one position behind."
-                )
-            if mtp_offset != prefix_len - 1:
-                raise ValueError(
-                    f"mtp_state offset mismatch: MTP cache covers "
-                    f"{mtp_offset} pairs but the prompt_cache prefix has "
-                    f"{prefix_len} tokens (expected {prefix_len - 1} pairs). "
-                    "The prefix snapshot and its draft sidecar were not "
-                    "captured together."
-                )
-        elif restored_seed_h is not None or mtp_offset != 0:
-            raise ValueError(
-                "mtp_state carries a restored draft context "
-                f"({mtp_offset} pairs, prev_tail_hidden "
-                f"{'set' if restored_seed_h is not None else 'unset'}) but the "
-                "prompt_cache prefix is empty; the sidecar must cover exactly "
-                "the cached tokens."
-            )
+        mtp_cache, restored_seed_h = _restore_mtp_state(cache, mtp_state)
     elif persistent and external_prompt_cache:
         raise ValueError(
             "persistent_mtp is incompatible with an external prompt_cache: the "
@@ -960,6 +926,44 @@ def _mtp_backbone(model, tokens, cache):
     return hidden, hidden
 
 
+def _restore_mtp_state(cache, mtp_state):
+    """Validate and unpack an MTP sidecar paired with ``cache``.
+
+    A persistent MTP cache contains one fewer teacher-forced pair than the
+    target cache contains tokens.  The sidecar also needs the trunk hidden of
+    the final cached token so the first uncached token can form the boundary
+    pair.  Validate this relationship before mutating either cache.
+    """
+    mtp_cache, restored_seed_h = mtp_state
+    prefix_len = max((getattr(c, "offset", 0) for c in cache), default=0)
+    mtp_offset = max((getattr(c, "offset", 0) for c in mtp_cache), default=0)
+    if prefix_len > 0:
+        if restored_seed_h is None:
+            raise ValueError(
+                "mtp_state with a non-empty prompt_cache prefix requires "
+                "prev_tail_hidden (the trunk hidden of the last cached "
+                "token); without it the boundary pair is skipped and the "
+                "MTP cache drafts one position behind."
+            )
+        if mtp_offset != prefix_len - 1:
+            raise ValueError(
+                f"mtp_state offset mismatch: MTP cache covers "
+                f"{mtp_offset} pairs but the prompt_cache prefix has "
+                f"{prefix_len} tokens (expected {prefix_len - 1} pairs). "
+                "The prefix snapshot and its draft sidecar were not "
+                "captured together."
+            )
+    elif restored_seed_h is not None or mtp_offset != 0:
+        raise ValueError(
+            "mtp_state carries a restored draft context "
+            f"({mtp_offset} pairs, prev_tail_hidden "
+            f"{'set' if restored_seed_h is not None else 'unset'}) but the "
+            "prompt_cache prefix is empty; the sidecar must cover exactly "
+            "the cached tokens."
+        )
+    return mtp_cache, restored_seed_h
+
+
 def self_mtp_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -979,6 +983,8 @@ def self_mtp_generate_step(
     depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
     prompt_cache: Optional[List[Any]] = None,
+    mtp_state: Optional[Tuple[Any, Optional[mx.array]]] = None,
+    mtp_state_out: Optional[dict] = None,
     logits_processors: Optional[
         List[Callable[[mx.array, mx.array], mx.array]]
     ] = None,
@@ -1046,10 +1052,11 @@ def self_mtp_generate_step(
     prefixes.
 
     ``prompt_cache`` lets serving own the target cache so the verified result
-    can be inserted into its automatic prefix cache.  It must be empty for a
-    persistent-MTP cold prefill: an already-populated target cache has no
-    corresponding MTP hidden/KV history, so callers must route prefix-cache
-    hits through plain decoding until a joint cache representation exists.
+    can be inserted into its automatic prefix cache. ``mtp_state`` restores
+    the matching persistent draft sidecar: ``(mtp_cache, prev_tail_hidden)``.
+    Its offsets are validated against the target cache before either is
+    mutated. ``mtp_state_out`` is a caller-owned mapping populated on exit
+    with an exact, fully evaluated sidecar.
 
     Yields ``(token, logprobs, from_draft)``.
     """
@@ -1073,16 +1080,22 @@ def self_mtp_generate_step(
         raise ValueError("mtp_window_size requires persistent_mtp=True")
 
     cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
-    mtp_cache = (
-        model.make_mtp_cache(mtp_window_size, mtp_sink_size)
-        if persistent_mtp and mtp_window_size is not None
-        else model.make_mtp_cache() if persistent_mtp else None
-    )
+    if mtp_state is not None:
+        if not persistent_mtp:
+            raise ValueError("mtp_state requires persistent_mtp=True")
+        mtp_cache, restored_seed_h = _restore_mtp_state(cache, mtp_state)
+    else:
+        restored_seed_h = None
+        mtp_cache = (
+            model.make_mtp_cache(mtp_window_size, mtp_sink_size)
+            if persistent_mtp and mtp_window_size is not None
+            else model.make_mtp_cache() if persistent_mtp else None
+        )
 
     y = prompt.astype(mx.uint32)
     processor_prompt = y
     with mx.stream(generation_stream):
-        prev_h = None  # trunk hidden of the previous chunk's last position
+        prev_h = restored_seed_h
         while y.size > 1:  # leave one token to produce the seed hidden
             n = min(prefill_step_size, y.size - 1)
             _, h_chunk = _mtp_backbone(model, y[:n][None], cache)
@@ -1145,6 +1158,7 @@ def self_mtp_generate_step(
             # prefix is present before tentative draft tokens are appended and
             # rewound at commit boundaries.
             token_prefix=processor_prompt,
+            mtp_state_out=mtp_state_out,
         )
     finally:
         _stop_all_speculation(cache)
@@ -1258,7 +1272,7 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float):
     return tau, bonus
 
 
-def _mtp_draft_verify_loop(
+def _mtp_draft_verify_loop_impl(
     model,
     cache,
     cur,
@@ -1275,6 +1289,7 @@ def _mtp_draft_verify_loop(
     logits_processors=None,
     token_prefix=None,
     share_qsa_indices: bool = False,
+    mtp_state_tracker: Optional[dict] = None,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
@@ -1303,6 +1318,14 @@ def _mtp_draft_verify_loop(
     persistent = mtp_cache is not None
     pending_hs = None  # committed (hidden, token) pairs not yet in mtp_cache
     pending_ts: List[int] = []
+    if mtp_state_tracker is not None:
+        mtp_state_tracker.update(
+            cache=cache,
+            mtp_cache=mtp_cache,
+            pending_hs=pending_hs,
+            pending_ts=pending_ts,
+            seed_h=seed_h,
+        )
     gated_off = False
     gate_cycles = 0
     spec_secs = 0.0  # wall-clock over measured spec cycles
@@ -1334,7 +1357,7 @@ def _mtp_draft_verify_loop(
             )
             lp = _temperature_logprobs(logits, sampling_temp)
             nxt = _sample_from_logprobs(lp, sampling_temp)
-        if persistent and not gated_off:
+        if persistent and (not gated_off or mtp_state_tracker is not None):
             # Pairs only matter if drafting can resume; after a permanent
             # de-latch they would just accumulate unused memory.
             pending_hs = (
@@ -1344,6 +1367,12 @@ def _mtp_draft_verify_loop(
             pending_ts.append(cur)
         token_prefix = proc_tokens
         seed_h, cur = h[:, -1:, :], nxt
+        if mtp_state_tracker is not None:
+            mtp_state_tracker.update(
+                pending_hs=pending_hs,
+                pending_ts=pending_ts,
+                seed_h=seed_h,
+            )
         stats.cycles += 1
         stats.plain_cycles += 1
         stats.plain_tokens += 1
@@ -1519,6 +1548,12 @@ def _mtp_draft_verify_loop(
                 pending_hs = seed_h
             pending_ts = [cur] + drafts[:n_accept]
         seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
+        if mtp_state_tracker is not None:
+            mtp_state_tracker.update(
+                pending_hs=pending_hs,
+                pending_ts=pending_ts,
+                seed_h=seed_h,
+            )
         stats.draft_proposed += k
         stats.draft_cycles += 1
         if speculation_router is not None:
@@ -1544,6 +1579,56 @@ def _mtp_draft_verify_loop(
         spec_secs += time.perf_counter() - cycle_t0
         spec_toks += ntoks - ntoks_at_cycle_start
         gate_cycles += 1
+
+
+def _mtp_draft_verify_loop(*args, mtp_state_out=None, **kwargs):
+    """Run the MTP tail and optionally materialize an exact APC sidecar.
+
+    The implementation carries committed pairs lazily for performance.  This
+    wrapper owns generator finalization, flushes those pairs once, evaluates
+    the resulting MLX state, and exposes it only when target and draft offsets
+    are structurally exact.
+    """
+    tracker = {} if mtp_state_out is not None else None
+    try:
+        yield from _mtp_draft_verify_loop_impl(
+            *args, mtp_state_tracker=tracker, **kwargs
+        )
+    finally:
+        if tracker is not None and tracker.get("mtp_cache") is not None:
+            mtp_cache = tracker["mtp_cache"]
+            pending_hs = tracker.get("pending_hs")
+            pending_ts = tracker.get("pending_ts") or []
+            if pending_hs is not None and pending_ts:
+                model = args[0] if args else kwargs["model"]
+                model.mtp_step(
+                    pending_hs,
+                    mx.array([pending_ts], mx.uint32),
+                    mtp_cache,
+                )
+            cache = tracker["cache"]
+            seed_h = tracker.get("seed_h")
+            mx.eval(
+                [c.state for c in cache],
+                [c.state for c in mtp_cache],
+                seed_h,
+            )
+            covered_tokens = max(
+                (getattr(c, "offset", 0) for c in cache), default=0
+            )
+            mtp_offset = max(
+                (getattr(c, "offset", 0) for c in mtp_cache), default=0
+            )
+            reusable = (
+                covered_tokens > 0
+                and seed_h is not None
+                and mtp_offset == covered_tokens - 1
+            )
+            mtp_state_out.update(
+                state=(mtp_cache, seed_h),
+                covered_tokens=covered_tokens,
+                reusable=reusable,
+            )
 
 
 def hybrid_stream_generate(

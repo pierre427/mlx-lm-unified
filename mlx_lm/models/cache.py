@@ -4182,6 +4182,7 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        sidecar: Any = None
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -4291,10 +4292,15 @@ class LRUPromptCache:
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        sidecar: Any = None,
     ):
         # Make the cache entry
+        sidecar_nbytes = int(getattr(sidecar, "nbytes", 0))
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            prompt_cache,
+            sum(c.nbytes for c in prompt_cache) + sidecar_nbytes,
+            cache_type,
+            sidecar,
         )
 
         # Insert into the trie and update the byte counter and lru position

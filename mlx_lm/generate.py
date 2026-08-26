@@ -1570,7 +1570,8 @@ def stream_generate(
           tokenizer as the main model. Default: ``None``.
         self_mtp (Optional[dict]): Enable the model's internal depth-one MTP
           head. This route is intended for a caller that has already gated the
-          request to an exact sampling regime and a cold target cache.
+          request to an exact sampling regime and either a cold target cache or
+          an exact matching ``state`` sidecar.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -1636,6 +1637,8 @@ def stream_generate(
             rate_gate=self_mtp.get("rate_gate", True),
             stats=self_mtp.get("stats"),
             prompt_cache=kwargs.get("prompt_cache"),
+            mtp_state=self_mtp.get("state"),
+            mtp_state_out=self_mtp.get("state_out"),
             logits_processors=kwargs.get("logits_processors"),
         )
     elif pld_safe:

@@ -24,6 +24,8 @@ from mlx_lm.server import (
     _make_sampler,
     _measure_kv_cost,
     _configure_process_wired_limit,
+    _request_output_ceiling,
+    _request_sampling_profile,
     _self_mtp_config,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
@@ -179,6 +181,18 @@ class TestSelfMTPAdmission(unittest.TestCase):
             )
         )
 
+    def test_prefix_cache_hit_with_exact_mtp_sidecar_is_admitted(self):
+        state = (object(), object())
+        config = _self_mtp_config(
+            self.args(),
+            self.cli,
+            self.model,
+            cached_prompt_tokens=128,
+            mtp_state=state,
+        )
+        self.assertIs(config["state"], state)
+        self.assertEqual(config["state_out"], {})
+
     def test_windowed_mtp_is_admitted_only_above_measured_threshold(self):
         short = _self_mtp_config(
             self.args(), self.cli, self.model, prompt_tokens=16384
@@ -205,6 +219,44 @@ class TestSelfMTPAdmission(unittest.TestCase):
         ):
             self.assertIsNone(_configure_process_wired_limit(self.cli))
         set_limit.assert_not_called()
+
+
+class TestThinkingServingProfiles(unittest.TestCase):
+    def setUp(self):
+        self.cli = types.SimpleNamespace(
+            chat_template_args={"enable_thinking": True, "preserve_thinking": True},
+            thinking_sampling_profile={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                "repetition_penalty": 1.0,
+            },
+            nonthinking_sampling_profile={
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 1.5,
+                "repetition_penalty": 1.0,
+            },
+            thinking_output_ceiling=262144,
+            nonthinking_output_ceiling=131072,
+        )
+
+    def test_request_mode_selects_profile_and_ceiling(self):
+        self.assertEqual(
+            _request_sampling_profile(self.cli)["temperature"], 1.0
+        )
+        self.assertEqual(_request_output_ceiling(self.cli), 262144)
+
+        override = {"enable_thinking": False}
+        self.assertEqual(
+            _request_sampling_profile(self.cli, override)["presence_penalty"],
+            1.5,
+        )
+        self.assertEqual(_request_output_ceiling(self.cli, override), 131072)
 
 
 class DummyModelProvider:

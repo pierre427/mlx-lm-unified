@@ -33,7 +33,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .apc import AutomaticPrefixCache
+from .apc import AutomaticPrefixCache, MTPAPCSidecar
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
@@ -627,6 +627,31 @@ def _make_logits_processors(args):
     )
 
 
+def _request_thinking_enabled(cli_args, chat_template_kwargs=None):
+    """Resolve the effective chat-template thinking mode for admission."""
+    template_args = dict(getattr(cli_args, "chat_template_args", {}) or {})
+    template_args.update(chat_template_kwargs or {})
+    return bool(template_args.get("enable_thinking", False))
+
+
+def _request_sampling_profile(cli_args, chat_template_kwargs=None):
+    """Return the configured mode profile; explicit request fields override it."""
+    thinking = _request_thinking_enabled(cli_args, chat_template_kwargs)
+    name = (
+        "thinking_sampling_profile"
+        if thinking
+        else "nonthinking_sampling_profile"
+    )
+    return dict(getattr(cli_args, name, None) or {})
+
+
+def _request_output_ceiling(cli_args, chat_template_kwargs=None):
+    """Return a mode-specific admission ceiling, never a generation default."""
+    thinking = _request_thinking_enabled(cli_args, chat_template_kwargs)
+    name = "thinking_output_ceiling" if thinking else "nonthinking_output_ceiling"
+    return getattr(cli_args, name, None)
+
+
 def _self_mtp_config(
     args,
     cli_args,
@@ -634,6 +659,7 @@ def _self_mtp_config(
     *,
     cached_prompt_tokens=0,
     prompt_tokens=0,
+    mtp_state=None,
 ):
     """Return an exact self-MTP route or fail closed to ordinary decoding.
 
@@ -645,7 +671,9 @@ def _self_mtp_config(
     """
     if not getattr(cli_args, "self_mtp", False):
         return None
-    if getattr(model, "mtp", None) is None or cached_prompt_tokens:
+    if getattr(model, "mtp", None) is None or (
+        cached_prompt_tokens and mtp_state is None
+    ):
         return None
     if args.model.draft != "default_model" or args.prompt_lookup_ngram:
         return None
@@ -676,7 +704,10 @@ def _self_mtp_config(
         ),
         "sampling_temp": sampling.temperature,
         "accept_rule": "residual",
+        "state_out": {},
     }
+    if mtp_state is not None:
+        config["state"] = mtp_state
     window_size = getattr(cli_args, "self_mtp_window_size", 0)
     window_minimum = getattr(cli_args, "self_mtp_window_min_prompt_tokens", 0)
     if (
@@ -1266,9 +1297,17 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
+            if hasattr(self.prompt_cache, "lookup"):
+                lookup = self.prompt_cache.lookup(
+                    self.model_provider.model_key, prompt
+                )
+                cache, rest = lookup.cache, lookup.remaining_tokens
+                mtp_sidecar = lookup.sidecar
+            else:
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                mtp_sidecar = None
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
@@ -1284,11 +1323,15 @@ class ResponseGenerator:
                 model,
                 cached_prompt_tokens=ctx.prompt_cache_count,
                 prompt_tokens=len(prompt),
+                mtp_state=(mtp_sidecar.state if mtp_sidecar is not None else None),
             )
             if self_mtp is not None:
                 logging.info(
-                    "Self-MTP admitted: prompt=%d cached=0 k=%d window=%s sink=%s",
+                    "Self-MTP admitted: prompt=%d cached=%d sidecar=%s "
+                    "k=%d window=%s sink=%s",
                     len(prompt),
+                    ctx.prompt_cache_count,
+                    mtp_sidecar is not None,
                     self_mtp["num_draft"],
                     self_mtp.get("window_size", "native"),
                     self_mtp.get("sink_size", "native"),
@@ -1300,7 +1343,7 @@ class ResponseGenerator:
                     else "request sampling/speculation regime"
                 )
                 logging.info("Self-MTP bypassed: %s", reason)
-            for gen in stream_generate(
+            token_stream = stream_generate(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=rest,
@@ -1334,43 +1377,70 @@ class ResponseGenerator:
                     "quantized_kv_start",
                     DEFAULT_QUANTIZED_KV_START,
                 ),
-            ):
-                finish_reason = gen.finish_reason
+            )
+            completed = False
+            try:
+                for gen in token_stream:
+                    finish_reason = gen.finish_reason
 
-                # Token-level stop word detection
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, gen.token
-                )
-                if matched:
-                    finish_reason = "stop"
-
-                rqueue.put(
-                    Response(
-                        gen.text,
-                        gen.token,
-                        gen.logprobs[gen.token].item(),
-                        finish_reason,
-                        _format_top_logprobs(
-                            gen.logprobs, args.top_logprobs, tokenizer
-                        ),
+                    # Token-level stop word detection
+                    stop_state, matched = StopSequenceMatcher.match(
+                        stop_state, stop_matcher._trie, gen.token
                     )
-                )
-                cache_key.append(gen.token)
+                    if matched:
+                        finish_reason = "stop"
 
-                if ctx._should_stop:
-                    if self._is_distributed:
-                        raise NotImplementedError()
-                    break
+                    rqueue.put(
+                        Response(
+                            gen.text,
+                            gen.token,
+                            gen.logprobs[gen.token].item(),
+                            finish_reason,
+                            _format_top_logprobs(
+                                gen.logprobs, args.top_logprobs, tokenizer
+                            ),
+                        )
+                    )
+                    cache_key.append(gen.token)
 
-                if finish_reason is not None:
-                    break
+                    if ctx._should_stop:
+                        if self._is_distributed:
+                            raise NotImplementedError()
+                        break
+
+                    if finish_reason is not None:
+                        completed = True
+                        break
+            finally:
+                token_stream.close()
 
             rqueue.put(None)
 
             # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            sidecar = None
+            if self_mtp is not None and completed:
+                captured = self_mtp["state_out"]
+                covered = int(captured.get("covered_tokens", 0))
+                cache_offset = max(
+                    (getattr(c, "offset", 0) for c in cache), default=0
+                )
+                if (
+                    captured.get("reusable")
+                    and covered == cache_offset
+                    and 0 < covered < len(cache_key)
+                ):
+                    sidecar = MTPAPCSidecar(captured["state"], covered)
+            if isinstance(self.prompt_cache, AutomaticPrefixCache):
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key,
+                    cache_key,
+                    cache,
+                    sidecar=sidecar,
+                )
+            else:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
@@ -1521,23 +1591,45 @@ class APIHandler(BaseHTTPRequestHandler):
             "prompt_lookup_ngram", self.response_generator.cli_args.prompt_lookup_ngram
         )
         self.prompt_lookup_tokens = self.body.get(
-            "prompt_lookup_tokens", self.response_generator.cli_args.prompt_lookup_tokens
+            "prompt_lookup_tokens",
+            self.response_generator.cli_args.prompt_lookup_tokens,
         )
         self.adapter = self.body.get("adapters", None)
+        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        sampling_profile = _request_sampling_profile(
+            self.response_generator.cli_args, self.chat_template_kwargs
+        )
+        self.output_token_ceiling = _request_output_ceiling(
+            self.response_generator.cli_args, self.chat_template_kwargs
+        )
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
                 "max_tokens", self.response_generator.cli_args.max_tokens
             )
         self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
+            "temperature",
+            sampling_profile.get("temperature", self.response_generator.cli_args.temp),
         )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
+        self.top_p = self.body.get(
+            "top_p",
+            sampling_profile.get("top_p", self.response_generator.cli_args.top_p),
+        )
+        self.top_k = self.body.get(
+            "top_k",
+            sampling_profile.get("top_k", self.response_generator.cli_args.top_k),
+        )
+        self.min_p = self.body.get(
+            "min_p",
+            sampling_profile.get("min_p", self.response_generator.cli_args.min_p),
+        )
+        self.repetition_penalty = self.body.get(
+            "repetition_penalty", sampling_profile.get("repetition_penalty", 0.0)
+        )
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.presence_penalty = self.body.get("presence_penalty", 0.0)
+        self.presence_penalty = self.body.get(
+            "presence_penalty", sampling_profile.get("presence_penalty", 0.0)
+        )
         self.presence_context_size = self.body.get("presence_context_size", 20)
         self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
         self.frequency_context_size = self.body.get("frequency_context_size", 20)
@@ -1547,7 +1639,6 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
-        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         try:
             self.validate_model_parameters()
         except ValueError as e:
@@ -1596,7 +1687,12 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        self._validate(
+            "max_tokens",
+            int,
+            min_val=0,
+            max_val=getattr(self, "output_token_ceiling", None),
+        )
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
@@ -2392,6 +2488,42 @@ def setup_arg_parser():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--thinking-sampling-profile",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON sampling defaults used when effective enable_thinking=true. "
+            "Explicit request parameters override each field."
+        ),
+    )
+    parser.add_argument(
+        "--nonthinking-sampling-profile",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON sampling defaults used when effective enable_thinking=false. "
+            "Explicit request parameters override each field."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-output-ceiling",
+        type=int,
+        default=None,
+        help=(
+            "Reject thinking-mode requests whose max token budget exceeds this "
+            "ceiling. This does not change --max-tokens."
+        ),
+    )
+    parser.add_argument(
+        "--nonthinking-output-ceiling",
+        type=int,
+        default=None,
+        help=(
+            "Reject non-thinking requests whose max token budget exceeds this "
+            "ceiling. This does not change --max-tokens."
+        ),
     )
     parser.add_argument(
         "--decode-concurrency",

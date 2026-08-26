@@ -4,7 +4,12 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.apc import APCKey, AutomaticPrefixCache, inspect_apc_capabilities
+from mlx_lm.apc import (
+    APCKey,
+    AutomaticPrefixCache,
+    MTPAPCSidecar,
+    inspect_apc_capabilities,
+)
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 
@@ -89,6 +94,30 @@ class TestAutomaticPrefixCache(unittest.TestCase):
         self.assertEqual(remaining, [3])
         self.assertEqual(apc.apc_stats["hits"], 1)
         self.assertEqual(apc.apc_stats["stores"], 1)
+
+    def test_mtp_sidecar_restores_only_at_joint_capture_boundary(self):
+        apc = AutomaticPrefixCache()
+        key = APCKey("qwen4")
+        target = [_state(KVCache(), 2)]
+        mtp = [_state(KVCache(), 1)]
+        sidecar = MTPAPCSidecar(
+            (mtp, mx.zeros((1, 1, 4), mx.float32)), covered_tokens=2
+        )
+        # The path contains the last yielded token, while both model caches
+        # cover the two tokens before it.
+        apc.store(key, [1, 2, 3], target, sidecar=sidecar)
+
+        hit = apc.lookup(key, [1, 2, 3, 4])
+        self.assertEqual(hit.hit_kind, "mtp_sidecar")
+        self.assertEqual(hit.cached_tokens, 2)
+        self.assertEqual(hit.remaining_tokens, [3, 4])
+        self.assertIsNot(hit.sidecar, sidecar)
+        self.assertEqual(hit.sidecar.covered_tokens, 2)
+
+        # A branch before the joint boundary must never pair a trimmed target
+        # cache with an untrimmed draft state.
+        branch = apc.lookup(key, [1, 9, 10])
+        self.assertIsNone(branch.sidecar)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ copy-on-write sharing.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Hashable, Iterable, List, Optional
 
@@ -68,6 +69,25 @@ class APCLookup:
     hit_kind: Optional[str]
     miss_reason: Optional[str]
     native: Any = None
+    sidecar: Any = None
+
+
+@dataclass
+class MTPAPCSidecar:
+    """Persistent draft state captured at an exact target-cache boundary."""
+
+    state: Any
+    covered_tokens: int
+
+    @property
+    def nbytes(self) -> int:
+        mtp_cache, tail_hidden = self.state
+        cache_bytes = sum(
+            int(getattr(entry, "nbytes", 0))
+            for entry in _walk_cache_entries(mtp_cache)
+        )
+        hidden_bytes = int(getattr(tail_hidden, "nbytes", 0))
+        return cache_bytes + hidden_bytes
 
 
 def _walk_cache_entries(prompt_cache: Iterable[Any]):
@@ -160,6 +180,57 @@ class AutomaticPrefixCache(LRUPromptCache):
     def lookup(self, key: Hashable, tokens: Iterable[int]) -> APCLookup:
         tokens = [int(token) for token in tokens]
         trie_result = self._trie.search(key, tokens)
+        # A target cache may only compose with an MTP sidecar at the exact
+        # boundary jointly captured by the two states. Prefer the deepest such
+        # candidate whose stored token path still matches through that
+        # boundary. Do not trim either cache: the uncached token tail starts at
+        # ``covered_tokens`` and teacher-forces forward from there.
+        sidecar_candidates = []
+        for path, common in (
+            (trie_result.exact, len(tokens)),
+            (trie_result.longer, trie_result.common_prefix),
+            (
+                trie_result.shorter,
+                len(trie_result.shorter)
+                if trie_result.shorter is not None
+                else 0,
+            ),
+        ):
+            if path is None:
+                continue
+            entry = self._trie.get(trie_result.model, path)
+            sidecar = getattr(entry, "sidecar", None)
+            covered = int(getattr(sidecar, "covered_tokens", 0))
+            if (
+                sidecar is not None
+                and 0 < covered < len(tokens)
+                and common >= covered
+            ):
+                cache_offset = max(
+                    (
+                        getattr(c, "offset", 0)
+                        for c in _walk_cache_entries(entry.prompt_cache)
+                    ),
+                    default=0,
+                )
+                if cache_offset == covered:
+                    sidecar_candidates.append((covered, entry, sidecar))
+        if sidecar_candidates:
+            covered, entry, sidecar = max(
+                sidecar_candidates, key=lambda item: item[0]
+            )
+            self._apc_stats["lookups"] += 1
+            self._apc_stats["hits"] += 1
+            self._apc_stats["cached_tokens"] += covered
+            return APCLookup(
+                copy.deepcopy(entry.prompt_cache),
+                tokens[covered:],
+                covered,
+                True,
+                "mtp_sidecar",
+                None,
+                sidecar=copy.deepcopy(sidecar),
+            )
         cache, remaining = super().fetch_nearest_cache(key, tokens)
         cached_tokens = len(tokens) - len(remaining) if cache is not None else 0
         hit = cache is not None and cached_tokens > 0
@@ -197,12 +268,17 @@ class AutomaticPrefixCache(LRUPromptCache):
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        sidecar: Any = None,
     ) -> APCCapabilities:
         capabilities = inspect_apc_capabilities(prompt_cache)
         if not capabilities.exact_prefix:
             return capabilities
         super().insert_cache(
-            key, [int(token) for token in tokens], prompt_cache, cache_type=cache_type
+            key,
+            [int(token) for token in tokens],
+            prompt_cache,
+            cache_type=cache_type,
+            sidecar=sidecar,
         )
         self._apc_stats["stores"] += 1
         return capabilities
@@ -218,8 +294,15 @@ class AutomaticPrefixCache(LRUPromptCache):
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        sidecar: Any = None,
     ):
-        return self.store(model, tokens, prompt_cache, cache_type=cache_type)
+        return self.store(
+            model,
+            tokens,
+            prompt_cache,
+            cache_type=cache_type,
+            sidecar=sidecar,
+        )
 
     @property
     def apc_stats(self):
@@ -236,5 +319,6 @@ __all__ = [
     "APCKey",
     "APCLookup",
     "AutomaticPrefixCache",
+    "MTPAPCSidecar",
     "inspect_apc_capabilities",
 ]

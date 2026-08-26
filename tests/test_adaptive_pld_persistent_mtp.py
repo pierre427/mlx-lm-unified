@@ -13,7 +13,11 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.hybrid_speculative import HybridStats, adaptive_pld_generate_step
+from mlx_lm.hybrid_speculative import (
+    HybridStats,
+    adaptive_pld_generate_step,
+    self_mtp_generate_step,
+)
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.qwen3_5 import TextModel
 
@@ -415,3 +419,48 @@ class TestRestoredMTPState(unittest.TestCase):
             mtp_state=(self.model.make_mtp_cache(), None),
         )
         self.assertEqual(toks, base)
+
+    def test_self_mtp_restored_state_matches_cold_stream(self):
+        base = [
+            int(t)
+            for t, _lp, _fd in self_mtp_generate_step(
+                self.prompt,
+                self.model,
+                max_tokens=32,
+                persistent_mtp=True,
+            )
+        ]
+        cache, mtp_cache, seed = _capture_prefix(self.model, self.prompt[:20])
+        restored = [
+            int(t)
+            for t, _lp, _fd in self_mtp_generate_step(
+                self.prompt[20:],
+                self.model,
+                max_tokens=32,
+                persistent_mtp=True,
+                prompt_cache=cache,
+                mtp_state=(mtp_cache, seed),
+            )
+        ]
+        self.assertEqual(restored, base)
+
+    def test_self_mtp_materializes_exact_sidecar_on_exit(self):
+        cache = make_prompt_cache(self.model)
+        captured = {}
+        result = list(
+            self_mtp_generate_step(
+                self.prompt,
+                self.model,
+                max_tokens=16,
+                persistent_mtp=True,
+                prompt_cache=cache,
+                mtp_state_out=captured,
+            )
+        )
+        self.assertEqual(len(result), 16)
+        self.assertTrue(captured["reusable"])
+        covered = max(getattr(c, "offset", 0) for c in cache)
+        mtp_cache, seed = captured["state"]
+        self.assertEqual(captured["covered_tokens"], covered)
+        self.assertEqual(max(c.offset for c in mtp_cache), covered - 1)
+        self.assertIsNotNone(seed)
