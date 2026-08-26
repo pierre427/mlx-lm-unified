@@ -229,6 +229,12 @@ class GenerationArguments:
     chat_template_kwargs: Optional[Dict[str, Any]]
     prompt_lookup_ngram: int = 0
     prompt_lookup_tokens: int = 8
+    prompt_lookup_adaptive: bool = True
+    prompt_lookup_rate_gate: bool = True
+    prompt_lookup_warmup: int = 48
+    prompt_lookup_gate: float = 0.12
+    prompt_lookup_rate_gate_probe: int = 32
+    prompt_lookup_rate_gate_margin: float = 0.0
 
 
 @dataclass
@@ -1366,6 +1372,12 @@ class ResponseGenerator:
                     {
                         "ngram_max": args.prompt_lookup_ngram,
                         "num_draft": args.prompt_lookup_tokens,
+                        "adaptive": args.prompt_lookup_adaptive,
+                        "rate_gate": args.prompt_lookup_rate_gate,
+                        "warmup": args.prompt_lookup_warmup,
+                        "gate": args.prompt_lookup_gate,
+                        "rate_gate_probe": args.prompt_lookup_rate_gate_probe,
+                        "rate_gate_margin": args.prompt_lookup_rate_gate_margin,
                         # The target APC already owns model state for this
                         # prefix; PLD separately needs the token IDs so suffix
                         # matches can cross the cached-prefix boundary.
@@ -1612,6 +1624,38 @@ class APIHandler(BaseHTTPRequestHandler):
             "prompt_lookup_tokens",
             self.response_generator.cli_args.prompt_lookup_tokens,
         )
+        self.prompt_lookup_adaptive = self.body.get(
+            "prompt_lookup_adaptive",
+            getattr(self.response_generator.cli_args, "prompt_lookup_adaptive", True),
+        )
+        self.prompt_lookup_rate_gate = self.body.get(
+            "prompt_lookup_rate_gate",
+            getattr(self.response_generator.cli_args, "prompt_lookup_rate_gate", True),
+        )
+        self.prompt_lookup_warmup = self.body.get(
+            "prompt_lookup_warmup",
+            getattr(self.response_generator.cli_args, "prompt_lookup_warmup", 48),
+        )
+        self.prompt_lookup_gate = self.body.get(
+            "prompt_lookup_gate",
+            getattr(self.response_generator.cli_args, "prompt_lookup_gate", 0.12),
+        )
+        self.prompt_lookup_rate_gate_probe = self.body.get(
+            "prompt_lookup_rate_gate_probe",
+            getattr(
+                self.response_generator.cli_args,
+                "prompt_lookup_rate_gate_probe",
+                32,
+            ),
+        )
+        self.prompt_lookup_rate_gate_margin = self.body.get(
+            "prompt_lookup_rate_gate_margin",
+            getattr(
+                self.response_generator.cli_args,
+                "prompt_lookup_rate_gate_margin",
+                0.0,
+            ),
+        )
         self.adapter = self.body.get("adapters", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         sampling_profile = _request_sampling_profile(
@@ -1721,6 +1765,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise ValueError(f"{name} must be of type int")
         self._validate("prompt_lookup_ngram", int, min_val=0)
         self._validate("prompt_lookup_tokens", int, min_val=1)
+        self._validate("prompt_lookup_adaptive", bool)
+        self._validate("prompt_lookup_rate_gate", bool)
+        self._validate("prompt_lookup_warmup", int, min_val=1)
+        self._validate("prompt_lookup_gate", (float, int), min_val=0, max_val=1)
+        self._validate("prompt_lookup_rate_gate_probe", int, min_val=1)
+        self._validate(
+            "prompt_lookup_rate_gate_margin", (float, int), min_val=0, max_val=1
+        )
         self._validate("repetition_penalty", (float, int), min_val=0)
         self._validate("repetition_context_size", int, min_val=0)
         self._validate("presence_penalty", (float, int))
@@ -1918,6 +1970,12 @@ class APIHandler(BaseHTTPRequestHandler):
             num_draft_tokens=self.num_draft_tokens,
             prompt_lookup_ngram=self.prompt_lookup_ngram,
             prompt_lookup_tokens=self.prompt_lookup_tokens,
+            prompt_lookup_adaptive=self.prompt_lookup_adaptive,
+            prompt_lookup_rate_gate=self.prompt_lookup_rate_gate,
+            prompt_lookup_warmup=self.prompt_lookup_warmup,
+            prompt_lookup_gate=self.prompt_lookup_gate,
+            prompt_lookup_rate_gate_probe=self.prompt_lookup_rate_gate_probe,
+            prompt_lookup_rate_gate_margin=self.prompt_lookup_rate_gate_margin,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -2447,6 +2505,30 @@ def setup_arg_parser():
         type=int,
         default=8,
         help="Max tokens to propose per prompt-lookup step. Default: 8.",
+    )
+    parser.add_argument(
+        "--prompt-lookup-adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Latch prompt lookup to ordinary decode when accepted proposals "
+            "stay below the configured gate (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-lookup-rate-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Measure prompt-lookup versus ordinary decode once and delatch if "
+            "it is not faster (default: enabled)."
+        ),
+    )
+    parser.add_argument("--prompt-lookup-warmup", type=int, default=48)
+    parser.add_argument("--prompt-lookup-gate", type=float, default=0.12)
+    parser.add_argument("--prompt-lookup-rate-gate-probe", type=int, default=32)
+    parser.add_argument(
+        "--prompt-lookup-rate-gate-margin", type=float, default=0.0
     )
     parser.add_argument(
         "--trust-remote-code",

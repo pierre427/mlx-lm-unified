@@ -430,7 +430,9 @@ def generate_step(
     *,
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    logits_processors: Optional[
+        List[Callable[[mx.array, mx.array], mx.array]]
+    ] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
@@ -1246,6 +1248,7 @@ def prompt_lookup_generate_step(
     rate_gate: bool = False,
     rate_gate_probe: int = 32,
     rate_gate_margin: float = 0.0,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     stats: Optional[Any] = None,
     history_prompt: Optional[mx.array] = None,
     **_ignored,
@@ -1276,16 +1279,6 @@ def prompt_lookup_generate_step(
     uncached tail backed by a prefilled ``prompt_cache``. Retrieval proposals use
     the full history, while target verification forwards only the uncached tail.
     """
-    if _ignored.get("logits_processors"):
-        # PLD has no logits-processor hook: masks would silently never be
-        # applied (grammar/constrained output would be unconstrained). The
-        # servers route constrained requests to generate_step; stream_generate's
-        # pld_safe gate does the same. Fail loud for direct callers.
-        raise ValueError(
-            "prompt_lookup_generate_step does not support logits_processors; "
-            "use generate_step (stream_generate routes constrained requests "
-            "there automatically)"
-        )
     from .prompt_lookup import (
         HybridStats,
         NgramProposer,
@@ -1400,13 +1393,32 @@ def prompt_lookup_generate_step(
 
             with mx.stream(generation_stream):
                 logits = model(mx.array(x)[None], cache=prompt_cache)[0]
-                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-                mx.eval(logprobs)
+                if logits_processors:
+                    mx.eval(logits)
+                    logprobs = None
+                else:
+                    logprobs = logits - mx.logsumexp(
+                        logits, axis=-1, keepdims=True
+                    )
+                    mx.eval(logprobs)
 
             base = len(pending) - 1
             emit = []  # (token, logprobs_row, from_draft)
             for j in range(len(prop) + 1):
-                row = logprobs[base + j]
+                if logits_processors:
+                    # Row j predicts after the committed history plus the j
+                    # tentative proposal tokens preceding it. Applying each
+                    # processor sequentially with that exact history preserves
+                    # generate_step semantics while still verifying all target
+                    # rows in one model forward.
+                    row_logits = logits[base + j][None]
+                    processor_tokens = mx.array(history_seq + prop[:j])
+                    for processor in logits_processors:
+                        row_logits = processor(processor_tokens, row_logits)
+                    row = row_logits[0] - mx.logsumexp(row_logits[0])
+                    mx.eval(row)
+                else:
+                    row = logprobs[base + j]
                 s = int(sampler(row[None])[0].item())
                 if j < len(prop) and prop[j] == s:
                     emit.append((prop[j], row, True))
@@ -1471,7 +1483,12 @@ def prompt_lookup_generate_step(
                 while n_probe < budget:
                     with mx.stream(generation_stream):
                         logits = model(mx.array(pending)[None], cache=prompt_cache)[0]
-                        last = logits[-1]
+                        last = logits[-1][None]
+                        if logits_processors:
+                            processor_tokens = mx.array(history_seq)
+                            for processor in logits_processors:
+                                last = processor(processor_tokens, last)
+                        last = last[0]
                         row = last - mx.logsumexp(last, keepdims=True)
                         mx.eval(row)
                     s = int(sampler(row[None])[0].item())
@@ -1503,11 +1520,33 @@ def prompt_lookup_generate_step(
         if latched and (max_tokens < 0 or generated < max_tokens):
             stats.latched = True
             remaining = -1 if max_tokens < 0 else (max_tokens - generated)
+            tail_processors = logits_processors
+            if logits_processors:
+                if history_seq[-len(pending) :] != pending:
+                    raise RuntimeError(
+                        "prompt-lookup processor history is not aligned with "
+                        "the plain-tail prompt"
+                    )
+                processor_prefix = mx.array(history_seq[: -len(pending)])
+
+                def with_history(processor):
+                    def wrapped(tokens, logits):
+                        full_tokens = (
+                            mx.concatenate([processor_prefix, tokens])
+                            if len(processor_prefix)
+                            else tokens
+                        )
+                        return processor(full_tokens, logits)
+
+                    return wrapped
+
+                tail_processors = [with_history(p) for p in logits_processors]
             for tok, lp in generate_step(
                 mx.array(pending),
                 model,
                 max_tokens=remaining,
                 sampler=sampler,
+                logits_processors=tail_processors,
                 prompt_cache=prompt_cache,
                 prefill_step_size=prefill_step_size,
             ):
@@ -1596,9 +1635,10 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     # Prompt-lookup (draft-free) speculative decoding. Engages only when it is
-    # safe to do losslessly: no draft model, no logits processors, no KV-cache
-    # quantization, and no input embeddings / bounded KV (unsupported by the
-    # rewind path). Otherwise fall through to the standard generators.
+    # safe to do losslessly: no draft model, no KV-cache quantization, and no
+    # input embeddings / bounded KV (unsupported by the rewind path). Logits
+    # processors are applied row-by-row with the exact committed/tentative
+    # history after the batched target forward.
     mtp_safe = (
         self_mtp
         and getattr(model, "mtp", None) is not None
@@ -1611,7 +1651,6 @@ def stream_generate(
     pld_safe = (
         prompt_lookup
         and draft_model is None
-        and not kwargs.get("logits_processors")
         and kwargs.get("kv_bits") is None
         and kwargs.get("input_embeddings") is None
         and kwargs.get("max_kv_size") is None
@@ -1644,7 +1683,7 @@ def stream_generate(
     elif pld_safe:
         for k in (
             "num_draft_tokens", "relaxed_topk", "relaxed_delta", "speculative_stats",
-            "logits_processors", "kv_bits", "kv_group_size", "quantized_kv_start",
+            "kv_bits", "kv_group_size", "quantized_kv_start",
             "input_embeddings", "max_kv_size",
         ):
             kwargs.pop(k, None)

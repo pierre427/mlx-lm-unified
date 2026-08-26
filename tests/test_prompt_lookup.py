@@ -176,6 +176,50 @@ class _LifecycleModel:
 
 
 class TestPromptLookupLifecycle(unittest.TestCase):
+    def test_logits_processors_receive_exact_history_across_adaptive_tail(self):
+        class WrongProposer:
+            def observe(self, token):
+                pass
+
+            def propose(self, seq, max_span, prompt_len):
+                return [7] * max_span
+
+        seen = []
+
+        def history_processor(tokens, logits):
+            history = tokens.tolist()
+            seen.append(history)
+            forced = len(history) % logits.shape[-1]
+            bias = mx.zeros_like(logits)
+            bias[:, forced] = 100.0
+            return logits + bias
+
+        cache = _LifecycleCache()
+        prompt = [1, 2, 3]
+        out = [
+            int(token)
+            for token, _, _ in prompt_lookup_generate_step(
+                mx.array(prompt),
+                _LifecycleModel(),
+                prompt_cache=[cache],
+                max_tokens=8,
+                num_draft=3,
+                backend=WrongProposer(),
+                logits_processors=[history_processor],
+                adaptive=True,
+                warmup=2,
+                gate=1.0,
+            )
+        ]
+
+        self.assertEqual(out, [3, 4, 5, 6, 7, 0, 1, 2])
+        self.assertEqual(seen[0], prompt)
+        # Speculative verification may also process tentative future rows, but
+        # every committed decision must see the exact prompt+output prefix.
+        for i in range(len(out)):
+            self.assertIn(prompt + out[:i], seen)
+        self.assertEqual(cache.offset, len(prompt) + len(out))
+
     def test_early_close_counts_only_yielded_tokens(self):
         class AcceptAllProposer:
             def observe(self, token):
