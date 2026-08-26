@@ -923,6 +923,12 @@ class NGramEmbedding(nn.Module):
         the chunk. Hashing and preads run on the embedding's prefetch pool;
         the call returns immediately and mutates no cache state. No-op for
         resident embeddings.
+
+        Stage 1: this warms the page cache, so the chunk's foreground
+        lookup re-reads the same rows warm (~1 us/row). TODO: hand the
+        prefetched row bytes to the next chunk's lookup directly to also
+        skip the warm re-read; needs a keyed handoff between the generate
+        loop and the forward pass.
         """
         if not self.file_backed:
             return
