@@ -427,6 +427,21 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
+    # Opt-in NVMe-backed PLE tables for Qwen4-Exp: verify the sidecar was
+    # built from this artifact, then swap the resident ShardedEmbedding for
+    # a file-backed one and drop the shard tensors before materialisation.
+    # Removing the shard modules here also removes them from the tree that
+    # nn.quantize walks, so the per-path quantization predicates below never
+    # visit them. Unset env keeps today's behavior bit-for-bit. The sidecar
+    # is deliberately not part of weight_files (see the UBC eviction note
+    # below and assert_sidecar_not_in_weight_files).
+    if (ple_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME")) and config[
+        "model_type"
+    ] == "qwen4_exp":
+        from .models.qwen4_ple_nvme import install_file_backed_ple
+
+        weights = install_file_backed_ple(model, weights, ple_sidecar, model_path)
+
     def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
@@ -512,6 +527,14 @@ def load_model(
             try:
                 from .ubc_evict import ubc_evict_paths
 
+                # Invariant: the NVMe PLE sidecar backs live lookups and
+                # must never be UBC-evicted. Its name cannot match the
+                # model*.safetensors glob, so it can never be in
+                # weight_files; assert that stays true.
+                if nvme_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME"):
+                    assert os.path.realpath(nvme_sidecar) not in {
+                        os.path.realpath(wf) for wf in weight_files
+                    }, "PLE sidecar must not be in the UBC eviction list"
                 ubc_evict_paths(weight_files)
             except Exception:  # never let eviction block a load
                 pass

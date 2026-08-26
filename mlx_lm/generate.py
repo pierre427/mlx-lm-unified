@@ -15,6 +15,7 @@ from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Un
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
@@ -593,6 +594,12 @@ def generate_step(
             (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
         )
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        # NVMe-backed PLE tables expose a prefetcher that warms the next
+        # chunk's rows while the current chunk evaluates on the GPU.
+        prefill_prefetch = getattr(model, "prefill_prefetch_hook", None)
+        prefill_prefetch = (
+            prefill_prefetch() if callable(prefill_prefetch) else None
+        )
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
@@ -605,6 +612,16 @@ def generate_step(
                     else None
                 ),
             )
+            if prefill_prefetch is not None and len(prompt) > n_to_process:
+                context_start = max(
+                    0, n_to_process - prefill_prefetch.context_len
+                )
+                prefill_prefetch(
+                    np.asarray(
+                        prompt[n_to_process : n_to_process + prefill_step_size]
+                    ),
+                    np.asarray(prompt[context_start:n_to_process]),
+                )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             # Prefill advances the model cache without calling _step(), but
@@ -2390,11 +2407,29 @@ class PromptProcessingBatch:
 
         # Actual prompt processing loop
         processed = 0
+        # NVMe-backed PLE tables expose a prefetcher that warms the next
+        # chunk's rows while the current chunk evaluates on the GPU.
+        prefill_prefetch = getattr(self.model, "prefill_prefetch_hook", None)
+        prefill_prefetch = (
+            prefill_prefetch() if callable(prefill_prefetch) else None
+        )
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             if BATCH_UID_HOOK is not None:
                 BATCH_UID_HOOK(list(self.uids))
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+            if prefill_prefetch is not None and tokens.shape[1] > n_to_process:
+                context_start = max(
+                    0, n_to_process - prefill_prefetch.context_len
+                )
+                prefill_prefetch(
+                    np.asarray(
+                        tokens[
+                            :, n_to_process : n_to_process + self.prefill_step_size
+                        ]
+                    ),
+                    np.asarray(tokens[:, context_start:n_to_process]),
+                )
             mx.eval([c.state for c in self.prompt_cache])
             processed += n_to_process
             record_state_checkpoints(

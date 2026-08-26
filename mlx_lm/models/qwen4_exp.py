@@ -745,11 +745,21 @@ class NGramEmbedding(nn.Module):
         input_ids: mx.array,
         cache: Optional[ArraysCache] = None,
         mask: Optional[mx.array] = None,
+        previous: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         mx.eval(input_ids, mask)
         tokens = np.asarray(input_ids, dtype=np.int64)
         batch, seq_len = tokens.shape
-        if cache is not None and cache[3] is not None:
+        if previous is not None:
+            previous = np.asarray(previous, dtype=np.int64)
+            if previous.shape[-1] < self.context_len:
+                pad = np.full(
+                    (batch, self.context_len - previous.shape[-1]),
+                    self.eos_token_id,
+                    dtype=np.int64,
+                )
+                previous = np.concatenate([pad, previous], axis=-1)
+        elif cache is not None and cache[3] is not None:
             previous = np.asarray(cache[3], dtype=np.int64)
         else:
             previous = np.full((batch, self.context_len), self.eos_token_id, dtype=np.int64)
@@ -885,6 +895,10 @@ class NGramEmbedding(nn.Module):
             stream=mx.gpu,
         )[0]
 
+    @property
+    def file_backed(self) -> bool:
+        return getattr(self.ngram_embedding, "is_file_backed", False)
+
     def ngram_ids(
         self,
         input_ids: mx.array,
@@ -900,15 +914,49 @@ class NGramEmbedding(nn.Module):
             self._ngram_ids_numpy(input_ids, cache, mask), dtype=mx.int64
         )
 
+    def prefetch_prompt_chunk(
+        self, chunk_tokens: np.ndarray, previous: np.ndarray
+    ) -> None:
+        """Warm the NVMe rows an upcoming prompt chunk will gather.
+
+        ``previous`` holds the up-to-context_len prompt tokens right before
+        the chunk. Hashing and preads run on the embedding's prefetch pool;
+        the call returns immediately and mutates no cache state. No-op for
+        resident embeddings.
+        """
+        if not self.file_backed:
+            return
+        chunk = np.asarray(chunk_tokens, dtype=np.int64)
+        prev = np.asarray(previous, dtype=np.int64)
+        if chunk.ndim == 1:
+            chunk = chunk[None]
+        if prev.ndim == 1:
+            prev = prev[None]
+        if chunk.size == 0:
+            return
+
+        def hash_and_warm():
+            ids = self._ngram_ids_numpy(mx.array(chunk), None, previous=prev)
+            self.ngram_embedding.prefetch_rows(ids)
+
+        self.ngram_embedding.submit_prefetch(hash_and_warm)
+
     def __call__(
         self,
         input_ids: mx.array,
         cache: Optional[ArraysCache] = None,
         mask: Optional[mx.array] = None,
     ):
-        if self.hash_backend == "routed_cpu" or (
-            self.hash_backend == "metal_prefill"
-            and input_ids.shape[1] < self.metal_hash_min_tokens
+        # File-backed embeddings force the CPU id path: ids are hashed and
+        # deduplicated on CPU and the rows are pread from NVMe, so a Metal
+        # hash round-trip would only add a sync.
+        if (
+            self.file_backed
+            or self.hash_backend == "routed_cpu"
+            or (
+                self.hash_backend == "metal_prefill"
+                and input_ids.shape[1] < self.metal_hash_min_tokens
+            )
         ):
             ids = self._ngram_ids_numpy(input_ids, cache, mask)
             return self.ngram_embedding.lookup_numpy(ids).reshape(
@@ -2446,6 +2494,28 @@ class Model(nn.Module):
     def mtp_backbone(self, inputs, cache=None):
         """Return LM-head and scheme-A HC hiddens from one trunk forward."""
         return self.language_model.model(inputs, cache, return_hyper=True)
+
+    def prefill_prefetch_hook(self):
+        """Return a chunk prefetcher when any PLE table is NVMe-backed.
+
+        The callable takes ``(chunk_tokens, previous_tokens)`` as numpy or
+        mx int arrays ([T] or [B, T]) and warms the sidecar rows the chunk
+        will gather, asynchronously. ``None`` when every table is resident.
+        """
+        embeddings = [
+            layer.ple.ple_embedding
+            for layer in self.language_model.model.layers
+            if layer.ple is not None and layer.ple.ple_embedding.file_backed
+        ]
+        if not embeddings:
+            return None
+
+        def hook(chunk_tokens, previous):
+            for embedding in embeddings:
+                embedding.prefetch_prompt_chunk(chunk_tokens, previous)
+
+        hook.context_len = max(e.context_len for e in embeddings)
+        return hook
 
     def make_mtp_cache(self, window_size: Optional[int] = None, sink_size: int = 4):
         if window_size is None:
