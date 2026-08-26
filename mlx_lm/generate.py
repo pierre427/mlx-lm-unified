@@ -1552,6 +1552,7 @@ def stream_generate(
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     prompt_lookup: Optional[dict] = None,
+    self_mtp: Optional[dict] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -1567,6 +1568,9 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        self_mtp (Optional[dict]): Enable the model's internal depth-one MTP
+          head. This route is intended for a caller that has already gated the
+          request to an exact sampling regime and a cold target cache.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -1594,6 +1598,15 @@ def stream_generate(
     # safe to do losslessly: no draft model, no logits processors, no KV-cache
     # quantization, and no input embeddings / bounded KV (unsupported by the
     # rewind path). Otherwise fall through to the standard generators.
+    mtp_safe = (
+        self_mtp
+        and getattr(model, "mtp", None) is not None
+        and draft_model is None
+        and not prompt_lookup
+        and kwargs.get("kv_bits") is None
+        and kwargs.get("input_embeddings") is None
+        and kwargs.get("max_kv_size") is None
+    )
     pld_safe = (
         prompt_lookup
         and draft_model is None
@@ -1602,7 +1615,29 @@ def stream_generate(
         and kwargs.get("input_embeddings") is None
         and kwargs.get("max_kv_size") is None
     )
-    if pld_safe:
+    if mtp_safe:
+        # Local import avoids generate <-> hybrid_speculative import recursion.
+        from .hybrid_speculative import self_mtp_generate_step
+
+        token_generator = self_mtp_generate_step(
+            prompt,
+            model,
+            num_draft=self_mtp.get("num_draft", 1),
+            max_tokens=max_tokens,
+            prefill_step_size=kwargs.get(
+                "prefill_step_size", DEFAULT_PREFILL_STEP_SIZE
+            ),
+            sampling_temp=self_mtp.get("sampling_temp", 0.0),
+            accept_rule=self_mtp.get("accept_rule", "residual"),
+            persistent_mtp=self_mtp.get("persistent", True),
+            mtp_window_size=self_mtp.get("window_size"),
+            mtp_sink_size=self_mtp.get("sink_size", 4),
+            rate_gate=self_mtp.get("rate_gate", True),
+            stats=self_mtp.get("stats"),
+            prompt_cache=kwargs.get("prompt_cache"),
+            logits_processors=kwargs.get("logits_processors"),
+        )
+    elif pld_safe:
         for k in (
             "num_draft_tokens", "relaxed_topk", "relaxed_delta", "speculative_stats",
             "logits_processors", "kv_bits", "kv_group_size", "quantized_kv_start",

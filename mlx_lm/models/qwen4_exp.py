@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -15,7 +15,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
-from .cache import ArraysCache, BatchKVCache, KVCache, dynamic_roll
+from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynamic_roll
 from .pipeline import PipelineMixin
 from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
@@ -223,6 +223,52 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         )
 
 
+class Qwen4ArraysCache(ArraysCache):
+    """Four-state PLE+GDN cache with one atomic speculative rollback."""
+
+    def start_speculation(self, rollback_window=None):
+        self._ple_rollback = None
+        super().start_speculation(rollback_window)
+
+    def stop_speculation(self):
+        self._ple_rollback = None
+        super().stop_speculation()
+
+    def stage_ple_rollback(self, num_tokens, fn, snapshot):
+        if self._ple_rollback is not None:
+            raise RuntimeError("Qwen4 PLE rollback was staged twice")
+        self._ple_rollback = (num_tokens, fn, snapshot)
+
+    def record_rollback(self, num_tokens, fn, snapshot):
+        staged = self._ple_rollback
+        self._ple_rollback = None
+        if staged is None:
+            return super().record_rollback(num_tokens, fn, snapshot)
+        ple_tokens, ple_fn, ple_snapshot = staged
+        if ple_tokens != num_tokens:
+            raise RuntimeError(
+                "Qwen4 PLE/GDN rollback span mismatch: "
+                f"{ple_tokens} != {num_tokens}"
+            )
+
+        def combined(m):
+            return list(fn(m)) + list(ple_fn(m))
+
+        return super().record_rollback(
+            num_tokens, combined, list(snapshot) + list(ple_snapshot)
+        )
+
+    def extract(self, idx):
+        cache = type(self)(len(self.cache))
+        cache.cache = [
+            None if value is None else mx.contiguous(value[idx : idx + 1])
+            for value in self.cache
+        ]
+        if idx < len(self._checkpoints):
+            cache._checkpoints = [list(self._checkpoints[idx])]
+        return cache
+
+
 class GatedResidual(nn.Module):
     def __init__(self, args: TextModelArgs, use_combine: bool = True):
         super().__init__()
@@ -407,6 +453,8 @@ class PLELayer(nn.Module):
         return nn.silu(self.conv1d(conv_input))[:, -x.shape[1] :, :]
 
     def __call__(self, hidden: mx.array, input_ids: mx.array, cache=None, mask=None):
+        previous_conv = cache[2] if cache is not None else None
+        previous_tokens = cache[3] if cache is not None else None
         embeddings = self.ple_embedding(input_ids, cache)
         key = self.norm_key(self.key_proj(embeddings)).reshape(
             *hidden.shape[:-1], self.hc_count, self.hidden_size
@@ -422,7 +470,47 @@ class PLELayer(nn.Module):
         if mask is not None:
             gated = mx.where(mask[..., None], gated, 0)
             normed = mx.where(mask[..., None], normed, 0)
-        return gated + self._short_conv(normed, cache)
+        conv = self._short_conv(normed, cache)
+        if (
+            isinstance(cache, Qwen4ArraysCache)
+            and cache.speculating
+            and mask is None
+            and cache.lengths is None
+            and cache.left_padding is None
+        ):
+            state_len = self.short_conv_state_len
+            conv_base = previous_conv
+            if conv_base is None:
+                conv_base = mx.zeros(
+                    (normed.shape[0], state_len, normed.shape[-1]), normed.dtype
+                )
+            conv_input = mx.concatenate([conv_base, normed], axis=1)
+            context_len = self.ple_embedding.context_len
+            token_base = previous_tokens
+            if token_base is None:
+                token_base = mx.full(
+                    (input_ids.shape[0], context_len),
+                    self.ple_embedding.eos_token_id,
+                    dtype=mx.int64,
+                )
+            token_history = mx.concatenate(
+                [token_base, input_ids.astype(mx.int64)], axis=1
+            )
+
+            def _ple_rollback(
+                m, ci=conv_input, th=token_history, sl=state_len, cl=context_len
+            ):
+                return [
+                    mx.contiguous(ci[:, m : m + sl, :]),
+                    mx.contiguous(th[:, m : m + cl]),
+                ]
+
+            cache.stage_ple_rollback(
+                input_ids.shape[1],
+                _ple_rollback,
+                [previous_conv, previous_tokens],
+            )
+        return gated + conv
 
 
 def _apply_rope_positions(x: mx.array, positions: mx.array, dims: int, base: float):
@@ -570,6 +658,12 @@ class QSAKVCache(KVCache):
         self.index_keys = keys if self.index_keys is None else mx.concatenate([self.index_keys[:, : self.offset], keys], axis=1)
         return self.index_keys
 
+    def trim(self, n):
+        n = super().trim(n)
+        if self.index_keys is not None:
+            self.index_keys = mx.contiguous(self.index_keys[:, : self.offset])
+        return n
+
     @classmethod
     def merge(cls, caches):
         return BatchQSAKVCache.merge(caches)
@@ -607,6 +701,12 @@ class QSAIndexer(nn.Module):
 
     def __call__(self, hidden: mx.array, causal_mask: mx.array, cache: QSAKVCache):
         batch, length, _ = hidden.shape
+        if isinstance(cache, SinkWindowKVCache):
+            # Windowed MTP deliberately replaces the draft head's global QSA
+            # lookup with dense sink+recent attention. The full target keeps
+            # native QSA and remains the sole verifier.
+            mask = cache.make_mask(length, return_array=True)
+            return None if mask is None else mask[None, None, :, :]
         qk = self.index_qk_proj(hidden)
         q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
         q = self.q_layernorm(q.reshape(batch, length, self.n_heads, self.head_dim))
@@ -652,7 +752,11 @@ class QSAIndexer(nn.Module):
             token_pos[None, None, :] <= q_pos[..., None]
         )
         sparse = selected_tokens | tail
-        return causal_mask & sparse[:, None, :, :]
+        sparse = sparse[:, None, :, :]
+        # ``create_attention_mask`` deliberately returns ``None`` for a
+        # single-token decode because every cached position is causal.  QSA
+        # still needs its sparse selection mask in that case.
+        return sparse if causal_mask is None else causal_mask & sparse
 
 
 class Attention(nn.Module):
@@ -742,7 +846,7 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
         if self.fa_idx is not None:
             fa_cache = cache[self.fa_idx]
             fa_mask = create_attention_mask(hidden, fa_cache, return_array=True)
-            if fa_mask.ndim == 2:
+            if fa_mask is not None and fa_mask.ndim == 2:
                 fa_mask = fa_mask[None, None, :, :]
         ssm_mask = create_ssm_mask(hidden, cache[self.ssm_idx]) if self.ssm_idx is not None else None
         for layer, layer_cache in zip(self.layers, cache):
@@ -770,7 +874,11 @@ class TextModel(nn.Module):
     def make_cache(self):
         caches = []
         for layer in self.layers:
-            caches.append(ArraysCache(size=4 if layer.ple is not None else 2) if layer.is_linear else QSAKVCache())
+            if layer.is_linear:
+                cache_type = Qwen4ArraysCache if layer.ple is not None else ArraysCache
+                caches.append(cache_type(size=4 if layer.ple is not None else 2))
+            else:
+                caches.append(QSAKVCache())
         return caches
 
     def sanitize(self, weights):
@@ -812,6 +920,44 @@ class TextModel(nn.Module):
         return predicate
 
 
+class Qwen4ExpMTP(nn.Module):
+    """Depth-1 residual-linear-shared MTP head with HC scheme-A state."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.hc_count = args.hc_count
+        hc_hidden = args.hc_count * args.hidden_size
+        self.pre_fc_norm_embedding = GroupRMSNorm(
+            args.hidden_size, None, args.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = GroupRMSNorm(
+            hc_hidden, args.hidden_size, args.rms_norm_eps
+        )
+        self.fc_embedding = nn.Linear(
+            args.hidden_size, args.hidden_size, bias=False
+        )
+        self.fc_hidden = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        mtp_args = replace(
+            args,
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            ple_layer_ids=[],
+        )
+        self.layers = [DecoderLayer(mtp_args, 0)]
+        self.hyper_connection_mixer = GatedResidual(mtp_args, use_combine=False)
+
+    def fuse(self, embeddings: mx.array, hidden: mx.array) -> mx.array:
+        embeddings = self.fc_embedding(self.pre_fc_norm_embedding(embeddings))
+        hidden = self.pre_fc_norm_hidden(hidden).reshape(
+            *hidden.shape[:-1], self.hc_count, self.hidden_size
+        )
+        hidden = self.fc_hidden(hidden)
+        return (embeddings[..., None, :] + hidden).reshape(
+            *hidden.shape[:-2], self.hc_count * self.hidden_size
+        )
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
@@ -825,15 +971,18 @@ class ModelArgs(BaseModelArgs):
 
 
 class Model(nn.Module):
-    # PLE has two additional recurrent states. Exact speculative rollback is
-    # deliberately disabled until all four states are restored as one unit.
-    supports_speculative_rollback = False
+    # Qwen4ArraysCache restores PLE token history + ShortConv and GDN
+    # convolution + recurrence as one atomic record.
+    supports_speculative_rollback = True
 
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
+        text_args = TextModelArgs.from_dict(args.text_config)
+        self.language_model = TextModel(text_args)
+        if text_args.mtp_num_hidden_layers > 0:
+            self.mtp = Qwen4ExpMTP(text_args)
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
         return self.language_model(inputs, cache, input_embeddings)
@@ -849,23 +998,70 @@ class Model(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def logits(self, hidden):
+        return (
+            self.language_model.model.embed_tokens.as_linear(hidden)
+            if self.language_model.args.tie_word_embeddings
+            else self.language_model.lm_head(hidden)
+        )
+
+    def mtp_backbone(self, inputs, cache=None):
+        """Return LM-head and scheme-A HC hiddens from one trunk forward."""
+        return self.language_model.model(inputs, cache, return_hyper=True)
+
+    def make_mtp_cache(self, window_size: Optional[int] = None, sink_size: int = 4):
+        if window_size is None:
+            return [QSAKVCache() for _ in self.mtp.layers]
+        return [SinkWindowKVCache(window_size, sink_size) for _ in self.mtp.layers]
+
+    def mtp_step(self, hidden, tokens, mtp_cache):
+        embeddings = self.language_model.model.embed_tokens(tokens)
+        multi = self.mtp.fuse(embeddings, hidden)
+        cache = mtp_cache[0]
+        mask = create_attention_mask(multi, cache, return_array=True)
+        if mask is not None and mask.ndim == 2:
+            mask = mask[None, None, :, :]
+        multi = self.mtp.layers[0](multi, tokens, mask, cache, None)
+        sample = self.mtp.hyper_connection_mixer(multi)
+        return self.logits(sample), multi
+
     def sanitize(self, weights):
+        has_mtp_weights = any(
+            key.startswith("mtp.")
+            or key.startswith("model.mtp.")
+            or key.startswith("model.language_model.mtp.")
+            for key in weights
+        )
+        if not (has_mtp_weights and getattr(self, "mtp", None) is not None):
+            if getattr(self, "mtp", None) is not None:
+                self.mtp = None
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("model.visual") or key.startswith("vision_tower"):
                 continue
-            if key.startswith("model.language_model"):
-                key = key.replace("model.language_model", "language_model.model", 1)
+            if key.startswith("model.language_model.mtp."):
+                key = key.replace("model.language_model.mtp.", "mtp.", 1)
+            elif key.startswith("model.mtp."):
+                key = key.removeprefix("model.")
             elif key.startswith("mtp."):
-                # MTP weights are retained in the release artifact but are not
-                # loaded until exact four-state speculative rollback lands.
-                continue
+                if getattr(self, "mtp", None) is None:
+                    continue
+            elif key.startswith("model.language_model"):
+                key = key.replace("model.language_model", "language_model.model", 1)
             elif not key.startswith("language_model."):
                 key = "language_model." + key
             sanitized[key] = value
 
-        for layer_idx in range(self.language_model.args.num_hidden_layers):
-            prefix = f"language_model.model.layers.{layer_idx}.mlp"
+        mlp_prefixes = [
+            f"language_model.model.layers.{layer_idx}.mlp"
+            for layer_idx in range(self.language_model.args.num_hidden_layers)
+        ]
+        if getattr(self, "mtp", None) is not None:
+            mlp_prefixes.extend(
+                f"mtp.layers.{layer_idx}.mlp"
+                for layer_idx in range(self.language_model.args.mtp_num_hidden_layers)
+            )
+        for prefix in mlp_prefixes:
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key not in sanitized:
                 continue

@@ -402,6 +402,48 @@ class TestPromptLookupGenerate(unittest.TestCase):
             # Cache is left EXACTLY at prompt + emitted.
             self.assertEqual(_pld_offset(cache[0]), prompt.size + len(out))
 
+    def test_ngram_lookup_composes_with_cached_prefix_history(self):
+        full = self._prompt(
+            "alpha beta gamma delta alpha beta gamma delta "
+            "alpha beta gamma delta continue the sequence"
+        )
+        split = max(1, full.size // 2)
+        prefix, tail = full[:split], full[split:]
+
+        cold_cache = make_prompt_cache(self.model)
+        cold = [
+            int(token)
+            for token, _, _ in prompt_lookup_generate_step(
+                full,
+                self.model,
+                max_tokens=32,
+                sampler=GREEDY,
+                prompt_cache=cold_cache,
+                backend="ngram",
+                ngram_max=3,
+            )
+        ]
+
+        cached = make_prompt_cache(self.model)
+        self.model(prefix[None], cache=cached)
+        mx.eval([entry.state for entry in cached])
+        warm = [
+            int(token)
+            for token, _, _ in prompt_lookup_generate_step(
+                tail,
+                self.model,
+                max_tokens=32,
+                sampler=GREEDY,
+                prompt_cache=cached,
+                backend="ngram",
+                ngram_max=3,
+                history_prompt=full,
+            )
+        ]
+
+        self.assertEqual(warm, cold)
+        self.assertEqual(_pld_offset(cached[0]), full.size + len(warm))
+
     def test_matches_target_batched_greedy(self):
         # PLD output must equal the target's own greedy over prompt+output, i.e.
         # every emitted token is the batched argmax given its prefix. (This is the

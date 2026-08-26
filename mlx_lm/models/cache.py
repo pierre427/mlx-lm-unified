@@ -793,6 +793,242 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class SinkWindowKVCache(_BaseCache):
+    """Bounded draft-only KV with attention sinks and absolute positions.
+
+    The target/verifier cache remains full-context.  A bounded tail beyond the
+    active window is retained only while speculation is active so rejection can
+    restore the exact pre-cycle state.
+    """
+
+    _ROLLBACK_WINDOW = 64
+
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        instance.speculating = False
+        instance._speculation_positions = []
+        return instance
+
+    def __init__(self, window_size: int, sink_size: int = 4, rollback_window: int = 64):
+        if window_size < 1:
+            raise ValueError("window_size must be >= 1")
+        if sink_size < 0:
+            raise ValueError("sink_size must be >= 0")
+        self.window_size = int(window_size)
+        self.sink_size = int(sink_size)
+        self.rollback_window = max(0, int(rollback_window))
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self._positions: List[int] = []
+        self._active_positions: List[int] = []
+
+    @property
+    def state(self):
+        return [] if self.keys is None else (self.keys, self.values)
+
+    @state.setter
+    def state(self, value):
+        if not value:
+            self.keys = self.values = None
+            stored = 0
+        else:
+            self.keys, self.values = value
+            stored = self.keys.shape[2]
+        self.window_size = max(1, stored)
+        self.sink_size = 0
+        self.rollback_window = self._ROLLBACK_WINDOW
+        self.offset = stored
+        self._positions = list(range(stored))
+        self._active_positions = self._active_keep_positions(self.offset)
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    1,
+                    self.window_size,
+                    self.sink_size,
+                    self.rollback_window,
+                    self.offset,
+                    *self._positions,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, value):
+        values = list(map(int, value))
+        if len(values) < 5 or values[0] != 1:
+            raise ValueError("Invalid SinkWindowKVCache metadata")
+        (
+            _,
+            self.window_size,
+            self.sink_size,
+            self.rollback_window,
+            self.offset,
+            *positions,
+        ) = values
+        if self.window_size < 1 or self.sink_size < 0 or self.rollback_window < 0:
+            raise ValueError("Invalid SinkWindowKVCache configuration in metadata")
+        if self.keys is None:
+            if positions:
+                raise ValueError("SinkWindowKVCache positions require stored state")
+        elif (
+            self.values is None
+            or self.keys.shape[2] != len(positions)
+            or self.values.shape[2] != len(positions)
+        ):
+            raise ValueError(
+                "SinkWindowKVCache state length does not match retained positions"
+            )
+        if positions != sorted(set(positions)) or any(
+            position < 0 or position >= self.offset for position in positions
+        ):
+            raise ValueError("Invalid SinkWindowKVCache retained positions")
+        self._positions = positions
+        self._active_positions = self._active_keep_positions(self.offset)
+        if not all(position in self._positions for position in self._active_positions):
+            raise ValueError("SinkWindowKVCache state is missing an active position")
+        self.speculating = False
+        self._speculation_positions = []
+
+    def _active_keep_positions(self, end: int) -> List[int]:
+        sinks = list(range(min(self.sink_size, end)))
+        window_start = max(0, end - self.window_size)
+        return sinks + list(range(max(self.sink_size, window_start), end))
+
+    def _stored_keep_positions(self, end: int) -> List[int]:
+        sinks = list(range(min(self.sink_size, end)))
+        tail_start = max(0, end - self.window_size - self.rollback_window)
+        return sinks + list(range(max(self.sink_size, tail_start), end))
+
+    def update_and_fetch(self, keys, values):
+        length = keys.shape[2]
+        start, end = self.offset, self.offset + length
+        if self.keys is None:
+            all_keys, all_values = keys, values
+            all_positions = list(range(start, end))
+        else:
+            all_keys = mx.concatenate([self.keys, keys], axis=2)
+            all_values = mx.concatenate([self.values, values], axis=2)
+            all_positions = self._positions + list(range(start, end))
+
+        position_to_index = {position: index for index, position in enumerate(all_positions)}
+        attention_positions = self._active_positions + list(range(start, end))
+        attention_indices = mx.array(
+            [position_to_index[position] for position in attention_positions],
+            dtype=mx.int32,
+        )
+        attention_keys = mx.take(all_keys, attention_indices, axis=2)
+        attention_values = mx.take(all_values, attention_indices, axis=2)
+
+        keep = [
+            position
+            for position in self._stored_keep_positions(end)
+            if position in position_to_index
+        ]
+        if self.speculating:
+            keep = sorted(set(keep).union(self._speculation_positions))
+        indices = mx.array(
+            [position_to_index[position] for position in keep], dtype=mx.int32
+        )
+        self.keys = mx.take(all_keys, indices, axis=2)
+        self.values = mx.take(all_values, indices, axis=2)
+        self._positions = keep
+        self._active_positions = self._active_keep_positions(end)
+        self.offset = end
+        return attention_keys, attention_values
+
+    def make_mask(self, length: int, window_size=None, return_array=False):
+        if length == 1:
+            return None
+        effective = (
+            self.window_size
+            if window_size is None
+            else min(self.window_size, int(window_size))
+        )
+        if effective < 1:
+            raise ValueError("window_size must be >= 1")
+        key_positions = self._active_positions + list(
+            range(self.offset, self.offset + length)
+        )
+        query_positions = list(range(self.offset, self.offset + length))
+        keys = mx.array(key_positions, dtype=mx.int32)[None]
+        queries = mx.array(query_positions, dtype=mx.int32)[:, None]
+        causal = queries >= keys
+        return causal & ((keys < self.sink_size) | (keys >= queries - effective))
+
+    def size(self):
+        return self.offset
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        return 0 if self.keys is None else self.keys.nbytes + self.values.nbytes
+
+    def is_trimmable(self):
+        return True
+
+    def start_speculation(self, rollback_window=None):
+        if self.speculating:
+            raise RuntimeError("SinkWindowKVCache speculation is already active")
+        self.speculating = True
+        self._speculation_positions = list(self._positions)
+
+    def stop_speculation(self):
+        if self.keys is not None:
+            position_to_index = {
+                position: index for index, position in enumerate(self._positions)
+            }
+            keep = self._stored_keep_positions(self.offset)
+            if not all(position in position_to_index for position in keep):
+                raise RuntimeError(
+                    "SinkWindowKVCache cannot compact after speculative rollback"
+                )
+            indices = mx.array(
+                [position_to_index[position] for position in keep], dtype=mx.int32
+            )
+            self.keys = mx.take(self.keys, indices, axis=2)
+            self.values = mx.take(self.values, indices, axis=2)
+            self._positions = keep
+            self._active_positions = self._active_keep_positions(self.offset)
+        self.speculating = False
+        self._speculation_positions = []
+
+    def trim(self, n):
+        if n < 0:
+            raise ValueError("trim count must be non-negative")
+        new_offset = max(0, self.offset - min(self.offset, n))
+        keep_indices = [
+            index for index, position in enumerate(self._positions) if position < new_offset
+        ]
+        if keep_indices:
+            kept_positions = [self._positions[index] for index in keep_indices]
+            active = self._active_keep_positions(new_offset)
+            if not all(position in kept_positions for position in active):
+                raise RuntimeError(
+                    "SinkWindowKVCache rollback exceeds its retained tail; "
+                    "increase rollback_window."
+                )
+            indices = mx.array(keep_indices, dtype=mx.int32)
+            self.keys = mx.take(self.keys, indices, axis=2)
+            self.values = mx.take(self.values, indices, axis=2)
+            self._positions = kept_positions
+            self._active_positions = active
+        else:
+            self.keys = self.values = None
+            self._positions = []
+            self._active_positions = []
+        trimmed = self.offset - new_offset
+        self.offset = new_offset
+        return trimmed
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
     # Tokens of exact-rollback history kept while speculating (mirrors

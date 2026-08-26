@@ -4,6 +4,7 @@ import random
 import unittest
 from collections import deque
 from typing import List
+from unittest.mock import patch
 
 import mlx.core as mx
 
@@ -113,6 +114,54 @@ class TestGenerate(unittest.TestCase):
         ):
             tokens.append(response.token)
         self.assertEqual(len(tokens), 4)
+
+    def test_stream_generate_routes_self_mtp_with_caller_owned_cache(self):
+        target_cache = [KVCache()]
+        observed = {}
+
+        def fake_self_mtp(prompt, model, **kwargs):
+            observed.update(kwargs)
+            for token in (10, 11):
+                yield token, mx.zeros((32,)), token == 10
+
+        had_mtp = hasattr(self.model, "mtp")
+        previous_mtp = getattr(self.model, "mtp", None)
+        self.model.mtp = object()
+        try:
+            with patch(
+                "mlx_lm.hybrid_speculative.self_mtp_generate_step",
+                side_effect=fake_self_mtp,
+            ):
+                responses = list(
+                    stream_generate(
+                        self.model,
+                        self.tokenizer,
+                        [1, 2, 3],
+                        max_tokens=2,
+                        prompt_cache=target_cache,
+                        self_mtp={
+                            "num_draft": 1,
+                            "persistent": True,
+                            "rate_gate": True,
+                            "sampling_temp": 0.0,
+                            "window_size": 2048,
+                            "sink_size": 4,
+                        },
+                    )
+                )
+        finally:
+            if had_mtp:
+                self.model.mtp = previous_mtp
+            else:
+                del self.model.mtp
+
+        self.assertEqual([r.token for r in responses], [10, 11])
+        self.assertIs(observed["prompt_cache"], target_cache)
+        self.assertEqual(observed["num_draft"], 1)
+        self.assertTrue(observed["persistent_mtp"])
+        self.assertTrue(observed["rate_gate"])
+        self.assertEqual(observed["mtp_window_size"], 2048)
+        self.assertEqual(observed["mtp_sink_size"], 4)
 
     def test_generate_with_processor(self):
         init_toks = self.tokenizer.encode("hello")

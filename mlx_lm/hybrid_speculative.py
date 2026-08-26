@@ -737,7 +737,7 @@ def adaptive_pld_generate_step(
                 # Teacher-force the MTP over pairs (hidden_i, token_{i+1}) so
                 # its KV covers the prompt with real positions (same protocol
                 # as self_mtp_generate_step's prefill).
-                h_chunk = model.model(y[:n][None], cache=cache)
+                _, h_chunk = _mtp_backbone(model, y[:n][None], cache)
                 if prev_h is None:
                     hs, ts = h_chunk[:, :-1], y[1:n][None]
                 else:
@@ -809,8 +809,10 @@ def adaptive_pld_generate_step(
                 if persistent:
                     # Same values as model(...) — logits = lm_head(model.model)
                     # — but the hiddens stay visible for MTP teacher-forcing.
-                    vhidden = model.model(y_verify[None], cache=cache)
-                    logits = model.logits(vhidden)
+                    vlogit_hidden, vhidden = _mtp_backbone(
+                        model, y_verify[None], cache
+                    )
+                    logits = model.logits(vlogit_hidden)
                 else:
                     logits = model(y_verify[None], cache=cache)
                 rel = logits[0, -(n_prop + 1) :, :]
@@ -897,8 +899,10 @@ def adaptive_pld_generate_step(
                             mtp_cache,
                         )
                         mtp_p_hs, mtp_p_ts = [], []
-                    bh = model.model(mx.array(pending, mx.uint32)[None], cache=cache)
-                    blp = model.logits(bh)[0, -1]
+                    blogit_hidden, bh = _mtp_backbone(
+                        model, mx.array(pending, mx.uint32)[None], cache
+                    )
+                    blp = model.logits(blogit_hidden)[0, -1]
                     blp = blp - mx.logsumexp(blp)
                     nxt = int(mx.argmax(blp).item())
                 ntoks += 1
@@ -944,6 +948,18 @@ def adaptive_pld_generate_step(
             _stop_all_speculation(cache)
 
 
+def _mtp_backbone(model, tokens, cache):
+    """Return (LM-head hidden, MTP seed hidden) for one trunk forward.
+
+    Conventional MTP models use the same post-norm hidden for both. Qwen4
+    scheme A keeps its pre-final-mixer HC multi-stream tensor for drafting.
+    """
+    if hasattr(model, "mtp_backbone"):
+        return model.mtp_backbone(tokens, cache=cache)
+    hidden = model.model(tokens, cache=cache)
+    return hidden, hidden
+
+
 def self_mtp_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -954,11 +970,14 @@ def self_mtp_generate_step(
     sampling_temp: float = 0.0,
     accept_rule: str = "residual",
     persistent_mtp: bool = False,
+    mtp_window_size: Optional[int] = None,
+    mtp_sink_size: int = 4,
     rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
     batch_size: int = 1,
     depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
+    prompt_cache: Optional[List[Any]] = None,
     logits_processors: Optional[
         List[Callable[[mx.array, mx.array], mx.array]]
     ] = None,
@@ -1003,6 +1022,11 @@ def self_mtp_generate_step(
     than an inline plain-decode probe; otherwise fall back to plain for the
     rest of the generation.
 
+    ``mtp_window_size`` bounds only the persistent draft head to attention
+    sinks plus a recent window. The target cache and verification remain
+    full-context, so the A/B changes proposal quality and cost, never which
+    model authorizes the emitted token.
+
     ``batch_size``/``depth_table`` apply the per-batch-size draft-depth policy
     (``spec_policy.draft_depth_for``): the table caps how deep the head drafts
     when the caller runs multiple lanes, then the hard M5 verify-width cap
@@ -1014,6 +1038,12 @@ def self_mtp_generate_step(
     the same rewind-on-shorter-history contract as external-draft speculative
     generation and make decisions only from committed-or-tentatively-accepted
     prefixes.
+
+    ``prompt_cache`` lets serving own the target cache so the verified result
+    can be inserted into its automatic prefix cache.  It must be empty for a
+    persistent-MTP cold prefill: an already-populated target cache has no
+    corresponding MTP hidden/KV history, so callers must route prefix-cache
+    hits through plain decoding until a joint cache representation exists.
 
     Yields ``(token, logprobs, from_draft)``.
     """
@@ -1033,9 +1063,15 @@ def self_mtp_generate_step(
     if max_tokens <= 0:
         # Zero-token budget: yield nothing and do no prefill or sampling work.
         return
+    if mtp_window_size is not None and not persistent_mtp:
+        raise ValueError("mtp_window_size requires persistent_mtp=True")
 
-    cache = make_prompt_cache(model)
-    mtp_cache = model.make_mtp_cache() if persistent_mtp else None
+    cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
+    mtp_cache = (
+        model.make_mtp_cache(mtp_window_size, mtp_sink_size)
+        if persistent_mtp and mtp_window_size is not None
+        else model.make_mtp_cache() if persistent_mtp else None
+    )
 
     y = prompt.astype(mx.uint32)
     processor_prompt = y
@@ -1043,7 +1079,7 @@ def self_mtp_generate_step(
         prev_h = None  # trunk hidden of the previous chunk's last position
         while y.size > 1:  # leave one token to produce the seed hidden
             n = min(prefill_step_size, y.size - 1)
-            h_chunk = model.model(y[:n][None], cache=cache)
+            _, h_chunk = _mtp_backbone(model, y[:n][None], cache)
             if persistent_mtp:
                 # Teacher-force the MTP over pairs (hidden_i, token_{i+1}) so
                 # its KV covers the prompt with real positions.
@@ -1061,9 +1097,9 @@ def self_mtp_generate_step(
             mx.clear_cache()
         if persistent_mtp and prev_h is not None:
             model.mtp_step(prev_h, y[None], mtp_cache)  # pair (h_{L-2}, t_{L-1})
-        hidden = model.model(y[None], cache=cache)   # [1, 1, H] post-final-norm
-        seed_h = hidden[:, -1:, :]                    # trunk hidden at last prompt pos
-        first_logits = model.logits(seed_h)[0, -1]
+        logit_hidden, hidden = _mtp_backbone(model, y[None], cache)
+        seed_h = hidden[:, -1:, :]
+        first_logits = model.logits(logit_hidden[:, -1:, :])[0, -1]
         first_logits = _apply_logits_processors(
             logits_processors, y=processor_prompt, logits=first_logits
         )
@@ -1279,12 +1315,14 @@ def _mtp_draft_verify_loop(
         # resume seamlessly after a probe.
         nonlocal cur, seed_h, pending_hs, pending_ts, token_prefix
         with mx.stream(generation_stream):
-            h = model.model(mx.array([[cur]], mx.uint32), cache=cache)
+            logit_h, h = _mtp_backbone(
+                model, mx.array([[cur]], mx.uint32), cache
+            )
             proc_tokens = mx.concatenate(
                 [token_prefix, mx.array([cur], mx.uint32)]
             )
             logits = _apply_logits_processors(
-                logits_processors, proc_tokens, model.logits(h)[0, -1]
+                logits_processors, proc_tokens, model.logits(logit_h)[0, -1]
             )
             lp = _temperature_logprobs(logits, sampling_temp)
             nxt = _sample_from_logprobs(lp, sampling_temp)
@@ -1399,8 +1437,8 @@ def _mtp_draft_verify_loop(
         # ---- verify: trunk over [cur, drafts...] in one forward --------------
         verify_in = mx.array([[cur] + drafts], mx.uint32)   # [1, k+1]
         with mx.stream(generation_stream):
-            vhidden = model.model(verify_in, cache=cache)   # [1, k+1, H]
-            vlogits = model.logits(vhidden)                 # [1, k+1, V]
+            vlogit_hidden, vhidden = _mtp_backbone(model, verify_in, cache)
+            vlogits = model.logits(vlogit_hidden)
             processed_logits = []
             for i in range(k + 1):
                 proc_tokens = mx.concatenate(

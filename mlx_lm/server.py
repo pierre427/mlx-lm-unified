@@ -627,6 +627,61 @@ def _make_logits_processors(args):
     )
 
 
+def _self_mtp_config(
+    args,
+    cli_args,
+    model,
+    *,
+    cached_prompt_tokens=0,
+    prompt_tokens=0,
+):
+    """Return an exact self-MTP route or fail closed to ordinary decoding.
+
+    The current engine is exact for greedy and temperature-only sampling.  A
+    top-p/top-k/min-p/XTC transform changes the draft distribution and needs a
+    shared transformed-distribution verifier, so those requests remain on the
+    ordinary sampler.  Likewise, an APC hit has target state but no matching
+    MTP hidden/KV state; it keeps the valuable prefix hit and decodes plainly.
+    """
+    if not getattr(cli_args, "self_mtp", False):
+        return None
+    if getattr(model, "mtp", None) is None or cached_prompt_tokens:
+        return None
+    if args.model.draft != "default_model" or args.prompt_lookup_ngram:
+        return None
+    sampling = args.sampling
+    transformed_sampling = (
+        sampling.temperature > 0
+        and (
+            sampling.top_p < 1.0
+            or sampling.top_k > 0
+            or sampling.min_p > 0.0
+            or sampling.xtc_probability > 0.0
+        )
+    )
+    if transformed_sampling:
+        return None
+    if getattr(cli_args, "kv_bits", None) is not None:
+        return None
+    config = {
+        "num_draft": cli_args.self_mtp_num_draft,
+        "persistent": cli_args.self_mtp_persistent,
+        "rate_gate": cli_args.self_mtp_rate_gate,
+        "sampling_temp": sampling.temperature,
+        "accept_rule": "residual",
+    }
+    window_size = getattr(cli_args, "self_mtp_window_size", 0)
+    window_minimum = getattr(cli_args, "self_mtp_window_min_prompt_tokens", 0)
+    if (
+        window_size
+        and cli_args.self_mtp_persistent
+        and prompt_tokens >= window_minimum
+    ):
+        config["window_size"] = window_size
+        config["sink_size"] = getattr(cli_args, "self_mtp_window_sink_size", 4)
+    return config
+
+
 def _segment_by_state(sm_state, text):
     """Advance a ``TextStateMachine`` one character at a time so emitted text is
     attributed to the state it was actually produced in, rather than to the
@@ -1208,6 +1263,13 @@ class ResponseGenerator:
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
+            self_mtp = _self_mtp_config(
+                args,
+                self.cli_args,
+                model,
+                cached_prompt_tokens=ctx.prompt_cache_count,
+                prompt_tokens=len(prompt),
+            )
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1222,10 +1284,15 @@ class ResponseGenerator:
                     {
                         "ngram_max": args.prompt_lookup_ngram,
                         "num_draft": args.prompt_lookup_tokens,
+                        # The target APC already owns model state for this
+                        # prefix; PLD separately needs the token IDs so suffix
+                        # matches can cross the cached-prefix boundary.
+                        "history_prompt": prompt,
                     }
                     if getattr(args, "prompt_lookup_ngram", 0)
                     else None
                 ),
+                self_mtp=self_mtp,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 kv_bits=getattr(self.cli_args, "kv_bits", None),
@@ -1521,8 +1588,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("xtc_probability", float, min_val=0, max_val=1)
         self._validate("xtc_threshold", float, min_val=0, max_val=1)
         self._validate("requested_model", str)
-        if getattr(self.response_generator.cli_args, "single_model", False):
-            configured = self.response_generator.cli_args.model
+        response_generator = getattr(self, "response_generator", None)
+        cli_args = getattr(response_generator, "cli_args", None)
+        if getattr(cli_args, "single_model", False):
+            configured = cli_args.model
             allowed = {"default_model", configured}
             configured_path = Path(configured)
             if configured_path.exists():
@@ -1653,7 +1722,8 @@ class APIHandler(BaseHTTPRequestHandler):
             choice[key_name] = {"role": "assistant"}
             if not self.stream:
                 # The schema requires "content" field to be present
-                choice[key_name]["content"] = text if text else None
+                if text or not tool_calls:
+                    choice[key_name]["content"] = text if text else None
             elif text:
                 choice[key_name]["content"] = text
             if reasoning_text:
@@ -2150,6 +2220,59 @@ def setup_arg_parser():
         default=3,
     )
     parser.add_argument(
+        "--self-mtp",
+        action="store_true",
+        help=(
+            "Enable the model's internal MTP head for exact greedy or "
+            "temperature-only requests. Transformed sampling and APC hits "
+            "fail closed to ordinary decoding."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-num-draft",
+        type=int,
+        default=1,
+        choices=range(1, 8),
+        metavar="{1..7}",
+        help="MTP draft depth. Qwen4 is trained at depth 1 (default: 1).",
+    )
+    parser.add_argument(
+        "--self-mtp-persistent",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep and teacher-force the MTP cache across committed tokens.",
+    )
+    parser.add_argument(
+        "--self-mtp-rate-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Measure once and fall back when self-MTP is slower (default: on).",
+    )
+    parser.add_argument(
+        "--self-mtp-window-size",
+        type=int,
+        default=0,
+        help=(
+            "Bound only the persistent MTP draft-head cache to this recent "
+            "window (0 disables; target verification remains full-context)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-window-sink-size",
+        type=int,
+        default=4,
+        help="Attention-sink tokens retained with the MTP draft window (default: 4).",
+    )
+    parser.add_argument(
+        "--self-mtp-window-min-prompt-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Enable --self-mtp-window-size only at or above this full prompt "
+            "length (default: 0)."
+        ),
+    )
+    parser.add_argument(
         "--prompt-lookup-ngram",
         type=int,
         default=0,
@@ -2314,6 +2437,15 @@ def setup_arg_parser():
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+    for name in (
+        "self_mtp_window_size",
+        "self_mtp_window_sink_size",
+        "self_mtp_window_min_prompt_tokens",
+    ):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be >= 0")
+    if args.self_mtp_window_size and not args.self_mtp_persistent:
+        parser.error("--self-mtp-window-size requires --self-mtp-persistent")
     try:
         validate_kv_args(args)
     except ValueError as exc:

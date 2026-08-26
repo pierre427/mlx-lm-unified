@@ -23,6 +23,7 @@ from mlx_lm.server import (
     SamplingArguments,
     _make_sampler,
     _measure_kv_cost,
+    _self_mtp_config,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
 from mlx_lm.utils import load
@@ -100,6 +101,80 @@ class TestModelProvider(unittest.TestCase):
             provider._load("model")
 
         self.assertTrue(provider.is_batchable)
+
+
+class TestSelfMTPAdmission(unittest.TestCase):
+    def setUp(self):
+        self.cli = types.SimpleNamespace(
+            self_mtp=True,
+            self_mtp_num_draft=1,
+            self_mtp_persistent=True,
+            self_mtp_rate_gate=True,
+            self_mtp_window_size=2048,
+            self_mtp_window_sink_size=4,
+            self_mtp_window_min_prompt_tokens=32768,
+            kv_bits=None,
+        )
+        self.model = types.SimpleNamespace(mtp=object())
+
+    @staticmethod
+    def args(*, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, xtc=0.0):
+        return types.SimpleNamespace(
+            model=types.SimpleNamespace(draft="default_model"),
+            prompt_lookup_ngram=0,
+            sampling=types.SimpleNamespace(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                xtc_probability=xtc,
+            ),
+        )
+
+    def test_greedy_admits_mtp_even_with_ignored_sampling_filters(self):
+        config = _self_mtp_config(
+            self.args(temperature=0.0, top_p=0.8, top_k=20),
+            self.cli,
+            self.model,
+        )
+        self.assertEqual(config["num_draft"], 1)
+        self.assertTrue(config["persistent"])
+
+    def test_temperature_only_sampling_is_exact_and_admitted(self):
+        config = _self_mtp_config(
+            self.args(temperature=0.7), self.cli, self.model
+        )
+        self.assertEqual(config["sampling_temp"], 0.7)
+
+    def test_transformed_sampling_fails_closed(self):
+        for kwargs in (
+            {"temperature": 0.7, "top_p": 0.8},
+            {"temperature": 0.7, "top_k": 20},
+            {"temperature": 0.7, "min_p": 0.1},
+            {"temperature": 0.7, "xtc": 0.1},
+        ):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNone(
+                    _self_mtp_config(self.args(**kwargs), self.cli, self.model)
+                )
+
+    def test_prefix_cache_hit_keeps_plain_decode(self):
+        self.assertIsNone(
+            _self_mtp_config(
+                self.args(), self.cli, self.model, cached_prompt_tokens=128
+            )
+        )
+
+    def test_windowed_mtp_is_admitted_only_above_measured_threshold(self):
+        short = _self_mtp_config(
+            self.args(), self.cli, self.model, prompt_tokens=16384
+        )
+        long = _self_mtp_config(
+            self.args(), self.cli, self.model, prompt_tokens=32768
+        )
+        self.assertNotIn("window_size", short)
+        self.assertEqual(long["window_size"], 2048)
+        self.assertEqual(long["sink_size"], 4)
 
 
 class DummyModelProvider:
