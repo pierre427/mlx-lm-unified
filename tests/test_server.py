@@ -23,6 +23,7 @@ from mlx_lm.server import (
     SamplingArguments,
     _make_sampler,
     _measure_kv_cost,
+    _configure_process_wired_limit,
     _self_mtp_config,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
@@ -183,6 +184,14 @@ class TestSelfMTPAdmission(unittest.TestCase):
         )
         request_args = types.SimpleNamespace(seed=None, prompt_lookup_ngram=0)
         self.assertFalse(generator._is_batchable(request_args))
+
+    def test_enabled_self_mtp_preserves_existing_process_wired_limit(self):
+        with (
+            patch("mlx_lm.server.mx.metal.is_available", return_value=True),
+            patch("mlx_lm.server.mx.set_wired_limit") as set_limit,
+        ):
+            self.assertIsNone(_configure_process_wired_limit(self.cli))
+        set_limit.assert_not_called()
 
 
 class DummyModelProvider:

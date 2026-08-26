@@ -2457,6 +2457,21 @@ def setup_arg_parser():
     return parser
 
 
+def _configure_process_wired_limit(args):
+    """Apply the legacy server clamp unless internal MTP owns the stream.
+
+    Qwen4 self-MTP plus its separately cached head runs close to the M5 working
+    set ceiling. Setting the recommended limit before loading this 100+ GB
+    model reproducibly causes a Metal watchdog timeout on its first PLE
+    command; MLX's existing default limit completes the same stream.
+    """
+    if not mx.metal.is_available() or getattr(args, "self_mtp", False):
+        return None
+    wired_limit = mx.device_info()["max_recommended_working_set_size"]
+    mx.set_wired_limit(wired_limit)
+    return wired_limit
+
+
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
@@ -2473,9 +2488,7 @@ def main():
         validate_kv_args(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_wired_limit(wired_limit)
+    _configure_process_wired_limit(args)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
