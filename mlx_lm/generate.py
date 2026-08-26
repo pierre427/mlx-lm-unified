@@ -1679,7 +1679,18 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, tokenizer=tokenizer, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
+    # ``self_mtp_generate_step`` owns the generation stream and may operate
+    # within only a few GB of the recommended working-set ceiling. Reapplying
+    # ``mx.set_wired_limit`` here after a 100+ GB model has already loaded can
+    # trigger a Metal watchdog timeout on the first PLE command. The server
+    # establishes its process-wide wired limit at startup; direct callers keep
+    # MLX's existing limit. Other generators retain the historical context.
+    limit_context = (
+        contextlib.nullcontext()
+        if mtp_safe
+        else wired_limit(model, [generation_stream])
+    )
+    with limit_context:
         tic = time.perf_counter()
         # max_tokens=0 (or a generator that yields nothing) must not reach
         # the final response, which reads the loop variables.

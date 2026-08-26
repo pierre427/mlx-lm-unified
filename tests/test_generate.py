@@ -128,9 +128,12 @@ class TestGenerate(unittest.TestCase):
         previous_mtp = getattr(self.model, "mtp", None)
         self.model.mtp = object()
         try:
-            with patch(
-                "mlx_lm.hybrid_speculative.self_mtp_generate_step",
-                side_effect=fake_self_mtp,
+            with (
+                patch(
+                    "mlx_lm.hybrid_speculative.self_mtp_generate_step",
+                    side_effect=fake_self_mtp,
+                ),
+                patch("mlx_lm.generate.wired_limit") as wired_limit,
             ):
                 responses = list(
                     stream_generate(
@@ -162,6 +165,7 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(observed["rate_gate"])
         self.assertEqual(observed["mtp_window_size"], 2048)
         self.assertEqual(observed["mtp_sink_size"], 4)
+        wired_limit.assert_not_called()
 
     def test_generate_with_processor(self):
         init_toks = self.tokenizer.encode("hello")
