@@ -111,6 +111,8 @@ class TestSelfMTPAdmission(unittest.TestCase):
             self_mtp_num_draft=1,
             self_mtp_persistent=True,
             self_mtp_rate_gate=True,
+            self_mtp_share_qsa_indices=True,
+            self_mtp_share_qsa_indices_min_prompt_tokens=16384,
             self_mtp_window_size=2048,
             self_mtp_window_sink_size=4,
             self_mtp_window_min_prompt_tokens=32768,
@@ -140,6 +142,17 @@ class TestSelfMTPAdmission(unittest.TestCase):
         )
         self.assertEqual(config["num_draft"], 1)
         self.assertTrue(config["persistent"])
+        self.assertFalse(config["share_qsa_indices"])
+
+    def test_qsa_index_sharing_obeys_measured_prompt_threshold(self):
+        below = _self_mtp_config(
+            self.args(), self.cli, self.model, prompt_tokens=16383
+        )
+        admitted = _self_mtp_config(
+            self.args(), self.cli, self.model, prompt_tokens=16384
+        )
+        self.assertFalse(below["share_qsa_indices"])
+        self.assertTrue(admitted["share_qsa_indices"])
 
     def test_temperature_only_sampling_is_exact_and_admitted(self):
         config = _self_mtp_config(

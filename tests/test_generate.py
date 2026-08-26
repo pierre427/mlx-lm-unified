@@ -149,6 +149,7 @@ class TestGenerate(unittest.TestCase):
                             "sampling_temp": 0.0,
                             "window_size": 2048,
                             "sink_size": 4,
+                            "share_qsa_indices": True,
                         },
                     )
                 )
@@ -165,6 +166,7 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(observed["rate_gate"])
         self.assertEqual(observed["mtp_window_size"], 2048)
         self.assertEqual(observed["mtp_sink_size"], 4)
+        self.assertTrue(observed["mtp_share_qsa_indices"])
         wired_limit.assert_not_called()
 
     def test_generate_with_processor(self):

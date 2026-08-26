@@ -972,6 +972,7 @@ def self_mtp_generate_step(
     persistent_mtp: bool = False,
     mtp_window_size: Optional[int] = None,
     mtp_sink_size: int = 4,
+    mtp_share_qsa_indices: bool = False,
     rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
     batch_size: int = 1,
@@ -1026,6 +1027,11 @@ def self_mtp_generate_step(
     sinks plus a recent window. The target cache and verification remain
     full-context, so the A/B changes proposal quality and cost, never which
     model authorizes the emitted token.
+
+    ``mtp_share_qsa_indices=True`` lets model-specific sparse-attention draft
+    heads compute top-k blocks on the first MTP step and reuse them on later
+    chained steps.  Verification is unchanged.  Models without the optional
+    ``mtp_start_cycle`` hook ignore it.
 
     ``batch_size``/``depth_table`` apply the per-batch-size draft-depth policy
     (``spec_policy.draft_depth_for``): the table caps how deep the head drafts
@@ -1131,6 +1137,7 @@ def self_mtp_generate_step(
             sampling_temp,
             accept_rule=accept_rule,
             mtp_cache=mtp_cache,
+            share_qsa_indices=mtp_share_qsa_indices,
             rate_gate=rate_gate,
             speculation_router=speculation_router,
             logits_processors=logits_processors,
@@ -1267,6 +1274,7 @@ def _mtp_draft_verify_loop(
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
     logits_processors=None,
     token_prefix=None,
+    share_qsa_indices: bool = False,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
@@ -1416,6 +1424,8 @@ def _mtp_draft_verify_loop(
         # ---- draft k tokens with the MTP head (chained) ----------------------
         if not persistent:
             mtp_cache = model.make_mtp_cache()
+        if hasattr(model, "mtp_start_cycle"):
+            model.mtp_start_cycle(mtp_cache, share_qsa_indices and k > 1)
         drafts: List[int] = []
         draft_logprobs: List[mx.array] = []
         h, tok = seed_h, mx.array([[cur]], mx.uint32)

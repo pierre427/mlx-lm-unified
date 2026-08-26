@@ -271,6 +271,42 @@ class TestQwen4Exp(unittest.TestCase):
         self.assertEqual(mtp_cache[0].offset, 6)
         self.assertEqual(mtp_cache[0]._active_positions, [0, 1, 3, 4, 5])
 
+    def test_qwen4_mtp_can_share_qsa_topk_within_one_draft_cycle(self):
+        args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
+        model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+        trunk_cache = model.make_cache()
+        _, hyper = model.mtp_backbone(
+            mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]], dtype=mx.int32),
+            trunk_cache,
+        )
+        mtp_cache = model.make_mtp_cache()
+        model.mtp_step(
+            hyper[:, :-1], mx.array([[2, 3, 4, 5, 6, 7, 8, 9]]), mtp_cache
+        )
+        mx.eval(mtp_cache[0].state)
+        self.assertEqual(mtp_cache[0].offset, 8)
+        self.assertEqual(mtp_cache[0].index_keys.shape[1], 8)
+
+        model.mtp_start_cycle(mtp_cache, share_qsa_indices=True)
+        logits, post = model.mtp_step(
+            hyper[:, -1:], mx.array([[10]], dtype=mx.int32), mtp_cache
+        )
+        mx.eval(logits, post, mtp_cache[0].state)
+        self.assertIsNotNone(mtp_cache[0]._mtp_shared_topk)
+        self.assertEqual(mtp_cache[0].offset, 9)
+        self.assertEqual(mtp_cache[0].index_keys.shape[1], 9)
+
+        token = mx.argmax(logits[:, -1:, :], axis=-1)
+        model.mtp_step(post[:, -1:], token, mtp_cache)
+        mx.eval(mtp_cache[0].state)
+        self.assertEqual(mtp_cache[0].offset, 10)
+        # Step 1 reused step 0's top-k and skipped the QSA index projection.
+        self.assertEqual(mtp_cache[0].index_keys.shape[1], 9)
+
+        trim_prompt_cache(mtp_cache, 2)
+        self.assertEqual(mtp_cache[0].offset, 8)
+        self.assertEqual(mtp_cache[0].index_keys.shape[1], 8)
+
     def test_q4_quantizes_ple_as_independent_group_32_shards(self):
         args = tiny_args(ple_layer_ids=[2], ple_embed_dim=128)
         config = {"model_type": "qwen4_exp", "text_config": args.__dict__}

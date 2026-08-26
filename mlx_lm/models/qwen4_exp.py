@@ -653,6 +653,12 @@ class QSAKVCache(KVCache):
     def __init__(self):
         super().__init__()
         self.index_keys = None
+        # Ephemeral MTP-cycle state.  Step zero computes QSA top-k normally;
+        # later chained draft steps may reuse those block indices and skip the
+        # index projection.  This is deliberately absent from ``state``: a
+        # cache snapshot is a sequence snapshot, not an in-flight draft cycle.
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
 
     def update_index_keys(self, keys: mx.array):
         self.index_keys = keys if self.index_keys is None else mx.concatenate([self.index_keys[:, : self.offset], keys], axis=1)
@@ -676,6 +682,8 @@ class QSAKVCache(KVCache):
     def state(self, value):
         self.keys, self.values, self.index_keys = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
 
     @property
     def nbytes(self):
@@ -707,38 +715,65 @@ class QSAIndexer(nn.Module):
             # native QSA and remains the sole verifier.
             mask = cache.make_mask(length, return_array=True)
             return None if mask is None else mask[None, None, :, :]
-        qk = self.index_qk_proj(hidden)
-        q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
-        q = self.q_layernorm(q.reshape(batch, length, self.n_heads, self.head_dim))
-        raw = raw.reshape(batch, length, self.head_dim)
         offset = 0 if cache is None else cache.offset
-        all_raw = raw if cache is None else cache.update_index_keys(raw)
-        total = all_raw.shape[1]
         if isinstance(offset, mx.array):
             q_pos = offset[:, None] + mx.arange(length)[None, :]
         else:
             q_pos = mx.arange(offset, offset + length)[None, :]
-        q = _apply_rope_positions(q, q_pos[..., None], self.rotary_dim, self.rope_theta)
+
+        shared_topk = (
+            getattr(cache, "_mtp_shared_topk", None) if cache is not None else None
+        )
+        if shared_topk is None:
+            qk = self.index_qk_proj(hidden)
+            q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
+            q = self.q_layernorm(
+                q.reshape(batch, length, self.n_heads, self.head_dim)
+            )
+            raw = raw.reshape(batch, length, self.head_dim)
+            all_raw = raw if cache is None else cache.update_index_keys(raw)
+            total = all_raw.shape[1]
+            q = _apply_rope_positions(
+                q, q_pos[..., None], self.rotary_dim, self.rope_theta
+            )
+        else:
+            # The current draft token is transient and will be rewound before
+            # any accepted span is teacher-forced next cycle.  Skipping its raw
+            # index key is therefore safe and is what removes the indexer work.
+            total = (
+                int(offset.max().item()) + length
+                if isinstance(offset, mx.array)
+                else offset + length
+            )
 
         n_blocks = total // self.compress_ratio
         if n_blocks == 0:
             return causal_mask
-        pooled = all_raw[:, : n_blocks * self.compress_ratio].reshape(
-            batch, n_blocks, self.compress_ratio, self.head_dim
-        ).astype(mx.float32).mean(axis=2).astype(all_raw.dtype)
-        pooled = self.k_layernorm(pooled)
         starts = mx.arange(n_blocks) * self.compress_ratio
-        pooled = _apply_rope_positions(
-            pooled, starts[None, :], self.rotary_dim, self.rope_theta
-        )
-        scores = mx.einsum("blhd,bnd->blnh", q.astype(mx.float32), pooled.astype(mx.float32))
-        scores = mx.sum(mx.maximum(scores, 0), axis=-1) / math.sqrt(self.head_dim)
         valid_blocks = (
             (starts + self.compress_ratio - 1)[None, None, :] <= q_pos[..., None]
         )
-        scores = mx.where(valid_blocks, scores, -mx.inf)
-        k = min(self.block_topk, n_blocks)
-        selected = mx.argpartition(scores, kth=n_blocks - k, axis=-1)[..., -k:]
+        if shared_topk is None:
+            pooled = all_raw[:, : n_blocks * self.compress_ratio].reshape(
+                batch, n_blocks, self.compress_ratio, self.head_dim
+            ).astype(mx.float32).mean(axis=2).astype(all_raw.dtype)
+            pooled = self.k_layernorm(pooled)
+            pooled = _apply_rope_positions(
+                pooled, starts[None, :], self.rotary_dim, self.rope_theta
+            )
+            scores = mx.einsum(
+                "blhd,bnd->blnh", q.astype(mx.float32), pooled.astype(mx.float32)
+            )
+            scores = mx.sum(mx.maximum(scores, 0), axis=-1) / math.sqrt(self.head_dim)
+            scores = mx.where(valid_blocks, scores, -mx.inf)
+            k = min(self.block_topk, n_blocks)
+            selected = mx.argpartition(scores, kth=n_blocks - k, axis=-1)[..., -k:]
+            if cache is not None and getattr(cache, "_mtp_share_topk", False):
+                cache._mtp_shared_topk = mx.contiguous(selected[:, -1])
+        else:
+            selected = mx.broadcast_to(
+                shared_topk[:, None, :], (batch, length, shared_topk.shape[-1])
+            )
         block_ids = mx.arange(n_blocks)
         chosen = mx.any(selected[..., None] == block_ids[None, None, None, :], axis=-2)
         chosen = chosen & valid_blocks
@@ -1013,6 +1048,13 @@ class Model(nn.Module):
         if window_size is None:
             return [QSAKVCache() for _ in self.mtp.layers]
         return [SinkWindowKVCache(window_size, sink_size) for _ in self.mtp.layers]
+
+    def mtp_start_cycle(self, mtp_cache, share_qsa_indices: bool = False):
+        """Reset optional QSA top-k sharing at an MTP draft-cycle boundary."""
+        for cache in mtp_cache:
+            if isinstance(cache, QSAKVCache):
+                cache._mtp_share_topk = bool(share_qsa_indices)
+                cache._mtp_shared_topk = None
 
     def mtp_step(self, hidden, tokens, mtp_cache):
         embeddings = self.language_model.model.embed_tokens(tokens)

@@ -1632,6 +1632,7 @@ def stream_generate(
             persistent_mtp=self_mtp.get("persistent", True),
             mtp_window_size=self_mtp.get("window_size"),
             mtp_sink_size=self_mtp.get("sink_size", 4),
+            mtp_share_qsa_indices=self_mtp.get("share_qsa_indices", False),
             rate_gate=self_mtp.get("rate_gate", True),
             stats=self_mtp.get("stats"),
             prompt_cache=kwargs.get("prompt_cache"),

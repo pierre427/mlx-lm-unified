@@ -663,10 +663,17 @@ def _self_mtp_config(
         return None
     if getattr(cli_args, "kv_bits", None) is not None:
         return None
+    share_qsa_minimum = getattr(
+        cli_args, "self_mtp_share_qsa_indices_min_prompt_tokens", 0
+    )
     config = {
         "num_draft": cli_args.self_mtp_num_draft,
         "persistent": cli_args.self_mtp_persistent,
         "rate_gate": cli_args.self_mtp_rate_gate,
+        "share_qsa_indices": (
+            getattr(cli_args, "self_mtp_share_qsa_indices", False)
+            and prompt_tokens >= share_qsa_minimum
+        ),
         "sampling_temp": sampling.temperature,
         "accept_rule": "residual",
     }
@@ -2281,6 +2288,24 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--self-mtp-share-qsa-indices",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse QSA top-k blocks after the first step of each chained MTP "
+            "draft cycle (default: off; target verification is unchanged)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-share-qsa-indices-min-prompt-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Enable MTP QSA top-k sharing only at or above this full prompt "
+            "length (default: 0)."
+        ),
+    )
+    parser.add_argument(
         "--self-mtp-window-sink-size",
         type=int,
         default=4,
@@ -2479,6 +2504,7 @@ def main():
         "self_mtp_window_size",
         "self_mtp_window_sink_size",
         "self_mtp_window_min_prompt_tokens",
+        "self_mtp_share_qsa_indices_min_prompt_tokens",
     ):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
