@@ -27,6 +27,7 @@ from mlx_lm.server import (
     _request_output_ceiling,
     _request_sampling_profile,
     _self_mtp_config,
+    process_message_content,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
 from mlx_lm.utils import load
@@ -257,6 +258,14 @@ class TestThinkingServingProfiles(unittest.TestCase):
             1.5,
         )
         self.assertEqual(_request_output_ceiling(self.cli, override), 131072)
+
+    def test_reasoning_alias_is_preserved_for_qwen_chat_templates(self):
+        messages = [
+            {"role": "assistant", "content": None, "reasoning": "trace"}
+        ]
+        process_message_content(messages)
+        self.assertEqual(messages[0]["reasoning_content"], "trace")
+        self.assertEqual(messages[0]["reasoning"], "trace")
 
 
 class DummyModelProvider:

@@ -158,6 +158,15 @@ def process_message_content(messages):
 
     """
     for message in messages:
+        # OpenAI-compatible clients commonly echo the server's ``reasoning``
+        # field, while Qwen's preserved-thinking template consumes
+        # ``reasoning_content``. Keep both spellings losslessly equivalent so
+        # historical traces remain part of chat serialization and APC identity.
+        if (
+            "reasoning_content" not in message
+            and isinstance(message.get("reasoning"), str)
+        ):
+            message["reasoning_content"] = message["reasoning"]
         content = message.get("content")
         if isinstance(content, list):
             text_fragments = [
@@ -1863,6 +1872,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 choice[key_name]["content"] = text
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
+                choice[key_name]["reasoning_content"] = reasoning_text
             if tool_calls:
                 choice[key_name]["tool_calls"] = tool_calls
         elif self.object_type == "text_completion":
