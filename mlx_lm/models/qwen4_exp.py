@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Union
 
@@ -313,8 +314,8 @@ class ShardedEmbedding(nn.Module):
         for index in range(num_shards):
             setattr(self, f"shard_{index}", nn.Embedding(self.rows_per_shard, dims))
 
-    def __call__(self, indices: mx.array) -> mx.array:
-        mx.eval(indices)
+    def lookup_numpy(self, indices: np.ndarray) -> mx.array:
+        """Gather already-hosted row ids without a redundant MLX sync."""
         shape = indices.shape
         flat = np.asarray(indices, dtype=np.int64).reshape(-1)
         output = None
@@ -329,6 +330,10 @@ class ShardedEmbedding(nn.Module):
                 output = mx.zeros((flat.size, self.dims), dtype=values.dtype)
             output = output.at[mx.array(positions)].add(values)
         return output.reshape(*shape, self.dims)
+
+    def __call__(self, indices: mx.array) -> mx.array:
+        mx.eval(indices)
+        return self.lookup_numpy(np.asarray(indices, dtype=np.int64))
 
 
 class NGramEmbedding(nn.Module):
@@ -367,8 +372,22 @@ class NGramEmbedding(nn.Module):
         self.ngram_embedding = ShardedEmbedding(
             padded, embedding_dim // self.ngram_heads, args.split_ngram_parts
         )
+        self.hash_backend = os.getenv("MLX_QWEN4_PLE_HASH_BACKEND", "cpu")
+        if self.hash_backend not in {"cpu", "routed_cpu", "metal", "metal_prefill"}:
+            raise ValueError(
+                "MLX_QWEN4_PLE_HASH_BACKEND must be cpu, routed_cpu, metal, "
+                "or metal_prefill"
+            )
+        self.metal_hash_min_tokens = int(
+            os.getenv("MLX_QWEN4_PLE_METAL_MIN_TOKENS", "1024")
+        )
+        if self.metal_hash_min_tokens < 1:
+            raise ValueError("MLX_QWEN4_PLE_METAL_MIN_TOKENS must be positive")
+        self._metal_hash_kernel = None
 
-    def ngram_ids(self, input_ids: mx.array, cache: Optional[ArraysCache] = None):
+    def _ngram_ids_numpy(
+        self, input_ids: mx.array, cache: Optional[ArraysCache] = None
+    ) -> np.ndarray:
         mx.eval(input_ids, self.layer_multipliers, self.ngram_heads_vocab_sizes, self.ngram_heads_offsets)
         tokens = np.asarray(input_ids, dtype=np.int64)
         batch, seq_len = tokens.shape
@@ -411,9 +430,95 @@ class NGramEmbedding(nn.Module):
             blocks.append(
                 np.remainder(mixed[..., None], sizes[start:end]) + offsets[start:end]
             )
-        return mx.array(np.concatenate(blocks, axis=-1)[:, -seq_len:], dtype=mx.int64)
+        return np.concatenate(blocks, axis=-1)[:, -seq_len:]
+
+    def _ngram_ids_metal(
+        self, input_ids: mx.array, cache: Optional[ArraysCache] = None
+    ) -> mx.array:
+        if self.ngram_size != 3 or not mx.metal.is_available():
+            return mx.array(self._ngram_ids_numpy(input_ids, cache), dtype=mx.int64)
+
+        batch, seq_len = input_ids.shape
+        if cache is not None and cache[3] is not None:
+            previous = cache[3]
+        else:
+            previous = mx.full(
+                (batch, self.context_len), self.eos_token_id, dtype=mx.int64
+            )
+        history = mx.concatenate([previous, input_ids.astype(mx.int64)], axis=-1)
+        if cache is not None:
+            cache[3] = mx.contiguous(history[:, -self.context_len :])
+
+        if self._metal_hash_kernel is None:
+            self._metal_hash_kernel = mx.fast.metal_kernel(
+                name="qwen4_ple_ngram3_hash",
+                input_names=["history", "multipliers", "sizes", "offsets"],
+                output_names=["out"],
+                source=r"""
+                    uint elem = thread_position_in_grid.x;
+                    uint head = elem % HEADS;
+                    uint token = (elem / HEADS) % SEQ_LEN;
+                    uint batch = elem / (HEADS * SEQ_LEN);
+                    uint history_pos = token + 2;
+                    uint history_base = batch * (SEQ_LEN + 2);
+
+                    long current = history[history_base + history_pos];
+                    long previous_1 = history[history_base + history_pos - 1];
+                    long previous_2 = history[history_base + history_pos - 2];
+                    if (previous_1 == EOS_TOKEN) {
+                        previous_2 = EOS_TOKEN;
+                    }
+
+                    ulong mixed = ulong(current) * ulong(multipliers[0]);
+                    mixed ^= ulong(previous_1) * ulong(multipliers[1]);
+                    if (head >= HEADS_PER_NGRAM) {
+                        mixed ^= ulong(previous_2) * ulong(multipliers[2]);
+                    }
+                    long remainder = long(mixed) % sizes[head];
+                    if (remainder < 0) {
+                        remainder += sizes[head];
+                    }
+                    out[elem] = remainder + offsets[head];
+                """,
+            )
+        total = batch * seq_len * self.ngram_heads
+        return self._metal_hash_kernel(
+            inputs=[
+                history,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            ],
+            template=[
+                ("HEADS", self.ngram_heads),
+                ("HEADS_PER_NGRAM", self.heads_per_ngram),
+                ("SEQ_LEN", seq_len),
+                ("EOS_TOKEN", self.eos_token_id),
+            ],
+            grid=(total, 1, 1),
+            threadgroup=(min(256, total), 1, 1),
+            output_shapes=[(batch, seq_len, self.ngram_heads)],
+            output_dtypes=[mx.int64],
+            stream=mx.gpu,
+        )[0]
+
+    def ngram_ids(self, input_ids: mx.array, cache: Optional[ArraysCache] = None):
+        if self.hash_backend == "metal" or (
+            self.hash_backend == "metal_prefill"
+            and input_ids.shape[1] >= self.metal_hash_min_tokens
+        ):
+            return self._ngram_ids_metal(input_ids, cache)
+        return mx.array(self._ngram_ids_numpy(input_ids, cache), dtype=mx.int64)
 
     def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache] = None):
+        if self.hash_backend == "routed_cpu" or (
+            self.hash_backend == "metal_prefill"
+            and input_ids.shape[1] < self.metal_hash_min_tokens
+        ):
+            ids = self._ngram_ids_numpy(input_ids, cache)
+            return self.ngram_embedding.lookup_numpy(ids).reshape(
+                *input_ids.shape, -1
+            )
         return self.ngram_embedding(self.ngram_ids(input_ids, cache)).reshape(
             *input_ids.shape, -1
         )

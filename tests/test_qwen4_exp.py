@@ -1,6 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
 import unittest
+from contextlib import contextmanager
+from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -66,6 +68,19 @@ def tiny_args(**overrides):
     return TextModelArgs(**values)
 
 
+@contextmanager
+def ple_hash_backend(name):
+    previous = environ.get("MLX_QWEN4_PLE_HASH_BACKEND")
+    environ["MLX_QWEN4_PLE_HASH_BACKEND"] = name
+    try:
+        yield
+    finally:
+        if previous is None:
+            environ.pop("MLX_QWEN4_PLE_HASH_BACKEND", None)
+        else:
+            environ["MLX_QWEN4_PLE_HASH_BACKEND"] = previous
+
+
 class TestQwen4Exp(unittest.TestCase):
     def test_sink_window_cache_preserves_positions_and_rolls_back(self):
         cache = SinkWindowKVCache(window_size=4, sink_size=2, rollback_window=4)
@@ -96,6 +111,43 @@ class TestQwen4Exp(unittest.TestCase):
         self.assertTrue(mx.array_equal(first, joined[:, :4]).item())
         self.assertTrue(mx.array_equal(second, joined[:, 4:]).item())
         self.assertEqual(first.shape[-1], 4)  # 2 heads each for bi- and trigrams
+
+    def test_ngram_hash_backends_match_cpu_with_cache_and_eos(self):
+        args = tiny_args()
+        inputs = [
+            mx.array([[1, 2, 63, 3], [63, 4, 5, 6]], dtype=mx.int64),
+            mx.array([[4, 5], [7, 63]], dtype=mx.int64),
+        ]
+        results = {}
+        from mlx_lm.models.cache import ArraysCache
+
+        for backend in ("cpu", "routed_cpu", "metal", "metal_prefill"):
+            with ple_hash_backend(backend):
+                emb = NGramEmbedding(args, 16, layer_idx=1, ple_layer_index=0)
+            cache = ArraysCache(4)
+            chunks = [emb.ngram_ids(value, cache) for value in inputs]
+            mx.eval(*chunks)
+            results[backend] = [np.asarray(value) for value in chunks]
+
+        for backend in ("routed_cpu", "metal", "metal_prefill"):
+            for expected, actual in zip(results["cpu"], results[backend]):
+                np.testing.assert_array_equal(actual, expected)
+
+    def test_optimized_embedding_backends_match_default(self):
+        args = tiny_args()
+        tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int64)
+        with ple_hash_backend("cpu"):
+            reference = NGramEmbedding(args, 16, layer_idx=1, ple_layer_index=0)
+        expected = reference(tokens)
+        for backend in ("routed_cpu", "metal", "metal_prefill"):
+            with ple_hash_backend(backend):
+                optimized = NGramEmbedding(args, 16, layer_idx=1, ple_layer_index=0)
+            optimized.update(reference.parameters())
+            if backend == "metal_prefill":
+                optimized.metal_hash_min_tokens = 1
+            actual = optimized(tokens)
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(expected, actual).item())
 
     def test_hyper_connection_shapes(self):
         args = tiny_args()
