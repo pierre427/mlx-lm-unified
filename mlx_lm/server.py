@@ -1358,6 +1358,27 @@ class ResponseGenerator:
                     else "request sampling/speculation regime"
                 )
                 logging.info("Self-MTP bypassed: %s", reason)
+            prompt_lookup_config = None
+            prompt_lookup_stats = None
+            if getattr(args, "prompt_lookup_ngram", 0):
+                from .prompt_lookup import HybridStats
+
+                prompt_lookup_stats = HybridStats()
+                prompt_lookup_config = {
+                    "ngram_max": args.prompt_lookup_ngram,
+                    "num_draft": args.prompt_lookup_tokens,
+                    "adaptive": args.prompt_lookup_adaptive,
+                    "rate_gate": args.prompt_lookup_rate_gate,
+                    "warmup": args.prompt_lookup_warmup,
+                    "gate": args.prompt_lookup_gate,
+                    "rate_gate_probe": args.prompt_lookup_rate_gate_probe,
+                    "rate_gate_margin": args.prompt_lookup_rate_gate_margin,
+                    "stats": prompt_lookup_stats,
+                    # The target APC already owns model state for this prefix;
+                    # PLD separately needs token IDs so suffix matches can
+                    # cross the cached-prefix boundary.
+                    "history_prompt": prompt,
+                }
             token_stream = stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1368,24 +1389,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
-                prompt_lookup=(
-                    {
-                        "ngram_max": args.prompt_lookup_ngram,
-                        "num_draft": args.prompt_lookup_tokens,
-                        "adaptive": args.prompt_lookup_adaptive,
-                        "rate_gate": args.prompt_lookup_rate_gate,
-                        "warmup": args.prompt_lookup_warmup,
-                        "gate": args.prompt_lookup_gate,
-                        "rate_gate_probe": args.prompt_lookup_rate_gate_probe,
-                        "rate_gate_margin": args.prompt_lookup_rate_gate_margin,
-                        # The target APC already owns model state for this
-                        # prefix; PLD separately needs the token IDs so suffix
-                        # matches can cross the cached-prefix boundary.
-                        "history_prompt": prompt,
-                    }
-                    if getattr(args, "prompt_lookup_ngram", 0)
-                    else None
-                ),
+                prompt_lookup=prompt_lookup_config,
                 self_mtp=self_mtp,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
@@ -1434,6 +1438,16 @@ class ResponseGenerator:
                         break
             finally:
                 token_stream.close()
+                if prompt_lookup_stats is not None:
+                    logging.info(
+                        "Prompt lookup: %s | rate_probe=%s delatched=%s "
+                        "spec_ms_tok=%.3f plain_ms_tok=%.3f",
+                        prompt_lookup_stats.summary(),
+                        prompt_lookup_stats.rate_gate_probed,
+                        prompt_lookup_stats.rate_gate_delatched,
+                        prompt_lookup_stats.rate_gate_spec_ms_per_tok,
+                        prompt_lookup_stats.rate_gate_plain_ms_per_tok,
+                    )
 
             rqueue.put(None)
 
