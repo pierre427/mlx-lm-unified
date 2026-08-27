@@ -678,11 +678,16 @@ def _self_mtp_config(
 ):
     """Return an exact self-MTP route or fail closed to ordinary decoding.
 
-    The current engine is exact for greedy and temperature-only sampling.  A
-    top-p/top-k/min-p/XTC transform changes the draft distribution and needs a
-    shared transformed-distribution verifier, so those requests remain on the
-    ordinary sampler.  Likewise, an APC hit has target state but no matching
-    MTP hidden/KV state; it keeps the valuable prefix hit and decodes plainly.
+    The engine is exact for greedy and temperature-only sampling. With
+    ``--self-mtp-transformed-verifier`` it is also exact for top-p/top-k/min-p
+    sampling: the same transform is applied to draft and target
+    log-probabilities before residual acceptance. XTC (a stochastic transform)
+    is not implemented, so it fails closed whenever it could engage
+    (``temperature > 0``); at ``temperature == 0`` the sampler is argmax and
+    XTC never engages, so such requests stay admitted as greedy. Without the
+    flag every transformed request remains on the ordinary sampler. Likewise,
+    an APC hit has target state but no matching MTP hidden/KV state; it keeps
+    the valuable prefix hit and decodes plainly.
     """
     if not getattr(cli_args, "self_mtp", False):
         return None
@@ -693,16 +698,23 @@ def _self_mtp_config(
     if args.model.draft != "default_model" or args.prompt_lookup_ngram:
         return None
     sampling = args.sampling
+    # ``top_p <= 0`` is a sampler no-op (make_sampler skips the filter), so
+    # it is classified untransformed and keeps the temperature-only path.
     transformed_sampling = (
         sampling.temperature > 0
         and (
-            sampling.top_p < 1.0
+            0.0 < sampling.top_p < 1.0
             or sampling.top_k > 0
             or sampling.min_p > 0.0
             or sampling.xtc_probability > 0.0
         )
     )
-    if transformed_sampling:
+    transformed_verifier = transformed_sampling and getattr(
+        cli_args, "self_mtp_transformed_verifier", False
+    )
+    if transformed_sampling and (
+        not transformed_verifier or sampling.xtc_probability > 0.0
+    ):
         return None
     if getattr(cli_args, "kv_bits", None) is not None:
         return None
@@ -721,6 +733,10 @@ def _self_mtp_config(
         "accept_rule": "residual",
         "state_out": {},
     }
+    if transformed_verifier:
+        config["top_p"] = sampling.top_p
+        config["top_k"] = sampling.top_k
+        config["min_p"] = sampling.min_p
     if mtp_state is not None:
         config["state"] = mtp_state
     window_size = getattr(cli_args, "self_mtp_window_size", 0)
@@ -2473,6 +2489,16 @@ def setup_arg_parser():
             "Enable the model's internal MTP head for exact greedy or "
             "temperature-only requests. Transformed sampling and APC hits "
             "fail closed to ordinary decoding."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-transformed-verifier",
+        action="store_true",
+        help=(
+            "Admit top-p/top-k/min-p sampling into self-MTP with an exact "
+            "transformed-distribution verifier (the same transform is applied "
+            "to draft and target before residual acceptance). Active XTC "
+            "(temperature > 0) still fails closed. Default: off."
         ),
     )
     parser.add_argument(

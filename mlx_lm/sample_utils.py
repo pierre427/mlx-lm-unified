@@ -2,6 +2,7 @@
 
 import math
 from collections import Counter
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
@@ -290,6 +291,85 @@ def apply_xtc(
 
 def categorical_sampling(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
+
+
+@lru_cache(maxsize=32)
+def make_transformed_logprobs(
+    temp: float,
+    *,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+    min_tokens_to_keep: int = 1,
+) -> Callable[[mx.array], mx.array]:
+    """Make a map from raw logits to the log-probabilities of the
+    distribution ``make_sampler(temp, top_p, min_p, top_k)`` samples from.
+
+    Memoized at module level per parameter tuple: repeat requests (the few
+    serving profiles dominate) reuse one compiled chain, and MLX's own trace
+    cache then covers the per-shape traces inside it. Safe to share — the
+    transform is deterministic (no random state is captured, unlike
+    ``make_sampler``, which must compile per call to bind the calling
+    thread's RNG state).
+
+    Mirrors the sampler exactly: normalization runs eagerly in the logits'
+    native dtype (as ``generate_step`` does before calling the sampler), and
+    the filter chain — top-p, then min-p, then top-k, in ``make_sampler``
+    order; XTC is not supported — plus the temperature scale runs inside
+    ``mx.compile``, so knife-edge filter ties resolve with the same fused
+    rounding as the compiled sampler. Filtered tokens are exactly ``-inf``.
+    Only the final renormalization is float32: it does not change the
+    represented distribution, it only makes the returned values accurate.
+    Requires ``temp > 0``; batched over leading axes.
+    """
+    if not temp or temp <= 0:
+        raise ValueError(
+            f"make_transformed_logprobs requires temp > 0, got {temp}"
+        )
+    sampling_methods = []
+    if top_p > 0 and top_p < 1.0:
+        sampling_methods.append(lambda x: apply_top_p(x, top_p))
+    if min_p != 0.0:
+        sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
+    if top_k > 0:
+        sampling_methods.append(lambda x: apply_top_k(x, top_k))
+
+    def chain(logprobs):
+        for method in sampling_methods:
+            logprobs = method(logprobs)
+        return logprobs * (1 / temp)
+
+    compiled = mx.compile(chain)
+
+    def transform(logits):
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        scaled = compiled(logprobs).astype(mx.float32)
+        return scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+
+    return transform
+
+
+def transformed_logprobs(
+    logits: mx.array,
+    temp: float,
+    *,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
+    min_tokens_to_keep: int = 1,
+) -> mx.array:
+    """One-shot form of ``make_transformed_logprobs`` (see its docstring).
+
+    The factory is memoized, so repeat calls with the same parameters reuse
+    one compiled chain.
+    """
+    return make_transformed_logprobs(
+        temp,
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+        min_tokens_to_keep=min_tokens_to_keep,
+    )(logits)
 
 
 def make_repetition_penalty(penalty: float, context_size: int = 20):

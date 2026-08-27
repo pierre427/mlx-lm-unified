@@ -1668,6 +1668,9 @@ def stream_generate(
                 "prefill_step_size", DEFAULT_PREFILL_STEP_SIZE
             ),
             sampling_temp=self_mtp.get("sampling_temp", 0.0),
+            sampling_top_p=self_mtp.get("top_p", 1.0),
+            sampling_top_k=self_mtp.get("top_k", 0),
+            sampling_min_p=self_mtp.get("min_p", 0.0),
             accept_rule=self_mtp.get("accept_rule", "residual"),
             persistent_mtp=self_mtp.get("persistent", True),
             mtp_window_size=self_mtp.get("window_size"),

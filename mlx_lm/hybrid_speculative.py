@@ -52,7 +52,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import make_sampler, make_transformed_logprobs
 from .spec_policy import draft_depth_for
 from .tokenizer_utils import TokenizerWrapper
 from .prompt_lookup import HybridStats as _PromptLookupStatsBase
@@ -972,6 +972,9 @@ def self_mtp_generate_step(
     max_tokens: int = 256,
     prefill_step_size: int = 512,
     sampling_temp: float = 0.0,
+    sampling_top_p: float = 1.0,
+    sampling_top_k: int = 0,
+    sampling_min_p: float = 0.0,
     accept_rule: str = "residual",
     persistent_mtp: bool = False,
     mtp_window_size: Optional[int] = None,
@@ -1001,8 +1004,12 @@ def self_mtp_generate_step(
 
     Greedy by default. When ``sampling_temp > 0``, the MTP path uses standard
     speculative rejection sampling with temperature-scaled target and draft
-    distributions. This is exact for temperature-only sampling; top-p/top-k need
-    a shared distribution transform before they can be made exact here.
+    distributions. This is exact for temperature-only sampling. When
+    ``sampling_top_p``/``sampling_top_k``/``sampling_min_p`` request a
+    transformed distribution, the SAME ``make_sampler``-order transform is
+    applied to both draft and target log-probabilities and the residual rule
+    runs on the transformed pair — exact for the fully transformed
+    distribution as well (XTC is not supported).
 
     ``accept_rule`` selects the temp>0 verification rule; greedy (temp=0)
     decisions are rule-independent and bit-identical. ``"residual"`` (the
@@ -1066,6 +1073,14 @@ def self_mtp_generate_step(
         raise ValueError(
             f"accept_rule must be 'exact', 'residual', or 'block'; got {accept_rule!r}"
         )
+    logprob_transform = _make_sampling_transform(
+        sampling_temp, sampling_top_p, sampling_top_k, sampling_min_p
+    )
+    if logprob_transform is not None and accept_rule != "residual":
+        raise ValueError(
+            "transformed sampling (top-p/top-k/min-p) supports only "
+            f"accept_rule='residual'; got {accept_rule!r}"
+        )
     stats = stats if stats is not None else HybridStats()
     _require_hybrid_stats(stats)
 
@@ -1122,7 +1137,11 @@ def self_mtp_generate_step(
         first_logits = _apply_logits_processors(
             logits_processors, y=processor_prompt, logits=first_logits
         )
-        first_lp = _temperature_logprobs(first_logits, sampling_temp)
+        first_lp = (
+            logprob_transform(first_logits)
+            if logprob_transform is not None
+            else _temperature_logprobs(first_logits, sampling_temp)
+        )
         cur = _sample_from_logprobs(first_lp, sampling_temp)
     _start_speculation_or_cleanup(
         cache,
@@ -1149,6 +1168,7 @@ def self_mtp_generate_step(
             stats,
             sampling_temp,
             accept_rule=accept_rule,
+            logprob_transform=logprob_transform,
             mtp_cache=mtp_cache,
             share_qsa_indices=mtp_share_qsa_indices,
             rate_gate=rate_gate,
@@ -1199,6 +1219,64 @@ def _residual_sample(
         return _sample_from_logprobs(target_logprobs, sampling_temp)
     residual_logprobs = mx.log(residual / total)
     return int(mx.random.categorical(residual_logprobs).item())
+
+
+def _make_sampling_transform(
+    sampling_temp: float,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+) -> Optional[Callable[[mx.array], mx.array]]:
+    """Return a shared draft/target logprob transform, or ``None``.
+
+    ``None`` means no filter is active (or ``temp == 0``, where the filters
+    cannot change the argmax) and the caller keeps the incumbent
+    temperature-only path bit-exactly. Otherwise the returned callable maps
+    raw logits to the log-probabilities ``make_sampler`` samples from, with
+    filtered tokens exactly ``-inf`` — applied identically to draft and
+    target so the residual acceptance ratio is well-defined.
+    """
+    filtered = (0.0 < top_p < 1.0) or top_k > 0 or min_p > 0.0
+    if not filtered or not sampling_temp or sampling_temp <= 0:
+        return None
+    return make_transformed_logprobs(
+        sampling_temp, top_p=top_p, top_k=top_k, min_p=min_p
+    )
+
+
+def _batched_residual_verify(
+    logprobs, draft_logprobs, drafts, sampling_temp: float
+):
+    """Residual acceptance over all k positions with one GPU sync.
+
+    Same rule as ``_accept_sampled_draft`` scanned per position, but every
+    uniform and log-ratio is computed in one graph and drained with a single
+    ``mx.eval`` (vs one per accepted position). A draft the target transform
+    filtered has ratio exactly 0 and is always rejected — ``u <= 0`` cannot
+    rescue it. Returns ``(n_accept, bonus)``.
+    """
+    k = len(drafts)
+    d = mx.array(drafts)[:, None]
+    target_at = mx.take_along_axis(logprobs[:k], d, axis=-1)[:, 0]
+    draft_at = mx.take_along_axis(mx.stack(draft_logprobs), d, axis=-1)[:, 0]
+    ratios = mx.exp(mx.minimum(target_at - draft_at, 0.0))
+    us = mx.random.uniform(shape=(k,))
+    mx.eval(ratios, us)
+    ratios, us = ratios.tolist(), us.tolist()
+    n_accept = 0
+    while (
+        n_accept < k
+        and ratios[n_accept] > 0.0
+        and us[n_accept] <= ratios[n_accept]
+    ):
+        n_accept += 1
+    if n_accept < k:
+        bonus = _residual_sample(
+            logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
+        )
+    else:
+        bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
+    return n_accept, bonus
 
 
 def _accept_sampled_draft(target_logprobs, draft_logprobs, token: int) -> bool:
@@ -1283,6 +1361,7 @@ def _mtp_draft_verify_loop_impl(
     stats,
     sampling_temp: float = 0.0,
     accept_rule: str = "residual",
+    logprob_transform=None,
     mtp_cache=None,
     rate_gate: bool = False,
     speculation_router: Optional[RoutedSpeculationPolicy] = None,
@@ -1316,6 +1395,14 @@ def _mtp_draft_verify_loop_impl(
     thrashing (the adaptive-PLD latch philosophy; per the D-Cut lesson,
     continuous adaptivity loses to simple decisions)."""
     persistent = mtp_cache is not None
+
+    def _logprobs(logits):
+        # ``logprob_transform`` is the shared draft/target transformed
+        # distribution; ``None`` is the incumbent temperature-only path.
+        if logprob_transform is not None:
+            return logprob_transform(logits)
+        return _temperature_logprobs(logits, sampling_temp)
+
     pending_hs = None  # committed (hidden, token) pairs not yet in mtp_cache
     pending_ts: List[int] = []
     if mtp_state_tracker is not None:
@@ -1355,7 +1442,7 @@ def _mtp_draft_verify_loop_impl(
             logits = _apply_logits_processors(
                 logits_processors, proc_tokens, model.logits(logit_h)[0, -1]
             )
-            lp = _temperature_logprobs(logits, sampling_temp)
+            lp = _logprobs(logits)
             nxt = _sample_from_logprobs(lp, sampling_temp)
         if persistent and (not gated_off or mtp_state_tracker is not None):
             # Pairs only matter if drafting can resume; after a permanent
@@ -1467,7 +1554,7 @@ def _mtp_draft_verify_loop_impl(
                     hs, ts = h, tok
                 d_logits, post = model.mtp_step(hs, ts, mtp_cache)
                 h = post[:, -1:, :]
-                d_lp = _temperature_logprobs(d_logits[0, -1], sampling_temp)
+                d_lp = _logprobs(d_logits[0, -1])
                 d = _sample_from_logprobs(d_lp, sampling_temp)
                 drafts.append(d)
                 draft_logprobs.append(d_lp)
@@ -1491,15 +1578,20 @@ def _mtp_draft_verify_loop_impl(
                         logits_processors, proc_tokens, vlogits[0, i]
                     )
                 )
-            logprobs = _temperature_logprobs(
-                mx.stack(processed_logits), sampling_temp
-            )
+            logprobs = _logprobs(mx.stack(processed_logits))
             targets = mx.argmax(logprobs, axis=-1)
         mx.eval(targets, vhidden)
 
         n_accept = 0
         if sampling_temp and sampling_temp > 0:
-            if accept_rule == "block":
+            if logprob_transform is not None:
+                # Transformed distributions: batched residual acceptance
+                # (one sync for the whole scan). Kept off the incumbent
+                # paths so their sync pattern and RNG stream are untouched.
+                n_accept, bonus = _batched_residual_verify(
+                    logprobs, draft_logprobs, drafts, sampling_temp
+                )
+            elif accept_rule == "block":
                 n_accept, bonus = _block_verify(
                     logprobs, draft_logprobs, drafts, sampling_temp
                 )
