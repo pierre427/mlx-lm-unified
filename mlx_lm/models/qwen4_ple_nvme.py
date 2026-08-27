@@ -24,6 +24,10 @@ default stream.
 
 Activated by ``MLX_QWEN4_PLE_NVME=/path/to/ple_rows.bin`` at load time (see
 ``install_file_backed_ple``). Unset, nothing in this module runs.
+
+The resident-path PLE micro-levers (``MLX_QWEN4_PLE_GATHER_CONCAT``) operate
+on ``ShardedEmbedding`` and are superseded here: installing the sidecar
+replaces that module, so those flags have no effect in NVMe mode.
 """
 
 from __future__ import annotations

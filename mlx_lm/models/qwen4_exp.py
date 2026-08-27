@@ -607,6 +607,9 @@ class ShardedEmbedding(nn.Module):
         if _PLE_GATHER_CONCAT:
             # One concatenate plus one take replaces the serial at[].add
             # chain; the inverse permutation restores the request order.
+            # Resident-path lever only: in NVMe mode (MLX_QWEN4_PLE_NVME)
+            # FileBackedShardedEmbedding replaces this module, gathers a
+            # deduplicated selection in one pass, and supersedes this flag.
             pieces = []
             ordering = []
             for shard_index in np.unique(shard_ids):
