@@ -20,12 +20,16 @@ from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynami
 from .pipeline import PipelineMixin
 from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+from . import qwen3_next
 from .qwen3_next import (
     _concat_tables,
     _env_flag,
     _proj_identity,
     _proj_signature,
     _proj_table,
+    check_materialization_budget,
+    table_bytes,
+    transform_moe_weights,
 )
 from .rope_utils import initialize_rope
 
@@ -1172,7 +1176,12 @@ class Attention(nn.Module):
         if signatures[0] is not None and all(
             s == signatures[0] for s in signatures
         ):
-            table = _concat_tables([_proj_table(m) for m in modules], axis=0)
+            parts = [_proj_table(m) for m in modules]
+            # This IS a runtime second copy, so size it first.
+            check_materialization_budget(
+                sum(table_bytes(part) for part in parts), "QSA fused projection"
+            )
+            table = _concat_tables(parts, axis=0)
         object.__setattr__(self, "_qsa_fused_cache", (key, table))
         return table
 
@@ -1545,16 +1554,29 @@ class Model(nn.Module):
             if gate_up_key not in sanitized:
                 continue
             gate_up = sanitized.pop(gate_up_key)
-            midpoint = gate_up.shape[-2] // 2
-            sanitized[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                ..., :midpoint, :
-            ]
-            sanitized[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                ..., midpoint:, :
-            ]
+            if qwen3_next._MOE_FUSED_GATE_UP:
+                # The lever consumes the shipped layout: never split it.
+                sanitized[f"{prefix}.switch_mlp.gate_up_proj.weight"] = gate_up
+            else:
+                midpoint = gate_up.shape[-2] // 2
+                sanitized[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
+                    ..., :midpoint, :
+                ]
+                sanitized[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
+                    ..., midpoint:, :
+                ]
             sanitized[f"{prefix}.switch_mlp.down_proj.weight"] = sanitized.pop(
                 f"{prefix}.experts.down_proj"
             )
+        # Load-time MoE lever transforms. They consume the file-backed
+        # checkpoint arrays, so the transformed tensor is the only resident
+        # copy (a runtime re-fusion cost 45 GB and was OOM-killed).
+        transform_moe_weights(
+            sanitized,
+            mlp_prefixes,
+            fuse_gate_up=qwen3_next._MOE_FUSED_GATE_UP,
+            fold_shared=qwen3_next._MOE_SHARED_IN_GATHER,
+        )
         return self.language_model.sanitize(sanitized)
 
     @property

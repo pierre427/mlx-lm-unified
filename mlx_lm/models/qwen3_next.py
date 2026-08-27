@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from functools import partial
@@ -23,11 +24,19 @@ from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import (
     QuantizedSwitchLinear,
+    SwiGLU,
     SwitchGLU,
     SwitchLinear,
     _gather_sort,
     _scatter_unsort,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+class MaterializationTooLarge(RuntimeError):
+    """A runtime weight materialization does not fit in device memory."""
 
 
 def _env_flag(name: str) -> bool:
@@ -54,22 +63,23 @@ _MOE_GATE_COMPILE_MAX_TOKENS = 8
 # lesson (D13, "same bytes, low single digits") was measured in the
 # bandwidth-bound regime and does not govern this operating point.
 #
-# MLX_QWEN4_MOE_FUSED_GATE_UP: run the routed experts' gate and up
-# projections as ONE gather matmul over the re-fused [gate|up] weight (the
-# layout the checkpoint ships before sanitize splits it) — halves routed
-# dispatches per layer and doubles N-tile fill.  Accumulation grouping in
-# the wide matmul may change => tolerance-level lever.
+# MLX_QWEN4_MOE_FUSED_GATE_UP: keep gate and up as the one [gate|up]
+# tensor the checkpoint ships and run them as ONE gather matmul. Halves
+# routed dispatches per layer and doubles N-tile fill. The wide matmul may
+# regroup accumulation => tolerance-level lever.
 _MOE_FUSED_GATE_UP = _env_flag("MLX_QWEN4_MOE_FUSED_GATE_UP")
 
 # MLX_QWEN4_MOE_SHARED_IN_GATHER: fold the shared expert into the routed
-# gather as constant extra expert index E, giving top_k+1 rows through one
-# dispatch instead of separate plain matmuls.  The output composition
-# (routed weighted sum + sigmoid-gated shared, added in stock order) is
-# preserved exactly, but the shared row moves from the plain (q)mm kernel
-# family to the gather family, which accumulates differently on M5 (the
-# fp32 gap is the NAX TF32 path; measured <= 1.5e-3 of output scale, and
-# <= 2e-7 with MLX_ENABLE_TF32=0) => tolerance-level lever, NOT bitwise.
+# table as expert index E, so top_k+1 rows go through one dispatch. The
+# output composition is unchanged, but the shared row moves to the gather
+# kernel family, which accumulates differently on M5 (<= 1.5e-3 of output
+# scale; <= 2e-7 with MLX_ENABLE_TF32=0) => tolerance-level lever.
 _MOE_SHARED_IN_GATHER = _env_flag("MLX_QWEN4_MOE_SHARED_IN_GATHER")
+
+# Both MoE levers are LOAD-TIME weight transforms, not runtime tables. A
+# runtime re-fusion was OOM-killed on the 104 GB serving artifact: the
+# fused [gate|up] set is 944 MB per layer x 48 = 45 GB, a full second copy
+# beside the split tensors. See wiki lessons/moe-runtime-fusion-oom.md.
 
 
 def _proj_signature(module):
@@ -133,24 +143,212 @@ def _concat_tables(tables, axis):
     return (weight, scales, biases, *tables[0][3:])
 
 
-def _gather_table_apply(table, x, idx, do_sort):
-    weight, scales, biases, group_size, bits, mode = table
-    if scales is None:
-        return mx.gather_mm(
-            x, weight.swapaxes(-1, -2), rhs_indices=idx, sorted_indices=do_sort
+def table_bytes(table) -> int:
+    """Bytes a materialized projection table occupies."""
+    return sum(part.nbytes for part in table[:3] if part is not None)
+
+
+def check_materialization_budget(nbytes: int, what: str, headroom: float = 0.15):
+    """Refuse a runtime materialization that does not fit in memory.
+
+    A runtime weight table is a SECOND copy of resident weights, so size it
+    against the device budget before building it. Returns the recorded
+    estimate and raises MaterializationTooLarge when it does not fit.
+    """
+    try:
+        budget = mx.metal.device_info()["max_recommended_working_set_size"]
+    except Exception:  # No Metal device: nothing to size against.
+        return {"bytes": nbytes, "checked": False}
+    active = mx.get_active_memory()
+    allowed = budget * (1.0 - headroom)
+    estimate = {
+        "bytes": nbytes,
+        "active_bytes": active,
+        "budget_bytes": budget,
+        "headroom": headroom,
+        "checked": True,
+        "fits": active + nbytes <= allowed,
+    }
+    logger.debug("materialization estimate for %s: %s", what, estimate)
+    if not estimate["fits"]:
+        raise MaterializationTooLarge(
+            f"{what} needs {nbytes / 1e9:.1f} GB beside {active / 1e9:.1f} GB "
+            f"active, past the {allowed / 1e9:.1f} GB budget"
         )
-    return mx.gather_qmm(
-        x,
-        weight,
-        scales,
-        biases,
-        rhs_indices=idx,
-        transpose=True,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-        sorted_indices=do_sort,
-    )
+    return estimate
+
+
+class FusedGateUpSwitchGLU(nn.Module):
+    """SwitchGLU holding gate and up as one [gate|up] projection.
+
+    One gather matmul of width 2*hidden_dims replaces two of width
+    hidden_dims. The halves are split from the OUTPUT, so the weights are
+    never copied.
+    """
+
+    def __init__(
+        self,
+        input_dims: int,
+        hidden_dims: int,
+        num_experts: int,
+        activation=SwiGLU(),
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_dims = hidden_dims
+        self.gate_up_proj = SwitchLinear(
+            input_dims, 2 * hidden_dims, num_experts, bias=bias
+        )
+        self.down_proj = SwitchLinear(
+            hidden_dims, input_dims, num_experts, bias=bias
+        )
+        self.activation = activation
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+        half = self.hidden_dims
+        x = self.down_proj(
+            self.activation(gate_up[..., half:], gate_up[..., :half]),
+            idx,
+            sorted_indices=do_sort,
+        )
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+
+def _parts(weights: dict, path: str) -> dict:
+    """The weight/scales/biases a module path contributes, if present."""
+    found = {}
+    for suffix in ("weight", "scales", "biases"):
+        key = f"{path}.{suffix}"
+        if key in weights:
+            found[suffix] = weights[key]
+    return found
+
+
+def _drop(weights: dict, path: str):
+    for suffix in ("weight", "scales", "biases"):
+        weights.pop(f"{path}.{suffix}", None)
+
+
+def _store(weights: dict, path: str, parts: dict):
+    for suffix, value in parts.items():
+        weights[f"{path}.{suffix}"] = value
+
+
+def _concat_parts(parts_list, axis: int):
+    """Concatenate matching part sets, or None when they do not match.
+
+    Affine groups run along each row's K axis, so concatenating along the
+    output-row axis or the expert axis keeps every packed value, scale and
+    bias byte for byte.
+    """
+    if not all(parts_list):
+        return None
+    suffixes = set(parts_list[0])
+    if any(set(parts) != suffixes for parts in parts_list):
+        return None
+    for suffix in suffixes:
+        shapes = [parts[suffix].shape for parts in parts_list]
+        if len({len(shape) for shape in shapes}) > 1:
+            return None
+        at = axis % len(shapes[0])
+        if len({shape[:at] + shape[at + 1 :] for shape in shapes}) > 1:
+            return None
+    return {
+        suffix: mx.concatenate(
+            [parts[suffix] for parts in parts_list], axis=axis
+        )
+        for suffix in suffixes
+    }
+
+
+def transform_moe_weights(
+    weights: dict, prefixes, *, fuse_gate_up: bool, fold_shared: bool
+) -> int:
+    """Apply the load-time MoE lever transforms in place.
+
+    ``fuse_gate_up`` keeps (or restores) the shipped [gate|up] tensor.
+    ``fold_shared`` appends the shared expert as routed expert index E and
+    drops the separate shared tensors. Both consume file-backed checkpoint
+    arrays and leave ONE resident tensor per projection, so neither adds a
+    second full-size copy. Returns the number of layers transformed.
+    """
+    if not (fuse_gate_up or fold_shared):
+        return 0
+    changed = 0
+    for prefix in prefixes:
+        switch = f"{prefix}.switch_mlp"
+        shared = f"{prefix}.shared_expert"
+        names = ["gate_up_proj"] if fuse_gate_up else ["gate_proj", "up_proj"]
+        routed = {}
+        if fuse_gate_up:
+            fused = _parts(weights, f"{switch}.gate_up_proj") or _concat_parts(
+                [
+                    _parts(weights, f"{switch}.gate_proj"),
+                    _parts(weights, f"{switch}.up_proj"),
+                ],
+                axis=-2,
+            )
+            if fused is None:
+                continue
+            routed["gate_up_proj"] = fused
+        else:
+            for name in names:
+                routed[name] = _parts(weights, f"{switch}.{name}")
+        routed["down_proj"] = _parts(weights, f"{switch}.down_proj")
+        if not all(routed.values()):
+            continue
+
+        if fold_shared:
+            shared_parts = {"down_proj": _parts(weights, f"{shared}.down_proj")}
+            if fuse_gate_up:
+                shared_parts["gate_up_proj"] = _parts(
+                    weights, f"{shared}.gate_up_proj"
+                ) or _concat_parts(
+                    [
+                        _parts(weights, f"{shared}.gate_proj"),
+                        _parts(weights, f"{shared}.up_proj"),
+                    ],
+                    axis=-2,
+                )
+            else:
+                for name in names:
+                    shared_parts[name] = _parts(weights, f"{shared}.{name}")
+            folded = {}
+            for name, parts in routed.items():
+                one = shared_parts.get(name)
+                if not one:
+                    folded = None
+                    break
+                merged = _concat_parts(
+                    [parts, {s: v[None] for s, v in one.items()}], axis=0
+                )
+                if merged is None:
+                    folded = None
+                    break
+                folded[name] = merged
+            if folded is None:
+                continue
+            routed = folded
+            for name in ("gate_proj", "up_proj", "gate_up_proj", "down_proj"):
+                _drop(weights, f"{shared}.{name}")
+
+        for name in ("gate_proj", "up_proj", "gate_up_proj", "down_proj"):
+            _drop(weights, f"{switch}.{name}")
+        for name, parts in routed.items():
+            _store(weights, f"{switch}.{name}", parts)
+        changed += 1
+    return changed
 
 
 # ``shapeless=True`` is rejected here: the top-k slice cannot infer output
@@ -497,114 +695,25 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
-
-        self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
+        # Lever layouts are structural: the module is built to match the
+        # transformed checkpoint, so no runtime weight copy is ever made.
+        self.fused_gate_up = _MOE_FUSED_GATE_UP
+        self.shared_folded = _MOE_SHARED_IN_GATHER and (
+            shared_expert_intermediate_size == intermediate_size
+        )
+        switch_cls = FusedGateUpSwitchGLU if self.fused_gate_up else SwitchGLU
+        self.switch_mlp = switch_cls(
+            dim,
+            intermediate_size,
+            num_experts + (1 if self.shared_folded else 0),
+        )
+        if not self.shared_folded:
+            self.shared_expert = Qwen3NextMLP(
+                dim, shared_expert_intermediate_size
+            )
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
         self.sharding_group = None
-        # Lazy lever tables (fused [gate|up], shared-as-expert-E), keyed by
-        # the identity of the source weight arrays so a later
-        # load_weights/update invalidates them (the stale-snapshot lesson).
-        # Kept in __dict__ (not Module items) so it never reaches
-        # parameters()/state.
-        object.__setattr__(self, "_moe_lever_cache", {})
-
-    def _moe_lever_tables(self, fused, folded):
-        """Build (or reuse) the lever tables; returns None when ineligible."""
-        routed = (
-            self.switch_mlp.gate_proj,
-            self.switch_mlp.up_proj,
-            self.switch_mlp.down_proj,
-        )
-        shared = (
-            self.shared_expert.gate_proj,
-            self.shared_expert.up_proj,
-            self.shared_expert.down_proj,
-        )
-        sources = routed + (shared if folded else ())
-        key = tuple(part for m in sources for part in _proj_identity(m))
-        cached = self._moe_lever_cache.get((fused, folded))
-        if (
-            cached is not None
-            and len(cached[0]) == len(key)
-            and all(new is old for new, old in zip(key, cached[0]))
-        ):
-            return cached[1]
-
-        signatures = [_proj_signature(m) for m in sources]
-        eligible = signatures[0] is not None and all(
-            s == signatures[0] for s in signatures
-        )
-        if eligible and folded:
-            # The shared expert must be shape-compatible with one routed
-            # expert so its tables concatenate as expert index E.
-            eligible = all(
-                s["weight"].shape == r["weight"].shape[1:]
-                for r, s in zip(routed, shared)
-            )
-        if not eligible:
-            tables = None
-        else:
-            gate, up, down = (_proj_table(m) for m in routed)
-            if folded:
-
-                def as_expert_row(module):
-                    table = _proj_table(module)
-                    return tuple(
-                        None if part is None else part[None]
-                        for part in table[:3]
-                    ) + table[3:]
-
-                gate = _concat_tables([gate, as_expert_row(shared[0])], axis=0)
-                up = _concat_tables([up, as_expert_row(shared[1])], axis=0)
-                down = _concat_tables([down, as_expert_row(shared[2])], axis=0)
-            tables = {"down": down}
-            if fused:
-                tables["gate_up"] = _concat_tables([gate, up], axis=-2)
-            else:
-                tables["gate"], tables["up"] = gate, up
-        self._moe_lever_cache[(fused, folded)] = (key, tables)
-        return tables
-
-    def _moe_lever_forward(self, x, inds, scores, fused, folded, tables):
-        top_k = inds.shape[-1]
-        idx_all = inds
-        if folded:
-            shared_col = mx.full(
-                inds.shape[:-1] + (1,), self.num_experts, dtype=inds.dtype
-            )
-            idx_all = mx.concatenate([inds, shared_col], axis=-1)
-        xe = mx.expand_dims(x, (-2, -3))
-        do_sort = idx_all.size >= 64
-        idx = idx_all
-        inv_order = None
-        if do_sort:
-            xe, idx, inv_order = _gather_sort(xe, idx_all)
-        if fused:
-            gate_up = _gather_table_apply(tables["gate_up"], xe, idx, do_sort)
-            hidden = gate_up.shape[-1] // 2
-            x_gate, x_up = gate_up[..., :hidden], gate_up[..., hidden:]
-        else:
-            x_up = _gather_table_apply(tables["up"], xe, idx, do_sort)
-            x_gate = _gather_table_apply(tables["gate"], xe, idx, do_sort)
-        h = self.switch_mlp.activation(x_up, x_gate)
-        if folded:
-            y = _gather_table_apply(tables["down"], h, idx, do_sort)
-        else:
-            y = self.switch_mlp.down_proj(h, idx, sorted_indices=do_sort)
-        if do_sort:
-            y = _scatter_unsort(y, inv_order, idx_all.shape)
-        y = y.squeeze(-2)
-        if folded:
-            routed = (y[..., :top_k, :] * scores[..., None]).sum(axis=-2)
-            shared_y = y[..., top_k, :]
-        else:
-            routed = (y * scores[..., None]).sum(axis=-2)
-            shared_y = self.shared_expert(x)
-        # Stock composition order: routed sum + sigmoid-gated shared.
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-        return routed + shared_y
 
     def __call__(
         self,
@@ -630,26 +739,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.norm_topk_prob:
                 scores = scores / scores.sum(axis=-1, keepdims=True)
 
-        if (
-            (_MOE_FUSED_GATE_UP or _MOE_SHARED_IN_GATHER)
-            and self.sharding_group is None
-            and not self.training
-        ):
-            fused, folded = _MOE_FUSED_GATE_UP, _MOE_SHARED_IN_GATHER
-            tables = self._moe_lever_tables(fused, folded)
-            if tables is None and fused and folded:
-                # Shared expert ineligible to fold: keep the fusion alone.
-                folded = False
-                tables = self._moe_lever_tables(fused, folded)
-            if tables is not None:
-                return self._moe_lever_forward(
-                    x, inds, scores, fused, folded, tables
-                )
-
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
-
-        shared_y = self.shared_expert(x)
+        if self.shared_folded:
+            # The shared expert is routed row E; it is added ungated by the
+            # router, exactly as the separate shared branch was.
+            shared_col = mx.full(
+                inds.shape[:-1] + (1,), self.num_experts, dtype=inds.dtype
+            )
+            rows = self.switch_mlp(
+                x, mx.concatenate([inds, shared_col], axis=-1)
+            )
+            y = (rows[..., : self.top_k, :] * scores[..., None]).sum(axis=-2)
+            shared_y = rows[..., self.top_k, :]
+        else:
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2)
+            shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
         y = y + shared_y

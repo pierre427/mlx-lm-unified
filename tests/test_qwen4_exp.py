@@ -69,6 +69,20 @@ def tiny_args(**overrides):
 
 
 @contextmanager
+def stock_moe_layout():
+    """Pin the stock split layout. MLX_QWEN4_MOE_FUSED_GATE_UP keeps the
+    shipped fused tensor instead, and these tests assert the split."""
+    from mlx_lm.models import qwen3_next
+
+    previous = qwen3_next._MOE_FUSED_GATE_UP
+    qwen3_next._MOE_FUSED_GATE_UP = False
+    try:
+        yield
+    finally:
+        qwen3_next._MOE_FUSED_GATE_UP = previous
+
+
+@contextmanager
 def ple_hash_backend(name):
     previous = environ.get("MLX_QWEN4_PLE_HASH_BACKEND")
     environ["MLX_QWEN4_PLE_HASH_BACKEND"] = name
@@ -512,12 +526,13 @@ class TestQwen4Exp(unittest.TestCase):
         model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
         gate_up = mx.arange(4 * 16 * 16).reshape(4, 16, 16)
         down = mx.zeros((4, 16, 8))
-        output = model.sanitize(
-            {
-                "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+        with stock_moe_layout():
+            output = model.sanitize(
+                {
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
                 "model.language_model.layers.0.mlp.experts.down_proj": down,
-            }
-        )
+                }
+            )
         prefix = "language_model.model.layers.0.mlp.switch_mlp"
         self.assertEqual(output[f"{prefix}.gate_proj.weight"].shape, (4, 8, 16))
         self.assertEqual(output[f"{prefix}.up_proj.weight"].shape, (4, 8, 16))
@@ -528,12 +543,13 @@ class TestQwen4Exp(unittest.TestCase):
         model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
         gate_up = mx.arange(4 * 16 * 16).reshape(4, 16, 16)
         down = mx.zeros((4, 16, 8))
-        output = model.sanitize(
-            {
-                "mtp.layers.0.mlp.experts.gate_up_proj": gate_up,
+        with stock_moe_layout():
+            output = model.sanitize(
+                {
+                    "mtp.layers.0.mlp.experts.gate_up_proj": gate_up,
                 "mtp.layers.0.mlp.experts.down_proj": down,
-            }
-        )
+                }
+            )
         prefix = "mtp.layers.0.mlp.switch_mlp"
         self.assertEqual(output[f"{prefix}.gate_proj.weight"].shape, (4, 8, 16))
         self.assertEqual(output[f"{prefix}.up_proj.weight"].shape, (4, 8, 16))
