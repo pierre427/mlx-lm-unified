@@ -6,6 +6,14 @@ from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+# mlx >= 0.32 runs fp32 GEMMs at TF32 precision on M5 unless this is 0, while
+# M=1 gemv shapes stay exact -- so a batched row (GEMM) and the same sequence
+# decoded singly (gemv) would be compared at two different precisions. The
+# flag latches process-wide on first matmul, so a full-suite run inherits the
+# pin from tests/test_models.py but a single-file run of this module did not.
+# See wiki lessons/tf32-default-fp32-gemm-m5.md.
+environ.setdefault("MLX_ENABLE_TF32", "0")
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -829,7 +837,45 @@ class TestQSALeftPaddedBatch(unittest.TestCase):
         self.assertTrue(all(dropped), f"dense-only rows: {dropped}")
         self._assert_logits_match(batch_steps, singles)
 
+    # Fraction of output scale a pure kernel-shape change is allowed to move
+    # the logits.  NOT an invented number: qwen3_next.py documents a measured
+    # <= 1.5e-3 of output scale on M5 for a kernel-family change alone
+    # (MLX_QWEN4_MOE_SHARED_IN_GATHER), and
+    # tests/test_qwen4_moe_levers.py::test_outputs_match_within_tolerance
+    # already gates that class at 2x it.  Same class, same band.
+    SHAPE_NOISE_BAND = 3e-3
+    TOP_K = 5
+
     def _assert_logits_match(self, batch_steps, singles):
+        """The batched row must decode like the single-sequence run.
+
+        This is a CROSS-SHAPE comparison -- a batched, left-padded row against
+        the same sequence at B=1 -- so it is not gated on equality:
+
+        * ``wiki/docs/plans/qwen38-mtp-batch-composition.md`` section 3: "B=1
+          inside the batch engine is not required to be byte-identical to the
+          single-stream path ... The gate for that comparison is
+          divergence-classification, not equality."
+        * ``results/qwen38-neartie-shape-probe-v2-20260826.json``: row count
+          alone shifts a top-token logprob (-1.125 at 1-2 rows, -1.000 at 5-9),
+          bucketed by kernel dispatch tier and repeatable.
+
+        So the gate is (a) magnitude inside ``SHAPE_NOISE_BAND`` of output
+        scale, measured the way test_qwen4_moe_levers.py measures it -- a
+        per-element relative metric explodes on near-zero logits -- and (b) the
+        claim that actually matters, that the batched row picks the same
+        tokens.  Positions whose reference top-1/top-2 margin is inside the
+        band are exempt from (b): an ordering that loose cannot be asserted,
+        and a near-tie flip is the probe-v2 class the plan doc permits.
+
+        The exemptions are counted so the gate cannot pass by exempting
+        everything.  Measured coverage over the four PROMPTS cases: 99/99
+        positions argmax-checked, 91/99 top-5-set-checked, 0 exempt, observed
+        magnitude ~1e-7 of scale.  The band is 2 orders of magnitude below the
+        bug it guards: run against the pre-fix indexer (8db42d5) the padded
+        row lands at 6.6e-2 to 1.6e-1 of output scale.
+        """
+        compared = ranked = exempt = 0
         for row, single_steps in enumerate(singles):
             self.assertEqual(len(single_steps), len(batch_steps))
             for index, (batch_step, single_step) in enumerate(
@@ -837,13 +883,46 @@ class TestQSALeftPaddedBatch(unittest.TestCase):
             ):
                 got, want = batch_step[1][row], single_step[1][0]
                 where = f"row {row} step {index}"
-                # ``assert_allclose`` defaults to equal_nan=True, which would
-                # pass an all-masked row on both sides.
+                # A NaN would sail through both the band and the argmax check,
+                # and an all-masked SDPA row -- the bug this class guards --
+                # produces exactly that.
                 self.assertTrue(np.isfinite(got).all(), f"{where}: batch")
                 self.assertTrue(np.isfinite(want).all(), f"{where}: single")
-                np.testing.assert_allclose(
-                    got, want, rtol=0, atol=2e-4, err_msg=where
+                self.assertEqual(got.shape, want.shape, where)
+                scale = float(np.abs(want).max())
+                self.assertGreater(scale, 0.0, f"{where}: logits are all zero")
+                error = float(np.abs(got - want).max()) / scale
+                self.assertLess(
+                    error,
+                    self.SHAPE_NOISE_BAND,
+                    f"{where}: {error:.3e} of output scale",
                 )
+                margin = self.SHAPE_NOISE_BAND * scale
+                for query in range(got.shape[0]):
+                    compared += 1
+                    order = np.argsort(want[query])[::-1]
+                    ordered = want[query][order]
+                    if ordered[0] - ordered[1] <= margin:
+                        exempt += 1
+                        continue
+                    self.assertEqual(
+                        int(got[query].argmax()),
+                        int(order[0]),
+                        f"{where} query {query}: argmax differs on a "
+                        f"non-tie (margin {ordered[0] - ordered[1]:.3e})",
+                    )
+                    k = self.TOP_K
+                    if ordered[k - 1] - ordered[k] <= margin:
+                        continue
+                    ranked += 1
+                    self.assertEqual(
+                        set(np.argsort(got[query])[::-1][:k].tolist()),
+                        set(order[:k].tolist()),
+                        f"{where} query {query}: top-{k} set differs",
+                    )
+        self.assertGreater(compared, 0, "no logits were compared")
+        self.assertGreater(ranked, 0, "no top-k set was comparable")
+        self.assertLess(exempt, compared // 2, "most positions were near ties")
 
     def test_batch_row_logits_match_single_sequence_decode(self):
         for prompts in self.PROMPTS:
