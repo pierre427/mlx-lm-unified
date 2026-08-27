@@ -1400,17 +1400,24 @@ class ResponseGenerator:
             )
             if self_mtp is not None:
                 depth_router = self_mtp.get("speculation_router")
+                # k stays a plain integer on both paths (the native/floor
+                # depth); the adaptive ceiling gets its own field so log
+                # parsers keyed on numeric k keep working.
                 logging.info(
                     "Self-MTP admitted: prompt=%d cached=%d sidecar=%s "
-                    "k=%s window=%s sink=%s",
+                    "k=%d adaptive_ceiling=%s window=%s sink=%s",
                     len(prompt),
                     ctx.prompt_cache_count,
                     mtp_sidecar is not None,
                     (
-                        "%d..%d(adaptive)"
-                        % (depth_router.floor, depth_router.ceiling)
+                        depth_router.floor
                         if depth_router is not None
                         else self_mtp["num_draft"]
+                    ),
+                    (
+                        depth_router.ceiling
+                        if depth_router is not None
+                        else "none"
                     ),
                     self_mtp.get("window_size", "native"),
                     self_mtp.get("sink_size", "native"),
@@ -2536,7 +2543,9 @@ def setup_arg_parser():
             "Adapt the MTP draft depth per request between "
             "--self-mtp-num-draft (the floor/native depth) and this ceiling, "
             "expanding only on sustained full-native-prefix acceptance and "
-            "backing off when it falls. Unset keeps today's fixed depth."
+            "backing off when it falls. Unset keeps today's fixed depth. "
+            "The 'Self-MTP admitted' log keeps k=<floor> numeric and adds "
+            "adaptive_ceiling=<N> when this flag is set."
         ),
     )
     parser.add_argument(

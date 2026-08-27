@@ -122,20 +122,54 @@ class TestDepthCeilingController(unittest.TestCase):
         controller.observe(3, 0)
         self.assertEqual(controller.depth, 2)
 
-    def test_truncated_round_accepted_in_full_counts_as_full(self):
+    def test_truncated_rounds_are_excluded_from_the_window(self):
         controller = DepthCeilingController(2, 3)
-        # Budget-truncated cycles (proposed < floor) accepted in full carry
-        # no evidence against expansion.
-        for _ in range(8):
+        # Budget-truncated cycles (proposed < floor) never tested the FULL
+        # native prefix: they are evidence of nothing and must not enter the
+        # window in either direction — successes must not fund an expansion...
+        for _ in range(16):
             controller.observe(1, 1)
-        self.assertEqual(controller.depth, 3)
+        self.assertEqual(controller.depth, 2)
+        self.assertEqual(len(controller._full_rounds), 0)
+        # ...and failures must not push toward a backoff either, nor move
+        # the windowed acceptance telemetry.
+        for _ in range(7):
+            controller.observe(2, 2)
+        probe = controller.accept_prob
+        controller.observe(1, 0)
+        self.assertEqual(controller.accept_prob, probe)
+        self.assertEqual(len(controller._full_rounds), 7)
+        # The raw totals still account for every proposal.
+        self.assertEqual(controller.total_proposed, 16 + 14 + 1)
+        self.assertEqual(controller.total_accepted, 16 + 14)
 
     def test_decide_respects_caps(self):
         controller = DepthCeilingController(2, 5)
+        # A harder external cap below the floor wins but stays positive.
         self.assertEqual(controller.decide(max_draft=1).num_draft, 1)
         self.assertEqual(controller.decide(max_draft=5, remaining=1).num_draft, 1)
-        self.assertEqual(controller.decide(max_draft=5, remaining=0).num_draft, 0)
         self.assertEqual(controller.decide().num_draft, 2)
+
+    def test_decide_rejects_nonpositive_caps(self):
+        # Never 0: the loop only consults the controller while budget
+        # remains, so a nonpositive cap is a caller bug and fails loud.
+        controller = DepthCeilingController(2, 5)
+        with self.assertRaises(ValueError):
+            controller.decide(max_draft=5, remaining=0)
+        with self.assertRaises(ValueError):
+            controller.decide(max_draft=0)
+        with self.assertRaises(ValueError):
+            controller.decide(max_draft=5, remaining=-3)
+
+    def test_decide_never_returns_zero_over_positive_caps(self):
+        controller = DepthCeilingController(2, 5)
+        for max_draft in range(1, 8):
+            for remaining in range(1, 8):
+                k = controller.decide(
+                    max_draft=max_draft, remaining=remaining
+                ).num_draft
+                self.assertGreaterEqual(k, 1)
+                self.assertLessEqual(k, controller.ceiling)
 
     def test_observe_validates_counts(self):
         controller = DepthCeilingController(2, 3)

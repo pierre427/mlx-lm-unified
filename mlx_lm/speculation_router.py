@@ -181,8 +181,13 @@ class DepthCeilingController:
     Unlike :class:`RoutedSpeculationPolicy` this controller never returns 0
     and never latches plain: the measured rate gate in the MTP loop keeps
     sole authority over WHETHER to speculate; this controller only decides
-    HOW DEEP inside ``[num_draft, ceiling]``. It is request-local state —
-    create one per admitted request and never persist it into APC sidecars.
+    HOW DEEP. ``decide`` returns a depth in ``[1, ceiling]``: normally
+    within ``[floor, ceiling]``, below the floor only when the caller passes
+    a harder external cap (``max_draft``/``remaining``) below it — the
+    harder cap wins but the result stays positive. A nonpositive cap is a
+    caller bug and raises ``ValueError`` (the driving loop only consults the
+    controller while budget remains). It is request-local state — create one
+    per admitted request and never persist it into APC sidecars.
 
     Duck-type compatible with the ``speculation_router=`` seam of
     ``self_mtp_generate_step``: ``decide``/``observe``/``accept_prob``/
@@ -249,9 +254,15 @@ class DepthCeilingController:
     ) -> SpeculationDecision:
         cap = self.ceiling if max_draft is None else min(self.ceiling, int(max_draft))
         if remaining is not None:
-            cap = min(cap, max(0, int(remaining)))
+            cap = min(cap, int(remaining))
         if cap <= 0:
-            return self._decision(0, "no_remaining_budget")
+            # Never 0: plain-vs-spec is the rate gate's axis, not ours. The
+            # loop only consults the controller while budget remains, so a
+            # nonpositive cap is a caller bug — fail loud.
+            raise ValueError(
+                f"decide() needs a positive draft cap; got {cap} "
+                f"(max_draft={max_draft!r}, remaining={remaining!r})"
+            )
         return self._decision(min(self.depth, cap), "depth_ceiling")
 
     def observe(self, proposed: int, accepted: int) -> None:
@@ -260,9 +271,12 @@ class DepthCeilingController:
             raise ValueError("require proposed > 0 and 0 <= accepted <= proposed")
         self.total_proposed += proposed
         self.total_accepted += accepted
-        # A budget-truncated round (proposed < floor) accepted in full still
-        # counts as a full native prefix; it carries no evidence against it.
-        self._full_rounds.append(accepted >= min(self.floor, proposed))
+        if proposed < self.floor:
+            # A budget-truncated round never tested the FULL native prefix:
+            # it is evidence of nothing, so it must not enter the window in
+            # either direction (it still counts in the raw totals above).
+            return
+        self._full_rounds.append(accepted >= self.floor)
         rate = sum(self._full_rounds) / len(self._full_rounds)
         self.accept_prob = rate
         if len(self._full_rounds) < self.window:
