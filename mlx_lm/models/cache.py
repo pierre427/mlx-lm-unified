@@ -2554,12 +2554,17 @@ class BatchQuantizedKVCache(_BaseCache):
         if self.keys is None:
             return cache
         padding = int(self.left_padding[idx].item())
+        # An extract before finalize() must exclude pending right-padding
+        # filler cells, the same contract BatchKVCache.extract keeps.
+        end = self._idx
+        if self._right_padding is not None:
+            end -= int(self._right_padding[idx].item())
         cache.keys = tree_map(
-            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]),
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding:end]),
             self.keys,
         )
         cache.values = tree_map(
-            lambda x: mx.contiguous(x[idx : idx + 1, :, padding : self._idx]),
+            lambda x: mx.contiguous(x[idx : idx + 1, :, padding:end]),
             self.values,
         )
         cache.offset = cache.keys[0].shape[2]
@@ -3946,6 +3951,20 @@ class BatchRotatingQuantizedKVCache(_BaseCache):
         )
         cache.offset = offset
         cache._idx = cache.keys[0].shape[2]
+        if self._lengths is not None:
+            # While a right-padded prefill is in flight, offset still counts
+            # the rectangular filler cells; match the post-finalize snapshot
+            # (same contract as BatchRotatingKVCache.extract).
+            pad = max(0, int((self.offset - self._lengths).tolist()[idx]))
+            if pad:
+                cache.keys = tree_map(
+                    lambda a: mx.contiguous(a[:, :, :-pad]), cache.keys
+                )
+                cache.values = tree_map(
+                    lambda a: mx.contiguous(a[:, :, :-pad]), cache.values
+                )
+                cache.offset -= pad
+                cache._idx = cache.keys[0].shape[2]
         return cache
 
     @classmethod
