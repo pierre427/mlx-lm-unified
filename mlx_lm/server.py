@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import pickle
 import platform
 import socket
@@ -481,6 +482,35 @@ def _measure_kv_cost(model):
     return raw_fixed, per_token, common_step
 
 
+def _release_int8_prefill_overlay(*, reapply: bool = True) -> bool:
+    """Flush the int8 prefill overlay at a model-unload boundary.
+
+    The overlay caches per-channel scales (and, with MLX_LM_INT8_CACHE=ttl,
+    int8 weight copies) keyed by module identity; entries must not outlive the
+    model that owned them. release() runs remove() (restore + flush) and, when
+    ``reapply`` is set, reinstalls the patch with empty caches so the next
+    model keeps int8 prefill; pass reapply=False at process shutdown. A no-op
+    when the overlay was never applied.
+    """
+    from .int8_prefill import release
+
+    return release(reapply=reapply)
+
+
+def _maybe_apply_int8_prefill(args) -> bool:
+    """Install the int8 NAX prefill overlay when requested by CLI or env."""
+    enabled = getattr(args, "int8_prefill", False) or os.environ.get(
+        "MLX_LM_INT8_PREFILL", ""
+    ).lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return False
+    from .int8_prefill import apply
+
+    apply()
+    logging.info("int8 NAX prefill patch applied.")
+    return True
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -528,6 +558,9 @@ class ModelProvider:
         self.tokenizer = None
         self.draft_model = None
         if had_loaded_model:
+            # Drop the int8 prefill overlay's per-module caches before the
+            # freed modules' ids can be reused by the replacement model.
+            _release_int8_prefill_overlay()
             # Return buffers from the previous model before allocating its replacement.
             mx.clear_cache()
 
@@ -2432,6 +2465,9 @@ def _run_http_server(
     except KeyboardInterrupt:
         httpd.shutdown()
         response_generator.stop_and_join()
+        # Process shutdown: restore QuantizedLinear, flush overlay caches and
+        # stop the reaper thread without reinstalling the patch.
+        _release_int8_prefill_overlay(reapply=False)
 
 
 def run(
@@ -2831,6 +2867,15 @@ def setup_arg_parser():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--int8-prefill",
+        action="store_true",
+        help=(
+            "Route prefill-sized MLP matmuls through W8A8 int8 GEMMs on the "
+            "M5 GPU neural accelerators (decode keeps the quantized kernels). "
+            "Requires an M5-class GPU. Maps to the MLX_LM_INT8_PREFILL env var."
+        ),
+    )
     return parser
 
 
@@ -2890,6 +2935,7 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    _maybe_apply_int8_prefill(args)
     run(args.host, args.port, ModelProvider(args))
 
 
