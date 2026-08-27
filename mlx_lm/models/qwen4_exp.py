@@ -705,6 +705,10 @@ class NGramEmbedding(nn.Module):
         Keyed by object identity (the sources are kept referenced, so an id
         can never be recycled): any ``load_weights``/``update`` swap of the
         underlying arrays invalidates the snapshot on the next call.
+        Concurrent prefetch snapshots are benign under the supported
+        lifecycle (constants are immutable after load); a concurrent live
+        ``load_weights`` would need synchronization - the two cache
+        assignments below are not jointly atomic.
         """
         src = (
             self.layer_multipliers,
