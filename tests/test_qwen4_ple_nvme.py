@@ -37,8 +37,10 @@ _spec.loader.exec_module(builder)
 
 
 def tiny_nvme_args(**overrides):
-    # dims per n-gram head = 640 / 4 = 160: five g32 groups per row, the
-    # release geometry, so every test row straddles group boundaries.
+    # dims per n-gram head = 640 / 4 = 160: five g32 groups per row - the
+    # release ROW geometry, so every test row straddles group boundaries.
+    # Shard count/rows/offsets stay tiny; production-scale addressing is
+    # covered by the sparse-sidecar and hash-range tests below.
     values = dict(
         hidden_size=16,
         num_hidden_layers=4,
@@ -466,6 +468,154 @@ class TestQwen4PleNvme(unittest.TestCase):
             ]
         self.assertEqual(outputs["resident"], outputs["nvme"])
 
+    def test_save_and_fuse_refused_while_file_backed(self):
+        # save_model serializes model.parameters(); with the shards pruned
+        # it would silently write an artifact without PLE tables. fuse()
+        # saves through the same path, so this guard covers both.
+        nvme = self.load_nvme()
+        with TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "NVMe sidecar"):
+                utils.save_model(Path(tmp) / "export", nvme)
+
+    def test_stale_sidecar_same_index_different_source_refused(self):
+        # Corrupt the source shard tensors while keeping
+        # model.safetensors.index.json byte-identical: the index digest
+        # check passes, the content spot check must refuse.
+        with TemporaryDirectory() as tmp:
+            stale_dir = Path(tmp) / "stale"
+            shutil.copytree(self.model_dir, stale_dir)
+            _, shards = builder.collect_shards(stale_dir)
+            ref = shards[0]["weight"]
+            with open(ref.file, "r+b") as f:
+                f.seek(ref.start)
+                length = ref.end - ref.start
+                data = bytearray(f.read(length))
+                for i in range(length):
+                    data[i] ^= 0xFF
+                f.seek(ref.start)
+                f.write(bytes(data))
+            self.assertEqual(
+                (stale_dir / "model.safetensors.index.json").read_bytes(),
+                (self.model_dir / "model.safetensors.index.json").read_bytes(),
+            )
+            with env_var(
+                "MLX_QWEN4_PLE_NVME", str(stale_dir / "ple_rows.bin")
+            ):
+                with self.assertRaisesRegex(ValueError, "stale or corrupt"):
+                    utils.load_model(stale_dir)
+
+    def test_bitflipped_same_size_sidecar_fails_load_preflight(self):
+        with TemporaryDirectory() as tmp:
+            corrupt = Path(tmp) / "ple_rows.bin"
+            raw = bytearray(self.sidecar.read_bytes())
+            for i in range(len(raw)):
+                raw[i] ^= 0xFF
+            corrupt.write_bytes(bytes(raw))
+            shutil.copy(
+                str(self.sidecar) + ".manifest.json",
+                str(corrupt) + ".manifest.json",
+            )
+            with env_var("MLX_QWEN4_PLE_NVME", str(corrupt)):
+                with self.assertRaisesRegex(ValueError, "stale or corrupt"):
+                    utils.load_model(self.model_dir)
+
+    def test_ubc_eviction_call_never_receives_the_sidecar(self):
+        from unittest import mock
+
+        with env_var("MLX_QWEN4_PLE_NVME", str(self.sidecar)):
+            with env_var("MLX_LM_UBC_EVICT", "1"):
+                with mock.patch(
+                    "mlx_lm.ubc_evict.ubc_evict_paths", return_value=0
+                ) as evict:
+                    utils.load_model(self.model_dir)
+        evict.assert_called_once()
+        (paths,) = evict.call_args.args
+        real_paths = {Path(p).resolve() for p in paths}
+        self.assertIn((self.model_dir / "model.safetensors").resolve(), real_paths)
+        self.assertNotIn(self.sidecar.resolve(), real_paths)
+
+    def test_linear_only_lora_applies_and_ple_adapter_is_refused(self):
+        from mlx.utils import tree_flatten as flatten
+
+        from mlx_lm.tuner.utils import linear_to_lora_layers, load_adapters
+
+        lora_config = {"rank": 2, "scale": 1.0, "dropout": 0.0,
+                       "keys": ["self_attn.q_proj"]}
+        donor = self.load_nvme()
+        linear_to_lora_layers(donor, 1, lora_config)
+        adapter_weights = {
+            name: value
+            for name, value in flatten(donor.parameters())
+            if name.rsplit(".", 1)[-1] in ("lora_a", "lora_b")
+        }
+        self.assertTrue(adapter_weights)
+
+        with TemporaryDirectory() as tmp:
+            adapter_dir = Path(tmp)
+            (adapter_dir / "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "fine_tune_type": "lora",
+                        "num_layers": 1,
+                        "lora_parameters": lora_config,
+                    }
+                )
+            )
+            mx.save_safetensors(
+                str(adapter_dir / "adapters.safetensors"), adapter_weights
+            )
+            model = load_adapters(self.load_nvme(), str(adapter_dir))
+            logits = model(mx.array([[1, 2, 3]], dtype=mx.int64))
+            mx.eval(logits)
+
+        shard_key = (
+            "language_model.model.layers.1.ple.ple_embedding"
+            ".ngram_embedding.shard_0.weight"
+        )
+        with TemporaryDirectory() as tmp:
+            adapter_dir = Path(tmp)
+            (adapter_dir / "adapter_config.json").write_text(
+                json.dumps({"fine_tune_type": "full"})
+            )
+            mx.save_safetensors(
+                str(adapter_dir / "adapters.safetensors"),
+                {shard_key: mx.zeros((22, 20), dtype=mx.uint32)},
+            )
+            with self.assertRaisesRegex(ValueError, "NVMe sidecar"):
+                load_adapters(self.load_nvme(), str(adapter_dir))
+
+    def test_fork_recovery_and_close_semantics(self):
+        table = self.ngram_embedding(self.load_nvme()).ngram_embedding
+        ids = np.arange(16).reshape(1, 1, 16)
+        before = np.asarray(table.lookup_numpy(ids).view(mx.uint16))
+
+        # Simulate a fork: pretend another process created the pools. The
+        # next lookup must rebuild fd + executors and still read correctly.
+        # (In a real fork the parent keeps its own resources; here both
+        # live in one process, so release the pre-"fork" ones afterwards.)
+        stale_pool, stale_prefetch, stale_fd = (
+            table._pool,
+            table._prefetch_pool,
+            table._fd,
+        )
+        table._owner_pid = -1
+        after = np.asarray(table.lookup_numpy(ids).view(mx.uint16))
+        np.testing.assert_array_equal(before, after)
+        self.assertIsNot(table._pool, stale_pool)
+        import os as _os
+
+        self.assertEqual(table._owner_pid, _os.getpid())
+        stale_pool.shutdown(wait=True)
+        stale_prefetch.shutdown(wait=True)
+        _os.close(stale_fd)
+
+        table.close()
+        table.close()  # idempotent
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            table.lookup_numpy(ids)
+        table.prefetch_rows(ids)  # optional path: silent no-op when closed
+        table.submit_prefetch(lambda: None)
+
     def test_prefetch_prompt_chunk_does_not_disturb_cache_or_results(self):
         nvme = self.load_nvme()
         embedding = self.ngram_embedding(nvme)
@@ -479,6 +629,249 @@ class TestQwen4PleNvme(unittest.TestCase):
         )
         embedding.ngram_embedding._prefetch_pool.shutdown(wait=True)
         np.testing.assert_array_equal(np.asarray(cache[1][3]), history_before)
+
+    def test_short_history_prefetch_is_wrong_row_but_harmless(self):
+        # An APC restore can hand the prefetcher fewer than context_len
+        # prior tokens. The EOS-padded hash then warms DIFFERENT rows than
+        # the real cache-backed lookup will use - a cold read, never a
+        # wrong result. Pin both halves of that contract.
+        resident = self.load_resident()
+        nvme = self.load_nvme()
+        embedding = self.ngram_embedding(nvme)
+
+        # (a) the prefetched ids differ from the true-history ids
+        chunk = mx.array([[5, 6, 7]], dtype=mx.int64)
+        true_ids = embedding._ngram_ids_numpy(
+            chunk, None, previous=np.array([[3, 4]])
+        )
+        short_ids = embedding._ngram_ids_numpy(
+            chunk, None, previous=np.array([[4]])  # one-token APC suffix
+        )
+        self.assertFalse(np.array_equal(true_ids, short_ids))
+
+        # (b) after a short-suffix prefetch, real forwards stay
+        # bit-identical to the resident model
+        embedding.prefetch_prompt_chunk(np.array([[5, 6, 7]]), np.array([[4]]))
+        embedding.ngram_embedding._prefetch_pool.shutdown(wait=True)
+        resident_cache = resident.make_cache()
+        nvme_cache = nvme.make_cache()
+        for step in ([[1, 2, 3, 4]], [[5]], [[6, 7]]):
+            tokens = mx.array(step, dtype=mx.int64)
+            self.assert_bit_identical(
+                resident(tokens, cache=resident_cache),
+                nvme(tokens, cache=nvme_cache),
+            )
+
+
+class TestQwen4PleNvmeProductionGeometry(unittest.TestCase):
+    """Production-scale addressing and numerics without a 32 GB sidecar."""
+
+    ROWS_PER_SHARD = 2_500_012
+    NUM_SHARDS = 128
+    TOTAL_ROWS = ROWS_PER_SHARD * NUM_SHARDS  # 320,001,536
+    REACHABLE_ROWS = 320_001_446  # sum of the 16 per-head prime vocabularies
+
+    def test_sparse_sidecar_production_shard_edges(self):
+        # An APFS-sparse file gives the production 32 GB offset space with
+        # near-zero allocation: only the probed rows are written. Covers
+        # shard boundaries, the last reachable row, and both ends of the
+        # 90-row padding tail.
+        probe_rows = [
+            0,
+            self.ROWS_PER_SHARD - 1,  # last row of shard 0
+            self.ROWS_PER_SHARD,  # first row of shard 1
+            64 * self.ROWS_PER_SHARD + 12345,  # mid-file
+            self.REACHABLE_ROWS - 1,  # last hash-reachable row
+            self.REACHABLE_ROWS,  # first padded row
+            self.TOTAL_ROWS - 1,  # last padded row (file end - 100 B)
+        ]
+        rng = np.random.default_rng(5)
+        payload = {
+            row: rng.integers(0, 256, size=100, dtype=np.uint8).tobytes()
+            for row in probe_rows
+        }
+        with TemporaryDirectory() as tmp:
+            sparse = Path(tmp) / "ple_rows.bin"
+            with open(sparse, "wb") as f:
+                f.truncate(self.TOTAL_ROWS * 100)
+            self.assertEqual(
+                sparse.stat().st_size, 32_000_153_600
+            )
+            with open(sparse, "r+b") as f:
+                for row, data in payload.items():
+                    f.seek(row * 100)
+                    f.write(data)
+            table = FileBackedShardedEmbedding(
+                str(sparse),
+                vocab_size=self.TOTAL_ROWS,
+                dims=160,
+                num_shards=self.NUM_SHARDS,
+            )
+            try:
+                ids = np.array(probe_rows, dtype=np.int64).reshape(1, -1)
+                actual = np.asarray(table.lookup_numpy(ids).view(mx.uint16))
+                expected = dequant_rows_numpy(
+                    np.stack(
+                        [
+                            np.frombuffer(payload[row], dtype=np.uint8)
+                            for row in probe_rows
+                        ]
+                    ),
+                    160,
+                )
+                np.testing.assert_array_equal(actual[0], expected)
+                # The shard/local split matches the resident computation.
+                for row in probe_rows:
+                    self.assertEqual(
+                        divmod(row, self.ROWS_PER_SHARD),
+                        (row // self.ROWS_PER_SHARD,
+                         row - (row // self.ROWS_PER_SHARD)
+                         * self.ROWS_PER_SHARD),
+                    )
+            finally:
+                table.close()
+
+    def test_release_hash_range_never_reaches_padding(self):
+        from mlx_lm.models.qwen4_exp import NGramEmbedding
+
+        args = TextModelArgs(ple_layer_ids=[2])
+        embedding = NGramEmbedding(
+            args, args.ple_embed_dim, layer_idx=1, ple_layer_index=0
+        )
+        sizes = np.asarray(embedding.ngram_heads_vocab_sizes)
+        offsets = np.asarray(embedding.ngram_heads_offsets)
+        self.assertEqual(int(sizes.sum()), self.REACHABLE_ROWS)
+        self.assertEqual(
+            embedding.ngram_embedding.vocab_size, self.TOTAL_ROWS
+        )
+        self.assertEqual(self.TOTAL_ROWS - self.REACHABLE_ROWS, 90)
+        # Per-head ranges tile [0, reachable) exactly; the maximum
+        # emittable id is reachable - 1, so the 90 padded rows can never
+        # be gathered.
+        self.assertEqual(int(offsets[-1] + sizes[-1]), self.REACHABLE_ROWS)
+        rng = np.random.default_rng(1)
+        tokens = mx.array(
+            rng.integers(0, args.vocab_size, size=(2, 257)), dtype=mx.int64
+        )
+        ids = embedding._ngram_ids_numpy(tokens, None)
+        self.assertGreaterEqual(int(ids.min()), 0)
+        self.assertLess(int(ids.max()), self.REACHABLE_ROWS)
+
+
+class TestQwen4PleNvmeDequantEdgeMatrix(unittest.TestCase):
+    """q x scale x bias edge matrix against the default-stream kernel.
+
+    The numpy path is IEEE float32 with one RTNE rounding to bfloat16. The
+    GPU kernel diverges only outside the checkpoint's value domain:
+      - results that are bfloat16-subnormal (GPU flushes to signed zero),
+      - q*scale overflowing float32 (the GPU fma avoids the intermediate
+        overflow that numpy's separate multiply hits).
+    Real q4/g32 checkpoint tables contain neither (the adversarial review
+    sampled real shards and found no subnormal or nonfinite scales/biases),
+    and nonfinite inputs are documented as out of domain. This test pins
+    exact equality on the supported domain and pins the divergence to
+    exactly those two windows so a kernel change cannot silently widen it.
+    """
+
+    SCALES = (0x3F80, 0xBF80, 0x4329, 0x0080, 0x0001, 0x8001, 0x7F00,
+              0xFF00, 0x7F7F)
+    BIASES = (0x0000, 0x8000, 0x3B80, 0xBB80, 0xC4BE, 0x7F7F, 0xFF7F)
+    SUBNORMAL_SCALES = {0x0001, 0x8001}
+    OVERFLOW_PAIRS = {(0x7F00, 0xFF7F), (0xFF00, 0x7F7F), (0x7F7F, 0xFF7F)}
+
+    def test_edge_matrix_matches_default_stream_on_supported_domain(self):
+        pairs = [(s, b) for s in self.SCALES for b in self.BIASES]
+        n = len(pairs)
+        # Two alternating words put every q in 0..15 in every group.
+        words = np.tile(
+            np.array([0x76543210, 0xFEDCBA98] * 10, dtype=np.uint32), (n, 1)
+        )
+        s_bits = np.array([[s] * 5 for s, _ in pairs], dtype=np.uint16)
+        b_bits = np.array([[b] * 5 for _, b in pairs], dtype=np.uint16)
+        rows = np.concatenate(
+            [
+                words.view(np.uint8).reshape(n, 80),
+                s_bits.view(np.uint8).reshape(n, 10),
+                b_bits.view(np.uint8).reshape(n, 10),
+            ],
+            axis=1,
+        )
+        with np.errstate(over="ignore"):
+            ours = dequant_rows_numpy(rows, 160)
+        reference = mx.dequantize(
+            mx.array(words),
+            mx.array(s_bits).view(mx.bfloat16),
+            mx.array(b_bits).view(mx.bfloat16),
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+        mx.eval(reference)
+        reference_bits = np.asarray(reference.view(mx.uint16))
+
+        divergent = np.zeros(n, dtype=bool)
+        for index, (s, b) in enumerate(pairs):
+            divergent[index] = (
+                s in self.SUBNORMAL_SCALES or (s, b) in self.OVERFLOW_PAIRS
+            )
+        np.testing.assert_array_equal(
+            reference_bits[~divergent], ours[~divergent]
+        )
+        # Window rows MAY diverge, and any divergence must follow the
+        # documented pattern: for subnormal scales the GPU value on a
+        # mismatched element is a flush to signed zero. (Overflow-window
+        # rows differ via fma vs separate multiply; no element pattern is
+        # asserted beyond membership in the window.)
+        for index in np.flatnonzero(divergent):
+            mismatch = reference_bits[index] != ours[index]
+            if pairs[index][0] in self.SUBNORMAL_SCALES and mismatch.any():
+                gpu = reference_bits[index][mismatch]
+                self.assertTrue(
+                    np.isin(gpu, (0x0000, 0x8000)).all(),
+                    "GPU subnormal handling changed: no longer a flush to "
+                    "signed zero",
+                )
+
+    def test_bf16_halfway_ties_round_to_even_both_parities_and_signs(self):
+        # q=1 rows: value = scale + bias. 1 + 2^-8 and 1 + 3*2^-8 are exact
+        # halfway points between bfloat16 neighbours; RTNE keeps the even
+        # mantissa (0x3F80) and rounds up to it (0x3F82) respectively.
+        cases = [
+            (0x3F80, 0x3B80, 0x3F80),  # 1.00390625 -> 1.0 (down to even)
+            (0x3F80, 0x3C40, 0x3F82),  # 1.01171875 -> 1.015625 (up to even)
+            (0xBF80, 0xBB80, 0xBF80),  # -1.00390625 -> -1.0
+            (0xBF80, 0xBC40, 0xBF82),  # -1.01171875 -> -1.015625
+        ]
+        word = np.uint32(0x11111111)  # q = 1 everywhere
+        for s_val, b_val, expected in cases:
+            w = mx.array(np.full((1, 20), word, dtype=np.uint32))
+            s = mx.array(np.full((1, 5), s_val, dtype=np.uint16)).view(
+                mx.bfloat16
+            )
+            b = mx.array(np.full((1, 5), b_val, dtype=np.uint16)).view(
+                mx.bfloat16
+            )
+            reference = mx.dequantize(
+                w, s, b, group_size=32, bits=4, mode="affine"
+            )
+            mx.eval(reference)
+            rows = np.concatenate(
+                [
+                    np.asarray(w).view(np.uint8).reshape(1, 80),
+                    np.full((1, 5), s_val, dtype=np.uint16)
+                    .view(np.uint8)
+                    .reshape(1, 10),
+                    np.full((1, 5), b_val, dtype=np.uint16)
+                    .view(np.uint8)
+                    .reshape(1, 10),
+                ],
+                axis=1,
+            )
+            ours = dequant_rows_numpy(rows, 160)
+            self.assertTrue((ours == expected).all(), hex(s_val))
+            np.testing.assert_array_equal(
+                ours, np.asarray(reference.view(mx.uint16))
+            )
 
 
 if __name__ == "__main__":
