@@ -20,7 +20,12 @@ from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynami
 from .pipeline import PipelineMixin
 from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
-from .qwen3_next import _env_flag
+from .qwen3_next import (
+    _concat_tables,
+    _env_flag,
+    _proj_signature,
+    _proj_table,
+)
 from .rope_utils import initialize_rope
 
 
@@ -30,6 +35,34 @@ _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
 _QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN")
 _PLE_VECTOR_SHIFT = _env_flag("MLX_QWEN4_PLE_VECTOR_SHIFT")
 _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
+
+# MLX_QWEN4_QSA_FUSED_PROJ (2026-08-27 decode-decomposition lever): run every
+# same-input QSA-layer projection — q_proj incl. its gate half, k_proj,
+# v_proj, and the indexer's index_qk_proj — as ONE wide quantized matmul over
+# x, split after.  Honesty note: North measured plain qkv-concat at -3..-4%
+# (bit-exact but slower; "MLX already overlaps independent kernels").  The
+# reopen rationale is the decomposition finding (GPU window 86% of the decode
+# step at 22% bandwidth at M=1): the overlap defense does not hold at this
+# occupancy-bound operating point, and this lever settles it empirically.
+# Trade documented: MTP shared-top-k steps and sink-window MTP skip the
+# separate indexer projection; the fused matmul always includes that slice.
+_QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
+
+
+def _table_matmul(table, x: mx.array) -> mx.array:
+    weight, scales, biases, group_size, bits, mode = table
+    if scales is None:
+        return x @ weight.T
+    return mx.quantized_matmul(
+        x,
+        weight,
+        scales,
+        biases,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
 
 
 _MASK64 = (1 << 64) - 1
@@ -984,7 +1017,13 @@ class QSAIndexer(nn.Module):
         cache._qsa_pooled_ratio = ratio
         return pooled
 
-    def __call__(self, hidden: mx.array, causal_mask: mx.array, cache: QSAKVCache):
+    def __call__(
+        self,
+        hidden: mx.array,
+        causal_mask: mx.array,
+        cache: QSAKVCache,
+        projected_qk: Optional[mx.array] = None,
+    ):
         batch, length, _ = hidden.shape
         if isinstance(cache, SinkWindowKVCache):
             # Windowed MTP deliberately replaces the draft head's global QSA
@@ -1002,7 +1041,11 @@ class QSAIndexer(nn.Module):
             getattr(cache, "_mtp_shared_topk", None) if cache is not None else None
         )
         if shared_topk is None:
-            qk = self.index_qk_proj(hidden)
+            qk = (
+                projected_qk
+                if projected_qk is not None
+                else self.index_qk_proj(hidden)
+            )
             q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
             q = self.q_layernorm(
                 q.reshape(batch, length, self.n_heads, self.head_dim)
@@ -1098,16 +1141,57 @@ class Attention(nn.Module):
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
+        # Lazy MLX_QWEN4_QSA_FUSED_PROJ table, identity-keyed by the source
+        # weight arrays (invalidated by load_weights/update); in __dict__ so
+        # it never reaches parameters()/state.
+        object.__setattr__(self, "_qsa_fused_cache", None)
+
+    def _fused_projection_table(self):
+        modules = (
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.indexer.index_qk_proj,
+        )
+        key = tuple(m["weight"] for m in modules)
+        cached = self._qsa_fused_cache
+        if cached is not None and all(
+            new is old for new, old in zip(key, cached[0])
+        ):
+            return cached[1]
+        signatures = [_proj_signature(m) for m in modules]
+        table = None
+        if signatures[0] is not None and all(
+            s == signatures[0] for s in signatures
+        ):
+            table = _concat_tables([_proj_table(m) for m in modules], axis=0)
+        object.__setattr__(self, "_qsa_fused_cache", (key, table))
+        return table
 
     def __call__(self, x: mx.array, mask: mx.array, cache: Optional[QSAKVCache]):
         batch, length, _ = x.shape
-        sparse_mask = self.indexer(x, mask, cache)
+        fused_index_qk = None
+        if _QSA_FUSED_PROJ and not self.training:
+            table = self._fused_projection_table()
+            if table is not None:
+                width_q = self.num_heads * self.head_dim * 2
+                width_kv = self.num_kv_heads * self.head_dim
+                qg, k_flat, v_flat, fused_index_qk = mx.split(
+                    _table_matmul(table, x),
+                    [width_q, width_q + width_kv, width_q + 2 * width_kv],
+                    axis=-1,
+                )
+        sparse_mask = self.indexer(x, mask, cache, projected_qk=fused_index_qk)
+        if fused_index_qk is None:
+            qg = self.q_proj(x)
+            k_flat = self.k_proj(x)
+            v_flat = self.v_proj(x)
         q, gate = mx.split(
-            self.q_proj(x).reshape(batch, length, self.num_heads, -1), 2, axis=-1
+            qg.reshape(batch, length, self.num_heads, -1), 2, axis=-1
         )
         gate = gate.reshape(batch, length, -1)
-        k = self.k_proj(x).reshape(batch, length, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).reshape(batch, length, self.num_kv_heads, self.head_dim)
+        k = k_flat.reshape(batch, length, self.num_kv_heads, self.head_dim)
+        v = v_flat.reshape(batch, length, self.num_kv_heads, self.head_dim)
         q = self.q_norm(q).transpose(0, 2, 1, 3)
         k = self.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)

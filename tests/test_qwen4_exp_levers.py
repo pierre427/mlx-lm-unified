@@ -625,6 +625,86 @@ class TestSharedTopkTrimFix(unittest.TestCase):
                 )
 
 
+# Lever C (MLX_QWEN4_QSA_FUSED_PROJ, 2026-08-27 decode-decomposition
+# addendum) lives here beside the other qwen4_exp levers; its args helper
+# comes from the MoE lever test file.
+from test_qwen4_moe_levers import moe_args  # noqa: E402
+
+from mlx_lm.models.qwen4_exp import Attention  # noqa: E402
+
+
+class TestQSAFusedProj(unittest.TestCase):
+    def _run_sequence(self, attn, chunks, share_at=None):
+        cache = QSAKVCache()
+        outputs = []
+        for index, chunk in enumerate(chunks):
+            length = chunk.shape[1]
+            mask = None
+            if length > 1 and cache.offset == 0:
+                mask = (
+                    mx.arange(length)[:, None] >= mx.arange(length)[None, :]
+                )[None, None]
+            if share_at is not None and index == share_at:
+                cache._mtp_share_topk = True
+                cache._mtp_shared_topk = None
+            out = attn(chunk, mask, cache)
+            mx.eval(out, cache.state)
+            outputs.append(out)
+        return outputs
+
+    def _attention(self, quantized, **overrides):
+        attn = Attention(moe_args(**overrides))
+        if quantized:
+            nn.quantize(attn, group_size=32, bits=4)
+        attn.eval()
+        mx.eval(attn.parameters())
+        return attn
+
+    def test_fused_projections_bitwise_over_prefill_decode_and_share(self):
+        for quantized in (False, True):
+            for dtype in (mx.float32, mx.bfloat16):
+                attn = self._attention(quantized)
+                chunks = [
+                    mx.random.normal((1, 9, 64), key=mx.random.key(0)).astype(
+                        dtype
+                    )
+                ]
+                chunks += [
+                    mx.random.normal(
+                        (1, 1, 64), key=mx.random.key(step)
+                    ).astype(dtype)
+                    for step in range(1, 5)
+                ]
+                expected = self._run_sequence(attn, chunks, share_at=2)
+                with lever(qwen4_exp, "_QSA_FUSED_PROJ"):
+                    actual = self._run_sequence(attn, chunks, share_at=2)
+                self.assertIsNotNone(attn._qsa_fused_cache[1])  # engaged
+                for left, right in zip(actual, expected):
+                    _bytes_equal(self, left, right)
+
+    def test_fused_table_tracks_weight_replacement(self):
+        attn = self._attention(False)
+        donor = self._attention(False)
+        chunk = mx.random.normal((1, 4, 64), key=mx.random.key(7))
+        mask = (mx.arange(4)[:, None] >= mx.arange(4)[None, :])[None, None]
+        with lever(qwen4_exp, "_QSA_FUSED_PROJ"):
+            self._run_sequence(attn, [chunk])  # build the fused table
+            attn.update(donor.parameters())
+            actual = attn(chunk, mask, QSAKVCache())
+        expected = donor(chunk, mask, QSAKVCache())
+        _bytes_equal(self, actual, expected)
+
+    def test_bias_attention_falls_back_to_stock(self):
+        attn = self._attention(False, attention_bias=True)
+        chunk = mx.random.normal((1, 4, 64), key=mx.random.key(8))
+        mask = (mx.arange(4)[:, None] >= mx.arange(4)[None, :])[None, None]
+        expected = attn(chunk, mask, QSAKVCache())
+        with lever(qwen4_exp, "_QSA_FUSED_PROJ"):
+            actual = attn(chunk, mask, QSAKVCache())
+        _bytes_equal(self, actual, expected)
+        self.assertIsNone(attn._qsa_fused_cache[1])
+
+
 class TestUnconditionalCaches(unittest.TestCase):
     def test_rope_position_freq_cache_is_byte_identical(self):
         def reference(x, positions, dims, base):
