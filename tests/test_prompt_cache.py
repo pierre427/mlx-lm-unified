@@ -1084,5 +1084,117 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(mask, expected))
 
 
+class TestModelLocalCacheClasses(unittest.TestCase):
+    """Cache subclasses defined in model files (not in models/cache.py) must
+    round-trip through save_prompt_cache / load_prompt_cache. They resolve
+    through the cache-class registry and module-qualified class tokens rather
+    than cache.py globals."""
+
+    def setUp(self):
+        self.test_dir_fid = tempfile.TemporaryDirectory()
+        self.test_dir = self.test_dir_fid.name
+
+    def tearDown(self):
+        self.test_dir_fid.cleanup()
+
+    def _make_qwen4_exp_caches(self):
+        from mlx_lm.models.qwen4_exp import (
+            BatchQSAKVCache,
+            QSAKVCache,
+            Qwen4ArraysCache,
+        )
+
+        qsa = QSAKVCache()
+        x = mx.random.uniform(shape=(1, 8, 10, 4))
+        qsa.update_and_fetch(x, x)
+        qsa.update_index_keys(mx.random.uniform(shape=(1, 10, 16)))
+
+        arrays = Qwen4ArraysCache(size=4)
+        for i in range(4):
+            arrays[i] = mx.random.uniform(shape=(1, 3, 5))
+
+        batch = BatchQSAKVCache([1, 0])
+        xb = mx.random.uniform(shape=(2, 8, 10, 4))
+        batch.update_and_fetch(xb, xb)
+        batch.update_index_keys(mx.random.uniform(shape=(2, 10, 16)))
+        return [qsa, arrays, batch]
+
+    def _assert_caches_equal(self, cache, loaded_cache):
+        from mlx.utils import tree_flatten
+
+        self.assertEqual(len(cache), len(loaded_cache))
+        for c, lc in zip(cache, loaded_cache):
+            self.assertIs(type(lc), type(c))
+            self.assertEqual(c.meta_state, lc.meta_state)
+            state, loaded_state = tree_flatten(c.state), tree_flatten(lc.state)
+            self.assertEqual([k for k, _ in state], [k for k, _ in loaded_state])
+            for (k, a), (_, b) in zip(state, loaded_state):
+                self.assertTrue(mx.array_equal(a, b), f"state leaf {k} differs")
+
+    def test_qwen4_exp_cache_round_trip(self):
+        cache = self._make_qwen4_exp_caches()
+        cache_file = os.path.join(self.test_dir, "qwen4_exp_cache.safetensors")
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self._assert_caches_equal(cache, loaded_cache)
+
+        # Generation can continue on the reloaded caches.
+        qsa = loaded_cache[0]
+        x = mx.random.uniform(shape=(1, 8, 1, 4))
+        keys, _ = qsa.update_and_fetch(x, x)
+        self.assertEqual(qsa.offset, 11)
+        self.assertEqual(keys.shape[2], 11)
+
+    def test_cache_list_with_model_local_members(self):
+        # CacheList serializes its members' classes itself; model-local
+        # members must survive that path too.
+        cache = [CacheList(*self._make_qwen4_exp_caches())]
+        cache_file = os.path.join(self.test_dir, "qwen4_exp_cache_list.safetensors")
+        save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self.assertIs(type(loaded_cache[0]), CacheList)
+        self._assert_caches_equal(cache[0].caches, loaded_cache[0].caches)
+
+    def test_load_without_importing_model_module(self):
+        # A fresh process that never imported qwen4_exp must still reload the
+        # cache: the saved module-qualified class tokens carry the import.
+        import subprocess
+        import sys
+
+        cache_file = os.path.join(self.test_dir, "qwen4_exp_cache.safetensors")
+        save_prompt_cache(cache_file, self._make_qwen4_exp_caches())
+        script = (
+            "import sys\n"
+            "from mlx_lm.models.cache import load_prompt_cache\n"
+            "assert 'mlx_lm.models.qwen4_exp' not in sys.modules\n"
+            f"cache = load_prompt_cache({cache_file!r})\n"
+            "print(','.join(type(c).__name__ for c in cache))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(), "QSAKVCache,Qwen4ArraysCache,BatchQSAKVCache"
+        )
+
+    def test_legacy_bare_name_resolves_via_registry(self):
+        # Files saved before class tokens were module-qualified hold bare
+        # names; once the model module is imported, the registry filled by
+        # _BaseCache.__init_subclass__ resolves them.
+        from unittest import mock
+
+        from mlx_lm.models import cache as cache_module
+
+        cache = self._make_qwen4_exp_caches()
+        cache_file = os.path.join(self.test_dir, "legacy_cache.safetensors")
+        with mock.patch.object(
+            cache_module, "_cache_class_token", lambda cls: cls.__name__
+        ):
+            save_prompt_cache(cache_file, cache)
+        loaded_cache = load_prompt_cache(cache_file)
+        self._assert_caches_equal(cache, loaded_cache)
+
+
 if __name__ == "__main__":
     unittest.main()
