@@ -52,7 +52,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .sample_utils import make_sampler, make_transformed_logprobs
+from .sample_utils import LaneRNG, draw_key, make_sampler, make_transformed_logprobs
 from .spec_policy import draft_depth_for
 from .tokenizer_utils import TokenizerWrapper
 from .prompt_lookup import HybridStats as _PromptLookupStatsBase
@@ -986,6 +986,7 @@ def self_mtp_generate_step(
     depth_table: Optional[Any] = None,
     stats: Optional[HybridStats] = None,
     prompt_cache: Optional[List[Any]] = None,
+    lane_rng: Optional[LaneRNG] = None,
     mtp_state: Optional[Tuple[Any, Optional[mx.array]]] = None,
     mtp_state_out: Optional[dict] = None,
     logits_processors: Optional[
@@ -1058,12 +1059,19 @@ def self_mtp_generate_step(
     generation and make decisions only from committed-or-tentatively-accepted
     prefixes.
 
+    ``lane_rng`` is this request's ``sample_utils.LaneRNG``: every draw of the
+    loop takes a subkey from it, so the request's tokens do not depend on
+    traffic decoded beside it. Leave it ``None`` for the global ``mx.random``
+    stream (byte-identical to a build without lane keys). Greedy requests draw
+    nothing and are unaffected either way.
+
     ``prompt_cache`` lets serving own the target cache so the verified result
     can be inserted into its automatic prefix cache. ``mtp_state`` restores
     the matching persistent draft sidecar: ``(mtp_cache, prev_tail_hidden)``.
     Its offsets are validated against the target cache before either is
     mutated. ``mtp_state_out`` is a caller-owned mapping populated on exit
-    with an exact, fully evaluated sidecar.
+    with an exact, fully evaluated sidecar, plus the lane's ``rng_key`` /
+    ``rng_draws`` so a resumed request continues its own stream.
 
     Yields ``(token, logprobs, from_draft)``.
     """
@@ -1072,6 +1080,13 @@ def self_mtp_generate_step(
     if accept_rule not in ("exact", "residual", "block"):
         raise ValueError(
             f"accept_rule must be 'exact', 'residual', or 'block'; got {accept_rule!r}"
+        )
+    if lane_rng is not None and not isinstance(lane_rng, LaneRNG):
+        # A bare seed is the footgun this exists to stop: a lane must CARRY and
+        # split one key, not re-derive key(seed) per call, which repeats draws.
+        raise TypeError(
+            "lane_rng must be a sample_utils.LaneRNG (carried across calls); "
+            f"got {type(lane_rng).__name__}"
         )
     logprob_transform = _make_sampling_transform(
         sampling_temp, sampling_top_p, sampling_top_k, sampling_min_p
@@ -1142,7 +1157,7 @@ def self_mtp_generate_step(
             if logprob_transform is not None
             else _temperature_logprobs(first_logits, sampling_temp)
         )
-        cur = _sample_from_logprobs(first_lp, sampling_temp)
+        cur = _sample_from_logprobs(first_lp, sampling_temp, rng=lane_rng)
     _start_speculation_or_cleanup(
         cache,
         cache,
@@ -1174,6 +1189,7 @@ def self_mtp_generate_step(
             rate_gate=rate_gate,
             speculation_router=speculation_router,
             logits_processors=logits_processors,
+            rng=lane_rng,
             # Match generate_step's processor contract: the immutable prompt
             # prefix is present before tentative draft tokens are appended and
             # rewound at commit boundaries.
@@ -1201,14 +1217,21 @@ def _apply_logits_processors(logits_processors, y, logits):
     return batched[0] if logits.ndim == 1 else batched
 
 
-def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0) -> int:
+def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0, *, rng=None) -> int:
+    # Greedy takes no draw, so it consumes no lane key (see the RNG note in
+    # ``_mtp_draft_verify_loop_impl``).
     if sampling_temp and sampling_temp > 0:
-        return int(mx.random.categorical(logprobs).item())
+        return int(mx.random.categorical(logprobs, key=draw_key(rng)).item())
     return int(mx.argmax(logprobs).item())
 
 
 def _residual_sample(
-    target_logprobs, draft_logprobs, sampling_temp: float, scale: float = 1.0
+    target_logprobs,
+    draft_logprobs,
+    sampling_temp: float,
+    scale: float = 1.0,
+    *,
+    rng=None,
 ) -> int:
     # ``scale`` is the block-verification cumulative ratio p_tau; 1.0 (the
     # per-token rule) multiplies bit-exactly, so the default is unchanged.
@@ -1216,9 +1239,9 @@ def _residual_sample(
     total = mx.sum(residual)
     mx.eval(total)
     if float(total.item()) <= 0.0:
-        return _sample_from_logprobs(target_logprobs, sampling_temp)
+        return _sample_from_logprobs(target_logprobs, sampling_temp, rng=rng)
     residual_logprobs = mx.log(residual / total)
-    return int(mx.random.categorical(residual_logprobs).item())
+    return int(mx.random.categorical(residual_logprobs, key=draw_key(rng)).item())
 
 
 def _make_sampling_transform(
@@ -1245,7 +1268,7 @@ def _make_sampling_transform(
 
 
 def _batched_residual_verify(
-    logprobs, draft_logprobs, drafts, sampling_temp: float
+    logprobs, draft_logprobs, drafts, sampling_temp: float, *, rng=None
 ):
     """Residual acceptance over all k positions with one GPU sync.
 
@@ -1260,7 +1283,7 @@ def _batched_residual_verify(
     target_at = mx.take_along_axis(logprobs[:k], d, axis=-1)[:, 0]
     draft_at = mx.take_along_axis(mx.stack(draft_logprobs), d, axis=-1)[:, 0]
     ratios = mx.exp(mx.minimum(target_at - draft_at, 0.0))
-    us = mx.random.uniform(shape=(k,))
+    us = mx.random.uniform(shape=(k,), key=draw_key(rng))
     mx.eval(ratios, us)
     ratios, us = ratios.tolist(), us.tolist()
     n_accept = 0
@@ -1272,26 +1295,28 @@ def _batched_residual_verify(
         n_accept += 1
     if n_accept < k:
         bonus = _residual_sample(
-            logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
+            logprobs[n_accept], draft_logprobs[n_accept], sampling_temp, rng=rng
         )
     else:
-        bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
+        bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp, rng=rng)
     return n_accept, bonus
 
 
-def _accept_sampled_draft(target_logprobs, draft_logprobs, token: int) -> bool:
+def _accept_sampled_draft(
+    target_logprobs, draft_logprobs, token: int, *, rng=None
+) -> bool:
     # min(1, p/q) computed in log space: exp(min(log p - log q, 0)). A
     # linear-space q floor (e.g. max(q, 1e-30)) would bias acceptance for
     # representable sub-floor q — q=1e-35, p=1e-34 must accept with
     # probability 1, not p/floor.
     log_ratio = mx.minimum(target_logprobs[token] - draft_logprobs[token], 0.0)
     ratio = mx.exp(log_ratio)
-    u = mx.random.uniform(shape=())
+    u = mx.random.uniform(shape=(), key=draw_key(rng))
     mx.eval(ratio, u)
     return float(u.item()) <= float(ratio.item())
 
 
-def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float):
+def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float, *, rng=None):
     """Block verification (Sun et al., arXiv 2403.10444): accept a draft
     PREFIX by cumulative joint likelihood ratio instead of independent
     per-token coin flips.
@@ -1316,7 +1341,7 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float):
     ``drafts``. Returns ``(n_accept, bonus)``.
     """
     k = len(drafts)
-    etas = mx.random.uniform(shape=(k,))
+    etas = mx.random.uniform(shape=(k,), key=draw_key(rng))
     mx.eval(etas)
     p_cums = [1.0]
     p_cum = 1.0
@@ -1342,10 +1367,14 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float):
         if float(etas[i].item()) <= h:
             tau = i + 1
     if tau == k:
-        bonus = _sample_from_logprobs(logprobs[k], sampling_temp)
+        bonus = _sample_from_logprobs(logprobs[k], sampling_temp, rng=rng)
     else:
         bonus = _residual_sample(
-            logprobs[tau], draft_logprobs[tau], sampling_temp, scale=p_cums[tau]
+            logprobs[tau],
+            draft_logprobs[tau],
+            sampling_temp,
+            scale=p_cums[tau],
+            rng=rng,
         )
     return tau, bonus
 
@@ -1368,6 +1397,7 @@ def _mtp_draft_verify_loop_impl(
     logits_processors=None,
     token_prefix=None,
     share_qsa_indices: bool = False,
+    rng: Optional[LaneRNG] = None,
     mtp_state_tracker: Optional[dict] = None,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
@@ -1393,7 +1423,17 @@ def _mtp_draft_verify_loop_impl(
     break-even is target- AND context-dependent (see
     lessons/persistent-mtp-context-cache) — and one-way, so no mid-stream
     thrashing (the adaptive-PLD latch philosophy; per the D-Cut lesson,
-    continuous adaptivity loses to simple decisions)."""
+    continuous adaptivity loses to simple decisions).
+
+    ``rng`` is this request's ``LaneRNG``. Every stochastic operation of the
+    loop — draft, plain-step and bonus sampling, the acceptance uniforms, the
+    block and exact rule draws, and residual correction — takes a subkey from
+    it, so a lane's draws depend on its own seed and history alone, never on
+    co-scheduled traffic (the batch-composition P1 contract). ``None`` keeps
+    the global ``mx.random`` stream, byte-identically. A rejected draft rewinds
+    tokens and caches but NEVER the key: the key advances once per draw made,
+    so a correction draw is independent of the proposal it replaces. Greedy
+    (``sampling_temp == 0``) takes no draw and consumes no key."""
     persistent = mtp_cache is not None
 
     def _logprobs(logits):
@@ -1412,6 +1452,9 @@ def _mtp_draft_verify_loop_impl(
             pending_hs=pending_hs,
             pending_ts=pending_ts,
             seed_h=seed_h,
+            # The lane object is carried by reference, so its key travels with
+            # the request through every rollback and rewind path.
+            rng=rng,
         )
     gated_off = False
     gate_cycles = 0
@@ -1443,7 +1486,7 @@ def _mtp_draft_verify_loop_impl(
                 logits_processors, proc_tokens, model.logits(logit_h)[0, -1]
             )
             lp = _logprobs(logits)
-            nxt = _sample_from_logprobs(lp, sampling_temp)
+            nxt = _sample_from_logprobs(lp, sampling_temp, rng=rng)
         if persistent and (not gated_off or mtp_state_tracker is not None):
             # Pairs only matter if drafting can resume; after a permanent
             # de-latch they would just accumulate unused memory.
@@ -1555,7 +1598,7 @@ def _mtp_draft_verify_loop_impl(
                 d_logits, post = model.mtp_step(hs, ts, mtp_cache)
                 h = post[:, -1:, :]
                 d_lp = _logprobs(d_logits[0, -1])
-                d = _sample_from_logprobs(d_lp, sampling_temp)
+                d = _sample_from_logprobs(d_lp, sampling_temp, rng=rng)
                 drafts.append(d)
                 draft_logprobs.append(d_lp)
                 tok = mx.array([[d]], mx.uint32)
@@ -1589,17 +1632,17 @@ def _mtp_draft_verify_loop_impl(
                 # (one sync for the whole scan). Kept off the incumbent
                 # paths so their sync pattern and RNG stream are untouched.
                 n_accept, bonus = _batched_residual_verify(
-                    logprobs, draft_logprobs, drafts, sampling_temp
+                    logprobs, draft_logprobs, drafts, sampling_temp, rng=rng
                 )
             elif accept_rule == "block":
                 n_accept, bonus = _block_verify(
-                    logprobs, draft_logprobs, drafts, sampling_temp
+                    logprobs, draft_logprobs, drafts, sampling_temp, rng=rng
                 )
             elif accept_rule == "exact":
                 # Upstream external-draft semantics: sample the target's own
                 # token at every position, accept while it equals the draft's
                 # sample; the first mismatch commits the target sample.
-                sampled = mx.random.categorical(logprobs)
+                sampled = mx.random.categorical(logprobs, key=draw_key(rng))
                 mx.eval(sampled)
                 sampled = sampled.tolist()
                 while n_accept < k and sampled[n_accept] == drafts[n_accept]:
@@ -1607,15 +1650,23 @@ def _mtp_draft_verify_loop_impl(
                 bonus = int(sampled[n_accept])
             else:  # "residual" — Leviathan/SpecDec rejection sampling
                 while n_accept < k and _accept_sampled_draft(
-                    logprobs[n_accept], draft_logprobs[n_accept], drafts[n_accept]
+                    logprobs[n_accept],
+                    draft_logprobs[n_accept],
+                    drafts[n_accept],
+                    rng=rng,
                 ):
                     n_accept += 1
                 if n_accept < k:
                     bonus = _residual_sample(
-                        logprobs[n_accept], draft_logprobs[n_accept], sampling_temp
+                        logprobs[n_accept],
+                        draft_logprobs[n_accept],
+                        sampling_temp,
+                        rng=rng,
                     )
                 else:
-                    bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp)
+                    bonus = _sample_from_logprobs(
+                        logprobs[n_accept], sampling_temp, rng=rng
+                    )
         else:
             targets = targets.tolist()
             while n_accept < k and targets[n_accept] == drafts[n_accept]:
@@ -1700,10 +1751,12 @@ def _mtp_draft_verify_loop(*args, mtp_state_out=None, **kwargs):
                 )
             cache = tracker["cache"]
             seed_h = tracker.get("seed_h")
+            lane_rng = tracker.get("rng")
             mx.eval(
                 [c.state for c in cache],
                 [c.state for c in mtp_cache],
                 seed_h,
+                *([lane_rng.key] if lane_rng is not None else []),
             )
             covered_tokens = max(
                 (getattr(c, "offset", 0) for c in cache), default=0
@@ -1720,6 +1773,12 @@ def _mtp_draft_verify_loop(*args, mtp_state_out=None, **kwargs):
                 state=(mtp_cache, seed_h),
                 covered_tokens=covered_tokens,
                 reusable=reusable,
+                # Where the lane stopped in its own stream. A resume rebuilds
+                # from this key (LaneRNG.from_key) so the continuation does not
+                # repeat draws; a fork of one snapshot into several lanes must
+                # split it (LaneRNG.fork), never copy it.
+                rng_key=None if lane_rng is None else lane_rng.key,
+                rng_draws=None if lane_rng is None else lane_rng.draws,
             )
 
 

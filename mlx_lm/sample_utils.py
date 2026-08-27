@@ -8,6 +8,84 @@ from typing import Callable, Dict, List, Optional
 import mlx.core as mx
 
 
+class LaneRNG:
+    """A per-request random key that advances once per draw.
+
+    Batched decode must not draw from the global ``mx.random`` stream: with one
+    stream, a lane that joins or leaves reorders every other lane's draws, so a
+    lane's tokens depend on the traffic scheduled beside it. A lane carries a
+    ``LaneRNG`` instead, and every draw takes a subkey from it, so its draw
+    sequence is a function of its own seed and its own history only.
+
+    Two rules keep that true:
+
+    * **Carry and split, never re-derive.** ``mx.random.key(seed)`` returns the
+      same key each call, so re-deriving repeats draws. ``next_key`` splits the
+      carried key, which advances it.
+    * **Never rewind.** A rejected draft rewinds tokens and caches, not the
+      key. Reusing a consumed key would couple the correction draw to the
+      proposal it replaces, and the residual acceptance rule needs those
+      independent. There is deliberately no rewind method.
+
+    ``key`` is the carried key. Put it in a snapshot and rebuild the lane with
+    ``from_key`` so a restored request continues its stream instead of
+    repeating it; use ``fork`` (not a copy) where one lane becomes several.
+    """
+
+    __slots__ = ("_key", "_draws")
+
+    def __init__(self, seed: int):
+        self._key = mx.random.key(int(seed))
+        self._draws = 0
+
+    @classmethod
+    def from_key(cls, key: mx.array, draws: int = 0) -> "LaneRNG":
+        """Rebuild a lane from a carried key (snapshot restore)."""
+        lane = cls.__new__(cls)
+        lane._key = key
+        lane._draws = int(draws)
+        return lane
+
+    @property
+    def key(self) -> mx.array:
+        """The carried key: the lane's position in its own stream."""
+        return self._key
+
+    @property
+    def draws(self) -> int:
+        """Key consumptions so far. Monotone — a rollback never lowers it."""
+        return self._draws
+
+    def next_key(self) -> mx.array:
+        """Advance the carried key and return a subkey for exactly one draw."""
+        self._key, sub = mx.random.split(self._key)
+        self._draws += 1
+        return sub
+
+    def fork(self, n: int) -> List["LaneRNG"]:
+        """Make ``n`` independent lanes and advance this one.
+
+        For parallel sampling (``n>1`` branches) and any other place one lane
+        becomes several: copying the object would replay one stream in every
+        copy.
+        """
+        if n < 1:
+            raise ValueError(f"n must be >= 1, got {n}")
+        keys = mx.random.split(self._key, n + 1)
+        self._key = keys[0]
+        self._draws += 1
+        return [LaneRNG.from_key(keys[i + 1]) for i in range(n)]
+
+
+def draw_key(rng: Optional[LaneRNG]) -> Optional[mx.array]:
+    """A subkey for one draw, or ``None`` to use the global stream.
+
+    ``key=None`` is the ``mx.random`` default, so a call site that always
+    forwards this stays byte-identical when no lane key is supplied.
+    """
+    return None if rng is None else rng.next_key()
+
+
 def make_sampler(
     temp: float = 0.0,
     top_p: float = 0.0,
