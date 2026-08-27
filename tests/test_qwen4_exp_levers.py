@@ -558,6 +558,54 @@ class TestSharedTopkTrimFix(unittest.TestCase):
             )
             mx.eval(logits)
 
+    def test_chained_draft_steps_advance_positions_by_one(self):
+        # llama.cpp #27781 class: draft tokens placed at stale or pinned
+        # positions present only as quiet accept-rate loss. Pin per-step
+        # advancement: each chained draft call must start at the previous
+        # call's end offset, advance it by exactly 1, and (with the index
+        # projection active) rope its indexer query at that same position.
+        mx.random.seed(0)
+        args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
+        model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+        cache = model.make_cache()
+        mtp_cache = model.make_mtp_cache()
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=mx.uint32)
+        _, hidden = model.mtp_backbone(prompt, cache)
+        model.mtp_step(hidden[:, :-1], prompt[:, 1:], mtp_cache)
+
+        for share in (False, True):
+            positions = []
+            original = qwen4_exp._apply_rope_positions
+
+            def spy(x, pos, dims, base, _record=positions):
+                mx.eval(pos)
+                flat = pos.reshape(-1).tolist()
+                if len(flat) == 1:
+                    _record.append(flat[0])
+                return original(x, pos, dims, base)
+
+            start = mtp_cache[0].offset
+            model.mtp_start_cycle(mtp_cache, share_qsa_indices=share)
+            h = hidden[:, -1:, :]
+            tok = mx.array([[5]], mx.uint32)
+            offsets = []
+            qwen4_exp._apply_rope_positions = spy
+            try:
+                for _ in range(3):
+                    offsets.append(mtp_cache[0].offset)
+                    _, post = model.mtp_step(h, tok, mtp_cache)
+                    h = post[:, -1:, :]
+            finally:
+                qwen4_exp._apply_rope_positions = original
+            self.assertEqual(offsets, [start, start + 1, start + 2], share)
+            if share:
+                # Sharing skips the index projection after step 0 by design.
+                self.assertEqual(positions[:1], [start])
+            else:
+                self.assertEqual(positions, [start, start + 1, start + 2])
+            trim_prompt_cache(mtp_cache, 3)
+            self.assertEqual(mtp_cache[0].offset, start)
+
     def test_pooled_keys_raise_on_index_desync(self):
         args = tiny_args()
         indexer = QSAIndexer(args)
