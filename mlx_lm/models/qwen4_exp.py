@@ -1221,6 +1221,25 @@ class TextModel(nn.Module):
                 weights[key] = value.moveaxis(2, 1)
             if raw and any(key.endswith(suffix) for suffix in zero_centered):
                 weights[key] = value + 1.0
+        # Convention sanity check, independent of the conv1d layout proxy
+        # (mlx-vlm #2041/#2045 class: a wrong zero-vs-ones-centered guess
+        # loads cleanly and produces deterministic garbage). Post-sanitize
+        # gains must center near 1; a wrong guess shifts every family by
+        # exactly +-1, so the aggregate lands near 0 or 2.
+        norm_means = [
+            weights[key].astype(mx.float32).mean()
+            for key in weights
+            if any(key.endswith(suffix) for suffix in zero_centered)
+        ]
+        if norm_means:
+            center = mx.mean(mx.stack(norm_means)).item()
+            if not 0.5 < center < 1.5:
+                raise ValueError(
+                    "norm convention mismatch: zero-centered norm families "
+                    f"average {center:.3f} after sanitize, expected ~1. The "
+                    "conv1d layout proxy disagrees with how this checkpoint "
+                    "stores its RMSNorm gains; refusing to load garbage."
+                )
         return weights
 
     @property

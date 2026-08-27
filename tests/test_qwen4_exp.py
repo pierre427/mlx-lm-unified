@@ -396,6 +396,52 @@ class TestQwen4Exp(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    def test_sanitize_refuses_norm_convention_mismatch(self):
+        # mlx-vlm #2041/#2045 class: a wrong zero-vs-ones-centered guess
+        # loads cleanly and produces deterministic garbage. The check must
+        # not depend on the conv1d layout proxy that makes the guess.
+        args = tiny_args()
+        model = TextModel(args)
+        raw_conv = mx.zeros((8, 1, 3))  # HF raw layout, shape[-1] != 1
+        norms = {
+            "model.layers.3.self_attn.q_norm.weight": mx.ones((8,)),
+            "model.layers.3.self_attn.k_norm.weight": mx.ones((8,)),
+        }
+
+        # Ones-centered norms inside a raw-looking checkpoint: the +1
+        # offset would shift gains to ~2. Must refuse, not load.
+        with self.assertRaisesRegex(ValueError, "norm convention mismatch"):
+            model.sanitize(
+                {"model.layers.0.linear_attn.conv1d.weight": raw_conv, **norms}
+            )
+
+        # Zero-centered norms in a converted-layout checkpoint (offset
+        # would be skipped, gains stay ~0) must also refuse.
+        zero_norms = {key: mx.zeros((8,)) for key in norms}
+        with self.assertRaisesRegex(ValueError, "norm convention mismatch"):
+            model.sanitize(
+                {
+                    "model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                        (8, 3, 1)
+                    ),
+                    **zero_norms,
+                }
+            )
+
+        # The two consistent pairings convert to ~1-centered gains.
+        raw_ok = model.sanitize(
+            {"model.layers.0.linear_attn.conv1d.weight": raw_conv, **zero_norms}
+        )
+        converted_ok = model.sanitize(
+            {
+                "model.layers.0.linear_attn.conv1d.weight": mx.zeros((8, 3, 1)),
+                **norms,
+            }
+        )
+        for output in (raw_ok, converted_ok):
+            gains = output["model.layers.3.self_attn.q_norm.weight"]
+            self.assertAlmostEqual(gains.mean().item(), 1.0, places=5)
+
     def test_raw_moe_weights_are_split_for_switch_glu(self):
         args = tiny_args()
         model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
