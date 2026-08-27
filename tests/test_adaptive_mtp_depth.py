@@ -593,6 +593,94 @@ class TestQwen4Composition(unittest.TestCase):
         self.assertEqual(len(tokens), 24)
         self.assertGreater(stats.draft_proposed, 0)
 
+    def test_consecutive_depth_change_rejections_use_cycle_local_trim(self):
+        # The extreme depth change (k=7 -> k=1) with a rejection on BOTH
+        # sides of the change: every trim must use ITS cycle's k, never a
+        # neighbor's. Per cycle: target trim == k - n_accept, MTP rewind
+        # == k, the MTP offset advances by exactly the PREVIOUS cycle's
+        # committed pairs (n_accept_prev + 1, the pending-pair flush), and
+        # the QSA shared top-k is cleared by the rewind.
+        target_cache = make_prompt_cache(self.model)
+        records = []
+        real_trim = hybrid_speculative.trim_prompt_cache
+
+        def spy(cache_list, n):
+            result = real_trim(cache_list, n)
+            is_target = cache_list is target_cache
+            offset_after = max(getattr(c, "offset", 0) for c in cache_list)
+            qsa_cleared = all(
+                getattr(c, "_mtp_shared_topk", None) is None
+                and not getattr(c, "_mtp_share_topk", False)
+                for c in cache_list
+            )
+            records.append((is_target, int(n), offset_after, qsa_cleared))
+            return result
+
+        max_tokens = 30
+        with mock.patch.object(hybrid_speculative, "trim_prompt_cache", spy):
+            tokens, stats = self._run(
+                num_draft=MAX_DRAFT_TOKENS,
+                persistent_mtp=True,
+                mtp_share_qsa_indices=True,
+                prompt_cache=target_cache,
+                speculation_router=_ScheduleRouter([MAX_DRAFT_TOKENS, 1]),
+                max_tokens=max_tokens,
+            )
+        self.assertEqual(len(tokens), max_tokens)
+
+        # Parse the strict (target trim, MTP rewind) pair per draft cycle.
+        cycles = []
+        self.assertEqual(len(records) % 2, 0)
+        for index in range(0, len(records), 2):
+            is_target, rejected, target_offset, _ = records[index]
+            is_target_2, k_cycle, mtp_offset, qsa_cleared = records[index + 1]
+            self.assertTrue(is_target)
+            self.assertFalse(is_target_2)
+            self.assertLessEqual(0, rejected)
+            self.assertLessEqual(rejected, k_cycle)
+            self.assertTrue(qsa_cleared, "QSA shared top-k survived a rewind")
+            cycles.append(
+                {
+                    "k": k_cycle,
+                    "rejected": rejected,
+                    "n_accept": k_cycle - rejected,
+                    "target_offset": target_offset,
+                    "mtp_offset": mtp_offset,
+                }
+            )
+        self.assertEqual(len(cycles), stats.draft_cycles)
+
+        # A k=7 cycle immediately followed by a k=1 cycle, BOTH rejecting.
+        change_pairs = [
+            (a, b)
+            for a, b in zip(cycles, cycles[1:])
+            if a["k"] == MAX_DRAFT_TOKENS
+            and b["k"] == 1
+            and a["rejected"] > 0
+            and b["rejected"] > 0
+        ]
+        self.assertTrue(
+            change_pairs,
+            "no consecutive k=7 -> k=1 cycle pair with rejections on both "
+            "sides was exercised",
+        )
+
+        # Cycle-local trim arithmetic via cache offsets. Target: each draft
+        # cycle nets n_accept + 1 rows (cur + accepted; rejected trimmed).
+        prompt_len = int(self.prompt.size)
+        expected_target = prompt_len
+        for cycle in cycles:
+            expected_target += cycle["n_accept"] + 1
+            self.assertEqual(cycle["target_offset"], expected_target)
+        # MTP: the rewind drops exactly k, so across cycles the offset
+        # advances by the PREVIOUS cycle's flushed pending pairs.
+        self.assertEqual(cycles[0]["mtp_offset"], prompt_len - 1)
+        for prev, cur in zip(cycles, cycles[1:]):
+            self.assertEqual(
+                cur["mtp_offset"] - prev["mtp_offset"],
+                prev["n_accept"] + 1,
+            )
+
     def test_qsa_index_sharing_with_varying_k(self):
         # Sharing is armed per cycle with THAT cycle's k (> 1); a k=1 cycle
         # must run unshared, and the end-of-cycle rewind must always clear
