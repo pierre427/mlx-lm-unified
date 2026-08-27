@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -21,6 +22,35 @@ from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+
+def _env_flag(name: str) -> bool:
+    """Read one opt-in performance flag once, at import time."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+# Compiles the expert-selection chain of EVERY user of
+# Qwen3NextSparseMoeBlock: qwen3_next itself, qwen3_5, and qwen4_exp.
+_MOE_GATE_COMPILE = _env_flag("MLX_QWEN4_MOE_GATE_COMPILE")
+
+# Shaped compile traces are keyed by exact width, and production widths are
+# not a small stable set: the final prefill chunk has arbitrary width per
+# prompt length, so compiling it would accumulate unbounded traces in a
+# long-lived server. Only the stable narrow shapes — decode (1 token) and
+# MTP verify (k+1 tokens) — take the compiled path; prefill stays eager.
+_MOE_GATE_COMPILE_MAX_TOKENS = 8
+
+
+# ``shapeless=True`` is rejected here: the top-k slice cannot infer output
+# shapes, so this follows the shaped glm4_moe/dots1 compile pattern.
+@mx.compile
+def _select_experts(gates: mx.array, top_k: int, norm_topk_prob: bool):
+    gates = mx.softmax(gates, axis=-1, precise=True)
+    inds = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+    scores = mx.take_along_axis(gates, inds, axis=-1)
+    if norm_topk_prob:
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+    return inds, scores
 
 
 @dataclass
@@ -370,13 +400,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
+        if (
+            _MOE_GATE_COMPILE
+            and gates.size // gates.shape[-1] <= _MOE_GATE_COMPILE_MAX_TOKENS
+        ):
+            inds, scores = _select_experts(
+                gates, self.top_k, bool(self.norm_topk_prob)
+            )
+        else:
+            gates = mx.softmax(gates, axis=-1, precise=True)
 
-        k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+            k = self.top_k
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if self.norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)

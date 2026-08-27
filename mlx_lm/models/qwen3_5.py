@@ -22,9 +22,13 @@ from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+from .qwen3_next import _env_flag
 
 
 logger = logging.getLogger(__name__)
+
+# Let the fusion scan also match GatedDeltaNet subclasses (e.g. Qwen4-Exp).
+_GDN_FUSION_SUBCLASS = _env_flag("MLX_QWEN35_GDN_PROJ_FUSION_SUBCLASS")
 
 # Keep the single-matmul path below the shape-dependent quantized-kernel
 # boundary observed by Rapid-MLX. Every enabled dtype is re-probed against the
@@ -190,7 +194,12 @@ def fuse_gated_delta_net_projections(model, *, enabled: bool = False) -> int:
         targets = [
             module
             for _, module in model.named_modules()
-            if type(module) is GatedDeltaNet and _can_fuse_gdn_projections(module)
+            if (
+                isinstance(module, GatedDeltaNet)
+                if _GDN_FUSION_SUBCLASS
+                else type(module) is GatedDeltaNet
+            )
+            and _can_fuse_gdn_projections(module)
         ]
     except Exception:
         logger.warning(

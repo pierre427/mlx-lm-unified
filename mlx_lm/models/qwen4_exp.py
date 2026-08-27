@@ -20,7 +20,16 @@ from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynami
 from .pipeline import PipelineMixin
 from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+from .qwen3_next import _env_flag
 from .rope_utils import initialize_rope
+
+
+# Opt-in micro-levers, each read once at import.  Off keeps the stock path.
+_RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
+_QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
+_QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN")
+_PLE_VECTOR_SHIFT = _env_flag("MLX_QWEN4_PLE_VECTOR_SHIFT")
+_PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 
 
 _MASK64 = (1 << 64) - 1
@@ -188,6 +197,18 @@ class GroupRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
+        if _RMSNORM_FAST:
+            # The stock path is a pure (not mean-centred) RMS norm, so
+            # ``mx.fast.rms_norm`` matches it up to fp32 accumulation order.
+            # Per-group weights differ, so the weight is applied outside.
+            if self.group_size is not None:
+                grouped = x.reshape(*x.shape[:-1], -1, self.group_size)
+                out = mx.fast.rms_norm(grouped, None, self.eps).reshape(x.shape)
+            else:
+                out = mx.fast.rms_norm(x, None, self.eps)
+            return (
+                out.astype(mx.float32) * self.weight.astype(mx.float32)
+            ).astype(dtype)
         xf = x.astype(mx.float32)
         if self.group_size is not None:
             xf = xf.reshape(*xf.shape[:-1], -1, self.group_size)
@@ -318,8 +339,29 @@ class ShardedEmbedding(nn.Module):
         """Gather already-hosted row ids without a redundant MLX sync."""
         shape = indices.shape
         flat = np.asarray(indices, dtype=np.int64).reshape(-1)
-        output = None
         shard_ids = flat // self.rows_per_shard
+        if _PLE_GATHER_CONCAT:
+            # One concatenate plus one take replaces the serial at[].add
+            # chain; the inverse permutation restores the request order.
+            pieces = []
+            ordering = []
+            for shard_index in np.unique(shard_ids):
+                positions = np.flatnonzero(shard_ids == shard_index)
+                local = flat[positions] - int(shard_index) * self.rows_per_shard
+                pieces.append(
+                    getattr(self, f"shard_{int(shard_index)}")(
+                        mx.array(local, dtype=mx.int64)
+                    )
+                )
+                ordering.append(positions)
+            permutation = np.concatenate(ordering)
+            inverse = np.empty_like(permutation)
+            inverse[permutation] = np.arange(permutation.size)
+            output = mx.take(
+                mx.concatenate(pieces, axis=0), mx.array(inverse), axis=0
+            )
+            return output.reshape(*shape, self.dims)
+        output = None
         for shard_index in np.unique(shard_ids):
             positions = np.flatnonzero(shard_ids == shard_index)
             local = flat[positions] - int(shard_index) * self.rows_per_shard
@@ -361,14 +403,19 @@ class NGramEmbedding(nn.Module):
         total = sum(sizes)
         divisor = args.make_ngram_vocab_size_divisible_by
         padded = math.ceil(total / divisor) * divisor
-        self.layer_multipliers = mx.array(
-            _build_layer_multipliers(
-                args.vocab_size, args.ngram_size, ple_layer_index, args.seed
-            ),
-            dtype=mx.int64,
+        multipliers = _build_layer_multipliers(
+            args.vocab_size, args.ngram_size, ple_layer_index, args.seed
         )
+        self.layer_multipliers = mx.array(multipliers, dtype=mx.int64)
         self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
+        # Host-side copies of the hash constants save one device round-trip
+        # per forward.  Snapshotted lazily and keyed by the source array
+        # objects: ``load_weights``/``update`` REPLACE the mx attributes with
+        # checkpoint values after construction, and the CPU hash must track
+        # them exactly as the Metal path does.
+        self._np_constants = None
+        self._np_constants_src = None
         self.ngram_embedding = ShardedEmbedding(
             padded, embedding_dim // self.ngram_heads, args.split_ngram_parts
         )
@@ -385,10 +432,54 @@ class NGramEmbedding(nn.Module):
             raise ValueError("MLX_QWEN4_PLE_METAL_MIN_TOKENS must be positive")
         self._metal_hash_kernel = None
 
+    def _hash_constants_numpy(self):
+        """Host copies of the hash constants, tracking the live mx arrays.
+
+        Keyed by object identity (the sources are kept referenced, so an id
+        can never be recycled): any ``load_weights``/``update`` swap of the
+        underlying arrays invalidates the snapshot on the next call.
+        """
+        src = (
+            self.layer_multipliers,
+            self.ngram_heads_vocab_sizes,
+            self.ngram_heads_offsets,
+        )
+        cached_src = self._np_constants_src
+        if cached_src is None or any(
+            new is not old for new, old in zip(src, cached_src)
+        ):
+            self._np_constants = tuple(
+                np.asarray(value, dtype=np.int64) for value in src
+            )
+            self._np_constants_src = src
+        return self._np_constants
+
+    def _shift_history_vectorized(self, history: np.ndarray) -> list:
+        """Vectorized per-token history shift with per-segment EOS resets."""
+        batch, length = history.shape
+        positions = np.arange(length, dtype=np.int64)
+        eos_at = np.where(history == self.eos_token_id, positions[None, :], -1)
+        # Latest EOS at a position strictly before each token; the token at
+        # ``pos - shift`` is in the same segment iff it sits after that EOS.
+        previous_eos = np.concatenate(
+            [
+                np.full((batch, 1), -1, dtype=np.int64),
+                np.maximum.accumulate(eos_at, axis=1)[:, :-1],
+            ],
+            axis=1,
+        )
+        shifted = [history.copy()]
+        for shift in range(1, self.ngram_size):
+            rolled = np.full_like(history, self.eos_token_id)
+            rolled[:, shift:] = history[:, :-shift]
+            valid = (positions[None, :] - shift) > previous_eos
+            shifted.append(np.where(valid, rolled, self.eos_token_id))
+        return shifted
+
     def _ngram_ids_numpy(
         self, input_ids: mx.array, cache: Optional[ArraysCache] = None
     ) -> np.ndarray:
-        mx.eval(input_ids, self.layer_multipliers, self.ngram_heads_vocab_sizes, self.ngram_heads_offsets)
+        mx.eval(input_ids)
         tokens = np.asarray(input_ids, dtype=np.int64)
         batch, seq_len = tokens.shape
         if cache is not None and cache[3] is not None:
@@ -399,24 +490,25 @@ class NGramEmbedding(nn.Module):
         if cache is not None:
             cache[3] = mx.array(history[:, -self.context_len :], dtype=mx.int64)
 
-        shifted = []
-        for shift in range(self.ngram_size):
-            out = np.full_like(history, self.eos_token_id)
-            if shift == 0:
-                out = history.copy()
-            else:
-                for b in range(batch):
-                    segment_start = 0
-                    for pos in range(history.shape[1]):
-                        if pos - segment_start >= shift:
-                            out[b, pos] = history[b, pos - shift]
-                        if history[b, pos] == self.eos_token_id:
-                            segment_start = pos + 1
-            shifted.append(out)
+        if _PLE_VECTOR_SHIFT:
+            shifted = self._shift_history_vectorized(history)
+        else:
+            shifted = []
+            for shift in range(self.ngram_size):
+                out = np.full_like(history, self.eos_token_id)
+                if shift == 0:
+                    out = history.copy()
+                else:
+                    for b in range(batch):
+                        segment_start = 0
+                        for pos in range(history.shape[1]):
+                            if pos - segment_start >= shift:
+                                out[b, pos] = history[b, pos - shift]
+                            if history[b, pos] == self.eos_token_id:
+                                segment_start = pos + 1
+                shifted.append(out)
 
-        multipliers = np.asarray(self.layer_multipliers, dtype=np.int64)
-        sizes = np.asarray(self.ngram_heads_vocab_sizes, dtype=np.int64)
-        offsets = np.asarray(self.ngram_heads_offsets, dtype=np.int64)
+        multipliers, sizes, offsets = self._hash_constants_numpy()
         blocks = []
         for ngram in range(2, self.ngram_size + 1):
             with np.errstate(over="ignore"):
@@ -618,11 +710,17 @@ class PLELayer(nn.Module):
         return gated + conv
 
 
+_ROPE_POSITION_FREQS: Dict[tuple, mx.array] = {}
+
+
 def _apply_rope_positions(x: mx.array, positions: mx.array, dims: int, base: float):
     """Transformers-compatible non-traditional partial RoPE at arbitrary positions."""
     if dims == 0:
         return x
-    freqs = mx.exp(-math.log(base) * mx.arange(0, dims, 2) / dims)
+    freqs = _ROPE_POSITION_FREQS.get((dims, base))
+    if freqs is None:
+        freqs = mx.exp(-math.log(base) * mx.arange(0, dims, 2) / dims)
+        _ROPE_POSITION_FREQS[(dims, base)] = freqs
     angles = positions[..., None].astype(mx.float32) * freqs
     cos, sin = mx.cos(angles), mx.sin(angles)
     rope, tail = x[..., :dims], x[..., dims:]
@@ -764,6 +862,11 @@ class QSAKVCache(KVCache):
         # cache snapshot is a sequence snapshot, not an in-flight draft cycle.
         self._mtp_share_topk = False
         self._mtp_shared_topk = None
+        # Ephemeral pooled+layernormed+roped block keys, derived from
+        # ``index_keys`` (MLX_QWEN4_QSA_POOLED_KEY_CACHE).  Also absent from
+        # ``state``: a restore simply recomputes them.
+        self._qsa_pooled_keys = None
+        self._qsa_pooled_ratio = None
 
     def update_index_keys(self, keys: mx.array):
         self.index_keys = keys if self.index_keys is None else mx.concatenate([self.index_keys[:, : self.offset], keys], axis=1)
@@ -771,8 +874,23 @@ class QSAKVCache(KVCache):
 
     def trim(self, n):
         n = super().trim(n)
+        # A rewind ends any MTP draft cycle.  A stale shared top-k would make
+        # the next uncycled ``mtp_step`` skip its raw-key append and desync
+        # ``index_keys`` from the KV offset; ``mtp_start_cycle`` re-arms it.
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
         if self.index_keys is not None:
             self.index_keys = mx.contiguous(self.index_keys[:, : self.offset])
+        if self._qsa_pooled_keys is not None:
+            # A block mean is a closed window over ``ratio`` tokens, so every
+            # block fully inside the trimmed offset stays exact.
+            keep = self.offset // self._qsa_pooled_ratio
+            if keep == 0:
+                self._qsa_pooled_keys = None
+            elif keep < self._qsa_pooled_keys.shape[1]:
+                self._qsa_pooled_keys = mx.contiguous(
+                    self._qsa_pooled_keys[:, :keep]
+                )
         return n
 
     @classmethod
@@ -789,6 +907,8 @@ class QSAKVCache(KVCache):
         self.offset = 0 if self.keys is None else self.keys.shape[2]
         self._mtp_share_topk = False
         self._mtp_shared_topk = None
+        self._qsa_pooled_keys = None
+        self._qsa_pooled_ratio = None
 
     @property
     def nbytes(self):
@@ -811,6 +931,58 @@ class QSAIndexer(nn.Module):
         )
         self.q_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+
+    def _pool_blocks(self, raw: mx.array, starts: mx.array) -> mx.array:
+        """Mean-pool, layernorm, and rope closed key blocks.
+
+        ``starts`` carries absolute block-start positions, so a partial
+        recompute matches the full recompute value for value.
+        """
+        batch = raw.shape[0]
+        pooled = (
+            raw.reshape(batch, starts.shape[0], self.compress_ratio, self.head_dim)
+            .astype(mx.float32)
+            .mean(axis=2)
+            .astype(raw.dtype)
+        )
+        pooled = self.k_layernorm(pooled)
+        return _apply_rope_positions(
+            pooled, starts[None, :], self.rotary_dim, self.rope_theta
+        )
+
+    def _pooled_keys(self, all_raw, n_blocks, starts, cache, length) -> mx.array:
+        ratio = self.compress_ratio
+        if not (_QSA_POOLED_KEY_CACHE and type(cache) is QSAKVCache):
+            return self._pool_blocks(all_raw[:, : n_blocks * ratio], starts)
+        if all_raw.shape[1] != cache.offset + length:
+            # A raw-key ledger out of step with the KV offset means block
+            # positions no longer match token positions; fail loudly instead
+            # of pooling from a shifted history.
+            raise RuntimeError(
+                "QSA index_keys desync: "
+                f"{all_raw.shape[1]} raw keys != offset {cache.offset} "
+                f"+ {length} new"
+            )
+        cached = cache._qsa_pooled_keys
+        count = 0 if cached is None else cached.shape[1]
+        if cached is not None and (
+            count > n_blocks
+            or cache._qsa_pooled_ratio != ratio
+            or cached.shape[0] != all_raw.shape[0]
+        ):
+            cached, count = None, 0
+        if count == n_blocks:
+            pooled = cached
+        else:
+            # A block is final once its last token is written; only blocks
+            # closed since the previous call need computing.
+            new = self._pool_blocks(
+                all_raw[:, count * ratio : n_blocks * ratio], starts[count:]
+            )
+            pooled = new if cached is None else mx.concatenate([cached, new], axis=1)
+        cache._qsa_pooled_keys = pooled
+        cache._qsa_pooled_ratio = ratio
+        return pooled
 
     def __call__(self, hidden: mx.array, causal_mask: mx.array, cache: QSAKVCache):
         batch, length, _ = hidden.shape
@@ -859,13 +1031,7 @@ class QSAIndexer(nn.Module):
             (starts + self.compress_ratio - 1)[None, None, :] <= q_pos[..., None]
         )
         if shared_topk is None:
-            pooled = all_raw[:, : n_blocks * self.compress_ratio].reshape(
-                batch, n_blocks, self.compress_ratio, self.head_dim
-            ).astype(mx.float32).mean(axis=2).astype(all_raw.dtype)
-            pooled = self.k_layernorm(pooled)
-            pooled = _apply_rope_positions(
-                pooled, starts[None, :], self.rotary_dim, self.rope_theta
-            )
+            pooled = self._pooled_keys(all_raw, n_blocks, starts, cache, length)
             scores = mx.einsum(
                 "blhd,bnd->blnh", q.astype(mx.float32), pooled.astype(mx.float32)
             )
@@ -879,8 +1045,20 @@ class QSAIndexer(nn.Module):
             selected = mx.broadcast_to(
                 shared_topk[:, None, :], (batch, length, shared_topk.shape[-1])
             )
-        block_ids = mx.arange(n_blocks)
-        chosen = mx.any(selected[..., None] == block_ids[None, None, None, :], axis=-2)
+        if _QSA_SCATTER_CHOSEN:
+            # ``argpartition`` output has no duplicate indices, so a scatter
+            # of ones is equivalent to the one-hot broadcast reduction.
+            chosen = mx.put_along_axis(
+                mx.zeros((batch, length, n_blocks), dtype=mx.bool_),
+                selected,
+                mx.array(True),
+                axis=-1,
+            )
+        else:
+            block_ids = mx.arange(n_blocks)
+            chosen = mx.any(
+                selected[..., None] == block_ids[None, None, None, :], axis=-2
+            )
         chosen = chosen & valid_blocks
         token_pos = mx.arange(total)
         token_block = mx.minimum(token_pos // self.compress_ratio, n_blocks - 1)
