@@ -16,7 +16,7 @@ from .base import (
     create_ssm_mask,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_gdn_qk
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
@@ -414,9 +414,7 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_gdn_qk(q, k)
 
         if (
             cache is not None

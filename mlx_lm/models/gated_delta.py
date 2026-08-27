@@ -626,6 +626,25 @@ def gated_delta_ops(
     return y, state
 
 
+def normalize_gdn_qk(q: mx.array, k: mx.array) -> Tuple[mx.array, mx.array]:
+    """L2-normalize GDN q/k and fold in the delta-rule query scale.
+
+    Matches the reference FLA l2norm, ``x * rsqrt(sum(x^2) + 1e-6)``, followed
+    by the delta rule's ``scale = head_dim ** -0.5`` applied to the query only.
+
+    ``mx.fast.rms_norm(x, None, eps)`` computes ``x / sqrt(mean(x^2) + eps)``,
+    i.e. it adds eps to the MEAN of squares, so the equivalent epsilon is
+    ``1e-6 / head_dim``. Passing ``1e-6`` straight through inflates the
+    effective epsilon on the sum by head_dim (128x at head_dim=128), which
+    systematically shrinks q/k whenever their norm is small.
+    """
+    inv_scale = k.shape[-1] ** -0.5
+    eps = 1e-6 * inv_scale**2
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+    k = inv_scale * mx.fast.rms_norm(k, None, eps)
+    return q, k
+
+
 def gated_delta_update(
     q: mx.array,
     k: mx.array,
