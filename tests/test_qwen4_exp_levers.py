@@ -11,7 +11,7 @@
 
 import math
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -779,6 +779,336 @@ class TestUnconditionalCaches(unittest.TestCase):
         if mx.metal.is_available():
             actual_metal = np.asarray(emb._ngram_ids_metal(tokens, None))
             np.testing.assert_array_equal(actual_metal, actual_cpu)
+
+
+class TestQSADenseShortCircuit(unittest.TestCase):
+    """MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT.
+
+    ``tiny_args`` puts the dense boundary at ``indexer_budget +
+    compress_ratio - 1`` = 8 + 4 - 1 = 11 cached tokens (block_topk 2, ratio
+    4), so these tests straddle 11 instead of the production 2051.  The mask
+    a short-circuited call returns is ``causal_mask`` itself, which for a
+    single-token decode is ``None`` where the stock path builds an all-true
+    array; ``_dense`` normalizes that so the two are compared as masks.
+    """
+
+    BOUNDARY = 11  # largest total that is dense by construction
+
+    def _dense(self, mask, length, total):
+        if mask is None:
+            return np.ones((1, 1, length, total), dtype=bool)
+        return np.asarray(mask)
+
+    def _drive(self, indexer, chunks, cache=None):
+        """Run ``chunks`` through one QSAKVCache, returning per-step masks."""
+        cache = QSAKVCache() if cache is None else cache
+        masks, ledger = [], []
+        for chunk in chunks:
+            length = chunk.shape[1]
+            total = cache.offset + length
+            if length > 1:
+                pos = mx.arange(cache.offset, total)
+                mask = (pos[:, None] >= mx.arange(total)[None, :])[None, None]
+            else:
+                mask = None
+            sparse = indexer(chunk, mask, cache)
+            mx.eval(sparse)
+            masks.append(self._dense(sparse, length, total))
+            cache.offset += length
+            ledger.append(
+                (
+                    cache.offset,
+                    0 if cache.index_keys is None else cache.index_keys.shape[1],
+                )
+            )
+        return masks, ledger
+
+    def _chunks(self, args, prefill, steps):
+        chunks = [
+            mx.random.normal((1, prefill, args.hidden_size), key=mx.random.key(0))
+        ]
+        chunks += [
+            mx.random.normal((1, 1, args.hidden_size), key=mx.random.key(step))
+            for step in range(1, steps + 1)
+        ]
+        return chunks
+
+    def test_flag_defaults_off(self):
+        self.assertFalse(qwen4_exp._QSA_DENSE_SHORTCIRCUIT)
+
+    def test_stock_mask_is_dense_exactly_below_the_boundary(self):
+        # The oracle the lever rests on, measured on the STOCK path: the
+        # sparse mask equals the causal mask iff n_blocks <= block_topk.
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        for total in (4, 7, 8, 10, 11, 12, 16, 20):
+            hidden = mx.random.normal(
+                (1, total, args.hidden_size), key=mx.random.key(total)
+            )
+            causal = (
+                mx.arange(total)[:, None] >= mx.arange(total)[None, :]
+            )[None, None]
+            sparse = indexer(hidden, causal, QSAKVCache())
+            mx.eval(sparse)
+            equal = np.array_equal(np.asarray(sparse), np.asarray(causal))
+            self.assertEqual(
+                equal, total <= self.BOUNDARY, f"total={total}"
+            )
+
+    def test_prefill_masks_bitwise_identical_across_boundary(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        for total in (4, 7, 8, 10, 11, 12, 16, 20):
+            chunks = [
+                mx.random.normal(
+                    (1, total, args.hidden_size), key=mx.random.key(total)
+                )
+            ]
+            stock, _ = self._drive(indexer, chunks)
+            with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+                fast, _ = self._drive(indexer, chunks)
+            np.testing.assert_array_equal(fast[0], stock[0], f"total={total}")
+
+    def test_decode_across_boundary_keeps_masks_and_ledger(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        # 5 prompt tokens + 12 decode steps walks total from 6 to 17, so the
+        # 11 -> 12 crossing happens mid-decode.
+        chunks = self._chunks(args, 5, 12)
+        stock, stock_ledger = self._drive(indexer, chunks)
+        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+            fast, fast_ledger = self._drive(indexer, chunks)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+        self.assertEqual(fast_ledger, stock_ledger)
+        for offset, keys in fast_ledger:
+            self.assertEqual(keys, offset)
+
+    def test_short_circuit_skips_pooling_and_query_rope(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        chunks = self._chunks(args, 5, 8)  # totals 5..13, crosses at 12
+        pooled, roped = [], []
+        original = qwen4_exp._apply_rope_positions
+        inner = QSAIndexer._pooled_keys
+
+        def rope_spy(x, pos, dims, base):
+            roped.append(x.shape)
+            return original(x, pos, dims, base)
+
+        def pool_spy(self, *args, **kwargs):
+            pooled.append(True)
+            return inner(self, *args, **kwargs)
+
+        qwen4_exp._apply_rope_positions = rope_spy
+        QSAIndexer._pooled_keys = pool_spy
+        try:
+            with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+                self._drive(indexer, chunks)
+        finally:
+            qwen4_exp._apply_rope_positions = original
+            QSAIndexer._pooled_keys = inner
+        # Only the two steps at total 12 and 13 do indexer work; the nine
+        # dense steps do the projection and the raw-key append and nothing
+        # else (one query rope + one pooled-key rope per working step).
+        self.assertEqual(len(pooled), 2)
+        self.assertEqual(len(roped), 4)
+
+    def test_composes_with_pooled_key_cache_and_scatter_chosen(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        chunks = self._chunks(args, 5, 12)
+        for extra in (
+            (),
+            ("_QSA_POOLED_KEY_CACHE",),
+            ("_QSA_SCATTER_CHOSEN",),
+            ("_QSA_POOLED_KEY_CACHE", "_QSA_SCATTER_CHOSEN"),
+        ):
+            with ExitStack() as stack:
+                for flag in extra:
+                    stack.enter_context(lever(qwen4_exp, flag))
+                stock, _ = self._drive(indexer, chunks)
+                stack.enter_context(lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"))
+                fast, ledger = self._drive(indexer, chunks)
+            for step, (expected, actual) in enumerate(zip(stock, fast)):
+                np.testing.assert_array_equal(actual, expected, f"{extra} {step}")
+            for offset, keys in ledger:
+                self.assertEqual(keys, offset, str(extra))
+
+    def _drive_shared_cycle(self, indexer, chunks, share_at):
+        cache = QSAKVCache()
+        masks = []
+        for index, chunk in enumerate(chunks):
+            length = chunk.shape[1]
+            total = cache.offset + length
+            mask = None
+            if length > 1:
+                pos = mx.arange(cache.offset, total)
+                mask = (pos[:, None] >= mx.arange(total)[None, :])[None, None]
+            if index == share_at:
+                cache._mtp_share_topk = True
+                cache._mtp_shared_topk = None
+            sparse = indexer(chunk, mask, cache)
+            mx.eval(sparse)
+            masks.append(self._dense(sparse, length, total))
+            cache.offset += length
+        return masks
+
+    def test_shared_topk_cycle_is_bitwise_identical(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        # Cycle opens at total 13 (past the boundary) so the shared index set
+        # is narrower than the block count and must NOT be short-circuited.
+        chunks = self._chunks(args, 9, 8)
+        for share_at in (0, 1, 2, 4, 6):
+            stock = self._drive_shared_cycle(indexer, chunks, share_at)
+            with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+                fast = self._drive_shared_cycle(indexer, chunks, share_at)
+            for step, (expected, actual) in enumerate(zip(stock, fast)):
+                np.testing.assert_array_equal(
+                    actual, expected, f"share_at={share_at} step={step}"
+                )
+
+    def test_shared_topk_below_boundary_is_dense_and_short_circuits(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        cache = QSAKVCache()
+        hidden = mx.random.normal((1, 8, args.hidden_size), key=mx.random.key(3))
+        mask = (mx.arange(8)[:, None] >= mx.arange(8)[None, :])[None, None]
+        mx.eval(indexer(hidden, mask, cache))
+        cache.offset += 8
+        cache._mtp_share_topk = True
+        cache._mtp_shared_topk = None
+        step = mx.random.normal((1, 1, args.hidden_size), key=mx.random.key(4))
+        mx.eval(indexer(step, None, cache))  # total 9, records the shared set
+        cache.offset += 1
+        self.assertEqual(cache._mtp_shared_topk.shape[-1], 2)
+        # total 10 still has 2 blocks, so the shared set covers them all.
+        self.assertTrue(indexer._dense_by_construction(2, cache._mtp_shared_topk, cache))
+        # total 12 closes a third block the shared set does not name.
+        self.assertFalse(indexer._dense_by_construction(3, cache._mtp_shared_topk, cache))
+
+    def test_dense_cycle_start_still_records_the_shared_set(self):
+        # A cycle that opens while the mask is dense must hand later steps
+        # the full block set, or they silently recompute (mask-equal but a
+        # different code path, and a divergence from the stock run).
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        cache = QSAKVCache()
+        hidden = mx.random.normal((1, 8, args.hidden_size), key=mx.random.key(3))
+        mask = (mx.arange(8)[:, None] >= mx.arange(8)[None, :])[None, None]
+        cache._mtp_share_topk = True
+        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+            self.assertIs(indexer(hidden, mask, cache), mask)
+        cache.offset += 8
+        self.assertIsNotNone(cache._mtp_shared_topk)
+        np.testing.assert_array_equal(
+            np.asarray(cache._mtp_shared_topk), np.array([[0, 1]])
+        )
+        self.assertEqual(cache.index_keys.shape[1], cache.offset)
+
+    def _model_sequence(self, model):
+        cache = model.make_cache()
+        outputs = []
+
+        def step(tokens):
+            logits = model(mx.array([tokens], dtype=mx.int32), cache=cache)
+            mx.eval(logits)
+            outputs.append(np.asarray(logits))
+
+        step([1, 2, 3, 4, 5])
+        for token in range(6, 24):  # walks the 11 -> 12 boundary mid-decode
+            step([token % 60])
+        for layer_cache in cache:
+            layer_cache.start_speculation()
+        step([7, 8, 9])
+        trim_prompt_cache(cache, 2)
+        for token in range(3):
+            step([10 + token])
+        for layer_cache in cache:
+            if isinstance(layer_cache, QSAKVCache):
+                self.assertEqual(
+                    layer_cache.index_keys.shape[1], layer_cache.offset
+                )
+        return outputs
+
+    def test_full_model_logits_bitwise_identical_with_rollback(self):
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2])
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=args.__dict__)
+        ).language_model
+        stock = self._model_sequence(model)
+        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+            fast = self._model_sequence(model)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+    def _batch_sequence(self, model, prompts):
+        caches = []
+        for prompt in prompts:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        batch = _merge_caches(caches)
+        outputs = []
+        for token in (5, 6, 7):
+            logits = model(
+                mx.array([[token]] * len(prompts), dtype=mx.int32), cache=batch
+            )
+            mx.eval(logits)
+            outputs.append(np.asarray(logits))
+        return batch, outputs
+
+    def test_batch_without_left_padding_is_bitwise_identical(self):
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2])
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=args.__dict__)
+        ).language_model
+        prompts = [[1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14]]
+        batch, stock = self._batch_sequence(model, prompts)
+        for layer_cache in batch:
+            if isinstance(layer_cache, qwen4_exp.BatchQSAKVCache):
+                self.assertEqual(layer_cache.left_padding.max().item(), 0)
+                self.assertTrue(
+                    qwen4_exp._qsa_positions_are_physical(layer_cache)
+                )
+        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+            _, fast = self._batch_sequence(model, prompts)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+    def test_left_padded_batch_never_short_circuits(self):
+        # A left-padded batch cache reports a LOGICAL offset while the block
+        # starts stay physical, so the dense identity does not hold there and
+        # the lever must leave that path byte-for-byte alone.
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2])
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=args.__dict__)
+        ).language_model
+        prompts = [[1, 2, 3, 4, 5, 6, 7], [8, 9, 10]]
+        batch, stock = self._batch_sequence(model, prompts)
+        padded = [
+            layer_cache
+            for layer_cache in batch
+            if isinstance(layer_cache, qwen4_exp.BatchQSAKVCache)
+        ]
+        self.assertTrue(padded)
+        for layer_cache in padded:
+            self.assertEqual(layer_cache.left_padding.max().item(), 4)
+            self.assertFalse(qwen4_exp._qsa_positions_are_physical(layer_cache))
+        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+            _, fast = self._batch_sequence(model, prompts)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+    def test_left_padding_predicate_is_rechecked_after_filter(self):
+        cache = qwen4_exp.BatchQSAKVCache([0, 3])
+        self.assertFalse(qwen4_exp._qsa_positions_are_physical(cache))
+        cache.left_padding = mx.array([0, 0])
+        self.assertTrue(qwen4_exp._qsa_positions_are_physical(cache))
 
 
 if __name__ == "__main__":

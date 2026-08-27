@@ -41,6 +41,47 @@ _QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN")
 _PLE_VECTOR_SHIFT = _env_flag("MLX_QWEN4_PLE_VECTOR_SHIFT")
 _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 
+# MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT (2026-08-27): skip the whole indexer
+# selection while the QSA mask is dense BY CONSTRUCTION, i.e. while
+# ``n_blocks <= block_topk`` (block_topk = indexer_budget // compress_ratio =
+# 512, so total <= indexer_budget + compress_ratio - 1 = 2051 cached tokens).
+# Rapid-MLX ships the same guard; llama.cpp documents the property as a test
+# oracle.  Gate class: BITWISE.
+#
+# Proof that ``causal_mask & sparse == causal_mask`` in that regime.  Write
+# r = compress_ratio, and let p be a query's position and t a key position.
+#  (0) k = min(block_topk, n_blocks) = n_blocks, and ``argpartition`` returns
+#      distinct indices, so ALL n_blocks blocks are selected.  The -inf scores
+#      of the invalid blocks change nothing, so chosen == valid_blocks and the
+#      pooled keys, the scores and the top-k never influence the result.
+#  (1) valid_blocks[n] = (n*r + r - 1 <= p): block n is picked iff it closed
+#      at or before p.  Blocks are complete by construction, so this is the
+#      only causality term the block half carries.
+#  (2) tail covers complete = ((p+1)//r)*r <= t <= p.
+#  (3) Take any t <= p.  If t >= complete, (2) gives it.  Otherwise t <
+#      complete <= n_blocks*r (complete is a multiple of r and <= p+1 <=
+#      total), so token_block[t] = t//r is unclamped, and that block ends at
+#      (t//r)*r + r - 1 <= complete - 1 <= p, hence valid by (1).
+#      So every causal (b, l, t) is set in ``sparse`` and the AND is a no-op.
+# The converse also holds -- ``sparse`` sets t > p for the clamped incomplete
+# tail -- which is why the short-circuit returns ``causal_mask`` itself (None
+# included: ``create_attention_mask`` returns None only for a 1-token decode,
+# where every cached t <= p) and never an all-true mask.  For a batch cache
+# that keeps the left padding out of the mask, returning ``causal_mask``
+# preserves that padding term exactly.
+#
+# Two guards, both provable:
+#  * MTP shared top-k reuses a k-wide index set from an earlier step, so it is
+#    dense only when that set still covers every block: shared.shape[-1] ==
+#    n_blocks (which already implies n_blocks <= block_topk).  A block closed
+#    mid-cycle is NOT in the shared set and NOT in the tail, so the stale mask
+#    is genuinely sparser than causal there.
+#  * A left-padded batch cache is excluded (_qsa_positions_are_physical):
+#    ``q_pos`` is then logical (offset = _idx - left_padding) while ``starts``
+#    and ``token_pos`` are physical, so the two halves of the mask disagree by
+#    the padding width and the identity above does not hold.
+_QSA_DENSE_SHORTCIRCUIT = _env_flag("MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT")
+
 # MLX_QWEN4_QSA_FUSED_PROJ (2026-08-27 decode-decomposition lever): run every
 # same-input QSA-layer projection — q_proj incl. its gate half, k_proj,
 # v_proj, and the indexer's index_qk_proj — as ONE wide quantized matmul over
@@ -960,6 +1001,30 @@ class QSAKVCache(KVCache):
         return super().nbytes + (0 if self.index_keys is None else self.index_keys.nbytes)
 
 
+def _qsa_positions_are_physical(cache) -> bool:
+    """True when the indexer's ``q_pos`` indexes the same axis as the cached
+    keys, i.e. the cache carries no left padding.
+
+    A left-padded batch cache reports a LOGICAL offset (``_idx`` minus the
+    padding) while block starts and token positions stay physical, so the two
+    halves of the QSA mask are shifted apart and the dense identity fails.
+    The answer is memoized against the ``left_padding`` array itself, which is
+    always rebound (never mutated) by prepare/filter/extend/merge, so the
+    ``.item()`` sync happens once per batch reconfiguration, not per token.
+    """
+    if cache is None or type(cache) is QSAKVCache:
+        return True
+    padding = getattr(cache, "left_padding", None)
+    if padding is None:
+        return False
+    memo = getattr(cache, "_qsa_left_pad_free", None)
+    if memo is not None and memo[0] is padding:
+        return memo[1]
+    free = padding.size == 0 or padding.max().item() == 0
+    cache._qsa_left_pad_free = (padding, free)
+    return free
+
+
 class QSAIndexer(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -994,6 +1059,17 @@ class QSAIndexer(nn.Module):
         return _apply_rope_positions(
             pooled, starts[None, :], self.rotary_dim, self.rope_theta
         )
+
+    def _dense_by_construction(self, n_blocks, shared_topk, cache) -> bool:
+        """True when the sparse mask this call would build equals the causal
+        mask exactly.  See the MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT proof."""
+        if not _qsa_positions_are_physical(cache):
+            return False
+        if shared_topk is None:
+            return n_blocks <= self.block_topk
+        # A reused index set covers every block only if it is as wide as the
+        # block count; that already implies n_blocks <= block_topk.
+        return shared_topk.shape[-1] == n_blocks
 
     def _pooled_keys(self, all_raw, n_blocks, starts, cache, length) -> mx.array:
         ratio = self.compress_ratio
@@ -1044,11 +1120,6 @@ class QSAIndexer(nn.Module):
             mask = cache.make_mask(length, return_array=True)
             return None if mask is None else mask[None, None, :, :]
         offset = 0 if cache is None else cache.offset
-        if isinstance(offset, mx.array):
-            q_pos = offset[:, None] + mx.arange(length)[None, :]
-        else:
-            q_pos = mx.arange(offset, offset + length)[None, :]
-
         shared_topk = (
             getattr(cache, "_mtp_shared_topk", None) if cache is not None else None
         )
@@ -1059,15 +1130,12 @@ class QSAIndexer(nn.Module):
                 else self.index_qk_proj(hidden)
             )
             q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
-            q = self.q_layernorm(
-                q.reshape(batch, length, self.n_heads, self.head_dim)
-            )
             raw = raw.reshape(batch, length, self.head_dim)
+            # The raw-key append is the ONE step the dense short-circuit below
+            # may not skip: the ledger must stay in step with the KV offset so
+            # a later step that does cross the budget can pool every block.
             all_raw = raw if cache is None else cache.update_index_keys(raw)
             total = all_raw.shape[1]
-            q = _apply_rope_positions(
-                q, q_pos[..., None], self.rotary_dim, self.rope_theta
-            )
         else:
             # The current draft token is transient and will be rewound before
             # any accepted span is teacher-forced next cycle.  Skipping its raw
@@ -1081,6 +1149,32 @@ class QSAIndexer(nn.Module):
         n_blocks = total // self.compress_ratio
         if n_blocks == 0:
             return causal_mask
+        if _QSA_DENSE_SHORTCIRCUIT and self._dense_by_construction(
+            n_blocks, shared_topk, cache
+        ):
+            if shared_topk is None and getattr(cache, "_mtp_share_topk", False):
+                # An MTP cycle opening on a dense step must still hand the
+                # later steps a set: top-k over all blocks IS every block, and
+                # the mask only ever uses ``selected`` as a set, so arange is
+                # the same selection the stock path would have stored.
+                cache._mtp_shared_topk = mx.contiguous(
+                    mx.broadcast_to(
+                        mx.arange(n_blocks, dtype=mx.uint32), (batch, n_blocks)
+                    )
+                )
+            return causal_mask
+
+        if isinstance(offset, mx.array):
+            q_pos = offset[:, None] + mx.arange(length)[None, :]
+        else:
+            q_pos = mx.arange(offset, offset + length)[None, :]
+        if shared_topk is None:
+            q = self.q_layernorm(
+                q.reshape(batch, length, self.n_heads, self.head_dim)
+            )
+            q = _apply_rope_positions(
+                q, q_pos[..., None], self.rotary_dim, self.rope_theta
+            )
         starts = mx.arange(n_blocks) * self.compress_ratio
         valid_blocks = (
             (starts + self.compress_ratio - 1)[None, None, :] <= q_pos[..., None]
