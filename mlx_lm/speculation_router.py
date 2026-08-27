@@ -9,6 +9,7 @@ It never touches model state: ``num_draft=0`` means take the plain decode floor.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
@@ -162,5 +163,129 @@ class RoutedSpeculationPolicy:
             "decisions": self.decisions,
             "plain_decisions": self.plain_decisions,
             "reengagements": self.reengagements,
+            "last_decision": asdict(self.last_decision),
+        }
+
+
+class DepthCeilingController:
+    """Adaptive draft-depth ceiling: the caller's depth is a floor, not a fix.
+
+    mlx-vlm PR #2046 semantics: start at the native depth (``num_draft``, the
+    trained regime), expand toward ``ceiling`` only after the full native
+    prefix has been accepted in at least ``expand_threshold`` of the last
+    ``window`` draft rounds, and back off when that fraction falls below
+    ``backoff_threshold``. The window is cleared after every depth change, so
+    each step needs ``window`` fresh rounds of evidence (hysteretic dwell —
+    no per-cycle thrashing).
+
+    Unlike :class:`RoutedSpeculationPolicy` this controller never returns 0
+    and never latches plain: the measured rate gate in the MTP loop keeps
+    sole authority over WHETHER to speculate; this controller only decides
+    HOW DEEP inside ``[num_draft, ceiling]``. It is request-local state —
+    create one per admitted request and never persist it into APC sidecars.
+
+    Duck-type compatible with the ``speculation_router=`` seam of
+    ``self_mtp_generate_step``: ``decide``/``observe``/``accept_prob``/
+    ``reengagements``.
+    """
+
+    def __init__(
+        self,
+        num_draft: int,
+        ceiling: int,
+        *,
+        window: int = 8,
+        expand_threshold: float = 0.65,
+        backoff_threshold: float = 0.50,
+    ):
+        if num_draft < 1:
+            raise ValueError("num_draft (the floor depth) must be >= 1")
+        if ceiling < num_draft:
+            raise ValueError(
+                f"ceiling {ceiling} must be >= the floor depth {num_draft}"
+            )
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        if not 0.0 < backoff_threshold <= expand_threshold <= 1.0:
+            raise ValueError(
+                "thresholds must satisfy 0 < backoff <= expand <= 1"
+            )
+        self.floor = int(num_draft)
+        self.ceiling = int(ceiling)
+        self.depth = self.floor
+        self.window = int(window)
+        self.expand_threshold = float(expand_threshold)
+        self.backoff_threshold = float(backoff_threshold)
+        self._full_rounds: deque = deque(maxlen=self.window)
+        self.accept_prob = 0.0
+        self.total_proposed = 0
+        self.total_accepted = 0
+        self.expansions = 0
+        self.backoffs = 0
+        self.decisions = 0
+        # Seam compatibility: this controller never latches plain, so it
+        # never re-engages either.
+        self.reengagements = 0
+        self.last_decision = SpeculationDecision(
+            0, "not_started", self.accept_prob, False, 0
+        )
+
+    def _decision(self, num_draft: int, reason: str) -> SpeculationDecision:
+        self.decisions += 1
+        self.last_decision = SpeculationDecision(
+            num_draft=num_draft,
+            reason=reason,
+            accept_prob=self.accept_prob,
+            latched_plain=False,
+            cooldown_remaining=0,
+        )
+        return self.last_decision
+
+    def decide(
+        self,
+        *,
+        max_draft: Optional[int] = None,
+        remaining: Optional[int] = None,
+    ) -> SpeculationDecision:
+        cap = self.ceiling if max_draft is None else min(self.ceiling, int(max_draft))
+        if remaining is not None:
+            cap = min(cap, max(0, int(remaining)))
+        if cap <= 0:
+            return self._decision(0, "no_remaining_budget")
+        return self._decision(min(self.depth, cap), "depth_ceiling")
+
+    def observe(self, proposed: int, accepted: int) -> None:
+        proposed, accepted = int(proposed), int(accepted)
+        if proposed <= 0 or not 0 <= accepted <= proposed:
+            raise ValueError("require proposed > 0 and 0 <= accepted <= proposed")
+        self.total_proposed += proposed
+        self.total_accepted += accepted
+        # A budget-truncated round (proposed < floor) accepted in full still
+        # counts as a full native prefix; it carries no evidence against it.
+        self._full_rounds.append(accepted >= min(self.floor, proposed))
+        rate = sum(self._full_rounds) / len(self._full_rounds)
+        self.accept_prob = rate
+        if len(self._full_rounds) < self.window:
+            return
+        if rate >= self.expand_threshold and self.depth < self.ceiling:
+            self.depth += 1
+            self.expansions += 1
+            self._full_rounds.clear()
+        elif rate < self.backoff_threshold and self.depth > self.floor:
+            self.depth -= 1
+            self.backoffs += 1
+            self._full_rounds.clear()
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "floor": self.floor,
+            "ceiling": self.ceiling,
+            "depth": self.depth,
+            "accept_prob": round(self.accept_prob, 6),
+            "total_proposed": self.total_proposed,
+            "total_accepted": self.total_accepted,
+            "expansions": self.expansions,
+            "backoffs": self.backoffs,
+            "decisions": self.decisions,
             "last_decision": asdict(self.last_decision),
         }

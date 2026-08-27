@@ -1677,6 +1677,9 @@ def stream_generate(
             mtp_sink_size=self_mtp.get("sink_size", 4),
             mtp_share_qsa_indices=self_mtp.get("share_qsa_indices", False),
             rate_gate=self_mtp.get("rate_gate", True),
+            # Optional per-request depth controller (e.g. the adaptive depth
+            # ceiling); None keeps today's fixed-depth path byte-identical.
+            speculation_router=self_mtp.get("speculation_router"),
             stats=self_mtp.get("stats"),
             prompt_cache=kwargs.get("prompt_cache"),
             mtp_state=self_mtp.get("state"),

@@ -46,6 +46,8 @@ from .generate import (
 )
 from .models.cache import LRUPromptCache, RotatingKVCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
+from .spec_policy import MAX_DRAFT_TOKENS
+from .speculation_router import DepthCeilingController
 from .utils import _parse_size, load, sharded_load
 
 
@@ -737,6 +739,16 @@ def _self_mtp_config(
         config["top_p"] = sampling.top_p
         config["top_k"] = sampling.top_k
         config["min_p"] = sampling.min_p
+    depth_ceiling = getattr(cli_args, "self_mtp_adaptive_depth_ceiling", None)
+    if depth_ceiling is not None:
+        # The configured depth becomes the floor; the ceiling is reached only
+        # on sustained measured acceptance. The controller is per-request
+        # state: fresh at admission, carried across cycles, never persisted
+        # into APC sidecars.
+        config["num_draft"] = int(depth_ceiling)
+        config["speculation_router"] = DepthCeilingController(
+            cli_args.self_mtp_num_draft, int(depth_ceiling)
+        )
     if mtp_state is not None:
         config["state"] = mtp_state
     window_size = getattr(cli_args, "self_mtp_window_size", 0)
@@ -1387,13 +1399,19 @@ class ResponseGenerator:
                 mtp_state=(mtp_sidecar.state if mtp_sidecar is not None else None),
             )
             if self_mtp is not None:
+                depth_router = self_mtp.get("speculation_router")
                 logging.info(
                     "Self-MTP admitted: prompt=%d cached=%d sidecar=%s "
-                    "k=%d window=%s sink=%s",
+                    "k=%s window=%s sink=%s",
                     len(prompt),
                     ctx.prompt_cache_count,
                     mtp_sidecar is not None,
-                    self_mtp["num_draft"],
+                    (
+                        "%d..%d(adaptive)"
+                        % (depth_router.floor, depth_router.ceiling)
+                        if depth_router is not None
+                        else self_mtp["num_draft"]
+                    ),
                     self_mtp.get("window_size", "native"),
                     self_mtp.get("sink_size", "native"),
                 )
@@ -2510,6 +2528,18 @@ def setup_arg_parser():
         help="MTP draft depth. Qwen4 is trained at depth 1 (default: 1).",
     )
     parser.add_argument(
+        "--self-mtp-adaptive-depth-ceiling",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Adapt the MTP draft depth per request between "
+            "--self-mtp-num-draft (the floor/native depth) and this ceiling, "
+            "expanding only on sustained full-native-prefix acceptance and "
+            "backing off when it falls. Unset keeps today's fixed depth."
+        ),
+    )
+    parser.add_argument(
         "--self-mtp-persistent",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2795,6 +2825,20 @@ def setup_arg_parser():
     return parser
 
 
+def _validate_adaptive_depth_ceiling(args):
+    """Enforce 1 <= --self-mtp-num-draft <= ceiling <= MAX_DRAFT_TOKENS."""
+    ceiling = getattr(args, "self_mtp_adaptive_depth_ceiling", None)
+    if ceiling is None:
+        return
+    num_draft = args.self_mtp_num_draft
+    if not 1 <= num_draft <= ceiling <= MAX_DRAFT_TOKENS:
+        raise ValueError(
+            f"--self-mtp-adaptive-depth-ceiling {ceiling} requires "
+            f"1 <= --self-mtp-num-draft ({num_draft}) <= ceiling <= "
+            f"{MAX_DRAFT_TOKENS} (the M5 verify-width cap)"
+        )
+
+
 def _configure_process_wired_limit(args):
     """Apply the legacy server clamp unless internal MTP owns the stream.
 
@@ -2823,6 +2867,10 @@ def main():
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
     if args.self_mtp_window_size and not args.self_mtp_persistent:
         parser.error("--self-mtp-window-size requires --self-mtp-persistent")
+    try:
+        _validate_adaptive_depth_ceiling(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         validate_kv_args(args)
     except ValueError as exc:
