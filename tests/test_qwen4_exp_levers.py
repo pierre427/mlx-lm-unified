@@ -564,6 +564,8 @@ class TestSharedTopkTrimFix(unittest.TestCase):
         # advancement: each chained draft call must start at the previous
         # call's end offset, advance it by exactly 1, and (with the index
         # projection active) rope its indexer query at that same position.
+        # Test-only pin (no local red revision): this asserts behavior the
+        # path already had; the red arm is the external engine's bug.
         mx.random.seed(0)
         args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
         model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
@@ -599,8 +601,9 @@ class TestSharedTopkTrimFix(unittest.TestCase):
                 qwen4_exp._apply_rope_positions = original
             self.assertEqual(offsets, [start, start + 1, start + 2], share)
             if share:
-                # Sharing skips the index projection after step 0 by design.
-                self.assertEqual(positions[:1], [start])
+                # Sharing runs the index projection EXACTLY once per cycle
+                # (step 0); later chained steps reuse its block selection.
+                self.assertEqual(positions, [start])
             else:
                 self.assertEqual(positions, [start, start + 1, start + 2])
             trim_prompt_cache(mtp_cache, 3)

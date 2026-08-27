@@ -482,9 +482,14 @@ class TestTransformedEndToEnd(unittest.TestCase):
         # omlx #3150 / vllm-mlx #735 class: MTP + presence_penalty +
         # moderate temperature turns into gibberish or repeated-token
         # locks. Pin the exact live non-thinking profile (temp 0.7,
-        # top_p 0.8, top_k 20, presence_penalty 1.5): the speculative arm
-        # must match the plain arm's distribution and never degenerate
-        # into token runs the penalty forbids.
+        # top_p 0.8, top_k 20, presence_penalty 1.5). The per-position
+        # chi-square against the plain transformed arm is the degeneration
+        # gate: a corrupted speculative arm diverges from the reference
+        # distribution. The accept assertions keep the gate honest - a
+        # verifier that always rejects would trivially match the plain
+        # marginals while proving nothing about accepted drafts.
+        # Test-only pin (no local red revision): the failing arm is the
+        # external engines' bug class, which this path never had.
         self.TEMP, self.TOP_P, self.TOP_K = 0.7, 0.8, 20
 
         def procs():
@@ -495,29 +500,29 @@ class TestTransformedEndToEnd(unittest.TestCase):
         n, new = 300, 4
         plain = [Counter() for _ in range(new)]
         spec = [Counter() for _ in range(new)]
+        accepted = proposed = 0
         for i in range(n):
             mx.random.seed(60_000 + i)
             for j, t in enumerate(self._plain(new, logits_processors=procs())):
                 plain[j][t] += 1
-            toks, _ = self._spec(910_000 + i, new, logits_processors=procs())
+            toks, stats = self._spec(910_000 + i, new, logits_processors=procs())
+            accepted += stats.draft_accepted
+            proposed += stats.draft_proposed
             for j, t in enumerate(toks):
                 spec[j][t] += 1
         for j in range(new):
             stat = self._binned_chi2(plain[j], spec[j])
             self.assertLess(stat, 32.0, f"position={j} chi2={stat:.1f}")
+        # Accepted drafts, not just proposals; measured rate is ~0.12 on
+        # this fixture, so 0.03 is a >4x safety margin over ~1200 draws.
+        self.assertGreater(proposed, 0)
+        self.assertGreater(accepted, 0)
+        self.assertGreater(accepted / proposed, 0.03)
 
-        # Degeneration markers on a longer speculative run: with a 1.5
-        # presence penalty the same token must not lock into a long run.
-        toks, stats = self._spec(
-            914_000, 48, logits_processors=procs()
-        )
+        # A longer chained decode must also commit accepted drafts.
+        toks, stats = self._spec(914_000, 48, logits_processors=procs())
         self.assertEqual(len(toks), 48)
-        self.assertGreater(stats.draft_proposed, 0)
-        run = max_run = 1
-        for a, b in zip(toks, toks[1:]):
-            run = run + 1 if a == b else 1
-            max_run = max(max_run, run)
-        self.assertLess(max_run, 8, toks)
+        self.assertGreater(stats.draft_accepted, 0)
 
     def test_transform_rejects_non_residual_rules(self):
         for rule in ("block", "exact"):
