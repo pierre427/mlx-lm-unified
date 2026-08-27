@@ -396,6 +396,29 @@ class TestQwen4Exp(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    @staticmethod
+    def _norm_gain_weights(center, seed=3):
+        # Noisy trained-looking gains: per-family centers spread around
+        # ``center``, including one strongly off-center family like the
+        # production checkpoint's pre_fc_norm_embedding (mean 0.236 when
+        # ones-centered). A legitimacy window would false-refuse that; the
+        # comparative check must not.
+        rng = np.random.default_rng(seed)
+        offsets = {
+            "model.layers.3.self_attn.q_norm.weight": 0.6,
+            "model.layers.3.self_attn.k_norm.weight": 0.6,
+            "model.layers.2.self_attn.q_layernorm.weight": -0.05,
+            "model.layers.2.self_attn.k_layernorm.weight": -0.05,
+            "model.layers.1.ple.norm_key.weight": -0.1,
+            "model.mtp.pre_fc_norm_embedding.weight": -0.76,
+        }
+        return {
+            key: mx.array(
+                (center + off + rng.normal(0, 0.05, 16)).astype(np.float32)
+            )
+            for key, off in offsets.items()
+        }
+
     def test_sanitize_refuses_norm_convention_mismatch(self):
         # mlx-vlm #2041/#2045 class: a wrong zero-vs-ones-centered guess
         # loads cleanly and produces deterministic garbage. The check must
@@ -403,44 +426,86 @@ class TestQwen4Exp(unittest.TestCase):
         args = tiny_args()
         model = TextModel(args)
         raw_conv = mx.zeros((8, 1, 3))  # HF raw layout, shape[-1] != 1
-        norms = {
-            "model.layers.3.self_attn.q_norm.weight": mx.ones((8,)),
-            "model.layers.3.self_attn.k_norm.weight": mx.ones((8,)),
-        }
+        converted_conv = mx.zeros((8, 3, 1))
+        ones_centered = self._norm_gain_weights(1.0)
+        zero_centered = self._norm_gain_weights(0.0)
 
-        # Ones-centered norms inside a raw-looking checkpoint: the +1
-        # offset would shift gains to ~2. Must refuse, not load.
-        with self.assertRaisesRegex(ValueError, "norm convention mismatch"):
-            model.sanitize(
-                {"model.layers.0.linear_attn.conv1d.weight": raw_conv, **norms}
-            )
-
-        # Zero-centered norms in a converted-layout checkpoint (offset
-        # would be skipped, gains stay ~0) must also refuse.
-        zero_norms = {key: mx.zeros((8,)) for key in norms}
-        with self.assertRaisesRegex(ValueError, "norm convention mismatch"):
+        # Ones-centered gains inside a raw-looking checkpoint: the +1
+        # offset would shift them to ~2. Must refuse with an actionable
+        # message, not load.
+        with self.assertRaisesRegex(
+            ValueError,
+            r"norm convention mismatch(?s:.*)raw \(\+1 offset\)"
+            r"(?s:.*)q_norm(?s:.*)MLX_QWEN4_NORM_CONVENTION",
+        ):
             model.sanitize(
                 {
-                    "model.layers.0.linear_attn.conv1d.weight": mx.zeros(
-                        (8, 3, 1)
-                    ),
-                    **zero_norms,
+                    "model.layers.0.linear_attn.conv1d.weight": raw_conv,
+                    **ones_centered,
                 }
             )
 
-        # The two consistent pairings convert to ~1-centered gains.
+        # Zero-centered gains in a converted-layout checkpoint (the offset
+        # would be skipped, gains stay ~0) must also refuse.
+        with self.assertRaisesRegex(ValueError, "norm convention mismatch"):
+            model.sanitize(
+                {
+                    "model.layers.0.linear_attn.conv1d.weight": converted_conv,
+                    **zero_centered,
+                }
+            )
+
+        # Both consistent pairings load, including the off-center family.
         raw_ok = model.sanitize(
-            {"model.layers.0.linear_attn.conv1d.weight": raw_conv, **zero_norms}
+            {
+                "model.layers.0.linear_attn.conv1d.weight": raw_conv,
+                **zero_centered,
+            }
         )
         converted_ok = model.sanitize(
             {
-                "model.layers.0.linear_attn.conv1d.weight": mx.zeros((8, 3, 1)),
-                **norms,
+                "model.layers.0.linear_attn.conv1d.weight": converted_conv,
+                **ones_centered,
             }
         )
         for output in (raw_ok, converted_ok):
             gains = output["model.layers.3.self_attn.q_norm.weight"]
-            self.assertAlmostEqual(gains.mean().item(), 1.0, places=5)
+            self.assertAlmostEqual(gains.mean().item(), 1.6, places=1)
+
+    def test_norm_convention_override_forces_and_skips_check(self):
+        args = tiny_args()
+        model = TextModel(args)
+        raw_conv = mx.zeros((8, 1, 3))
+        ones_centered = self._norm_gain_weights(1.0)
+
+        environ["MLX_QWEN4_NORM_CONVENTION"] = "converted"
+        try:
+            # The proxy says raw; the override forces converted (no +1)
+            # and skips the refusal.
+            output = model.sanitize(
+                {
+                    "model.layers.0.linear_attn.conv1d.weight": raw_conv,
+                    **ones_centered,
+                }
+            )
+        finally:
+            del environ["MLX_QWEN4_NORM_CONVENTION"]
+        gains = output["model.layers.3.self_attn.q_norm.weight"]
+        self.assertAlmostEqual(gains.mean().item(), 1.6, places=1)
+        # The layout transform still runs under an override.
+        self.assertEqual(
+            output["model.layers.0.linear_attn.conv1d.weight"].shape,
+            (8, 3, 1),
+        )
+
+        environ["MLX_QWEN4_NORM_CONVENTION"] = "bogus"
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "MLX_QWEN4_NORM_CONVENTION"
+            ):
+                model.sanitize(dict(ones_centered))
+        finally:
+            del environ["MLX_QWEN4_NORM_CONVENTION"]
 
     def test_raw_moe_weights_are_split_for_switch_glu(self):
         args = tiny_args()

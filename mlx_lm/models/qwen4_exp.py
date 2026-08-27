@@ -1202,7 +1202,15 @@ class TextModel(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+        override = os.environ.get("MLX_QWEN4_NORM_CONVENTION")
+        if override not in (None, "", "raw", "converted"):
+            raise ValueError(
+                "MLX_QWEN4_NORM_CONVENTION must be 'raw' or 'converted', "
+                f"got {override!r}"
+            )
         raw = any("conv1d.weight" in key and value.shape[-1] != 1 for key, value in weights.items())
+        if override:
+            raw = override == "raw"
         zero_centered = (
             ".hc_norm.weight",
             ".norm_key.weight",
@@ -1221,26 +1229,61 @@ class TextModel(nn.Module):
                 weights[key] = value.moveaxis(2, 1)
             if raw and any(key.endswith(suffix) for suffix in zero_centered):
                 weights[key] = value + 1.0
-        # Convention sanity check, independent of the conv1d layout proxy
-        # (mlx-vlm #2041/#2045 class: a wrong zero-vs-ones-centered guess
-        # loads cleanly and produces deterministic garbage). Post-sanitize
-        # gains must center near 1; a wrong guess shifts every family by
-        # exactly +-1, so the aggregate lands near 0 or 2.
-        norm_means = [
-            weights[key].astype(mx.float32).mean()
-            for key in weights
-            if any(key.endswith(suffix) for suffix in zero_centered)
-        ]
-        if norm_means:
-            center = mx.mean(mx.stack(norm_means)).item()
-            if not 0.5 < center < 1.5:
-                raise ValueError(
-                    "norm convention mismatch: zero-centered norm families "
-                    f"average {center:.3f} after sanitize, expected ~1. The "
-                    "conv1d layout proxy disagrees with how this checkpoint "
-                    "stores its RMSNorm gains; refusing to load garbage."
-                )
+        if not override:
+            self._check_norm_convention(weights, zero_centered, raw)
         return weights
+
+    @staticmethod
+    def _check_norm_convention(weights, zero_centered, raw):
+        """Refuse the exact +-1 signature of a wrong convention guess.
+
+        A wrong zero-vs-ones-centered guess loads cleanly and produces
+        deterministic garbage (mlx-vlm #2041/#2045 class). The check is
+        comparative, not a legitimacy window on learned gains: it refuses
+        only when the opposite convention fits gains-near-1 decisively
+        better across the per-family aggregates.
+        """
+        families = {}
+        for key, value in weights.items():
+            for suffix in zero_centered:
+                if key.endswith(suffix):
+                    families.setdefault(suffix, []).append(
+                        (key, value.astype(mx.float32).mean().item())
+                    )
+                    break
+        if not families:
+            return
+        # Post-sanitize means; the alternative convention differs by -1
+        # (raw applied +1 that converted would not) or +1 (the reverse).
+        shift = -1.0 if raw else 1.0
+        total = chosen = alternative = 0.0
+        rows = []
+        for suffix, entries in families.items():
+            count = len(entries)
+            mean = sum(value for _, value in entries) / count
+            chosen += count * abs(mean - 1.0)
+            alternative += count * abs(mean + shift - 1.0)
+            total += count
+            rows.append((abs(mean - 1.0), suffix, count, mean))
+        if alternative / total + 0.25 >= chosen / total:
+            return
+        rows.sort(reverse=True)
+        worst = ", ".join(
+            f"{suffix} (n={count}, mean {mean:.3f})"
+            for _, suffix, count, mean in rows[:4]
+        )
+        applied, other = "raw (+1 offset)", "converted (no offset)"
+        if not raw:
+            applied, other = other, applied
+        raise ValueError(
+            "norm convention mismatch: the conv1d layout proxy chose the "
+            f"{applied} convention, but the {other} convention fits the "
+            f"stored RMSNorm gains decisively better (mean |gain-1| "
+            f"{chosen / total:.3f} vs {alternative / total:.3f}). Worst "
+            f"families: {worst}. If the proxy misreads this checkpoint, set "
+            "MLX_QWEN4_NORM_CONVENTION=raw|converted to force the "
+            "convention and skip this check."
+        )
 
     @property
     def quant_predicate(self):
