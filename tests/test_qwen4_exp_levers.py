@@ -781,6 +781,122 @@ class TestUnconditionalCaches(unittest.TestCase):
             np.testing.assert_array_equal(actual_metal, actual_cpu)
 
 
+@contextmanager
+def count_pooling():
+    """Count every entry into block pooling, by cache shape."""
+    calls = []
+    originals = {
+        name: getattr(QSAIndexer, name)
+        for name in ("_pooled_keys", "_pool_blocks_left_padded")
+    }
+
+    def spy(name, inner):
+        def wrapper(indexer, *args, **kwargs):
+            calls.append(name)
+            return inner(indexer, *args, **kwargs)
+
+        return wrapper
+
+    for name, inner in originals.items():
+        setattr(QSAIndexer, name, spy(name, inner))
+    try:
+        yield calls
+    finally:
+        for name, inner in originals.items():
+            setattr(QSAIndexer, name, inner)
+
+
+class TestQSALeftPaddedBatchComposition(unittest.TestCase):
+    """The other QSA levers over the left-padded batch geometry.
+
+    The 2026-08-27 coordinate fix rebuilt the pooling, the token->block map
+    and the tail term for that path, so each lever is re-checked there rather
+    than only on the single-sequence path the rest of this file drives.
+
+    ``_QSA_POOLED_KEY_CACHE`` is the exception: it cannot engage on a batch
+    cache at all, and must not.  Its incremental append keys blocks by index
+    on the assumption that a block, once closed, is final -- true for one
+    sequence, false for a batch, where the shared block count is the widest
+    row's and a padded row's same-indexed block is still open.  The test below
+    pins that non-engagement rather than pretending to exercise the flag.
+
+    The schedule ends on a four-token chunk so the PADDED row's own logical
+    total crosses the 11-token dense boundary (4, 5, 8, 9, 13) instead of
+    leaving only the unpadded row genuinely sparse.  What this file asserts is
+    that pooling ran on the padded geometry; per-row mask sparsity itself is
+    pinned in ``tests/test_qwen4_exp.py::TestQSALeftPaddedBatch``.
+    """
+
+    PROMPTS = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17]]
+    CHUNKS = ([20], [21], [22, 23, 24], [25], [26, 27, 28, 29])
+
+    def _merged(self):
+        """Prefill each prompt on its own cache and merge.  Single-sequence
+        work, so it is deliberately outside the pooling counter below."""
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2])
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=args.__dict__)
+        ).language_model
+        caches = []
+        for prompt in self.PROMPTS:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        batch = _merge_caches(caches)
+        padding = next(
+            layer.left_padding.tolist()
+            for layer in batch
+            if isinstance(layer, qwen4_exp.BatchQSAKVCache)
+        )
+        return model, batch, padding
+
+    def _decode(self, model, batch):
+        outputs = []
+        for chunk in self.CHUNKS:
+            logits = model(
+                mx.array([list(chunk)] * len(self.PROMPTS), dtype=mx.int32),
+                cache=batch,
+            )
+            mx.eval(logits)
+            outputs.append(np.asarray(logits))
+        return outputs
+
+    def _run(self, count=False):
+        model, batch, padding = self._merged()
+        if not count:
+            return padding, self._decode(model, batch), None
+        with count_pooling() as pooled:
+            outputs = self._decode(model, batch)
+            return padding, outputs, list(pooled)
+
+    def test_levers_are_bitwise_over_a_left_padded_batch(self):
+        padding, stock, pooled = self._run(count=True)
+        self.assertEqual(padding, [0, 11])  # 14 vs 3 tokens
+        # The comparison is only meaningful where the padded geometry is
+        # actually pooled, i.e. where the schedule really does go sparse.
+        self.assertEqual(set(pooled), {"_pool_blocks_left_padded"})
+        for flag in ("_QSA_SCATTER_CHOSEN", "_RMSNORM_FAST"):
+            with self.subTest(flag=flag):
+                with lever(qwen4_exp, flag):
+                    _, fast, _ = self._run()
+                for step, (expected, actual) in enumerate(zip(stock, fast)):
+                    np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+    def test_pooled_key_cache_cannot_engage_on_a_batch_cache(self):
+        # An engagement check, not a bitwise one.  The incremental pooled
+        # cache is single-sequence-only by construction; if a later change
+        # routed a batch cache through ``_pooled_keys`` this fails rather than
+        # silently pooling a padded row's still-open block.
+        _, stock, _ = self._run()
+        with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
+            _, fast, pooled = self._run(count=True)
+        self.assertNotIn("_pooled_keys", pooled)
+        self.assertIn("_pool_blocks_left_padded", pooled)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+
 class TestQSADenseShortCircuit(unittest.TestCase):
     """MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT.
 
@@ -984,9 +1100,9 @@ class TestQSADenseShortCircuit(unittest.TestCase):
         cache.offset += 1
         self.assertEqual(cache._mtp_shared_topk.shape[-1], 2)
         # total 10 still has 2 blocks, so the shared set covers them all.
-        self.assertTrue(indexer._dense_by_construction(2, cache._mtp_shared_topk, cache))
+        self.assertTrue(indexer._dense_by_construction(2, cache._mtp_shared_topk))
         # total 12 closes a third block the shared set does not name.
-        self.assertFalse(indexer._dense_by_construction(3, cache._mtp_shared_topk, cache))
+        self.assertFalse(indexer._dense_by_construction(3, cache._mtp_shared_topk))
 
     def test_dense_cycle_start_still_records_the_shared_set(self):
         # A cycle that opens while the mask is dense must hand later steps
@@ -1071,18 +1187,18 @@ class TestQSADenseShortCircuit(unittest.TestCase):
         for layer_cache in batch:
             if isinstance(layer_cache, qwen4_exp.BatchQSAKVCache):
                 self.assertEqual(layer_cache.left_padding.max().item(), 0)
-                self.assertTrue(
-                    qwen4_exp._qsa_positions_are_physical(layer_cache)
-                )
         with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
             _, fast = self._batch_sequence(model, prompts)
         for step, (expected, actual) in enumerate(zip(stock, fast)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
 
-    def test_left_padded_batch_never_short_circuits(self):
-        # A left-padded batch cache reports a LOGICAL offset while the block
-        # starts stay physical, so the dense identity does not hold there and
-        # the lever must leave that path byte-for-byte alone.
+    def test_left_padded_batch_is_bitwise_identical(self):
+        # The indexer's geometry is per-row LOGICAL as of 2026-08-27, so the
+        # dense identity holds row for row and the lever covers a left-padded
+        # batch too.  Before that fix ``q_pos`` was logical while the block
+        # starts and token positions stayed physical, the stock mask itself
+        # was wrong for a padded row, and this path was excluded by a
+        # ``_qsa_positions_are_physical`` guard.
         mx.random.seed(11)
         args = tiny_args(ple_layer_ids=[2])
         model = Model(
@@ -1098,17 +1214,22 @@ class TestQSADenseShortCircuit(unittest.TestCase):
         self.assertTrue(padded)
         for layer_cache in padded:
             self.assertEqual(layer_cache.left_padding.max().item(), 4)
-            self.assertFalse(qwen4_exp._qsa_positions_are_physical(layer_cache))
-        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
-            _, fast = self._batch_sequence(model, prompts)
+        with count_pooling() as pooled:
+            with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+                _, fast = self._batch_sequence(model, prompts)
+            short_circuited = list(pooled)
+            del pooled[:]
+            self._batch_sequence(model, prompts)
+            stock_pooling = list(pooled)
         for step, (expected, actual) in enumerate(zip(stock, fast)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
-
-    def test_left_padding_predicate_is_rechecked_after_filter(self):
-        cache = qwen4_exp.BatchQSAKVCache([0, 3])
-        self.assertFalse(qwen4_exp._qsa_positions_are_physical(cache))
-        cache.left_padding = mx.array([0, 0])
-        self.assertTrue(qwen4_exp._qsa_positions_are_physical(cache))
+        # Equality would be vacuous if the lever simply declined this path:
+        # every step here stays at or below the 11-token dense boundary, so
+        # the stock run pools and the lever run must not.
+        self.assertTrue(
+            any(name == "_pool_blocks_left_padded" for name in stock_pooling)
+        )
+        self.assertEqual(short_circuited, [])
 
 
 if __name__ == "__main__":

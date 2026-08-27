@@ -12,9 +12,10 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from mlx_lm import utils
-from mlx_lm.generate import _merge_caches
+from mlx_lm.generate import _merge_caches, _right_pad_prompts
 from mlx_lm.models.cache import SinkWindowKVCache, trim_prompt_cache
 from mlx_lm.models.qwen4_exp import (
+    BatchQSAKVCache,
     GatedResidual,
     Model,
     ModelArgs,
@@ -554,6 +555,321 @@ class TestQwen4Exp(unittest.TestCase):
         self.assertEqual(output[f"{prefix}.gate_proj.weight"].shape, (4, 8, 16))
         self.assertEqual(output[f"{prefix}.up_proj.weight"].shape, (4, 8, 16))
         self.assertEqual(output[f"{prefix}.down_proj.weight"].shape, down.shape)
+
+
+class TestQSALeftPaddedBatch(unittest.TestCase):
+    """QSA geometry for a merged batch of unequal-length prompts.
+
+    ``BatchKVCache.offset`` is LOGICAL -- the physical write index minus that
+    row's left padding -- while ``index_keys`` and the KV columns are PHYSICAL
+    and shared across the batch.  Until 2026-08-27 the indexer mixed the two:
+    ``q_pos`` was logical while the block starts and token positions stayed
+    physical, so a padded row's blocks sat off its own keys.  Prompts of
+    length 7 and 3, merged and decoded one token, produced a causal row of
+    ``[F,F,F,F,T,T,T,T]`` and a QSA row of ``[F]*8`` -- a fully masked SDPA
+    row for that request.  Latent while serving runs at concurrency 1; live
+    the moment batch serving is enabled.
+
+    ``tiny_args`` has compress_ratio 4 and indexer_budget 8, so block_topk is
+    2 and the mask is dense by construction up to 11 cached tokens and
+    genuinely sparse past it.  The cases below straddle that boundary, and
+    each asserts the sparsity is real so the comparisons cannot go vacuous.
+    """
+
+    # Mixed widths so a left-padded cache is exercised by multi-token chunks
+    # as well as single-token decodes.
+    CHUNKS = ([20], [21], [22, 23, 24], [25], [26, 27], [28], [29, 30])
+
+    PROMPTS = (
+        [[1, 2, 3, 4, 5, 6, 7], [8, 9, 10]],
+        [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]],
+        [[1, 2], [3, 4, 5, 6, 7, 8, 9], [10, 11, 12, 13]],
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17]],
+    )
+
+    def _model(self):
+        mx.random.seed(11)
+        return TextModel(tiny_args(ple_layer_ids=[2]))
+
+    @contextmanager
+    def _capture(self):
+        """Record every ``(causal_mask, qsa_mask)`` pair the indexer builds."""
+        records = []
+        original = QSAIndexer.__call__
+
+        def spy(indexer, hidden, causal_mask, cache, projected_qk=None):
+            out = original(
+                indexer, hidden, causal_mask, cache, projected_qk=projected_qk
+            )
+            records.append(
+                (
+                    None if causal_mask is None else np.asarray(causal_mask),
+                    None if out is None else np.asarray(out),
+                )
+            )
+            return out
+
+        QSAIndexer.__call__ = spy
+        try:
+            yield records
+        finally:
+            QSAIndexer.__call__ = original
+
+    def _steps(self, model, cache, chunks, records):
+        """Run ``chunks`` through ``cache``, returning (masks, logits) each."""
+        steps = []
+        for chunk in chunks:
+            del records[:]
+            logits = model(mx.array(chunk, dtype=mx.int32), cache=cache)
+            mx.eval(logits)
+            steps.append((list(records), np.asarray(logits)))
+        return steps
+
+    def _batch(self, model, prompts, records):
+        """Prefill each prompt on its own cache, merge, then run CHUNKS."""
+        caches = []
+        for prompt in prompts:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        batch = _merge_caches(caches)
+        padding = [
+            layer.left_padding.tolist()
+            for layer in batch
+            if isinstance(layer, BatchQSAKVCache)
+        ]
+        self.assertTrue(padding, "the merge produced no batched QSA cache")
+        self.assertEqual(len(set(map(tuple, padding))), 1)
+        rows = len(prompts)
+        steps = self._steps(
+            model, batch, [[list(c)] * rows for c in self.CHUNKS], records
+        )
+        return batch, padding[0], steps
+
+    def _single(self, model, prompt, records):
+        """The same chunks on one sequence; the prefill step is dropped."""
+        cache = model.make_cache()
+        chunks = [[prompt]] + [[list(c)] for c in self.CHUNKS]
+        return self._steps(model, cache, chunks, records)[1:]
+
+    def test_merged_prompts_leave_no_fully_masked_row(self):
+        # The reported repro, asserted directly: prompts of length 7 and 3
+        # merged, then decoded.  Row 1 carries four padding columns.
+        model = self._model()
+        with self._capture() as records:
+            _, padding, steps = self._batch(model, self.PROMPTS[0], records)
+        self.assertEqual(padding, [0, 4])
+        queries = 0
+        for index, (masks, _) in enumerate(steps):
+            self.assertTrue(masks, f"step {index} ran no attention layer")
+            for layer, (causal, sparse) in enumerate(masks):
+                where = f"step {index} layer {layer}"
+                # A batch cache always builds a mask, even for one token.
+                self.assertIsNotNone(causal, where)
+                self.assertIsNotNone(sparse, where)
+                self.assertEqual(sparse.shape, causal.shape, where)
+                # QSA only ever removes causal cells; it never adds one.
+                self.assertFalse(bool((sparse & ~causal).any()), where)
+                for row in range(sparse.shape[0]):
+                    for query in range(sparse.shape[2]):
+                        self.assertEqual(
+                            bool(sparse[row, 0, query].any()),
+                            bool(causal[row, 0, query].any()),
+                            f"{where} row {row} query {query}",
+                        )
+                        queries += 1
+        self.assertGreater(queries, 0)
+
+    def test_merged_prompts_are_dense_below_the_block_boundary(self):
+        # 7 cached + up to 4 more stays at or under the 11-token dense
+        # boundary, where the QSA mask must equal the causal mask exactly --
+        # including its left-padding term.
+        model = self._model()
+        with self._capture() as records:
+            _, padding, steps = self._batch(model, self.PROMPTS[0], records)
+        self.assertEqual(padding, [0, 4])
+        total = max(len(p) for p in self.PROMPTS[0])
+        compared = 0
+        for index, (masks, _) in enumerate(steps):
+            total += len(self.CHUNKS[index])
+            if total > 11:
+                break
+            for layer, (causal, sparse) in enumerate(masks):
+                np.testing.assert_array_equal(
+                    sparse, causal, f"step {index} layer {layer}"
+                )
+                compared += 1
+        self.assertGreater(compared, 0)
+
+    def _assert_rows_match(self, padding, batch_steps, singles):
+        """Every row's QSA mask equals its own single-sequence mask.
+
+        Returns the causal cells QSA removed PER ROW, so a caller can assert
+        the comparison was not made in the dense regime -- where any
+        implementation that returns the causal mask would pass -- for the
+        padded rows specifically, not just for the batch as a whole.
+        """
+        dropped = [0] * len(singles)
+        layers = len(batch_steps[0][0])
+        self.assertGreater(layers, 0, "no attention layer was recorded")
+        for row, single_steps in enumerate(singles):
+            pad = padding[row]
+            # ``zip`` truncates, so a dropped trailing step or layer would
+            # silently shrink the comparison instead of failing it.
+            self.assertEqual(len(single_steps), len(batch_steps))
+            for index, (batch_step, single_step) in enumerate(
+                zip(batch_steps, single_steps)
+            ):
+                self.assertEqual(len(batch_step[0]), layers, f"step {index}")
+                self.assertEqual(len(single_step[0]), layers, f"step {index}")
+                for layer, (batched, reference) in enumerate(
+                    zip(batch_step[0], single_step[0])
+                ):
+                    causal, sparse = batched
+                    where = f"row {row} step {index} layer {layer}"
+                    got = sparse[row]
+                    want = reference[1]
+                    if want is None:
+                        # ``create_attention_mask`` returns None for a
+                        # single-token decode on an unpadded cache and QSA
+                        # passes that through when every cached position is
+                        # selected: an all-true row.
+                        want = np.ones(
+                            got.shape[:-1] + (got.shape[-1] - pad,), dtype=bool
+                        )
+                    else:
+                        want = want[0]
+                    self.assertFalse(
+                        bool(got[..., :pad].any()),
+                        f"{where}: attended its own left padding",
+                    )
+                    np.testing.assert_array_equal(got[..., pad:], want, where)
+                    dropped[row] += int((causal[row] & ~sparse[row]).sum())
+        return dropped
+
+    def test_batch_rows_match_their_single_sequence_masks(self):
+        for prompts in self.PROMPTS:
+            with self.subTest(lengths=[len(p) for p in prompts]):
+                model = self._model()
+                with self._capture() as records:
+                    _, padding, batch_steps = self._batch(model, prompts, records)
+                    singles = [self._single(model, p, records) for p in prompts]
+                dropped = self._assert_rows_match(padding, batch_steps, singles)
+                # Equality is only meaningful where QSA actually goes sparse,
+                # and the padded rows are the ones the fix is about, so every
+                # row's own logical total must cross the dense boundary.
+                self.assertTrue(all(dropped), f"dense-only rows: {dropped}")
+
+    def test_right_padded_continuation_makes_min_left_padding_positive(self):
+        """``min(left_padding) == 0`` is NOT an invariant.
+
+        ``merge()`` and ``filter()`` do leave a zero minimum, but the row
+        carrying the zero left padding and the row carrying the zero right
+        padding need not be the same one, so ``finalize()`` can lift the
+        minimum: histories of 10 and 5 tokens merge to ``left_padding``
+        ``[0, 5]``, and a right-padded continuation of 1 and 5 tokens
+        finalizes to ``[4, 5]``.  The shared block grid is then an upper
+        bound, not a per-row count -- surplus blocks must stay causally
+        invalid for every row.  (Found by adversarial review, 2026-08-27.)
+
+        This case uses an attention-only model on purpose.  A right-padded
+        lane also advances the GDN and PLE recurrent state by its filler
+        tokens, which the batch generator undoes with its own state
+        checkpoints rather than with the cache roll; including those layers
+        here would test that machinery, not QSA geometry.
+        """
+        mx.random.seed(11)
+        model = TextModel(
+            tiny_args(ple_layer_ids=[], layer_types=["full_attention"] * 4)
+        )
+        histories = [list(range(1, 11)), list(range(20, 25))]
+        continuations = [[40], [41, 42, 43, 44, 45]]
+        decode = [[[t]] * len(histories) for t in (50, 51, 52)]
+        with self._capture() as records:
+            caches = []
+            for prompt in histories:
+                cache = model.make_cache()
+                mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+                caches.append(cache)
+            batch = _merge_caches(caches)
+            lengths = [len(c) for c in continuations]
+            width = max(lengths)
+            for layer in batch:
+                layer.prepare(
+                    lengths=lengths,
+                    right_padding=[width - length for length in lengths],
+                )
+            mx.eval(
+                model(
+                    _right_pad_prompts(continuations, max_length=width),
+                    cache=batch,
+                )
+            )
+            for layer in batch:
+                layer.finalize()
+            padding = next(
+                layer.left_padding.tolist()
+                for layer in batch
+                if isinstance(layer, BatchQSAKVCache)
+            )
+            self.assertEqual(padding, [4, 5])
+            self.assertGreater(min(padding), 0)
+            batch_steps = self._steps(model, batch, decode, records)
+            singles = [
+                self._steps(
+                    model,
+                    model.make_cache(),
+                    [[history + continuation]]
+                    + [[[t]] for t in (50, 51, 52)],
+                    records,
+                )[1:]
+                for history, continuation in zip(histories, continuations)
+            ]
+        dropped = self._assert_rows_match(padding, batch_steps, singles)
+        self.assertTrue(all(dropped), f"dense-only rows: {dropped}")
+        self._assert_logits_match(batch_steps, singles)
+
+    def _assert_logits_match(self, batch_steps, singles):
+        for row, single_steps in enumerate(singles):
+            self.assertEqual(len(single_steps), len(batch_steps))
+            for index, (batch_step, single_step) in enumerate(
+                zip(batch_steps, single_steps)
+            ):
+                got, want = batch_step[1][row], single_step[1][0]
+                where = f"row {row} step {index}"
+                # ``assert_allclose`` defaults to equal_nan=True, which would
+                # pass an all-masked row on both sides.
+                self.assertTrue(np.isfinite(got).all(), f"{where}: batch")
+                self.assertTrue(np.isfinite(want).all(), f"{where}: single")
+                np.testing.assert_allclose(
+                    got, want, rtol=0, atol=2e-4, err_msg=where
+                )
+
+    def test_batch_row_logits_match_single_sequence_decode(self):
+        for prompts in self.PROMPTS:
+            with self.subTest(lengths=[len(p) for p in prompts]):
+                model = self._model()
+                with self._capture() as records:
+                    _, _, batch_steps = self._batch(model, prompts, records)
+                    singles = [self._single(model, p, records) for p in prompts]
+                self._assert_logits_match(batch_steps, singles)
+
+    def test_batch_index_ledger_desync_is_refused(self):
+        # The block columns address ``index_keys`` by PHYSICAL position, so a
+        # ledger out of step with the write index would silently pool a
+        # shifted history.  Fail loudly instead.
+        model = self._model()
+        caches = []
+        for prompt in ([1, 2, 3, 4, 5, 6, 7], [8, 9, 10]):
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        batch = _merge_caches(caches)
+        for layer in batch:
+            if isinstance(layer, BatchQSAKVCache):
+                layer.index_keys = layer.index_keys[:, :-1]
+        with self.assertRaisesRegex(RuntimeError, "index_keys desync"):
+            mx.eval(model(mx.array([[9], [9]], dtype=mx.int32), cache=batch))
 
 
 if __name__ == "__main__":

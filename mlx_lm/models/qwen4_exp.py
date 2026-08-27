@@ -63,23 +63,30 @@ _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 #      total), so token_block[t] = t//r is unclamped, and that block ends at
 #      (t//r)*r + r - 1 <= complete - 1 <= p, hence valid by (1).
 #      So every causal (b, l, t) is set in ``sparse`` and the AND is a no-op.
-# The converse also holds -- ``sparse`` sets t > p for the clamped incomplete
-# tail -- which is why the short-circuit returns ``causal_mask`` itself (None
-# included: ``create_attention_mask`` returns None only for a 1-token decode,
-# where every cached t <= p) and never an all-true mask.  For a batch cache
-# that keeps the left padding out of the mask, returning ``causal_mask``
-# preserves that padding term exactly.
+# The identity is one-directional: ``sparse`` is never NARROWER than causal on
+# the valid cells, but it can be WIDER.  ``token_block`` clamps a logical key
+# past the last closed block down into that block, so a future t > p can ride
+# in on a selected block (r=4, total=10, left_pad=1, p=7, t=8).  That is
+# exactly why the short-circuit returns ``causal_mask`` itself and never an
+# all-true mask (None included: ``create_attention_mask`` returns None only
+# for a 1-token decode on an unpadded cache, where no future column exists at
+# all).  For a batch cache, which keeps the left padding out of its mask,
+# returning ``causal_mask`` preserves that padding term exactly.
 #
-# Two guards, both provable:
-#  * MTP shared top-k reuses a k-wide index set from an earlier step, so it is
-#    dense only when that set still covers every block: shared.shape[-1] ==
-#    n_blocks (which already implies n_blocks <= block_topk).  A block closed
-#    mid-cycle is NOT in the shared set and NOT in the tail, so the stale mask
-#    is genuinely sparser than causal there.
-#  * A left-padded batch cache is excluded (_qsa_positions_are_physical):
-#    ``q_pos`` is then logical (offset = _idx - left_padding) while ``starts``
-#    and ``token_pos`` are physical, so the two halves of the mask disagree by
-#    the padding width and the identity above does not hold.
+# One guard, provable: MTP shared top-k reuses a k-wide index set from an
+# earlier step, so it is dense only when that set still covers every block:
+# shared.shape[-1] == n_blocks (which already implies n_blocks <= block_topk).
+# A block closed mid-cycle is NOT in the shared set and NOT in the tail, so
+# the stale mask is genuinely sparser than causal there.
+#
+# The proof is written in the indexer's LOGICAL coordinates, so it covers a
+# left-padded batch row for row.  Physical column j of row b holds logical
+# position ``j - left_padding[b]``, the causal mask admits exactly
+# ``0 <= t <= p``, and step (3)'s ``complete <= n_blocks*r`` still holds
+# because that row's own block count is at most the shared ``n_blocks``.
+# (Before 2026-08-27 it did not: ``q_pos`` was logical while ``starts`` and
+# ``token_pos`` were physical, which made the stock sparse mask itself wrong
+# for a left-padded row -- see QSAIndexer.__call__.)
 _QSA_DENSE_SHORTCIRCUIT = _env_flag("MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT")
 
 # MLX_QWEN4_QSA_FUSED_PROJ (2026-08-27 decode-decomposition lever): run every
@@ -1001,30 +1008,6 @@ class QSAKVCache(KVCache):
         return super().nbytes + (0 if self.index_keys is None else self.index_keys.nbytes)
 
 
-def _qsa_positions_are_physical(cache) -> bool:
-    """True when the indexer's ``q_pos`` indexes the same axis as the cached
-    keys, i.e. the cache carries no left padding.
-
-    A left-padded batch cache reports a LOGICAL offset (``_idx`` minus the
-    padding) while block starts and token positions stay physical, so the two
-    halves of the QSA mask are shifted apart and the dense identity fails.
-    The answer is memoized against the ``left_padding`` array itself, which is
-    always rebound (never mutated) by prepare/filter/extend/merge, so the
-    ``.item()`` sync happens once per batch reconfiguration, not per token.
-    """
-    if cache is None or type(cache) is QSAKVCache:
-        return True
-    padding = getattr(cache, "left_padding", None)
-    if padding is None:
-        return False
-    memo = getattr(cache, "_qsa_left_pad_free", None)
-    if memo is not None and memo[0] is padding:
-        return memo[1]
-    free = padding.size == 0 or padding.max().item() == 0
-    cache._qsa_left_pad_free = (padding, free)
-    return free
-
-
 class QSAIndexer(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -1060,11 +1043,46 @@ class QSAIndexer(nn.Module):
             pooled, starts[None, :], self.rotary_dim, self.rope_theta
         )
 
-    def _dense_by_construction(self, n_blocks, shared_topk, cache) -> bool:
-        """True when the sparse mask this call would build equals the causal
-        mask exactly.  See the MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT proof."""
-        if not _qsa_positions_are_physical(cache):
-            return False
+    def _pool_blocks_left_padded(
+        self, all_raw: mx.array, n_blocks: int, starts: mx.array, left_pad
+    ) -> mx.array:
+        """Pool logical blocks out of a left-padded physical key ledger.
+
+        Row ``b``'s logical block ``n`` occupies physical columns
+        ``[left_pad[b] + n*r, left_pad[b] + (n+1)*r)``, so gather each row's
+        own columns before pooling.  ``n_blocks`` is sized off the physical
+        width, an upper bound on any row's own block count, so a padded row's
+        trailing gathers run past the ledger and are clamped here.
+
+        A clamped block IS pooled and scored -- what it can never do is reach
+        the returned mask.  Row ``b``'s deepest query sits at logical
+        ``total - 1 - left_pad[b]``, and a block clamps exactly when
+        ``left_pad[b] + block_end > total - 1``, i.e. when
+        ``block_end > total - 1 - left_pad[b] >= q_pos``: precisely the
+        condition under which ``valid_blocks`` rejects it.  A NaN or Inf from
+        garbage keys is block-local and is overwritten by the ``-inf`` in
+        ``mx.where(valid_blocks, ...)``; an invalid id that ``argpartition``
+        still returns (there can be fewer than ``k`` valid blocks) is dropped
+        by ``chosen & valid_blocks``.
+        """
+        batch, total, _ = all_raw.shape
+        columns = mx.minimum(
+            left_pad[:, None, None]
+            + starts[None, :, None]
+            + mx.arange(self.compress_ratio)[None, None, :],
+            total - 1,
+        )
+        gathered = mx.take_along_axis(
+            all_raw, columns.reshape(batch, -1)[..., None], axis=1
+        )
+        return self._pool_blocks(gathered, starts)
+
+    def _dense_by_construction(self, n_blocks, shared_topk) -> bool:
+        """True when ``causal_mask & sparse == causal_mask`` for the mask this
+        call would build, i.e. when the selection removes no causal cell -- so
+        returning ``causal_mask`` is exact.  Raw ``sparse`` may still be wider
+        than causal; see the MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT proof.
+        """
         if shared_topk is None:
             return n_blocks <= self.block_topk
         # A reused index set covers every block only if it is as wide as the
@@ -1120,6 +1138,19 @@ class QSAIndexer(nn.Module):
             mask = cache.make_mask(length, return_array=True)
             return None if mask is None else mask[None, None, :, :]
         offset = 0 if cache is None else cache.offset
+        # This indexer straddles two coordinate systems and ``left_pad`` is the
+        # only bridge between them.  A BatchKVCache reports a LOGICAL, per-row
+        # ``offset`` (its physical write index minus that row's left padding)
+        # while ``index_keys`` and the KV columns are PHYSICAL and shared
+        # across the batch: physical column ``j`` of row ``b`` holds logical
+        # position ``j - left_pad[b]``.  Everything below -- block starts,
+        # block validity, the incomplete tail, both RoPE position sets -- is
+        # LOGICAL, so an unequal-length merge reproduces each row's own
+        # single-sequence geometry exactly.  Mixing the two emitted an
+        # ALL-FALSE mask row for a shorter row (2026-08-27).
+        left_pad = None
+        if isinstance(offset, mx.array):
+            left_pad = cache.left_padding.astype(offset.dtype)
         shared_topk = (
             getattr(cache, "_mtp_shared_topk", None) if cache is not None else None
         )
@@ -1136,21 +1167,42 @@ class QSAIndexer(nn.Module):
             # a later step that does cross the budget can pool every block.
             all_raw = raw if cache is None else cache.update_index_keys(raw)
             total = all_raw.shape[1]
+            if left_pad is not None and total != cache._idx + length:
+                # Same contract as the pooled-key cache check below, for the
+                # batch ledger: raw keys out of step with the PHYSICAL write
+                # index mean block columns no longer address the keys they
+                # name.  Fail loudly rather than pool a shifted history.
+                raise RuntimeError(
+                    "QSA index_keys desync: "
+                    f"{total} raw keys != physical index {cache._idx} "
+                    f"+ {length} new"
+                )
         else:
             # The current draft token is transient and will be rewound before
             # any accepted span is teacher-forced next cycle.  Skipping its raw
             # index key is therefore safe and is what removes the indexer work.
-            total = (
-                int(offset.max().item()) + length
-                if isinstance(offset, mx.array)
-                else offset + length
-            )
+            # ``total`` counts PHYSICAL columns, so a batch cache reads its
+            # write index, not its (per-row, left-padding-adjusted) offset.
+            total = (cache._idx if left_pad is not None else offset) + length
 
+        # One logical block grid, shared by every row and read off the
+        # PHYSICAL width so it costs no host sync.  It is an upper bound, not
+        # a per-row count: row b closes (total - left_padding[b]) // r blocks.
+        # merge() and filter() do leave min(left_padding) at 0, but finalize()
+        # need not -- the row holding the zero left padding and the row holding
+        # the zero right padding can differ, so a right-padded continuation of
+        # an already-left-padded batch (histories [10, 5], continuations
+        # [1, 5]) lands on left_padding [4, 5].  Over-counting is contained:
+        # a surplus block ends past every row's deepest query, so valid_blocks
+        # rejects it for every row (see _pool_blocks_left_padded), and the
+        # dense short-circuit below only declines more often.  The cost is
+        # pooling and scoring up to min(left_padding) // r blocks nothing
+        # reads.
         n_blocks = total // self.compress_ratio
         if n_blocks == 0:
             return causal_mask
         if _QSA_DENSE_SHORTCIRCUIT and self._dense_by_construction(
-            n_blocks, shared_topk, cache
+            n_blocks, shared_topk
         ):
             if shared_topk is None and getattr(cache, "_mtp_share_topk", False):
                 # An MTP cycle opening on a dense step must still hand the
@@ -1164,10 +1216,14 @@ class QSAIndexer(nn.Module):
                 )
             return causal_mask
 
-        if isinstance(offset, mx.array):
+        if left_pad is not None:
             q_pos = offset[:, None] + mx.arange(length)[None, :]
+            # Negative for a row's left padding, which is not a key of that
+            # row at all; the ``>= 0`` term at the bottom drops those columns.
+            token_logical = mx.arange(total)[None, :] - left_pad[:, None]
         else:
             q_pos = mx.arange(offset, offset + length)[None, :]
+            token_logical = mx.arange(total)[None, :]
         if shared_topk is None:
             q = self.q_layernorm(
                 q.reshape(batch, length, self.n_heads, self.head_dim)
@@ -1180,7 +1236,11 @@ class QSAIndexer(nn.Module):
             (starts + self.compress_ratio - 1)[None, None, :] <= q_pos[..., None]
         )
         if shared_topk is None:
-            pooled = self._pooled_keys(all_raw, n_blocks, starts, cache, length)
+            pooled = (
+                self._pool_blocks_left_padded(all_raw, n_blocks, starts, left_pad)
+                if left_pad is not None
+                else self._pooled_keys(all_raw, n_blocks, starts, cache, length)
+            )
             scores = mx.einsum(
                 "blhd,bnd->blnh", q.astype(mx.float32), pooled.astype(mx.float32)
             )
@@ -1209,16 +1269,23 @@ class QSAIndexer(nn.Module):
                 selected[..., None] == block_ids[None, None, None, :], axis=-2
             )
         chosen = chosen & valid_blocks
-        token_pos = mx.arange(total)
-        token_block = mx.minimum(token_pos // self.compress_ratio, n_blocks - 1)
+        # ``clip`` where the unpadded path clamped: the lower bound only bites
+        # on left padding, whose columns the ``>= 0`` term below removes.
+        token_block = mx.clip(
+            token_logical // self.compress_ratio, 0, n_blocks - 1
+        )
         selected_tokens = mx.take_along_axis(
-            chosen, mx.broadcast_to(token_block[None, None, :], (batch, length, total)), axis=-1
+            chosen,
+            mx.broadcast_to(token_block[:, None, :], (batch, length, total)),
+            axis=-1,
         )
         complete = ((q_pos + 1) // self.compress_ratio) * self.compress_ratio
-        tail = (token_pos[None, None, :] >= complete[..., None]) & (
-            token_pos[None, None, :] <= q_pos[..., None]
+        tail = (token_logical[:, None, :] >= complete[..., None]) & (
+            token_logical[:, None, :] <= q_pos[..., None]
         )
         sparse = selected_tokens | tail
+        if left_pad is not None:
+            sparse = sparse & (token_logical[:, None, :] >= 0)
         sparse = sparse[:, None, :, :]
         # ``create_attention_mask`` deliberately returns ``None`` for a
         # single-token decode because every cached position is causal.  QSA
