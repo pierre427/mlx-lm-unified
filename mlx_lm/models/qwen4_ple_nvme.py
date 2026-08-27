@@ -37,8 +37,10 @@ import hashlib
 import json
 import os
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +57,17 @@ PREFILL_ID_THRESHOLD = 512
 DECODE_WORKERS = 16
 PREFILL_WORKERS = 64
 PREFETCH_WORKERS = 16
+
+
+@dataclass(frozen=True)
+class LookupStats:
+    """Foreground lookup counters (prefetch reads are not counted)."""
+
+    lookups: int
+    rows: int
+    unique_rows: int
+    bytes_read: int
+    elapsed_seconds: float
 
 
 def bf16_bits_to_f32(bits: np.ndarray) -> np.ndarray:
@@ -120,6 +133,7 @@ def _source_shard_refs(model_path, manifest):
     refs = {}
     for file_name in files:
         header, data_offset = _read_safetensors_header(model_path / file_name)
+        file_size = os.path.getsize(model_path / file_name)
         for name, info in header.items():
             if not name.startswith(prefix + ".shard_"):
                 continue
@@ -127,6 +141,13 @@ def _source_shard_refs(model_path, manifest):
             part = name.rsplit(".", 1)[1]
             start, end = info["data_offsets"]
             rows = info["shape"][0]
+            if rows <= 0 or end <= start:
+                raise ValueError(f"{name} has an empty tensor in {file_name}")
+            if start < 0 or data_offset + end > file_size:
+                raise ValueError(
+                    f"{name} byte range [{start}, {end}) exceeds {file_name} "
+                    f"({file_size} bytes)"
+                )
             refs.setdefault(shard_index, {})[part] = (
                 model_path / file_name,
                 data_offset + start,
@@ -227,7 +248,49 @@ def load_manifest(sidecar_path: str) -> dict:
         raise ValueError(
             f"unsupported PLE sidecar manifest version {manifest.get('version')}"
         )
+    _validate_manifest_geometry(manifest)
     return manifest
+
+
+def _validate_manifest_geometry(manifest: dict) -> None:
+    """Reject a manifest whose declared layout is internally inconsistent.
+
+    The digest and spot checks bind the sidecar to the artifact; this binds
+    the addressing arithmetic (row width, strides, shard split) before any
+    field is used to compute a file offset.
+    """
+    quant = {key: manifest.get(key) for key in ("bits", "group_size", "mode")}
+    if quant != {"bits": 4, "group_size": 32, "mode": "affine"}:
+        raise ValueError(f"unsupported PLE sidecar quantization: {quant}")
+    dims = manifest.get("dims", 0)
+    if dims <= 0 or dims % 32:
+        raise ValueError(f"PLE sidecar dims={dims} must be a positive multiple of 32")
+    groups = dims // 32
+    expected = {
+        "weight_bytes": dims // 2,
+        "scales_bytes": groups * 2,
+        "biases_bytes": groups * 2,
+        "row_bytes": dims // 2 + 2 * groups * 2,
+    }
+    for field, value in expected.items():
+        if manifest.get(field) != value:
+            raise ValueError(
+                f"PLE sidecar {field}={manifest.get(field)} does not match "
+                f"dims={dims} (expected {value})"
+            )
+    num_shards = manifest.get("num_shards", 0)
+    rows_per_shard = manifest.get("rows_per_shard", 0)
+    if num_shards <= 0 or rows_per_shard <= 0:
+        raise ValueError("PLE sidecar shard counts must be positive")
+    if manifest.get("total_rows") != num_shards * rows_per_shard:
+        raise ValueError(
+            f"PLE sidecar total_rows={manifest.get('total_rows')} != "
+            f"{num_shards} shards x {rows_per_shard} rows"
+        )
+    if manifest.get("data_offset", -1) < 0:
+        raise ValueError("PLE sidecar data_offset must be non-negative")
+    if len(manifest.get("shard_sha256", [])) != num_shards:
+        raise ValueError("PLE sidecar manifest needs one sha256 per shard")
 
 
 def index_json_sha256(model_path) -> str:
@@ -325,6 +388,12 @@ class FileBackedShardedEmbedding(nn.Module):
         # fork cannot inherit dead executor threads unnoticed.
         self._lifecycle_lock = threading.Lock()
         self._closed = False
+        # Counters mutate only on the forward (lookup) thread.
+        self._stat_lookups = 0
+        self._stat_rows = 0
+        self._stat_unique_rows = 0
+        self._stat_bytes = 0
+        self._stat_elapsed = 0.0
         self._open_resources()
 
     def _open_resources(self):
@@ -452,13 +521,30 @@ class FileBackedShardedEmbedding(nn.Module):
         return mx.dequantize(w, s, b, group_size=32, bits=4, mode="affine")
 
     def lookup_numpy(self, indices: np.ndarray) -> mx.array:
+        started = time.perf_counter()
         shape = indices.shape
         flat = np.asarray(indices, dtype=np.int64).reshape(-1)
         unique, inverse = np.unique(flat, return_inverse=True)
         rows = self._read_rows(unique, self._workers_for(flat.size))
         values = self._dequant(rows)
-        return values[mx.array(inverse.astype(np.int64))].reshape(
+        result = values[mx.array(inverse.astype(np.int64))].reshape(
             *shape, self.dims
+        )
+        self._stat_lookups += 1
+        self._stat_rows += int(flat.size)
+        self._stat_unique_rows += int(unique.size)
+        self._stat_bytes += int(unique.size) * self.row_bytes
+        self._stat_elapsed += time.perf_counter() - started
+        return result
+
+    @property
+    def stats(self) -> LookupStats:
+        return LookupStats(
+            self._stat_lookups,
+            self._stat_rows,
+            self._stat_unique_rows,
+            self._stat_bytes,
+            self._stat_elapsed,
         )
 
     def __call__(self, indices: mx.array) -> mx.array:

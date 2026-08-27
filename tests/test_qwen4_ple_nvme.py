@@ -24,6 +24,8 @@ from mlx_lm.models.qwen4_ple_nvme import (
     bf16_bits_to_f32,
     dequant_rows_numpy,
     f32_to_bf16_bits,
+    load_manifest,
+    spot_check_sidecar_rows,
     verify_sidecar_against_artifact,
 )
 
@@ -202,6 +204,70 @@ class TestQwen4PleNvme(unittest.TestCase):
                 f.write(b"\x00")
             with self.assertRaisesRegex(ValueError, "size"):
                 verify_sidecar_against_artifact(str(copied), self.model_dir)
+
+    def test_builder_refuses_published_fp8_layout(self):
+        with TemporaryDirectory() as tmp:
+            fp8_dir = Path(tmp)
+            prefix = (
+                "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+            )
+            tensors = {
+                f"{prefix}.shard_0.weight": mx.to_fp8(mx.ones((4, 160))),
+                f"{prefix}.weight_scale": mx.array([0.5], dtype=mx.bfloat16),
+            }
+            mx.save_safetensors(str(fp8_dir / "model.safetensors"), tensors)
+            (fp8_dir / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {},
+                        "weight_map": {k: "model.safetensors" for k in tensors},
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "FP8 layout"):
+                builder.collect_shards(fp8_dir)
+
+    def test_manifest_geometry_is_validated(self):
+        cases = (
+            ({"bits": 8}, "quantization"),
+            ({"mode": "mxfp4"}, "quantization"),
+            ({"dims": 168}, "multiple of 32"),
+            ({"row_bytes": 99}, "does not match"),
+            ({"weight_bytes": 84}, "does not match"),
+            ({"total_rows": 89}, "shards x"),
+            ({"num_shards": 0}, "positive"),
+            ({"data_offset": -1}, "non-negative"),
+            ({"shard_sha256": ["0" * 64]}, "one sha256 per shard"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with TemporaryDirectory() as tmp:
+                    copied = Path(tmp) / "ple_rows.bin"
+                    shutil.copy(self.sidecar, copied)
+                    manifest_file = Path(str(copied) + ".manifest.json")
+                    manifest = json.loads(
+                        Path(str(self.sidecar) + ".manifest.json").read_text()
+                    )
+                    manifest.update(overrides)
+                    manifest_file.write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(ValueError, message):
+                        verify_sidecar_against_artifact(
+                            str(copied), self.model_dir
+                        )
+
+    def test_truncated_source_file_is_refused_by_range_check(self):
+        manifest = load_manifest(str(self.sidecar))
+        with TemporaryDirectory() as tmp:
+            broken_dir = Path(tmp) / "model"
+            shutil.copytree(self.model_dir, broken_dir)
+            for weights_file in broken_dir.glob("*.safetensors"):
+                _, data_offset = builder.read_safetensors_header(weights_file)
+                with open(weights_file, "r+b") as f:
+                    f.truncate(data_offset + 10)
+            with self.assertRaisesRegex(ValueError, r"byte range .* exceeds"):
+                spot_check_sidecar_rows(
+                    str(self.sidecar), broken_dir, manifest, num_random=4
+                )
 
     # ------------------------------------------------------------------
     # Dequantization parity
