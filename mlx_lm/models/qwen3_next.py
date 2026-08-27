@@ -89,6 +89,19 @@ def _proj_signature(module):
     return None
 
 
+def _proj_identity(module):
+    """Identity key of every array a projection contributes to a table.
+
+    Scales and biases are included so a partial ``update()`` that replaces
+    only them (weight untouched) still invalidates the lazy tables.
+    """
+    return (
+        module["weight"],
+        getattr(module, "scales", None),
+        getattr(module, "biases", None),
+    )
+
+
 def _proj_table(module):
     """(weight, scales, biases, group_size, bits, mode) view of a projection."""
     if _proj_signature(module)[0] == "quantized":
@@ -510,7 +523,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             self.shared_expert.down_proj,
         )
         sources = routed + (shared if folded else ())
-        key = tuple(m["weight"] for m in sources)
+        key = tuple(part for m in sources for part in _proj_identity(m))
         cached = self._moe_lever_cache.get((fused, folded))
         if (
             cached is not None

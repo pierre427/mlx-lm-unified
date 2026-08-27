@@ -21,10 +21,13 @@
 #                        family to the gather family (fp32 gap = M5 NAX
 #                        TF32 path; <= 2e-7 with MLX_ENABLE_TF32=0).
 #                        Measured <= 1.5e-3 of output scale => tolerance.
-#   qsa_fused_proj       BIT-IDENTICAL (plain qmm -> one wider plain qmm,
-#                        same kernel family); asserted bitwise in
-#                        tests/test_qwen4_exp_levers.py as its promotion
-#                        basis for the bench's bitwise set.
+#   qsa_fused_proj       BIT-IDENTICAL at tiny scale, but TOLERANCE-class
+#                        (2026-08-27 review): mlx qmm dispatch is width-
+#                        dependent (quantized.cpp:102/:907 — split-K and
+#                        qmv/qmm crossovers differ between the stock 512-
+#                        wide and fused 13952-wide ops), so toy shapes
+#                        cannot establish production bitwise.  Tests in
+#                        tests/test_qwen4_exp_levers.py.
 
 import unittest
 from contextlib import contextmanager
@@ -205,6 +208,28 @@ class TestMoESharedInGather(unittest.TestCase):
             actual = block(x)
         _bytes_equal(self, actual, expected)
         self.assertIsNone(block._moe_lever_cache[(False, True)][1])
+
+    def test_tables_track_partial_scales_update(self):
+        """A scales-only partial update() (weights untouched) must also
+        invalidate the lazy tables — the identity key covers weight,
+        scales, and biases."""
+        block = _moe_block(True)
+        x = mx.random.normal((1, 3, 64), key=mx.random.key(6)).astype(
+            mx.bfloat16
+        )
+        with lever(qwen3_next, "_MOE_FUSED_GATE_UP"), lever(
+            qwen3_next, "_MOE_SHARED_IN_GATHER"
+        ):
+            stale = block(x)
+            mx.eval(stale)  # tables built from the original scales
+            block.switch_mlp.gate_proj.update(
+                {"scales": block.switch_mlp.gate_proj.scales * 2}
+            )
+            actual = block(x)
+        expected = block(x)  # stock path, same updated scales
+        mx.eval(stale, actual, expected)
+        self.assertGreater(_scaled_err(expected, stale), 1e-2)  # real change
+        self.assertLess(_scaled_err(actual, expected), 3e-3)
 
     def test_tables_track_weight_replacement(self):
         block = _moe_block(False)

@@ -23,6 +23,7 @@ from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 from .qwen3_next import (
     _concat_tables,
     _env_flag,
+    _proj_identity,
     _proj_signature,
     _proj_table,
 )
@@ -46,6 +47,13 @@ _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 # occupancy-bound operating point, and this lever settles it empirically.
 # Trade documented: MTP shared-top-k steps and sink-window MTP skip the
 # separate indexer projection; the fused matmul always includes that slice.
+# Gate class: TOLERANCE, not bitwise (demoted 2026-08-27 review).  Tiny-
+# scale outputs measured bit-identical, but mlx's qmm dispatch is width-
+# dependent (mlx-src/mlx/backend/metal/quantized.cpp:102 thresholds,
+# :907 split-K selection): at M=512 the stock 512-wide K/V projections take
+# split-K=2 while the fused 13952-wide op takes non-split qmm, and the
+# qmv/qmm crossover differs at M=12-15 — regimes a toy-shape test cannot
+# see, so production shapes may not be bit-identical.
 _QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
 
 
@@ -1153,7 +1161,7 @@ class Attention(nn.Module):
             self.v_proj,
             self.indexer.index_qk_proj,
         )
-        key = tuple(m["weight"] for m in modules)
+        key = tuple(part for m in modules for part in _proj_identity(m))
         cached = self._qsa_fused_cache
         if cached is not None and all(
             new is old for new, old in zip(key, cached[0])

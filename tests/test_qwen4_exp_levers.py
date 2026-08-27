@@ -634,6 +634,16 @@ from mlx_lm.models.qwen4_exp import Attention  # noqa: E402
 
 
 class TestQSAFusedProj(unittest.TestCase):
+    """MLX_QWEN4_QSA_FUSED_PROJ — TOLERANCE-class lever (demoted from
+    bitwise, 2026-08-27 review).  The bitwise assertions below hold at THIS
+    file's tiny shapes and guard the lever's structure, but they cannot
+    establish bitwise at production shapes: mlx's qmm dispatch is width-
+    dependent (mlx-src/mlx/backend/metal/quantized.cpp:102 thresholds, :907
+    split-K selection) — at M=512 the stock 512-wide K/V projections take
+    split-K=2 while the fused 13952-wide op takes non-split qmm, and the
+    qmv/qmm crossover differs at M=12-15.  The bench gates this arm with
+    the tolerance (digest + chosen-logprob) machinery."""
+
     def _run_sequence(self, attn, chunks, share_at=None):
         cache = QSAKVCache()
         outputs = []
