@@ -197,6 +197,19 @@ class TestDepthCeilingController(unittest.TestCase):
         self.assertEqual(snapshot["depth"], 3)
         self.assertEqual(snapshot["expansions"], 1)
 
+    def test_snapshot_is_json_serializable(self):
+        # The server logs the snapshot as JSON ("Self-MTP adaptive depth:")
+        # for depth-engagement telemetry; the payload must stay serializable.
+        import json
+
+        controller = DepthCeilingController(2, 3)
+        controller.decide(max_draft=3, remaining=10)
+        controller.observe(2, 2)
+        parsed = json.loads(json.dumps(controller.snapshot(), sort_keys=True))
+        self.assertEqual(parsed["floor"], 2)
+        self.assertIn("expansions", parsed)
+        self.assertIn("last_decision", parsed)
+
 
 class TestServerAdmission(unittest.TestCase):
     """_self_mtp_config wiring for --self-mtp-adaptive-depth-ceiling."""

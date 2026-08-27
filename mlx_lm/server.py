@@ -1552,6 +1552,18 @@ class ResponseGenerator:
                         prompt_lookup_stats.rate_gate_spec_ms_per_tok,
                         prompt_lookup_stats.rate_gate_plain_ms_per_tok,
                     )
+                if self_mtp is not None:
+                    adaptive_router = self_mtp.get("speculation_router")
+                    if adaptive_router is not None:
+                        # Depth-engagement telemetry: one JSON snapshot per
+                        # adaptive request so an A/B can verify the ceiling
+                        # actually engaged (expansions/backoffs/final depth).
+                        logging.info(
+                            "Self-MTP adaptive depth: %s",
+                            json.dumps(
+                                adaptive_router.snapshot(), sort_keys=True
+                            ),
+                        )
 
             rqueue.put(None)
 
