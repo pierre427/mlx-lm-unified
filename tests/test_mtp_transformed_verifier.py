@@ -478,6 +478,47 @@ class TestTransformedEndToEnd(unittest.TestCase):
             stat = self._binned_chi2(plain[j], spec[j])
             self.assertLess(stat, 32.0, f"position={j} chi2={stat:.1f}")
 
+    def test_live_nonthinking_profile_with_presence_penalty(self):
+        # omlx #3150 / vllm-mlx #735 class: MTP + presence_penalty +
+        # moderate temperature turns into gibberish or repeated-token
+        # locks. Pin the exact live non-thinking profile (temp 0.7,
+        # top_p 0.8, top_k 20, presence_penalty 1.5): the speculative arm
+        # must match the plain arm's distribution and never degenerate
+        # into token runs the penalty forbids.
+        self.TEMP, self.TOP_P, self.TOP_K = 0.7, 0.8, 20
+
+        def procs():
+            return make_logits_processors(
+                presence_penalty=1.5, presence_context_size=20
+            )
+
+        n, new = 300, 4
+        plain = [Counter() for _ in range(new)]
+        spec = [Counter() for _ in range(new)]
+        for i in range(n):
+            mx.random.seed(60_000 + i)
+            for j, t in enumerate(self._plain(new, logits_processors=procs())):
+                plain[j][t] += 1
+            toks, _ = self._spec(910_000 + i, new, logits_processors=procs())
+            for j, t in enumerate(toks):
+                spec[j][t] += 1
+        for j in range(new):
+            stat = self._binned_chi2(plain[j], spec[j])
+            self.assertLess(stat, 32.0, f"position={j} chi2={stat:.1f}")
+
+        # Degeneration markers on a longer speculative run: with a 1.5
+        # presence penalty the same token must not lock into a long run.
+        toks, stats = self._spec(
+            914_000, 48, logits_processors=procs()
+        )
+        self.assertEqual(len(toks), 48)
+        self.assertGreater(stats.draft_proposed, 0)
+        run = max_run = 1
+        for a, b in zip(toks, toks[1:]):
+            run = run + 1 if a == b else 1
+            max_run = max(max_run, run)
+        self.assertLess(max_run, 8, toks)
+
     def test_transform_rejects_non_residual_rules(self):
         for rule in ("block", "exact"):
             gen = self_mtp_generate_step(
