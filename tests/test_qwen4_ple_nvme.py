@@ -387,6 +387,9 @@ class TestQwen4PleNvme(unittest.TestCase):
                 "unique_rows": int,
                 "bytes_read": int,
                 "elapsed_seconds": float,
+                "cache_hits": int,
+                "cache_misses": int,
+                "cache_evictions": int,
             },
         )
 
@@ -395,6 +398,161 @@ class TestQwen4PleNvme(unittest.TestCase):
         self.assertTrue(timed.stats_timing)
         timed.lookup_numpy(ids)
         self.assertGreater(timed.stats.elapsed_seconds, 0.0)
+
+    # ------------------------------------------------------------------
+    # Hot tier: LRU row cache + preheat
+    # ------------------------------------------------------------------
+
+    def load_nvme_hot(self, lru_mb="1", preheat=None):
+        with env_var("MLX_QWEN4_PLE_NVME_LRU_MB", lru_mb):
+            with env_var("MLX_QWEN4_PLE_NVME_PREHEAT", preheat):
+                return self.load_nvme()
+
+    def test_lru_cache_is_exact_and_counted(self):
+        plain = self.ngram_embedding(self.load_nvme()).ngram_embedding
+        hot = self.ngram_embedding(self.load_nvme_hot()).ngram_embedding
+        self.assertEqual(plain.lru_capacity_rows, 0)
+        self.assertGreater(hot.lru_capacity_rows, 88)
+        rng = np.random.default_rng(23)
+        ids = rng.integers(0, 88, size=(2, 7, 16))
+        first = hot.lookup_numpy(ids)
+        expected = plain.lookup_numpy(ids)
+        mx.eval(first, expected)
+        self.assertTrue(
+            mx.array_equal(
+                first.view(mx.uint16), expected.view(mx.uint16)
+            ).item()
+        )
+        stats = hot.stats
+        unique = np.unique(ids).size
+        self.assertEqual(stats.cache_misses, unique)
+        self.assertEqual(stats.bytes_read, unique * hot.row_bytes)
+
+        # The second lookup is served fully from the cache, byte-identical.
+        second = hot.lookup_numpy(ids)
+        mx.eval(second)
+        self.assertTrue(
+            mx.array_equal(
+                second.view(mx.uint16), expected.view(mx.uint16)
+            ).item()
+        )
+        stats = hot.stats
+        self.assertEqual(stats.cache_hits, unique)
+        self.assertEqual(stats.cache_misses, unique)
+        self.assertEqual(stats.bytes_read, unique * hot.row_bytes)
+
+    def test_lru_budget_bounds_entries_and_counts_evictions(self):
+        # 0.001 MB = 1048 bytes = 10 rows of 100 B.
+        hot = self.ngram_embedding(
+            self.load_nvme_hot(lru_mb="0.001")
+        ).ngram_embedding
+        self.assertEqual(hot.lru_capacity_rows, 10)
+        hot.lookup_numpy(np.arange(88))
+        self.assertLessEqual(len(hot._lru), 10)
+        self.assertEqual(hot.stats.cache_evictions, 88 - 10)
+        # Cached survivors still serve exact bytes.
+        survivors = np.asarray(sorted(hot._lru), dtype=np.int64)
+        expected = self.ngram_embedding(self.load_nvme()).ngram_embedding
+        actual = hot.lookup_numpy(survivors)
+        reference = expected.lookup_numpy(survivors)
+        mx.eval(actual, reference)
+        self.assertTrue(
+            mx.array_equal(
+                actual.view(mx.uint16), reference.view(mx.uint16)
+            ).item()
+        )
+
+    def test_lru_is_cleared_on_close_and_rebuilt_on_fork_lifecycle(self):
+        hot = self.ngram_embedding(self.load_nvme_hot()).ngram_embedding
+        hot.lookup_numpy(np.arange(16))
+        self.assertEqual(len(hot._lru), 16)
+        hot.close()
+        self.assertEqual(len(hot._lru), 0)
+
+    def test_prefetch_populates_the_lru(self):
+        hot = self.ngram_embedding(self.load_nvme_hot()).ngram_embedding
+        ids = np.arange(12)
+        for future in hot.prefetch_rows(ids):
+            future.result()
+        self.assertEqual(len(hot._lru), 12)
+        plain = self.ngram_embedding(self.load_nvme()).ngram_embedding
+        actual = hot.lookup_numpy(ids)
+        reference = plain.lookup_numpy(ids)
+        mx.eval(actual, reference)
+        self.assertTrue(
+            mx.array_equal(
+                actual.view(mx.uint16), reference.view(mx.uint16)
+            ).item()
+        )
+        stats = hot.stats
+        self.assertEqual(stats.cache_hits, 12)
+        self.assertEqual(stats.bytes_read, 0)
+
+    def test_preheat_manifest_loads_caps_and_fails_closed(self):
+        with TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "hot_rows.txt"
+            manifest.write_text(
+                "# qwen4-ple-hot-rows v1 {}\n5\n7\n5\n2\n# comment\n\n"
+            )
+            hot = self.ngram_embedding(
+                self.load_nvme_hot(preheat=str(manifest))
+            ).ngram_embedding
+            self.assertEqual(hot.preheated_rows, 3)
+            hot.lookup_numpy(np.array([2, 5, 7]))
+            self.assertEqual(hot.stats.cache_hits, 3)
+            self.assertEqual(hot.stats.bytes_read, 0)
+
+            # Budget cap: 10 rows keeps only the first (hottest) ids.
+            many = Path(tmp) / "many.txt"
+            many.write_text("\n".join(str(i) for i in range(40)) + "\n")
+            capped = self.ngram_embedding(
+                self.load_nvme_hot(lru_mb="0.001", preheat=str(many))
+            ).ngram_embedding
+            self.assertEqual(capped.preheated_rows, 10)
+            self.assertEqual(sorted(capped._lru), list(range(10)))
+
+            # Fail closed: id outside the table, and preheat without LRU.
+            bad = Path(tmp) / "bad.txt"
+            bad.write_text("88\n")
+            with self.assertRaisesRegex(ValueError, "outside the PLE table"):
+                self.load_nvme_hot(preheat=str(bad))
+            with self.assertRaisesRegex(ValueError, "requires"):
+                self.load_nvme_hot(lru_mb=None, preheat=str(manifest))
+
+    def test_hot_rows_script_matches_unchunked_hash_and_preheats(self):
+        _spec_hot = importlib.util.spec_from_file_location(
+            "build_qwen4_ple_hot_rows",
+            _REPO_ROOT / "scripts" / "build_qwen4_ple_hot_rows.py",
+        )
+        hot_rows = importlib.util.module_from_spec(_spec_hot)
+        _spec_hot.loader.exec_module(hot_rows)
+
+        embedding = hot_rows.build_ngram_embedding(self.model_dir, 0)
+        self.assertEqual(embedding.layer_idx, 1)
+        rng = np.random.default_rng(5)
+        tokens = rng.integers(0, 64, size=300)
+        tokens[::37] = 63  # sprinkle EOS segment resets
+
+        chunked = hot_rows.hash_corpus_row_counts(embedding, tokens, 7)
+        whole = hot_rows.hash_corpus_row_counts(embedding, tokens, 10_000)
+        self.assertEqual(chunked, whole)
+        self.assertTrue(all(0 <= i < 88 for i in chunked))
+        self.assertEqual(
+            sum(chunked.values()), tokens.size * embedding.ngram_heads
+        )
+
+        hottest = hot_rows.top_rows(chunked, 5)
+        self.assertEqual(len(hottest), 5)
+        counts = [chunked[i] for i in hottest]
+        self.assertEqual(counts, sorted(counts, reverse=True))
+
+        with TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "hot.txt"
+            hot_rows.write_hot_rows(manifest, hottest, {"test": True})
+            hot = self.ngram_embedding(
+                self.load_nvme_hot(preheat=str(manifest))
+            ).ngram_embedding
+            self.assertEqual(hot.preheated_rows, 5)
 
     # ------------------------------------------------------------------
     # Load path

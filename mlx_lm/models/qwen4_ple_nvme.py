@@ -39,6 +39,7 @@ import os
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,13 +62,20 @@ PREFETCH_WORKERS = 16
 
 @dataclass(frozen=True)
 class LookupStats:
-    """Foreground lookup counters (prefetch reads are not counted)."""
+    """Foreground lookup counters (prefetch reads are not counted).
+
+    ``bytes_read`` counts disk preads only; an LRU hit reads no bytes.
+    ``cache_evictions`` includes evictions caused by prefetch inserts.
+    """
 
     lookups: int
     rows: int
     unique_rows: int
     bytes_read: int
     elapsed_seconds: float
+    cache_hits: int
+    cache_misses: int
+    cache_evictions: int
 
 
 def bf16_bits_to_f32(bits: np.ndarray) -> np.ndarray:
@@ -383,6 +391,14 @@ class FileBackedShardedEmbedding(nn.Module):
         self.stats_timing = (
             os.getenv("MLX_QWEN4_PLE_NVME_STATS_TIMING") == "1"
         )
+        # Optional explicit hot tier: a bytes-capped LRU of packed rows.
+        # macOS UBC already caches the sidecar implicitly; this tier's value
+        # is immunity to page-cache eviction under memory pressure. 0 = off.
+        lru_mb = float(os.getenv("MLX_QWEN4_PLE_NVME_LRU_MB", "0"))
+        if lru_mb < 0:
+            raise ValueError("MLX_QWEN4_PLE_NVME_LRU_MB must be non-negative")
+        self.lru_capacity_rows = int(lru_mb * 2**20) // self.row_bytes
+        self.preheated_rows = 0
         self.decode_workers = int(
             os.getenv("MLX_QWEN4_PLE_NVME_DECODE_WORKERS", str(DECODE_WORKERS))
         )
@@ -394,16 +410,24 @@ class FileBackedShardedEmbedding(nn.Module):
         # fork cannot inherit dead executor threads unnoticed.
         self._lifecycle_lock = threading.Lock()
         self._closed = False
-        # Counters mutate only on the forward (lookup) thread.
+        # Counters mutate only on the forward (lookup) thread, except
+        # cache evictions, which are updated under the LRU lock.
         self._stat_lookups = 0
         self._stat_rows = 0
         self._stat_unique_rows = 0
         self._stat_bytes = 0
         self._stat_elapsed = 0.0
+        self._stat_cache_hits = 0
+        self._stat_cache_misses = 0
+        self._stat_cache_evictions = 0
         self._open_resources()
 
     def _open_resources(self):
         self._owner_pid = os.getpid()
+        # Fork safety: rebuilt (empty) in a forked child alongside the fd
+        # and pools, so a lock held by a dead parent thread cannot leak in.
+        self._lru = OrderedDict()
+        self._lru_lock = threading.Lock()
         self._fd = os.open(self.sidecar_path, os.O_RDONLY)
         self._pool = ThreadPoolExecutor(
             max_workers=max(self.decode_workers, self.prefill_workers),
@@ -447,11 +471,14 @@ class FileBackedShardedEmbedding(nn.Module):
                 return
             self._closed = True
             fd, pool, prefetch_pool = self._fd, self._pool, self._prefetch_pool
-        # Shut down outside the lock: workers never take the lock, and any
-        # submission that won the race completes before the fd closes.
+        # Shut down outside the lock: workers never take the lifecycle
+        # lock, and any submission that won the race completes before the
+        # fd closes.
         pool.shutdown(wait=True)
         prefetch_pool.shutdown(wait=True)
         os.close(fd)
+        with self._lru_lock:
+            self._lru.clear()
 
     def __del__(self):
         try:
@@ -464,7 +491,8 @@ class FileBackedShardedEmbedding(nn.Module):
             return self.prefill_workers
         return self.decode_workers
 
-    def _read_rows(self, row_ids: np.ndarray, workers: int) -> np.ndarray:
+    def _pread_rows(self, row_ids: np.ndarray, workers: int) -> np.ndarray:
+        """Read ``row_ids`` from disk on the pool; no cache involved."""
         n = int(row_ids.size)
         out = np.empty((n, self.row_bytes), dtype=np.uint8)
         if n == 0:
@@ -500,6 +528,44 @@ class FileBackedShardedEmbedding(nn.Module):
         wait(futures)
         for future in futures:
             future.result()
+        return out
+
+    def _cache_put(self, row_ids, rows: np.ndarray) -> None:
+        """Insert packed rows; evict LRU entries over the byte budget."""
+        if not self.lru_capacity_rows:
+            return
+        with self._lru_lock:
+            for row_id, row in zip(np.asarray(row_ids).tolist(), rows):
+                self._lru[int(row_id)] = bytes(row)
+                self._lru.move_to_end(int(row_id))
+            while len(self._lru) > self.lru_capacity_rows:
+                self._lru.popitem(last=False)
+                self._stat_cache_evictions += 1
+
+    def _read_rows(self, row_ids: np.ndarray, workers: int) -> np.ndarray:
+        """Serve ``row_ids`` from the LRU where possible, disk otherwise."""
+        n = int(row_ids.size)
+        if not self.lru_capacity_rows or n == 0:
+            self._stat_bytes += n * self.row_bytes
+            return self._pread_rows(row_ids, workers)
+        out = np.empty((n, self.row_bytes), dtype=np.uint8)
+        missing_positions = []
+        with self._lru_lock:
+            for i in range(n):
+                cached = self._lru.get(int(row_ids[i]))
+                if cached is None:
+                    missing_positions.append(i)
+                else:
+                    self._lru.move_to_end(int(row_ids[i]))
+                    out[i] = np.frombuffer(cached, dtype=np.uint8)
+        self._stat_cache_hits += n - len(missing_positions)
+        self._stat_cache_misses += len(missing_positions)
+        if missing_positions:
+            missing_ids = row_ids[np.asarray(missing_positions, dtype=np.int64)]
+            rows = self._pread_rows(missing_ids, workers)
+            out[np.asarray(missing_positions, dtype=np.int64)] = rows
+            self._cache_put(missing_ids, rows)
+            self._stat_bytes += len(missing_positions) * self.row_bytes
         return out
 
     def _dequant(self, row_bytes: np.ndarray) -> mx.array:
@@ -539,7 +605,6 @@ class FileBackedShardedEmbedding(nn.Module):
         self._stat_lookups += 1
         self._stat_rows += flat.size
         self._stat_unique_rows += unique.size
-        self._stat_bytes += unique.size * self.row_bytes
         if started is not None:
             self._stat_elapsed += time.perf_counter() - started
         return result
@@ -554,31 +619,65 @@ class FileBackedShardedEmbedding(nn.Module):
             int(self._stat_unique_rows),
             int(self._stat_bytes),
             float(self._stat_elapsed),
+            int(self._stat_cache_hits),
+            int(self._stat_cache_misses),
+            int(self._stat_cache_evictions),
         )
 
     def __call__(self, indices: mx.array) -> mx.array:
         mx.eval(indices)
         return self.lookup_numpy(np.asarray(indices, dtype=np.int64))
 
-    def prefetch_rows(self, indices: np.ndarray) -> None:
-        """Warm the page cache for ``indices`` without blocking. Fire-and-forget."""
+    def prefetch_rows(self, indices: np.ndarray) -> list:
+        """Warm the page cache (and LRU, when enabled) without blocking.
+
+        Fire-and-forget. With the LRU on, already-cached rows are skipped
+        and freshly-read rows are inserted, so prefetched rows survive
+        page-cache eviction under memory pressure.
+        """
         flat = np.unique(np.asarray(indices, dtype=np.int64).reshape(-1))
+        if self.lru_capacity_rows and flat.size:
+            with self._lru_lock:
+                flat = np.asarray(
+                    [i for i in flat.tolist() if i not in self._lru],
+                    dtype=np.int64,
+                )
         if flat.size == 0:
-            return
+            return []
         row_bytes = self.row_bytes
         base = self.data_offset
+        cache_put = self._cache_put if self.lru_capacity_rows else None
         bounds = np.linspace(
             0, flat.size, min(PREFETCH_WORKERS, flat.size) + 1, dtype=np.int64
         )
 
         def warm(start, stop):
             def task(fd):
+                span = []
                 for i in range(start, stop):
-                    os.pread(fd, row_bytes, base + int(flat[i]) * row_bytes)
+                    span.append(
+                        os.pread(fd, row_bytes, base + int(flat[i]) * row_bytes)
+                    )
+                if cache_put is not None:
+                    complete = [
+                        (int(flat[start + j]), data)
+                        for j, data in enumerate(span)
+                        if len(data) == row_bytes
+                    ]
+                    if complete:
+                        cache_put(
+                            [row_id for row_id, _ in complete],
+                            [
+                                np.frombuffer(data, dtype=np.uint8)
+                                for _, data in complete
+                            ],
+                        )
 
             return task
 
-        self._submit(
+        # Futures are returned for tests/synchronization; production
+        # callers ignore them (fire-and-forget).
+        return self._submit(
             True,
             [
                 warm(int(bounds[w]), int(bounds[w + 1]))
@@ -594,6 +693,41 @@ class FileBackedShardedEmbedding(nn.Module):
         ``fn`` takes no arguments; a closed embedding drops it silently.
         """
         self._submit(True, [lambda _fd: fn()], required=False)
+
+    def preheat_from_file(self, path: str) -> int:
+        """Load hot-row ids (one per line, ``#`` comments) into the LRU.
+
+        The file is ordered hottest-first (see
+        ``scripts/build_qwen4_ple_hot_rows.py``); ids beyond the LRU byte
+        budget are dropped. Synchronous and fail-closed: an id outside the
+        table refuses. Returns the number of rows cached.
+        """
+        if not self.lru_capacity_rows:
+            raise ValueError(
+                "MLX_QWEN4_PLE_NVME_PREHEAT requires MLX_QWEN4_PLE_NVME_LRU_MB "
+                "to be set to a positive budget"
+            )
+        ids = []
+        with open(path) as f:
+            for line in f:
+                text = line.split("#", 1)[0].strip()
+                if not text:
+                    continue
+                row_id = int(text)
+                if not 0 <= row_id < self.vocab_size:
+                    raise ValueError(
+                        f"hot-row id {row_id} in {path} is outside the PLE "
+                        f"table [0, {self.vocab_size})"
+                    )
+                ids.append(row_id)
+        unique = np.unique(
+            np.asarray(ids[: self.lru_capacity_rows], dtype=np.int64)
+        )
+        if unique.size == 0:
+            return 0
+        rows = self._pread_rows(unique, self.prefill_workers)
+        self._cache_put(unique, rows)
+        return int(unique.size)
 
 
 def _iter_ple_embeddings(model):
@@ -659,6 +793,13 @@ def install_file_backed_ple(model, weights: dict, sidecar_path: str, model_path)
             num_shards=manifest["num_shards"],
             data_offset=manifest["data_offset"],
         )
+        # Optional static preheat of the LRU hot tier from a hot-rows
+        # manifest (built by scripts/build_qwen4_ple_hot_rows.py). The
+        # count lands on the embedding for bench/config observability.
+        if preheat := os.environ.get("MLX_QWEN4_PLE_NVME_PREHEAT"):
+            ngram_embedding.ngram_embedding.preheated_rows = (
+                ngram_embedding.ngram_embedding.preheat_from_file(preheat)
+            )
         # NVMe mode hashes and gathers on CPU by construction. The Metal
         # hash backends would put the row ids on the GPU only for the
         # lookup to sync them straight back; refuse the combination.
