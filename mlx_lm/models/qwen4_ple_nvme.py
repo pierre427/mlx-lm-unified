@@ -13,9 +13,11 @@ stored shard-major, so ``global_row = shard_index * rows_per_shard + local_row``
 
 Dequantization runs in numpy: unpack the 4-bit values, multiply-add in
 float32, round once to bfloat16 (round-to-nearest-even). For q4 the product
-``q * scale`` has at most 12 significant bits and is exact in float32, so the
+``q * scale`` has at most 12 significant bits and, for finite non-overflowing
+operands, is exactly representable in float32, so the
 single float32 rounding matches MLX's default-stream ``mx.dequantize`` (and
-therefore the resident ``nn.QuantizedEmbedding`` gather) bit-for-bit. The
+therefore the resident ``nn.QuantizedEmbedding`` gather) bit-for-bit
+(nonfinite scales/biases are outside the supported input domain). The
 CPU-stream ``mx.dequantize`` kernel rounds through bfloat16 and does NOT
 match; the optional "mx" fallback backend therefore dequantizes on the
 default stream.
@@ -89,6 +91,121 @@ def dequant_rows_numpy(row_bytes: np.ndarray, dims: int) -> np.ndarray:
     s = np.repeat(bf16_bits_to_f32(scales), 32, axis=1)
     b = np.repeat(bf16_bits_to_f32(biases), 32, axis=1)
     return f32_to_bf16_bits(q * s + b)
+
+
+def _read_safetensors_header(path):
+    """Return (tensor header dict, data section offset) for a safetensors file."""
+    import struct
+
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return header, 8 + header_len
+
+
+def _source_shard_refs(model_path, manifest):
+    """Map shard index -> {part: (file, start, row_nbytes)} for the source tensors."""
+    model_path = Path(model_path)
+    with open(model_path / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+    prefix = manifest["tensor_prefix"]
+    files = sorted(
+        {v for k, v in weight_map.items() if k.startswith(prefix + ".shard_")}
+    )
+    refs = {}
+    for file_name in files:
+        header, data_offset = _read_safetensors_header(model_path / file_name)
+        for name, info in header.items():
+            if not name.startswith(prefix + ".shard_"):
+                continue
+            shard_index = int(name.split(".shard_")[1].split(".")[0])
+            part = name.rsplit(".", 1)[1]
+            start, end = info["data_offsets"]
+            rows = info["shape"][0]
+            refs.setdefault(shard_index, {})[part] = (
+                model_path / file_name,
+                data_offset + start,
+                (end - start) // rows,
+            )
+    return refs
+
+
+def spot_check_sidecar_rows(
+    sidecar_path: str, model_path, manifest: dict, num_random: int = 256
+) -> int:
+    """Compare sampled sidecar rows byte-for-byte against the source tensors.
+
+    The manifest's index digest only proves the sidecar was built against an
+    artifact with the same ``model.safetensors.index.json``; this binds the
+    check to actual tensor content. Deterministic edge rows (first/last row
+    of the first and last shard, plus each shard boundary neighborhood of
+    the first shard) and ``num_random`` freshly-drawn random rows are read
+    from both the sidecar and the safetensors source. Raises ``ValueError``
+    on the first mismatch: a bit-flipped sidecar or a source whose shard
+    bytes changed under an unchanged index must both refuse to load.
+
+    Returns the number of rows checked.
+    """
+    rows_per_shard = manifest["rows_per_shard"]
+    total_rows = manifest["total_rows"]
+    row_bytes = manifest["row_bytes"]
+    refs = _source_shard_refs(model_path, manifest)
+    if sorted(refs) != list(range(manifest["num_shards"])):
+        raise ValueError(
+            f"artifact has shard indices {sorted(refs)[:3]}..., manifest "
+            f"expects 0..{manifest['num_shards'] - 1}"
+        )
+
+    edges = {
+        0,
+        rows_per_shard - 1,
+        min(rows_per_shard, total_rows - 1),
+        total_rows - rows_per_shard,
+        total_rows - 1,
+    }
+    rng = np.random.default_rng()
+    picks = sorted(
+        edges | {int(r) for r in rng.integers(0, total_rows, size=num_random)}
+    )
+
+    handles = {}
+
+    def fh(path):
+        if path not in handles:
+            handles[path] = open(path, "rb")
+        return handles[path]
+
+    try:
+        with open(sidecar_path, "rb") as sidecar:
+            for global_row in picks:
+                shard_index, local = divmod(global_row, rows_per_shard)
+                expected = b""
+                for part in ("weight", "scales", "biases"):
+                    path, start, nbytes = refs[shard_index][part]
+                    f = fh(path)
+                    f.seek(start + local * nbytes)
+                    expected += f.read(nbytes)
+                sidecar.seek(manifest["data_offset"] + global_row * row_bytes)
+                if sidecar.read(row_bytes) != expected:
+                    raise ValueError(
+                        f"PLE sidecar row {global_row} (shard {shard_index}, "
+                        f"local {local}) does not match the artifact's shard "
+                        "tensors: the sidecar is stale or corrupt. Rebuild it "
+                        "with scripts/build_qwen4_ple_sidecar.py."
+                    )
+    finally:
+        for f in handles.values():
+            f.close()
+    return len(picks)
+
+
+def has_file_backed_ple(model) -> bool:
+    """True when any module in ``model`` is an NVMe-backed PLE embedding."""
+    return any(
+        getattr(module, "is_file_backed", False)
+        for _, module in model.named_modules()
+    )
 
 
 def manifest_path(sidecar_path: str) -> str:
@@ -199,6 +316,15 @@ class FileBackedShardedEmbedding(nn.Module):
         self.prefill_workers = int(
             os.getenv("MLX_QWEN4_PLE_NVME_PREFILL_WORKERS", str(PREFILL_WORKERS))
         )
+        # All lifecycle state (fd, pools, closed flag, owning pid) is
+        # guarded by one lock so close() cannot race a submission and a
+        # fork cannot inherit dead executor threads unnoticed.
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
+        self._open_resources()
+
+    def _open_resources(self):
+        self._owner_pid = os.getpid()
         self._fd = os.open(self.sidecar_path, os.O_RDONLY)
         self._pool = ThreadPoolExecutor(
             max_workers=max(self.decode_workers, self.prefill_workers),
@@ -209,17 +335,44 @@ class FileBackedShardedEmbedding(nn.Module):
         self._prefetch_pool = ThreadPoolExecutor(
             max_workers=PREFETCH_WORKERS, thread_name_prefix="ple-nvme-prefetch"
         )
-        self._closed = False
-        self._close_lock = threading.Lock()
+
+    def _submit(self, use_prefetch_pool: bool, fns, required: bool):
+        """Submit ``fns`` atomically with the closed/fork check.
+
+        Fork safety: a forked child inherits executor bookkeeping but none
+        of the worker threads, so submissions in the child would hang.
+        Detect the pid change and rebuild fd + pools in the child (the
+        parent's descriptors stay untouched). Submitting under the
+        lifecycle lock makes the closed check atomic with the submission,
+        so close() either sees the futures (and drains them before closing
+        the fd) or the submission observes the closed flag. ``required``
+        submissions raise when closed; optional (prefetch) ones no-op.
+
+        Each fn is called as ``fn(fd)``; the fd stays valid while the
+        returned futures may still run because close() drains the pools
+        before closing it.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                if required:
+                    raise RuntimeError("FileBackedShardedEmbedding is closed")
+                return []
+            if os.getpid() != self._owner_pid:
+                self._open_resources()
+            pool = self._prefetch_pool if use_prefetch_pool else self._pool
+            return [pool.submit(fn, self._fd) for fn in fns]
 
     def close(self):
-        with self._close_lock:
+        with self._lifecycle_lock:
             if self._closed:
                 return
             self._closed = True
-        self._pool.shutdown(wait=True)
-        self._prefetch_pool.shutdown(wait=True)
-        os.close(self._fd)
+            fd, pool, prefetch_pool = self._fd, self._pool, self._prefetch_pool
+        # Shut down outside the lock: workers never take the lock, and any
+        # submission that won the race completes before the fd closes.
+        pool.shutdown(wait=True)
+        prefetch_pool.shutdown(wait=True)
+        os.close(fd)
 
     def __del__(self):
         try:
@@ -238,30 +391,33 @@ class FileBackedShardedEmbedding(nn.Module):
         if n == 0:
             return out
         row_bytes = self.row_bytes
-        fd = self._fd
         base = self.data_offset
 
-        def read_span(start: int, stop: int):
-            for i in range(start, stop):
-                offset = base + int(row_ids[i]) * row_bytes
-                data = os.pread(fd, row_bytes, offset)
-                if len(data) != row_bytes:
-                    raise IOError(
-                        f"short pread of PLE row {int(row_ids[i])} "
-                        f"({len(data)}/{row_bytes} bytes)"
-                    )
-                out[i] = np.frombuffer(data, dtype=np.uint8)
+        def read_span(start, stop):
+            def task(fd):
+                for i in range(start, stop):
+                    offset = base + int(row_ids[i]) * row_bytes
+                    data = os.pread(fd, row_bytes, offset)
+                    if len(data) != row_bytes:
+                        raise IOError(
+                            f"short pread of PLE row {int(row_ids[i])} "
+                            f"({len(data)}/{row_bytes} bytes)"
+                        )
+                    out[i] = np.frombuffer(data, dtype=np.uint8)
+
+            return task
 
         workers = max(1, min(workers, n))
-        if workers == 1:
-            read_span(0, n)
-            return out
         bounds = np.linspace(0, n, workers + 1, dtype=np.int64)
-        futures = [
-            self._pool.submit(read_span, int(bounds[w]), int(bounds[w + 1]))
-            for w in range(workers)
-            if bounds[w] < bounds[w + 1]
-        ]
+        futures = self._submit(
+            False,
+            [
+                read_span(int(bounds[w]), int(bounds[w + 1]))
+                for w in range(workers)
+                if bounds[w] < bounds[w + 1]
+            ],
+            required=True,
+        )
         wait(futures)
         for future in futures:
             future.result()
@@ -308,27 +464,37 @@ class FileBackedShardedEmbedding(nn.Module):
     def prefetch_rows(self, indices: np.ndarray) -> None:
         """Warm the page cache for ``indices`` without blocking. Fire-and-forget."""
         flat = np.unique(np.asarray(indices, dtype=np.int64).reshape(-1))
-        if flat.size == 0 or self._closed:
+        if flat.size == 0:
             return
         row_bytes = self.row_bytes
-        fd = self._fd
         base = self.data_offset
         bounds = np.linspace(
             0, flat.size, min(PREFETCH_WORKERS, flat.size) + 1, dtype=np.int64
         )
 
-        def warm(start: int, stop: int):
-            for i in range(start, stop):
-                os.pread(fd, row_bytes, base + int(flat[i]) * row_bytes)
+        def warm(start, stop):
+            def task(fd):
+                for i in range(start, stop):
+                    os.pread(fd, row_bytes, base + int(flat[i]) * row_bytes)
 
-        for w in range(len(bounds) - 1):
-            if bounds[w] < bounds[w + 1]:
-                self._prefetch_pool.submit(warm, int(bounds[w]), int(bounds[w + 1]))
+            return task
+
+        self._submit(
+            True,
+            [
+                warm(int(bounds[w]), int(bounds[w + 1]))
+                for w in range(len(bounds) - 1)
+                if bounds[w] < bounds[w + 1]
+            ],
+            required=False,
+        )
 
     def submit_prefetch(self, fn) -> None:
-        """Run ``fn`` (id hashing + ``prefetch_rows``) on the prefetch pool."""
-        if not self._closed:
-            self._prefetch_pool.submit(fn)
+        """Run ``fn`` (id hashing + ``prefetch_rows``) on the prefetch pool.
+
+        ``fn`` takes no arguments; a closed embedding drops it silently.
+        """
+        self._submit(True, [lambda _fd: fn()], required=False)
 
 
 def _iter_ple_embeddings(model):
@@ -357,6 +523,17 @@ def install_file_backed_ple(model, weights: dict, sidecar_path: str, model_path)
     """
     assert_sidecar_not_in_weight_files(sidecar_path)
     manifest = verify_sidecar_against_artifact(sidecar_path, model_path)
+    # Bind the sidecar to actual tensor content, not just the index file:
+    # sampled + edge rows must match the source bytes (catches both a
+    # corrupted sidecar and source shards that changed under an unchanged
+    # index). MLX_QWEN4_PLE_NVME_SPOT_CHECK_ROWS sizes the random sample;
+    # the deterministic edge rows are always checked.
+    spot_check_sidecar_rows(
+        sidecar_path,
+        model_path,
+        manifest,
+        num_random=int(os.getenv("MLX_QWEN4_PLE_NVME_SPOT_CHECK_ROWS", "256")),
+    )
 
     installed = False
     for prefix, ngram_embedding in _iter_ple_embeddings(model):

@@ -136,6 +136,21 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
             use_dora=(fine_tune_type == "dora"),
         )
     weights = mx.load(str(adapter_path / "adapters.safetensors"))
+    from ..models.qwen4_ple_nvme import has_file_backed_ple
+
+    if has_file_backed_ple(model):
+        ple_keys = [
+            name
+            for name in weights
+            if ".ple_embedding.ngram_embedding.shard_" in name
+        ]
+        if ple_keys:
+            raise ValueError(
+                "This model serves its PLE tables from an NVMe sidecar "
+                "(MLX_QWEN4_PLE_NVME) and cannot apply an adapter that "
+                f"targets the PLE shards (e.g. {ple_keys[0]}). Reload the "
+                "model with MLX_QWEN4_PLE_NVME unset to use this adapter."
+            )
     params = dict(tree_flatten(model.parameters()))
     if fine_tune_type == "full":
         allowed = params

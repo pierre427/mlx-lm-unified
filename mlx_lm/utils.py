@@ -432,7 +432,9 @@ def load_model(
     # a file-backed one and drop the shard tensors before materialisation.
     # Removing the shard modules here also removes them from the tree that
     # nn.quantize walks, so the per-path quantization predicates below never
-    # visit them. Unset env keeps today's behavior bit-for-bit. The sidecar
+    # visit them. Unset env keeps the resident parameter tree and numerical
+    # path unchanged (the generation loops additionally resolve a
+    # prefill-prefetch hook, which is None for resident models). The sidecar
     # is deliberately not part of weight_files (see the UBC eviction note
     # below and assert_sidecar_not_in_weight_files).
     if (ple_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME")) and config[
@@ -854,6 +856,15 @@ def save_model(
     donate_model: bool = False,
 ) -> None:
     """Save model weights and metadata index into specified directory."""
+    from .models.qwen4_ple_nvme import has_file_backed_ple
+
+    if has_file_backed_ple(model):
+        raise ValueError(
+            "This model serves its PLE tables from an NVMe sidecar "
+            "(MLX_QWEN4_PLE_NVME): the shard parameters are not resident, so "
+            "saving or fusing would silently write an artifact without them. "
+            "Reload the model with MLX_QWEN4_PLE_NVME unset to export it."
+        )
     if isinstance(save_path, str):
         save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
