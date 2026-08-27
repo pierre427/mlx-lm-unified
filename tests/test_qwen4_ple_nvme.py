@@ -37,6 +37,13 @@ _spec = importlib.util.spec_from_file_location(
 builder = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(builder)
 
+_spec_hot = importlib.util.spec_from_file_location(
+    "build_qwen4_ple_hot_rows",
+    _REPO_ROOT / "scripts" / "build_qwen4_ple_hot_rows.py",
+)
+hot_rows = importlib.util.module_from_spec(_spec_hot)
+_spec_hot.loader.exec_module(hot_rows)
+
 
 def tiny_nvme_args(**overrides):
     # dims per n-gram head = 640 / 4 = 160: five g32 groups per row - the
@@ -488,6 +495,83 @@ class TestQwen4PleNvme(unittest.TestCase):
         self.assertEqual(stats.cache_hits, 12)
         self.assertEqual(stats.bytes_read, 0)
 
+    def test_cache_put_after_close_is_a_no_op(self):
+        hot = self.ngram_embedding(self.load_nvme_hot()).ngram_embedding
+        ids = np.arange(4)
+        rows = hot._pread_rows(ids, 4)
+        hot.close()
+        # A foreground miss returning from its preads after close() must
+        # not repopulate the cleared cache.
+        hot._cache_put(ids, rows)
+        self.assertEqual(len(hot._lru), 0)
+
+    def test_stale_pid_rebuilds_before_cache_hit_and_prefetch(self):
+        from os import getpid
+
+        hot = self.ngram_embedding(self.load_nvme_hot()).ngram_embedding
+        ids = np.arange(8)
+        expected = hot.lookup_numpy(ids)
+        self.assertEqual(len(hot._lru), 8)
+
+        # Simulate a forked child: the pid no longer matches, so the next
+        # complete cache hit must rebuild (empty LRU, fresh fd/pools) and
+        # re-read from disk instead of serving inherited state.
+        hot._owner_pid = getpid() + 1
+        bytes_before = hot.stats.bytes_read
+        again = hot.lookup_numpy(ids)
+        mx.eval(expected, again)
+        self.assertEqual(hot._owner_pid, getpid())
+        self.assertTrue(
+            mx.array_equal(
+                again.view(mx.uint16), expected.view(mx.uint16)
+            ).item()
+        )
+        self.assertGreater(hot.stats.bytes_read, bytes_before)
+
+        # Same for the prefetch membership filter.
+        hot._owner_pid = getpid() + 1
+        for future in hot.prefetch_rows(ids):
+            future.result()
+        self.assertEqual(hot._owner_pid, getpid())
+        self.assertEqual(len(hot._lru), 8)
+
+    def test_preheat_eviction_priority_and_dedupe_before_cap(self):
+        with TemporaryDirectory() as tmp:
+            # Hottest-first manifest, capacity 10 (0.001 MB): eviction must
+            # discard the COLDEST preheated rows first.
+            ranked = Path(tmp) / "ranked.txt"
+            ranked.write_text("\n".join(str(i) for i in range(20)) + "\n")
+            hot = self.ngram_embedding(
+                self.load_nvme_hot(lru_mb="0.001", preheat=str(ranked))
+            ).ngram_embedding
+            self.assertEqual(hot.preheated_rows, 10)
+            self.assertEqual(sorted(hot._lru), list(range(10)))
+            hot.lookup_numpy(np.array([30, 31, 32]))
+            self.assertEqual(
+                sorted(hot._lru), [0, 1, 2, 3, 4, 5, 6, 30, 31, 32]
+            )
+
+            # Duplicates dedupe BEFORE the cap, so they cannot underfill
+            # the budget: capacity 3 still gets three distinct hot rows.
+            dup = Path(tmp) / "dup.txt"
+            dup.write_text("5\n5\n7\n5\n2\n7\n1\n")
+            capped = self.ngram_embedding(
+                self.load_nvme_hot(lru_mb="0.0003", preheat=str(dup))
+            ).ngram_embedding
+            self.assertEqual(capped.lru_capacity_rows, 3)
+            self.assertEqual(capped.preheated_rows, 3)
+            self.assertEqual(sorted(capped._lru), [2, 5, 7])
+
+    def test_hot_rows_verify_constants_against_checkpoint(self):
+        embedding = hot_rows.build_ngram_embedding(self.model_dir, 0)
+        status = hot_rows.verify_hash_constants(embedding, self.model_dir)
+        self.assertIn("verified", status)
+        embedding.layer_multipliers = mx.array(
+            np.asarray(embedding.layer_multipliers, dtype=np.int64) + 1
+        )
+        with self.assertRaisesRegex(ValueError, "differs"):
+            hot_rows.verify_hash_constants(embedding, self.model_dir)
+
     def test_preheat_manifest_loads_caps_and_fails_closed(self):
         with TemporaryDirectory() as tmp:
             manifest = Path(tmp) / "hot_rows.txt"
@@ -520,13 +604,6 @@ class TestQwen4PleNvme(unittest.TestCase):
                 self.load_nvme_hot(lru_mb=None, preheat=str(manifest))
 
     def test_hot_rows_script_matches_unchunked_hash_and_preheats(self):
-        _spec_hot = importlib.util.spec_from_file_location(
-            "build_qwen4_ple_hot_rows",
-            _REPO_ROOT / "scripts" / "build_qwen4_ple_hot_rows.py",
-        )
-        hot_rows = importlib.util.module_from_spec(_spec_hot)
-        _spec_hot.loader.exec_module(hot_rows)
-
         embedding = hot_rows.build_ngram_embedding(self.model_dir, 0)
         self.assertEqual(embedding.layer_idx, 1)
         rng = np.random.default_rng(5)

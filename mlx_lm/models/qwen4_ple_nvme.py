@@ -439,6 +439,21 @@ class FileBackedShardedEmbedding(nn.Module):
             max_workers=PREFETCH_WORKERS, thread_name_prefix="ple-nvme-prefetch"
         )
 
+    def _check_owner(self) -> None:
+        """Rebuild fd/pools/LRU after a fork before touching any of them.
+
+        A forked child inherits the parent's dict and possibly a lock held
+        at fork time; every LRU-touching entry point calls this first (not
+        only ``_submit``) so a complete cache hit or a prefetch membership
+        filter can never use the inherited state. The unlocked pid compare
+        is safe: it only ever races a fork of THIS process, which the
+        supported lifecycle excludes.
+        """
+        if os.getpid() != self._owner_pid:
+            with self._lifecycle_lock:
+                if os.getpid() != self._owner_pid:
+                    self._open_resources()
+
     def _submit(self, use_prefetch_pool: bool, fns, required: bool):
         """Submit ``fns`` atomically with the closed/fork check.
 
@@ -534,7 +549,13 @@ class FileBackedShardedEmbedding(nn.Module):
         """Insert packed rows; evict LRU entries over the byte budget."""
         if not self.lru_capacity_rows:
             return
+        self._check_owner()
         with self._lru_lock:
+            # In-lock closed check: close() sets the flag before it clears
+            # the dict, so a straggler put (a foreground miss returning
+            # from its preads after close) can never repopulate it.
+            if self._closed:
+                return
             for row_id, row in zip(np.asarray(row_ids).tolist(), rows):
                 self._lru[int(row_id)] = bytes(row)
                 self._lru.move_to_end(int(row_id))
@@ -548,6 +569,8 @@ class FileBackedShardedEmbedding(nn.Module):
         if not self.lru_capacity_rows or n == 0:
             self._stat_bytes += n * self.row_bytes
             return self._pread_rows(row_ids, workers)
+        # A complete cache hit never reaches _submit's fork check.
+        self._check_owner()
         out = np.empty((n, self.row_bytes), dtype=np.uint8)
         missing_positions = []
         with self._lru_lock:
@@ -637,6 +660,8 @@ class FileBackedShardedEmbedding(nn.Module):
         """
         flat = np.unique(np.asarray(indices, dtype=np.int64).reshape(-1))
         if self.lru_capacity_rows and flat.size:
+            # Membership filtering touches the LRU before _submit's check.
+            self._check_owner()
             with self._lru_lock:
                 flat = np.asarray(
                     [i for i in flat.tolist() if i not in self._lru],
@@ -720,14 +745,18 @@ class FileBackedShardedEmbedding(nn.Module):
                         f"table [0, {self.vocab_size})"
                     )
                 ids.append(row_id)
-        unique = np.unique(
-            np.asarray(ids[: self.lru_capacity_rows], dtype=np.int64)
-        )
-        if unique.size == 0:
+        # Order-preserving dedupe BEFORE the cap, so duplicates cannot
+        # underfill the budget and the manifest's hottest-first order
+        # survives into eviction priority.
+        ordered = list(dict.fromkeys(ids))[: self.lru_capacity_rows]
+        if not ordered:
             return 0
-        rows = self._pread_rows(unique, self.prefill_workers)
-        self._cache_put(unique, rows)
-        return int(unique.size)
+        id_array = np.asarray(ordered, dtype=np.int64)
+        rows = self._pread_rows(id_array, self.prefill_workers)
+        # Insert coldest-first: the LRU evicts oldest-inserted first, so
+        # the hottest manifest rows must be the youngest entries.
+        self._cache_put(id_array[::-1], rows[::-1])
+        return len(ordered)
 
 
 def _iter_ple_embeddings(model):

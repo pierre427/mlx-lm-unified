@@ -82,6 +82,44 @@ def build_ngram_embedding(model_dir: Path, ple_layer_index: int):
     return NGramEmbedding(args, args.ple_embed_dim, layer_idx, ple_layer_index)
 
 
+def verify_hash_constants(embedding, model_dir: Path) -> str:
+    """Compare derived hash constants against checkpoint overrides.
+
+    ``load_weights`` replaces the constants with checkpoint tensors when
+    the artifact carries them; a manifest built from mismatching constants
+    would preheat the wrong rows. Raises ``ValueError`` on a mismatch.
+    Returns a short status string.
+    """
+    import mlx.core as mx
+
+    index_file = model_dir / "model.safetensors.index.json"
+    weight_map = json.loads(index_file.read_text())["weight_map"]
+    prefix = f"layers.{embedding.layer_idx}.ple.ple_embedding."
+    names = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
+    keys = {
+        name: key
+        for name in names
+        for key in weight_map
+        if key.endswith(prefix + name)
+    }
+    if not keys:
+        return "checkpoint carries no hash-constant overrides; derived values apply"
+    for name in names:
+        key = keys.get(name)
+        if key is None:
+            raise ValueError(f"checkpoint stores only some hash constants: missing {name}")
+        stored = np.asarray(
+            mx.load(str(model_dir / weight_map[key]))[key], dtype=np.int64
+        )
+        derived = np.asarray(getattr(embedding, name), dtype=np.int64)
+        if not np.array_equal(stored, derived):
+            raise ValueError(
+                f"checkpoint hash constant {key} differs from the value "
+                "derived from config.json; rebuild against the right config"
+            )
+    return f"verified {len(names)} hash constants against the checkpoint"
+
+
 def rows_for_budget(embedding, budget_mb: float) -> int:
     dims = embedding.ngram_embedding.dims
     row_bytes = dims // 2 + 2 * (dims // 32) * 2
@@ -104,11 +142,27 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--ple-layer-index", type=int, default=0)
     parser.add_argument("--chunk-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--verify-constants",
+        action="store_true",
+        help="Check the derived hash constants against checkpoint overrides",
+    )
     args = parser.parse_args(argv)
 
     from mlx_lm.utils import load_tokenizer
 
     embedding = build_ngram_embedding(args.model_dir, args.ple_layer_index)
+    if args.verify_constants:
+        print(
+            f"[hot-rows] {verify_hash_constants(embedding, args.model_dir)}",
+            flush=True,
+        )
+    else:
+        print(
+            "[hot-rows] hash constants derived from config.json; pass "
+            "--verify-constants to check checkpoint overrides",
+            flush=True,
+        )
     limit = args.top_rows
     if args.budget_mb is not None:
         limit = min(limit, rows_for_budget(embedding, args.budget_mb))
