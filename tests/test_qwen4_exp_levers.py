@@ -876,12 +876,34 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
         # The comparison is only meaningful where the padded geometry is
         # actually pooled, i.e. where the schedule really does go sparse.
         self.assertEqual(set(pooled), {"_pool_blocks_left_padded"})
-        for flag in ("_QSA_SCATTER_CHOSEN", "_RMSNORM_FAST"):
+        # _RMSNORM_FAST is deliberately NOT in this list: it is the one
+        # tolerance-class lever in the bundle (mx.fast.rms_norm rounds the
+        # normalized value once before the per-stream weight multiply, a
+        # documented <=1 fp16 ulp deviation), so asserting bitwise equality
+        # for it asserts something the lever never claimed. It is gated by
+        # tolerance in TestRMSNormFast and disqualified-on-mismatch in the
+        # lever bench, not here.
+        for flag in ("_QSA_SCATTER_CHOSEN",):
             with self.subTest(flag=flag):
                 with lever(qwen4_exp, flag):
                     _, fast, _ = self._run()
                 for step, (expected, actual) in enumerate(zip(stock, fast)):
                     np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+        # ...but it must still be within its tolerance class over the same
+        # left-padded geometry, which is the property that actually matters.
+        with lever(qwen4_exp, "_RMSNORM_FAST"):
+            _, fast, _ = self._run()
+        scale = max(float(np.abs(np.asarray(s)).max()) for s in stock)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            deviation = float(
+                np.abs(np.asarray(actual) - np.asarray(expected)).max()
+            )
+            self.assertLess(
+                deviation,
+                3e-3 * scale,
+                f"_RMSNORM_FAST step {step}: {deviation:.3e} vs scale {scale:.3e}",
+            )
 
     def test_pooled_key_cache_cannot_engage_on_a_batch_cache(self):
         # An engagement check, not a bitwise one.  The incremental pooled
