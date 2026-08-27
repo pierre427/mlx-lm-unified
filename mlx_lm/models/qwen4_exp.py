@@ -125,6 +125,41 @@ def _table_matmul(table, x: mx.array) -> mx.array:
     )
 
 
+def _valid_span_end(mask):
+    """One past each row's last valid position, as a ``[B]`` vector.
+
+    ``ArraysCache.make_mask`` builds either ``pos >= left_padding`` (leading
+    pads, from a left-padded batched prefill) or ``pos < lengths`` (trailing
+    pads, from a right-padded continuation or a ragged verify), so a row's
+    valid positions are always ONE contiguous run and its end is all the PLE
+    state updates need.  An all-pad row returns 0 and keeps its prior state.
+    """
+    length = mask.shape[1]
+    if isinstance(mask, np.ndarray):
+        return np.max(np.where(mask, np.arange(1, length + 1), 0), axis=1)
+    return mx.max(mx.where(mask, mx.arange(1, length + 1), 0), axis=1)
+
+
+def _row_tail(values, end, width):
+    """Per-row trailing window of ``[prev(width), new]`` ending at ``end``.
+
+    Both PLE states are stored as the last ``width`` entries of a
+    ``width``-prefixed buffer, so row ``b``'s window is
+    ``values[b, end[b] : end[b] + width]``.  With ``end == values.shape[1] -
+    width`` this is exactly ``values[:, -width:]``, the unpadded update.
+    """
+    positions = end[:, None] + (
+        np.arange(width) if isinstance(values, np.ndarray) else mx.arange(width)
+    )
+    if isinstance(values, np.ndarray):
+        return np.take_along_axis(values, positions, axis=1)
+    if values.ndim == 3:
+        positions = mx.broadcast_to(
+            positions[..., None], (values.shape[0], width, values.shape[2])
+        )
+    return mx.take_along_axis(values, positions, axis=1)
+
+
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -570,18 +605,33 @@ class NGramEmbedding(nn.Module):
         return shifted
 
     def _ngram_ids_numpy(
-        self, input_ids: mx.array, cache: Optional[ArraysCache] = None
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache] = None,
+        mask: Optional[mx.array] = None,
     ) -> np.ndarray:
-        mx.eval(input_ids)
+        mx.eval(input_ids, mask)
         tokens = np.asarray(input_ids, dtype=np.int64)
         batch, seq_len = tokens.shape
         if cache is not None and cache[3] is not None:
             previous = np.asarray(cache[3], dtype=np.int64)
         else:
             previous = np.full((batch, self.context_len), self.eos_token_id, dtype=np.int64)
+        if mask is not None:
+            # A pad id is not a token.  EOS is the segment sentinel the shift
+            # already resets on, so substituting it makes a padded row hash
+            # and store exactly what that row hashes and stores alone.
+            tokens = np.where(np.asarray(mask), tokens, self.eos_token_id)
         history = np.concatenate([previous, tokens], axis=-1)
         if cache is not None:
-            cache[3] = mx.array(history[:, -self.context_len :], dtype=mx.int64)
+            tail = (
+                history[:, -self.context_len :]
+                if mask is None
+                else _row_tail(
+                    history, _valid_span_end(np.asarray(mask)), self.context_len
+                )
+            )
+            cache[3] = mx.array(tail, dtype=mx.int64)
 
         if _PLE_VECTOR_SHIFT:
             shifted = self._shift_history_vectorized(history)
@@ -618,10 +668,15 @@ class NGramEmbedding(nn.Module):
         return np.concatenate(blocks, axis=-1)[:, -seq_len:]
 
     def _ngram_ids_metal(
-        self, input_ids: mx.array, cache: Optional[ArraysCache] = None
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         if self.ngram_size != 3 or not mx.metal.is_available():
-            return mx.array(self._ngram_ids_numpy(input_ids, cache), dtype=mx.int64)
+            return mx.array(
+                self._ngram_ids_numpy(input_ids, cache, mask), dtype=mx.int64
+            )
 
         batch, seq_len = input_ids.shape
         if cache is not None and cache[3] is not None:
@@ -630,9 +685,16 @@ class NGramEmbedding(nn.Module):
             previous = mx.full(
                 (batch, self.context_len), self.eos_token_id, dtype=mx.int64
             )
-        history = mx.concatenate([previous, input_ids.astype(mx.int64)], axis=-1)
+        tokens = input_ids.astype(mx.int64)
+        if mask is not None:
+            tokens = mx.where(mask, tokens, self.eos_token_id)
+        history = mx.concatenate([previous, tokens], axis=-1)
         if cache is not None:
-            cache[3] = mx.contiguous(history[:, -self.context_len :])
+            cache[3] = mx.contiguous(
+                history[:, -self.context_len :]
+                if mask is None
+                else _row_tail(history, _valid_span_end(mask), self.context_len)
+            )
 
         if self._metal_hash_kernel is None:
             self._metal_hash_kernel = mx.fast.metal_kernel(
@@ -687,26 +749,38 @@ class NGramEmbedding(nn.Module):
             stream=mx.gpu,
         )[0]
 
-    def ngram_ids(self, input_ids: mx.array, cache: Optional[ArraysCache] = None):
+    def ngram_ids(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache] = None,
+        mask: Optional[mx.array] = None,
+    ):
         if self.hash_backend == "metal" or (
             self.hash_backend == "metal_prefill"
             and input_ids.shape[1] >= self.metal_hash_min_tokens
         ):
-            return self._ngram_ids_metal(input_ids, cache)
-        return mx.array(self._ngram_ids_numpy(input_ids, cache), dtype=mx.int64)
+            return self._ngram_ids_metal(input_ids, cache, mask)
+        return mx.array(
+            self._ngram_ids_numpy(input_ids, cache, mask), dtype=mx.int64
+        )
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache] = None):
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: Optional[ArraysCache] = None,
+        mask: Optional[mx.array] = None,
+    ):
         if self.hash_backend == "routed_cpu" or (
             self.hash_backend == "metal_prefill"
             and input_ids.shape[1] < self.metal_hash_min_tokens
         ):
-            ids = self._ngram_ids_numpy(input_ids, cache)
+            ids = self._ngram_ids_numpy(input_ids, cache, mask)
             return self.ngram_embedding.lookup_numpy(ids).reshape(
                 *input_ids.shape, -1
             )
-        return self.ngram_embedding(self.ngram_ids(input_ids, cache)).reshape(
-            *input_ids.shape, -1
-        )
+        return self.ngram_embedding(
+            self.ngram_ids(input_ids, cache, mask)
+        ).reshape(*input_ids.shape, -1)
 
 
 class PLELayer(nn.Module):
@@ -733,19 +807,34 @@ class PLELayer(nn.Module):
             bias=False,
         )
 
-    def _short_conv(self, x: mx.array, cache: Optional[ArraysCache]):
+    def _short_conv(self, x: mx.array, cache: Optional[ArraysCache], mask=None):
         state = cache[2] if cache is not None else None
         if state is None:
             state = mx.zeros((x.shape[0], self.short_conv_state_len, x.shape[-1]), x.dtype)
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :, :])
+            # The conv is causal, so the branch OUTPUT at a valid position is
+            # already pad-free; the persistent tail is not.  Cut each row's
+            # window at its own last valid position instead of at the padded
+            # width, or the row carries pads in its conv state forever.
+            cache[2] = mx.contiguous(
+                conv_input[:, -self.short_conv_state_len :, :]
+                if mask is None
+                else _row_tail(
+                    conv_input, _valid_span_end(mask), self.short_conv_state_len
+                )
+            )
         return nn.silu(self.conv1d(conv_input))[:, -x.shape[1] :, :]
 
     def __call__(self, hidden: mx.array, input_ids: mx.array, cache=None, mask=None):
+        if mask is None and isinstance(cache, ArraysCache):
+            # A model with no linear layer builds no ssm mask, so read the
+            # padding geometry off the cache rather than trust the caller.
+            if cache.lengths is not None or cache.left_padding is not None:
+                mask = cache.make_mask(input_ids.shape[1])
         previous_conv = cache[2] if cache is not None else None
         previous_tokens = cache[3] if cache is not None else None
-        embeddings = self.ple_embedding(input_ids, cache)
+        embeddings = self.ple_embedding(input_ids, cache, mask)
         key = self.norm_key(self.key_proj(embeddings)).reshape(
             *hidden.shape[:-1], self.hc_count, self.hidden_size
         )
@@ -760,7 +849,7 @@ class PLELayer(nn.Module):
         if mask is not None:
             gated = mx.where(mask[..., None], gated, 0)
             normed = mx.where(mask[..., None], normed, 0)
-        conv = self._short_conv(normed, cache)
+        conv = self._short_conv(normed, cache, mask)
         if (
             isinstance(cache, Qwen4ArraysCache)
             and cache.speculating

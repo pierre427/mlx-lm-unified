@@ -28,8 +28,10 @@ from mlx_lm.models.qwen4_exp import (
     Model,
     ModelArgs,
     NGramEmbedding,
+    PLELayer,
     QSAIndexer,
     QSAKVCache,
+    Qwen4ArraysCache,
     TextModel,
     TextModelArgs,
 )
@@ -949,6 +951,323 @@ class TestQSALeftPaddedBatch(unittest.TestCase):
                 layer.index_keys = layer.index_keys[:, :-1]
         with self.assertRaisesRegex(RuntimeError, "index_keys desync"):
             mx.eval(model(mx.array([[9], [9]], dtype=mx.int32), cache=batch))
+
+
+class TestPLEPadSafety(unittest.TestCase):
+    """PLE state under a padded batch row must equal that row decoded alone.
+
+    Unlike logits, PLE state is deterministic bookkeeping -- an integer token
+    history and a pure slice of the conv buffer -- so the bar here is exact
+    equality, not a divergence band.  Two defects broke it (design review of
+    ``wiki/docs/plans/qwen38-mtp-batch-composition.md`` section 2):
+
+    * ``_short_conv`` cut the persistent tail at the PADDED width, so a short
+      row's conv state advanced through its filler positions.  Only the branch
+      output was masked, and the output is causal, so nothing downstream saw
+      it in the same forward -- the damage landed in the next one.
+    * The n-gram history took every input id, so pad id 0 entered ``cache[3]``
+      as a real token and (with leading pads) also entered the hash of the
+      row's FIRST real tokens, where EOS belongs.
+
+    Both are prerequisites for the section-2 uniform-width verify, where rows
+    with ``k_i < k_max`` carry trailing pads every cycle.
+    """
+
+    PLE_LAYER = 1  # ple_layer_ids=[2] is layer_idx + 1
+    CONV, HISTORY = 2, 3
+
+    def _layer(self, args):
+        mx.random.seed(5)
+        return PLELayer(args, self.PLE_LAYER, 0)
+
+    @staticmethod
+    def _prefix_mask(lengths, width):
+        return mx.arange(width)[None, :] < mx.array(lengths)[:, None]
+
+    @staticmethod
+    def _suffix_mask(padding, width):
+        return mx.arange(width)[None, :] >= mx.array(padding)[:, None]
+
+    def test_short_conv_tail_stops_at_each_row_valid_end(self):
+        args = tiny_args(ple_layer_ids=[2])
+        layer = self._layer(args)
+        state_len = layer.short_conv_state_len
+        channels = args.hidden_size * args.hc_count
+        lengths = [6, 4, 1]
+        width = 6
+        mx.random.seed(7)
+        x = mx.random.normal((len(lengths), width, channels))
+        previous = mx.random.normal((len(lengths), state_len, channels))
+
+        batch = Qwen4ArraysCache(4)
+        batch[self.CONV] = previous
+        layer._short_conv(x, batch, self._prefix_mask(lengths, width))
+        mx.eval(batch[self.CONV])
+        naive = mx.contiguous(
+            mx.concatenate([previous, x], axis=1)[:, -state_len:, :]
+        )
+
+        for row, length in enumerate(lengths):
+            single = Qwen4ArraysCache(4)
+            single[self.CONV] = previous[row : row + 1]
+            layer._short_conv(x[row : row + 1, :length], single, None)
+            mx.eval(single[self.CONV])
+            self.assertTrue(
+                mx.array_equal(
+                    batch[self.CONV][row : row + 1], single[self.CONV]
+                ).item(),
+                f"row {row}: conv tail differs from the solo run",
+            )
+            # Non-vacuous: the padded rows are exactly the ones the old
+            # width-based tail got wrong.
+            padded = length < width
+            self.assertEqual(
+                padded,
+                not mx.array_equal(
+                    batch[self.CONV][row : row + 1], naive[row : row + 1]
+                ).item(),
+                f"row {row}: padding/naive-tail disagreement",
+            )
+
+    def test_short_conv_tail_is_unchanged_by_leading_pads(self):
+        # ``make_mask`` also builds ``pos >= left_padding``.  Leading pads
+        # already leave the tail at the padded width, so the fix must be a
+        # no-op there -- the whole buffer, state included, is the same one.
+        args = tiny_args(ple_layer_ids=[2])
+        layer = self._layer(args)
+        channels = args.hidden_size * args.hc_count
+        mx.random.seed(8)
+        x = mx.random.normal((2, 5, channels))
+        masked = Qwen4ArraysCache(4)
+        layer._short_conv(x, masked, self._suffix_mask([0, 3], 5))
+        plain = Qwen4ArraysCache(4)
+        layer._short_conv(x, plain, None)
+        mx.eval(masked[self.CONV], plain[self.CONV])
+        self.assertTrue(
+            mx.array_equal(masked[self.CONV], plain[self.CONV]).item()
+        )
+
+    def _ngram(self, args):
+        mx.random.seed(5)
+        return NGramEmbedding(args, args.ple_embed_dim, self.PLE_LAYER, 0)
+
+    def test_ngram_history_stops_at_each_row_valid_end(self):
+        args = tiny_args(ple_layer_ids=[2])
+        lengths = [6, 3, 1]
+        width = 6
+        rows = [[1, 2, 3, 4, 5, 6], [7, 8, 9, 0, 0, 0], [10, 0, 0, 0, 0, 0]]
+        ids = mx.array(rows, dtype=mx.int32)
+        for backend in ("cpu", "routed_cpu", "metal_prefill"):
+            with self.subTest(backend=backend), ple_hash_backend(backend):
+                embedding = self._ngram(args)
+                batch = Qwen4ArraysCache(4)
+                embedding.ngram_ids(ids, batch, self._prefix_mask(lengths, width))
+                mx.eval(batch[self.HISTORY])
+                history = np.asarray(batch[self.HISTORY])
+                for row, length in enumerate(lengths):
+                    single = Qwen4ArraysCache(4)
+                    embedding.ngram_ids(
+                        ids[row : row + 1, :length], single, None
+                    )
+                    mx.eval(single[self.HISTORY])
+                    np.testing.assert_array_equal(
+                        history[row : row + 1],
+                        np.asarray(single[self.HISTORY]),
+                        f"{backend} row {row}",
+                    )
+                # Pad id 0 is not a token of any of these rows, so its
+                # presence anywhere in the history IS the defect.
+                self.assertFalse(
+                    bool((history == 0).any()),
+                    f"{backend}: a pad id entered the token history",
+                )
+
+    def test_ngram_ids_with_leading_pads_hash_eos_not_pad(self):
+        # A left-padded row's first real tokens hash against their PREVIOUS
+        # tokens.  With pads left raw those are id 0; alone they are EOS, the
+        # sentinel the segment shift resets on.
+        args = tiny_args(ple_layer_ids=[2])
+        padding = [0, 4]
+        width = 7
+        rows = [[1, 2, 3, 4, 5, 6, 7], [0, 0, 0, 0, 11, 12, 13]]
+        ids = mx.array(rows, dtype=mx.int32)
+        for backend in ("cpu", "routed_cpu", "metal_prefill"):
+            with self.subTest(backend=backend), ple_hash_backend(backend):
+                embedding = self._ngram(args)
+                batch = Qwen4ArraysCache(4)
+                batched = np.asarray(
+                    embedding.ngram_ids(
+                        ids, batch, self._suffix_mask(padding, width)
+                    )
+                )
+                raw = np.asarray(
+                    embedding.ngram_ids(ids, Qwen4ArraysCache(4), None)
+                )
+                mx.eval(batch[self.HISTORY])
+                for row, pad in enumerate(padding):
+                    single = Qwen4ArraysCache(4)
+                    reference = np.asarray(
+                        embedding.ngram_ids(ids[row : row + 1, pad:], single, None)
+                    )
+                    np.testing.assert_array_equal(
+                        batched[row : row + 1, pad:],
+                        reference,
+                        f"{backend} row {row}: ids differ from the solo run",
+                    )
+                    np.testing.assert_array_equal(
+                        np.asarray(batch[self.HISTORY])[row : row + 1],
+                        np.asarray(single[self.HISTORY]),
+                        f"{backend} row {row}: history differs",
+                    )
+                    if pad:
+                        # Non-vacuous: pad ids really did change the hash.
+                        self.assertTrue(
+                            bool((batched[row, pad:] != raw[row, pad:]).any()),
+                            f"{backend} row {row}: pads were already inert",
+                        )
+
+
+class TestRaggedBatchRecurrentState(unittest.TestCase):
+    """A right-padded continuation must leave every row's recurrent state
+    exactly where that row's own decode leaves it.
+
+    This is the section-2 uniform-width verify geometry, and the one the
+    batch generator already drives today (``PromptBatch.prompt`` right-pads a
+    ragged prompt chunk, calls ``prepare(lengths=..., right_padding=...)``,
+    then ``finalize()``).  Until the PLE pad-safety fix the PLE half of it was
+    wrong and only the per-lane state checkpoints hid it.
+
+    Precondition worth naming: this drives a merge of ALREADY-PREFILLED
+    caches, where ``ArraysCache.left_padding`` is ``None`` and ``make_mask``
+    therefore builds the ``pos < lengths`` mask.  A merge of EMPTY caches sets
+    ``left_padding = [0] * B``, which takes precedence in ``make_mask`` and
+    returns an all-true mask, so a fresh ragged batch masks nothing at all
+    (``cache.py``; reported separately, not fixable from this module).
+    """
+
+    CASES = (
+        ([[1, 2, 3, 4, 5, 6, 7], [8, 9, 10]], [[40], [41, 42, 43, 44, 45]]),
+        (
+            [list(range(1, 15)), [15, 16, 17]],
+            [[40, 41, 42], [43]],
+        ),
+        (
+            [[1, 2], [3, 4, 5, 6, 7, 8, 9], [10, 11, 12, 13]],
+            [[40, 41, 42, 43], [44], [45, 46]],
+        ),
+    )
+    DECODE = (50, 51, 52)
+    PLE_LAYER = 1
+    # Same class and band as TestQSALeftPaddedBatch.SHAPE_NOISE_BAND: a
+    # batched row and a solo row are different kernel shapes, so the float
+    # halves of the state are compared at that tolerance.  The integer token
+    # history is compared exactly.
+    STATE_NOISE_BAND = 3e-3
+
+    def _model(self):
+        mx.random.seed(11)
+        return TextModel(tiny_args(ple_layer_ids=[2]))
+
+    def _batch(self, model, prompts, continuations):
+        caches = []
+        for prompt in prompts:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        batch = _merge_caches(caches)
+        lengths = [len(c) for c in continuations]
+        width = max(lengths)
+        for layer in batch:
+            layer.prepare(
+                lengths=lengths,
+                right_padding=[width - length for length in lengths],
+            )
+        mx.eval(
+            model(_right_pad_prompts(continuations, max_length=width), cache=batch)
+        )
+        for layer in batch:
+            layer.finalize()
+        rows = len(prompts)
+        for token in self.DECODE:
+            mx.eval(
+                model(
+                    mx.array([[token]] * rows, dtype=mx.int32), cache=batch
+                )
+            )
+        return batch
+
+    def _single(self, model, prompt, continuation):
+        cache = model.make_cache()
+        mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+        mx.eval(model(mx.array([continuation], dtype=mx.int32), cache=cache))
+        for token in self.DECODE:
+            mx.eval(model(mx.array([[token]], dtype=mx.int32), cache=cache))
+        return cache
+
+    def _assert_state_matches(self, got, want, where):
+        got, want = np.asarray(got), np.asarray(want)
+        self.assertEqual(got.shape, want.shape, where)
+        if np.issubdtype(want.dtype, np.integer):
+            np.testing.assert_array_equal(got, want, where)
+            return
+        scale = float(np.abs(want).max())
+        self.assertGreater(scale, 0.0, f"{where}: state is all zero")
+        error = float(np.abs(got - want).max()) / scale
+        self.assertLess(
+            error, self.STATE_NOISE_BAND, f"{where}: {error:.3e} of state scale"
+        )
+
+    def test_ragged_continuation_leaves_each_row_where_solo_decode_does(self):
+        for prompts, continuations in self.CASES:
+            with self.subTest(
+                prompts=[len(p) for p in prompts],
+                continuations=[len(c) for c in continuations],
+            ):
+                model = self._model()
+                batch = self._batch(model, prompts, continuations)
+                singles = [
+                    self._single(model, prompt, continuation)
+                    for prompt, continuation in zip(prompts, continuations)
+                ]
+                ple = batch[self.PLE_LAYER]
+                self.assertIsInstance(ple, Qwen4ArraysCache)
+                self.assertEqual(len(ple.cache), 4)
+                slots = ("gdn conv", "gdn state", "ple conv", "ple history")
+                for row, single in enumerate(singles):
+                    for slot, name in enumerate(slots):
+                        self._assert_state_matches(
+                            ple[slot][row : row + 1],
+                            single[self.PLE_LAYER][slot],
+                            f"row {row} {name}",
+                        )
+                # The history is the integer half, and pad id 0 is not a
+                # token of any of these sequences.
+                self.assertFalse(
+                    bool((np.asarray(ple[3]) == 0).any()),
+                    "a pad id survived in the token history",
+                )
+
+    def test_ragged_continuation_keeps_the_rows_decoding_alike(self):
+        # State exactness is only useful if the next forward agrees, so gate
+        # the logits too -- divergence CLASS, per the plan doc's section 3.
+        model = self._model()
+        prompts, continuations = self.CASES[0]
+        batch = self._batch(model, prompts, continuations)
+        rows = len(prompts)
+        batched = np.asarray(
+            model(mx.array([[60]] * rows, dtype=mx.int32), cache=batch)
+        )
+        for row, (prompt, continuation) in enumerate(zip(prompts, continuations)):
+            single = self._single(model, prompt, continuation)
+            want = np.asarray(model(mx.array([[60]], dtype=mx.int32), cache=single))
+            scale = float(np.abs(want).max())
+            error = float(np.abs(batched[row : row + 1] - want).max()) / scale
+            self.assertLess(error, 3e-3, f"row {row}: {error:.3e} of scale")
+            self.assertEqual(
+                int(batched[row, -1].argmax()),
+                int(want[0, -1].argmax()),
+                f"row {row}: argmax differs",
+            )
 
 
 if __name__ == "__main__":
