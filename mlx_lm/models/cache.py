@@ -1,9 +1,11 @@
 # Copyright © 2023-2026 Apple Inc.
 
 import copy
+import importlib
 import inspect
 import math
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -13,6 +15,83 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask, hadamard_size_ok, rotate_last
+
+_ROOT_PACKAGE = __name__.split(".")[0]
+
+# Every cache class that can appear in a saved prompt cache, keyed by class
+# name. ``_BaseCache.__init_subclass__`` fills it automatically, so
+# model-local subclasses (e.g. ``qwen4_exp.QSAKVCache``) are covered the
+# moment their module is imported.
+_CACHE_CLASS_REGISTRY: Dict[str, type] = {}
+# Names claimed by classes from more than one module: resolving such a bare
+# name would silently pick one of them, so it errors instead.
+_AMBIGUOUS_CACHE_NAMES: set = set()
+
+
+def register_cache_class(cls):
+    """Register a cache class so ``load_prompt_cache`` can resolve it by name.
+
+    Subclasses of ``_BaseCache`` register themselves when defined; calling
+    this directly (it also works as a class decorator) is only needed for
+    duck-typed cache classes outside that hierarchy.
+    """
+    name = cls.__name__
+    prev = _CACHE_CLASS_REGISTRY.get(name)
+    if prev is not None and (
+        prev.__module__ != cls.__module__ or prev.__qualname__ != cls.__qualname__
+    ):
+        _AMBIGUOUS_CACHE_NAMES.add(name)
+    _CACHE_CLASS_REGISTRY[name] = cls
+    return cls
+
+
+def _cache_class_token(cls) -> str:
+    """Serialized identifier for a cache class.
+
+    Classes defined in this module serialize as their bare name (the format
+    older files already use); model-local classes carry their defining module
+    as ``module:ClassName`` so a fresh process can resolve them without having
+    imported the model first.
+    """
+    name = cls.__name__
+    if globals().get(name) is cls:
+        return name
+    return f"{cls.__module__}:{name}"
+
+
+def _resolve_cache_class(token: str):
+    """Inverse of ``_cache_class_token``, with a registry fallback for older
+    files that recorded a model-local class as a bare name."""
+    module_name, _, name = token.rpartition(":")
+    if module_name:
+        module = sys.modules.get(module_name)
+        # Only import modules inside this package: cache-file metadata must
+        # not be able to trigger arbitrary imports.
+        if module is None and module_name.split(".")[0] == _ROOT_PACKAGE:
+            module = importlib.import_module(module_name)
+        cls = getattr(module, name, None) if module is not None else None
+        if cls is not None:
+            return cls
+    else:
+        cls = globals().get(name)
+        if cls is not None:
+            return cls
+        if name in _AMBIGUOUS_CACHE_NAMES:
+            raise ValueError(
+                f"Prompt-cache class name {name!r} is ambiguous: cache classes "
+                "with that name exist in more than one imported module. "
+                "Re-save the cache with this version of mlx-lm to record the "
+                "defining module."
+            )
+    cls = _CACHE_CLASS_REGISTRY.get(name)
+    if cls is None:
+        raise ValueError(
+            f"Unknown prompt-cache class {token!r}. If it is defined in a "
+            "model file, import that module (e.g. by loading the model) "
+            "before calling load_prompt_cache, or register it with "
+            "register_cache_class."
+        )
+    return cls
 
 
 def make_prompt_cache(
@@ -62,7 +141,7 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
-    cache_classes = [type(c).__name__ for c in cache]
+    cache_classes = [_cache_class_token(type(c)) for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
@@ -86,7 +165,7 @@ def load_prompt_cache(file_name, return_metadata=False):
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
     cache = [
-        globals()[c].from_state(state, meta_state)
+        _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
     ]
     if return_metadata:
@@ -247,6 +326,10 @@ def create_attention_mask(
 
 
 class _BaseCache:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        register_cache_class(cls)
+
     @property
     def state(self):
         return []
@@ -2190,7 +2273,7 @@ class CacheList(_BaseCache):
     @property
     def meta_state(self):
         return (
-            [type(c).__name__ for c in self.caches],
+            [_cache_class_token(type(c)) for c in self.caches],
             [c.meta_state for c in self.caches],
         )
 
@@ -2247,7 +2330,8 @@ class CacheList(_BaseCache):
     def from_state(cls, state, meta_state):
         obj = cls.__new__(cls)
         obj.caches = [
-            globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
+            _resolve_cache_class(c).from_state(s, m)
+            for s, c, m in zip(state, *meta_state)
         ]
         return obj
 
