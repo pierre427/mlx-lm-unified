@@ -23,8 +23,10 @@ from mlx_lm import utils
 from mlx_lm.generate import (
     _merge_caches,
     _right_pad_prompts,
+    generate_step,
     maybe_quantize_kv_cache,
 )
+from mlx_lm.hybrid_speculative import _GREEDY, HybridStats, self_mtp_generate_step
 from mlx_lm.models.cache import (
     CacheList,
     KVCache,
@@ -1390,6 +1392,118 @@ class TestMTPCycleAbort(unittest.TestCase):
         model.mtp_start_cycle(head, share_qsa_indices=False)
         self.assertIsNone(cache._mtp_shared_topk)
         self.assertFalse(cache._mtp_share_topk)
+
+
+class TestSelfMTPLeavesNoDraftResidue(unittest.TestCase):
+    """A full self-MTP generation must leave no trace of rejected drafts.
+
+    The per-trim rewind is covered elsewhere. This covers the accumulated
+    state after many cycles: two runs commit the same tokens but draft
+    different (always rejected) tails, so every trunk cache must end
+    bit-identical. Both runs use the same forward shapes, so an inequality
+    is residue, not reduction order.
+    """
+
+    PROMPT = mx.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=mx.uint32)
+    MAX_TOKENS = 16
+
+    def _model(self):
+        mx.random.seed(23)
+        args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
+        return Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+
+    def _never_drafted(self, count):
+        """Token ids the trunk never picks, so every forced draft is rejected."""
+        model = self._model()
+        picked = {
+            int(token)
+            for token, _ in generate_step(
+                self.PROMPT, model, max_tokens=self.MAX_TOKENS, sampler=_GREEDY
+            )
+        }
+        free = [t for t in range(model.args.text_config["vocab_size"]) if t not in picked]
+        self.assertGreaterEqual(len(free), count)
+        return free[-count:]
+
+    def _run(self, draft_token):
+        model = self._model()
+
+        real_step = model.mtp_step
+
+        def forced_step(hidden, tokens, mtp_cache):
+            logits, post = real_step(hidden, tokens, mtp_cache)
+            forced = mx.full(logits.shape, -30.0)
+            forced[..., draft_token] = 30.0
+            return forced, post
+
+        model.mtp_step = forced_step
+        cache = make_prompt_cache(model)
+        stats = HybridStats()
+        tokens = [
+            int(token)
+            for token, _, _ in self_mtp_generate_step(
+                self.PROMPT,
+                model,
+                num_draft=2,
+                max_tokens=self.MAX_TOKENS,
+                persistent_mtp=True,
+                prompt_cache=cache,
+                stats=stats,
+            )
+        ]
+        for entry in cache:
+            entry.stop_speculation()
+        mx.eval([entry.state for entry in cache])
+        return tokens, cache, stats
+
+    def test_rejected_tails_leave_the_trunk_cache_identical(self):
+        first, second = self._never_drafted(2)
+        tokens_a, cache_a, stats_a = self._run(draft_token=first)
+        tokens_b, cache_b, stats_b = self._run(draft_token=second)
+
+        # The forced drafts must all be rejected, or the two runs commit
+        # different tokens and there is nothing to compare.
+        self.assertEqual(stats_a.draft_accepted, 0)
+        self.assertEqual(stats_b.draft_accepted, 0)
+        self.assertGreater(stats_a.draft_proposed, 0)
+        self.assertEqual(
+            tokens_a,
+            tokens_b,
+            "the drafted tail changed the committed tokens, so a rejected "
+            "span stayed in the trunk cache",
+        )
+
+        for index, (entry_a, entry_b) in enumerate(zip(cache_a, cache_b)):
+            if isinstance(entry_a, Qwen4ArraysCache):
+                self.assertIsNone(entry_a._ple_rollback)
+            if hasattr(entry_a, "cache"):
+                for slot, (got, want) in enumerate(
+                    zip(entry_a.cache, entry_b.cache)
+                ):
+                    self.assertTrue(
+                        mx.array_equal(got, want).item(),
+                        f"layer {index} slot {slot} kept rejected-draft state",
+                    )
+            else:
+                self.assertEqual(entry_a.offset, entry_b.offset)
+                width = entry_a.offset
+                for name in ("keys", "values", "index_keys"):
+                    got = getattr(entry_a, name)
+                    want = getattr(entry_b, name)
+                    if got is None:
+                        self.assertIsNone(want)
+                        continue
+                    if name == "index_keys":
+                        got, want = got[:, :width], want[:, :width]
+                    else:
+                        got, want = got[..., :width, :], want[..., :width, :]
+                    self.assertTrue(
+                        mx.array_equal(got, want).item(),
+                        f"layer {index} {name} kept rejected-draft state",
+                    )
+                # The raw indexer ledger must span exactly the cursor.
+                if entry_a.index_keys is not None:
+                    self.assertEqual(entry_a.index_keys.shape[1], entry_a.offset)
 
 
 class TestRaggedRollbackComposition(unittest.TestCase):
