@@ -12,6 +12,7 @@
 import math
 import unittest
 from contextlib import ExitStack, contextmanager
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -702,6 +703,30 @@ class TestQSAFusedProj(unittest.TestCase):
             attn.update(donor.parameters())
             actual = attn(chunk, mask, QSAKVCache())
         expected = donor(chunk, mask, QSAKVCache())
+        _bytes_equal(self, actual, expected)
+
+    def test_full_device_does_not_abort_the_forward_pass(self):
+        # The 2026-08-28 bench abort: with the 104.3 GB serving artifact
+        # resident in a 120.3 GB working set, the budget guard refused the
+        # ~20 MB fused table and raised MaterializationTooLarge out of
+        # Attention.__call__ -- killing the run for a lever it was only
+        # warming up.  Resident weights must not, by themselves, refuse.
+        attn = self._attention(True)
+        chunk = mx.random.normal((1, 6, 64), key=mx.random.key(11))
+        mask = (mx.arange(6)[:, None] >= mx.arange(6)[None, :])[None, None]
+        expected = attn(chunk, mask, QSAKVCache())
+        with lever(qwen4_exp, "_QSA_FUSED_PROJ"), mock.patch.object(
+            mx.metal, "is_available", return_value=True
+        ), mock.patch.object(
+            mx, "get_active_memory", return_value=104_300_000_000
+        ), mock.patch.object(
+            mx,
+            "device_info",
+            create=True,
+            return_value={"max_recommended_working_set_size": 120_259_084_288},
+        ):
+            actual = attn(chunk, mask, QSAKVCache())
+        self.assertIsNotNone(attn._qsa_fused_cache[1])  # the lever engaged
         _bytes_equal(self, actual, expected)
 
     def test_bias_attention_falls_back_to_stock(self):

@@ -19,6 +19,7 @@
 
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -28,6 +29,7 @@ from mlx_lm.models import qwen3_next
 from mlx_lm.models.qwen3_next import (
     MaterializationTooLarge,
     check_materialization_budget,
+    materialization_headroom,
     transform_moe_weights,
 )
 from mlx_lm.models.qwen4_exp import TextModelArgs
@@ -346,6 +348,35 @@ class TestSanitizeSeamEndToEnd(unittest.TestCase):
 
 
 class TestMaterializationBudget(unittest.TestCase):
+    # The observed failure: a 120.3 GB working set with the 104.3 GB
+    # Qwen3.8-Flash-Next 4-bit artifact resident, refusing the 20.1 MB
+    # per-layer QSA fused projection table.
+    BUDGET = 120_259_084_288
+    RESIDENT = 104_300_000_000
+    QSA_TABLE = 20_090_000
+    HEADROOM = 0.15
+
+    @contextmanager
+    def device(self, active, budget=None):
+        """Report a chosen device state to the guard, at the mlx boundary."""
+        budget = self.BUDGET if budget is None else budget
+        with mock.patch.object(
+            mx,
+            "device_info",
+            return_value={"max_recommended_working_set_size": budget},
+            create=True,
+        ), mock.patch.object(
+            mx.metal, "is_available", return_value=True
+        ), mock.patch.object(
+            mx, "get_active_memory", return_value=active
+        ):
+            yield
+
+    def _old_allowance(self, active, budget=None):
+        """The rule this guard applied before 2026-08-28."""
+        budget = self.BUDGET if budget is None else budget
+        return budget * (1.0 - self.HEADROOM) - active
+
     def test_small_table_is_allowed_and_recorded(self):
         estimate = check_materialization_budget(1 << 20, "tiny table")
         self.assertEqual(estimate["bytes"], 1 << 20)
@@ -357,8 +388,174 @@ class TestMaterializationBudget(unittest.TestCase):
         if not mx.metal.is_available():
             self.skipTest("no Metal device to size against")
         with self.assertRaises(MaterializationTooLarge):
-            # The 45 GB the OOM-killed runtime fusion would have needed.
+            # 450 GB -- far past any working set the guard will ever see.
             check_materialization_budget(45 * 10**9 * 10, "oversized table")
+
+    # -- the regression, through the public guard ------------------------
+
+    def test_qsa_table_is_admitted_beside_the_resident_model(self):
+        with self.device(self.RESIDENT):
+            estimate = check_materialization_budget(
+                self.QSA_TABLE, "QSA fused projection"
+            )
+        self.assertTrue(estimate["fits"])
+        self.assertEqual(estimate["active_bytes"], self.RESIDENT)
+        # ...and the old rule really did refuse it.
+        self.assertLess(self._old_allowance(self.RESIDENT), self.QSA_TABLE)
+
+    def test_a_request_of_nothing_is_admitted_however_full_the_device(self):
+        for active in (
+            0,
+            self.BUDGET // 2,
+            self.RESIDENT,
+            self.BUDGET,
+            self.BUDGET * 2,
+        ):
+            with self.device(active):
+                estimate = check_materialization_budget(0, "empty table")
+            self.assertTrue(estimate["fits"], f"active={active}")
+
+    def test_oversized_table_still_refused_beside_the_resident_model(self):
+        # The guard keeps its teeth: 45 GB does not fit in the 16 GB left.
+        with self.device(self.RESIDENT):
+            with self.assertRaises(MaterializationTooLarge) as caught:
+                check_materialization_budget(45 * 10**9, "oversized table")
+        self.assertIn("45.0 GB", str(caught.exception))
+
+    # -- the fix changes no verdict the old rule got right ---------------
+
+    def test_verdicts_are_unchanged_wherever_the_old_rule_was_satisfiable(self):
+        # The minimality property: the fallback is reachable ONLY where the
+        # old rule refused a zero-byte request, so anywhere the old rule
+        # could say yes to anything, old and new agree exactly.
+        sizes = (0, 1, self.QSA_TABLE, 10**9, 13 * 10**9, 45 * 10**9, 100 * 10**9)
+        checked = 0
+        for step in range(0, 21):
+            active = self.BUDGET * step // 20
+            old_allowance = self._old_allowance(active)
+            if old_allowance < 0:
+                continue  # the broken region; verdicts are expected to differ
+            for nbytes in sizes:
+                with self.device(active):
+                    try:
+                        new_fits = check_materialization_budget(nbytes, "probe")["fits"]
+                    except MaterializationTooLarge:
+                        new_fits = False
+                self.assertEqual(
+                    new_fits,
+                    nbytes <= old_allowance,
+                    f"active={active} nbytes={nbytes}",
+                )
+                checked += 1
+        self.assertGreater(checked, 0)  # the sweep actually ran
+
+    def test_the_degraded_allowance_is_capped(self):
+        # Uncapped, the allowance leapt from ~0 to 15.3 GB the instant a
+        # resident model crossed the reserve line -- being slightly bigger
+        # would have bought a much larger claim. The cap bounds that step.
+        cap = self.BUDGET * self.HEADROOM * self.HEADROOM
+        just_past = self.BUDGET * (1.0 - self.HEADROOM) + 1
+        step = materialization_headroom(just_past, self.BUDGET, self.HEADROOM)
+        self.assertAlmostEqual(step, cap, delta=1)
+        self.assertLess(step, 3 * 10**9)  # 2.7 GB, not 15.3 GB
+        # Still admits what the regime exists for, still refuses the rest.
+        self.assertGreater(step, self.QSA_TABLE)
+        self.assertLess(step, 45 * 10**9)
+
+    def test_the_cap_never_raises_the_allowance(self):
+        # A cap must only ever lower: check it against the uncapped form
+        # across the whole degraded region.
+        for step in range(0, 41):
+            active = self.BUDGET * (1.0 - self.HEADROOM) + self.BUDGET * step / 200
+            uncapped = max(0, self.BUDGET - active) * (1.0 - self.HEADROOM)
+            self.assertLessEqual(
+                materialization_headroom(active, self.BUDGET, self.HEADROOM),
+                uncapped + 1,
+                f"active={active}",
+            )
+
+    def test_the_reserve_boundary_itself_still_governs(self):
+        # Knife edge: at reserved == 0 exactly, the old rule admitted a
+        # zero-byte request and nothing else. The fallback must not fire
+        # there, or that one verdict would change too.
+        active = self.BUDGET * (1.0 - self.HEADROOM)
+        self.assertEqual(
+            materialization_headroom(active, self.BUDGET, self.HEADROOM), 0
+        )
+
+    def test_codex_counterexample_is_still_refused(self):
+        # (active=60 GB, nbytes=45 GB, budget=120 GB): a free-space-only rule
+        # would have admitted this; the old rule refused it, so it stays
+        # refused.
+        budget, active, nbytes = 120 * 10**9, 60 * 10**9, 45 * 10**9
+        self.assertGreater(self._old_allowance(active, budget), 0)
+        allowed = materialization_headroom(active, budget, self.HEADROOM)
+        self.assertLess(allowed, nbytes)
+        with self.device(active, budget):
+            with self.assertRaises(MaterializationTooLarge):
+                check_materialization_budget(nbytes, "45 GB fusion")
+
+    def test_an_admitted_request_never_fills_the_working_set(self):
+        for step in range(0, 21):
+            active = self.BUDGET * step // 20
+            allowed = materialization_headroom(active, self.BUDGET, self.HEADROOM)
+            self.assertLessEqual(active + allowed, self.BUDGET, f"active={active}")
+
+    def test_nothing_is_claimable_once_active_reaches_the_budget(self):
+        # Only a zero-byte request can pass, which is the point: an
+        # over-budget model is a fact about the past, not about the request.
+        for active in (self.BUDGET, self.BUDGET + 1, self.BUDGET * 2):
+            self.assertEqual(
+                materialization_headroom(active, self.BUDGET, self.HEADROOM), 0
+            )
+
+    # -- reporting and failure modes -------------------------------------
+
+    def test_message_reports_sub_gigabyte_requests_in_mb(self):
+        with self.device(self.BUDGET - 1_000_000):
+            with self.assertRaises(MaterializationTooLarge) as caught:
+                check_materialization_budget(self.QSA_TABLE, "QSA fused projection")
+        # 20.1 MB used to print as "0.0 GB", which read as a zero-size request.
+        self.assertIn("20.1 MB", str(caught.exception))
+
+    def test_invalid_headroom_is_rejected(self):
+        for bad in (-0.1, 1.0, 1.5):
+            with self.assertRaises(ValueError):
+                materialization_headroom(0, self.BUDGET, bad)
+
+    def test_absent_metal_device_skips_the_check(self):
+        with mock.patch.object(mx.metal, "is_available", return_value=False):
+            estimate = check_materialization_budget(45 * 10**9, "unsized table")
+        self.assertFalse(estimate["checked"])
+
+    def test_a_device_reporting_no_working_set_skips_the_check(self):
+        with mock.patch.object(
+            mx, "device_info", return_value={}, create=True
+        ), mock.patch.object(mx.metal, "is_available", return_value=True):
+            estimate = check_materialization_budget(45 * 10**9, "unsized table")
+        self.assertFalse(estimate["checked"])
+
+    def test_a_malformed_working_set_does_not_silently_disable_the_guard(self):
+        # The key is PRESENT but unusable -- `.get()` would have returned None
+        # here and been read as "no device", disabling the guard silently.
+        for bad in (None, 0, -1):
+            with mock.patch.object(
+                mx,
+                "device_info",
+                create=True,
+                return_value={"max_recommended_working_set_size": bad},
+            ), mock.patch.object(mx.metal, "is_available", return_value=True):
+                with self.assertRaises(ValueError, msg=f"budget={bad!r}"):
+                    check_materialization_budget(45 * 10**9, "unsized table")
+
+    def test_a_broken_device_query_does_not_silently_disable_the_guard(self):
+        # Fail closed on our own bugs: a guard that reports "no device" when
+        # its query raises still reads as protection while providing none.
+        with mock.patch.object(
+            mx, "device_info", side_effect=TypeError("boom"), create=True
+        ), mock.patch.object(mx.metal, "is_available", return_value=True):
+            with self.assertRaises(TypeError):
+                check_materialization_budget(45 * 10**9, "unsized table")
 
 
 if __name__ == "__main__":

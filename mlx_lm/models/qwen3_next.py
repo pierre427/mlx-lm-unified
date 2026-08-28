@@ -157,32 +157,109 @@ def table_bytes(table) -> int:
     return sum(part.nbytes for part in table[:3] if part is not None)
 
 
+def _fmt_bytes(nbytes: float) -> str:
+    """Size text that keeps a small request legible instead of rounding it away."""
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if abs(nbytes) >= scale:
+            return f"{nbytes / scale:.1f} {unit}"
+    return f"{nbytes:.0f} B"
+
+
+def _working_set_bytes() -> Optional[int]:
+    """Recommended working-set size, or None when the device has no such limit.
+
+    Only a POSITIVELY detected absence returns None. A broken API or a
+    malformed reply propagates: a memory guard that fails open on its own bugs
+    is worse than no guard at all, because it still reads as protection.
+    """
+    metal = getattr(mx, "metal", None)
+    is_available = getattr(metal, "is_available", None)
+    if is_available is not None and not is_available():
+        return None
+    # mx.metal.device_info is deprecated; prefer mx.device_info where it exists
+    # so the guard survives the old spelling being removed.
+    info = getattr(mx, "device_info", None) or getattr(metal, "device_info", None)
+    if info is None:
+        return None
+    # A device that reports no working-set limit is an absence, not a fault;
+    # anything else raising here is a fault and is left to propagate.
+    reported = info()
+    if "max_recommended_working_set_size" not in reported:
+        return None
+    budget = reported["max_recommended_working_set_size"]
+    # Present but null or non-positive is a MALFORMED reply, not an absence.
+    # Do not quietly turn it into "no device": that disables the guard while
+    # it still reads as protection.
+    if budget is None or budget <= 0:
+        raise ValueError(f"device reported an unusable working set: {budget!r}")
+    return budget
+
+
+def materialization_headroom(active: int, budget: int, headroom: float) -> float:
+    """Bytes a NEW allocation may claim beside `active` bytes already held.
+
+    The primary rule is the one this guard has always applied: hold `headroom`
+    of the recommended working set back from TOTAL occupancy, leaving
+    `budget * (1 - headroom) - active` for the request.
+
+    That rule goes unsatisfiable the moment resident weights alone exceed it.
+    A 104.3 GB model in a 120.3 GB working set leaves 102.2 - 104.3 < 0, so
+    `active + nbytes <= allowed` is false for EVERY nbytes -- zero included --
+    and the guard refuses 20 MB tables that plainly fit. Loading the model
+    already spent the reserve; refusing a projection table cannot win it back.
+
+    So when, and only when, the reserve is already gone, fall back to a
+    DEGRADED allowance: the same fraction of what is still unclaimed, capped at
+    `headroom` of the reserve that should have been there. The cap is the point
+    -- uncapped, the allowance leaps from ~0 to 15.3 GB the instant a resident
+    model crosses the reserve line, so being slightly bigger would buy a much
+    larger claim. Capped, that step is 2.7 GB at the shipped constants: enough
+    for the incidental per-layer tables this regime exists to stop refusing,
+    and nowhere near a deliberate multi-GB materialization.
+
+    The fallback is reachable only where the primary rule refused a request of
+    nothing, so no allocation the primary rule judged -- admitted or refused --
+    changes verdict.
+    """
+    if not 0.0 <= headroom < 1.0:
+        raise ValueError(f"headroom must be in [0, 1), got {headroom!r}")
+    reserved = budget * (1.0 - headroom) - active
+    if reserved >= 0:
+        # Note >=, not >: at exactly zero the primary rule still admitted a
+        # request of nothing, so it must keep governing or that one verdict
+        # would change too.
+        return reserved
+    degraded = max(0, budget - active) * (1.0 - headroom)
+    return min(degraded, budget * headroom * headroom)
+
+
 def check_materialization_budget(nbytes: int, what: str, headroom: float = 0.15):
     """Refuse a runtime materialization that does not fit in memory.
 
     A runtime weight table is a SECOND copy of resident weights, so size it
-    against the device budget before building it. Returns the recorded
-    estimate and raises MaterializationTooLarge when it does not fit.
+    against the remaining working-set allowance before building it. Returns the
+    recorded estimate and raises MaterializationTooLarge when it does not fit.
     """
-    try:
-        budget = mx.metal.device_info()["max_recommended_working_set_size"]
-    except Exception:  # No Metal device: nothing to size against.
+    budget = _working_set_bytes()
+    if budget is None:
         return {"bytes": nbytes, "checked": False}
     active = mx.get_active_memory()
-    allowed = budget * (1.0 - headroom)
+    allowed = materialization_headroom(active, budget, headroom)
     estimate = {
         "bytes": nbytes,
         "active_bytes": active,
         "budget_bytes": budget,
+        "allowed_bytes": allowed,
         "headroom": headroom,
         "checked": True,
-        "fits": active + nbytes <= allowed,
+        "fits": nbytes <= allowed,
     }
     logger.debug("materialization estimate for %s: %s", what, estimate)
     if not estimate["fits"]:
         raise MaterializationTooLarge(
-            f"{what} needs {nbytes / 1e9:.1f} GB beside {active / 1e9:.1f} GB "
-            f"active, past the {allowed / 1e9:.1f} GB budget"
+            f"{what} needs {_fmt_bytes(nbytes)} beside {_fmt_bytes(active)} "
+            f"active; the allowance is {_fmt_bytes(allowed)} of the "
+            f"{_fmt_bytes(budget)} recommended working set"
         )
     return estimate
 
