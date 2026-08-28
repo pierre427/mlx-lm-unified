@@ -331,5 +331,120 @@ class TestGatedDeltaHeadMapping(unittest.TestCase):
                     self._check(fn, Hk, Hv)
 
 
+class TestGatedDeltaReadoutRange(unittest.TestCase):
+    """Pin the readout against the activation dtype's range.
+
+    The recurrent state is fp32 but the readout leaves in the activation
+    dtype. float16 tops out at 65504, and an infinite readout becomes NaN in
+    the RMSNormGated that every GDN caller applies next. bfloat16 shares
+    float32's exponent, so it must stay untouched.
+    """
+
+    B, T, H, D = 1, 8, 1, 128
+    # k_t = e_t gives orthogonal keys, so the delta rule never self-corrects
+    # and the state keeps one large row per step; q = 1 sums all 8 of them.
+    EXPECTED = 8 * 20000.0
+
+    def _inputs(self, dtype):
+        k = mx.zeros((self.B, self.T, self.H, self.D))
+        for t in range(self.T):
+            k[0, t, 0, t] = 1.0
+        v = mx.full((self.B, self.T, self.H, self.D), 20000.0)
+        q = mx.ones((self.B, self.T, self.H, self.D))
+        g = mx.ones((self.B, self.T, self.H), dtype=mx.float32)
+        beta = mx.ones((self.B, self.T, self.H), dtype=mx.float32)
+        state = mx.zeros((self.B, self.H, self.D, self.D), dtype=mx.float32)
+        return q.astype(dtype), k.astype(dtype), v.astype(dtype), g, beta, state
+
+    def _paths(self):
+        paths = {"ops": gated_delta_ops}
+        if mx.default_device() == mx.gpu:
+            paths.update(
+                packed=gated_delta_kernel,
+                unpacked=gated_delta_kernel_unpacked,
+                xtree=gated_delta_kernel_xtree,
+            )
+        return paths
+
+    def test_construction_exceeds_the_float16_ceiling(self):
+        # Without this the fp16 cases below would prove nothing.
+        args = self._inputs(mx.float32)
+        y, _ = gated_delta_ops(*args, None)
+        mx.eval(y)
+        self.assertAlmostEqual(mx.max(y).item(), self.EXPECTED, delta=1.0)
+        self.assertGreater(self.EXPECTED, mx.finfo(mx.float16).max)
+
+    def test_float16_readout_saturates_instead_of_overflowing(self):
+        for name, fn in self._paths().items():
+            with self.subTest(path=name):
+                y, _ = fn(*self._inputs(mx.float16), None)
+                mx.eval(y)
+                self.assertEqual(y.dtype, mx.float16)
+                self.assertEqual(int(mx.isinf(y).sum().item()), 0)
+                self.assertEqual(int(mx.isnan(y).sum().item()), 0)
+                self.assertEqual(mx.max(y).item(), mx.finfo(mx.float16).max)
+
+    def test_float16_saturated_readout_survives_the_gated_norm(self):
+        # The failure this guards against is a NaN layer output, not the inf.
+        from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
+
+        norm = Qwen3NextRMSNormGated(self.D, eps=1e-6)
+        for name, fn in self._paths().items():
+            with self.subTest(path=name):
+                y, _ = fn(*self._inputs(mx.float16), None)
+                out = norm(y, mx.ones_like(y))
+                mx.eval(out)
+                self.assertEqual(int(mx.isnan(out).sum().item()), 0)
+                self.assertEqual(int(mx.isinf(out).sum().item()), 0)
+
+    def test_bfloat16_readout_is_not_clamped(self):
+        # bf16 reaches 1.6e5 unaided, so it must take the untouched path.
+        for name, fn in self._paths().items():
+            with self.subTest(path=name):
+                y, _ = fn(*self._inputs(mx.bfloat16), None)
+                mx.eval(y)
+                self.assertEqual(y.dtype, mx.bfloat16)
+                self.assertEqual(int(mx.isinf(y).sum().item()), 0)
+                self.assertAlmostEqual(
+                    mx.max(y).astype(mx.float32).item(), self.EXPECTED, delta=512.0
+                )
+
+    def test_widening_predicate_tracks_exponent_width(self):
+        needs = gated_delta._readout_needs_widening
+        self.assertTrue(needs(mx.float16, mx.float32))
+        self.assertFalse(needs(mx.bfloat16, mx.float32))
+        self.assertFalse(needs(mx.float32, mx.float32))
+        self.assertFalse(needs(mx.float16, mx.float16))
+
+    def test_saturating_cast_keeps_nan(self):
+        # Range clamping must not hide a genuinely diverged state.
+        y = mx.array([float("nan"), float("inf"), 1.0], dtype=mx.float32)
+        out = gated_delta._cast_readout(y, mx.float16, mx.float32)
+        mx.eval(out)
+        self.assertTrue(mx.isnan(out[0]).item())
+        self.assertEqual(out[1].item(), mx.finfo(mx.float16).max)
+
+    def test_core_adapter_declines_narrow_readout_dtypes(self):
+        # mx.fast.gated_delta_update writes its readout without saturating.
+        gated_delta._ENABLE_GDN_CORE = True
+        previous = gated_delta._core_gated_delta_update
+        gated_delta._core_gated_delta_update = lambda *a, **kw: None
+        try:
+            B, T, Hk, Hv, D = 1, 64, 16, 32, 128
+            state = mx.zeros((B, Hv, D, D), dtype=mx.float32)
+            g = mx.ones((B, T, Hv), dtype=mx.float32)
+            for dtype, expected in ((mx.bfloat16, True), (mx.float16, False)):
+                q = mx.zeros((B, T, Hk, D), dtype=dtype)
+                v = mx.zeros((B, T, Hv, D), dtype=dtype)
+                with self.subTest(dtype=dtype):
+                    self.assertEqual(
+                        gated_delta._can_use_core_gated_delta(q, q, v, g, state, None),
+                        expected,
+                    )
+        finally:
+            gated_delta._ENABLE_GDN_CORE = False
+            gated_delta._core_gated_delta_update = previous
+
+
 if __name__ == "__main__":
     unittest.main()

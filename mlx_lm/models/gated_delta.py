@@ -28,6 +28,47 @@ _CORE_GDN_HEADS = frozenset(
 _core_gated_delta_update = getattr(mx.fast, "gated_delta_update", None)
 
 
+def _readout_needs_widening(input_type, state_type) -> bool:
+    """Whether the fp32 state's range can overflow the activation dtype.
+
+    A dtype with the state's exponent width holds its maximum to within a
+    factor of two (bfloat16: 3.39e38 vs float32 3.40e38); a narrower one is
+    smaller by many orders of magnitude (float16: 65504). So this comparison
+    is the exponent-width test.
+    """
+    if input_type == state_type:
+        return False
+    return mx.finfo(input_type).max < mx.finfo(state_type).max / 2
+
+
+_SATURATING_CASTS = {}
+
+
+def _saturating_cast(dtype):
+    """Compiled clamp-then-cast, so the narrowing is one elementwise pass."""
+    fn = _SATURATING_CASTS.get(dtype)
+    if fn is None:
+        info = mx.finfo(dtype)
+        fn = mx.compile(
+            lambda y, lo=info.min, hi=info.max: mx.clip(y, lo, hi).astype(dtype),
+            shapeless=True,
+        )
+        _SATURATING_CASTS[dtype] = fn
+    return fn
+
+
+def _cast_readout(y, input_type, state_type):
+    """Narrow the readout to the activation dtype, saturating on overflow.
+
+    Every GDN caller feeds the readout straight into a scale-invariant
+    RMSNorm, so one infinite component gives inf/inf = NaN and destroys the
+    layer. Clamping keeps the vector finite and signed. NaN still propagates.
+    """
+    if not _readout_needs_widening(input_type, state_type):
+        return y.astype(input_type)
+    return _saturating_cast(input_type)(y)
+
+
 def _can_use_core_gated_delta(q, k, v, g, state, mask):
     """Whether the fixed MLX primitive covers this exact recurrence layout."""
     if not _ENABLE_GDN_CORE or _core_gated_delta_update is None:
@@ -50,6 +91,10 @@ def _can_use_core_gated_delta(q, k, v, g, state, mask):
         and q.dtype in (mx.float32, mx.bfloat16, mx.float16)
         and k.dtype in (mx.float32, mx.bfloat16, mx.float16)
         and v.dtype in (mx.float32, mx.bfloat16, mx.float16)
+        # The MLX primitive writes its readout in the activation dtype with no
+        # saturation (see _cast_readout). Leave those dtypes to the local
+        # kernels, which do saturate.
+        and not _readout_needs_widening(q.dtype, state.dtype)
     )
 
 
@@ -447,7 +492,7 @@ def _gated_delta_step_ops(
     if mask is not None:
         mask = mx.expand_dims(mask, axis=(1, 2, 3))
         state = mx.where(mask, state, old_state)
-    return y.astype(q.dtype), state
+    return _cast_readout(y, q.dtype, old_state.dtype), state
 
 
 def _gated_delta_kernel_impl(
@@ -465,6 +510,13 @@ def _gated_delta_kernel_impl(
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
+
+    # The kernel accumulates the readout in fp32 and writes it out as InT.
+    # When InT cannot hold the state's range, take it out wide and saturate
+    # on the way back down, so the dtype the caller sees never changes.
+    # bf16 and fp32 keep the original template, output dtypes and kernel.
+    widen = _readout_needs_widening(input_type, state_type)
+    readout_type = mx.float32 if widen else input_type
 
     # The packed kernel gives each lane Dk/4 state elements and packs 32/4
     # value rows into a SIMD-group, so it needs Dk == 128 and Dv divisible by
@@ -501,10 +553,10 @@ def _gated_delta_kernel_impl(
         grid = (32, Dv, B * Hv)
         threadgroup = (32, 4, 1)
 
-    return kernel(
+    y, new_state = kernel(
         inputs=inputs,
         template=[
-            ("InT", input_type),
+            ("InT", readout_type),
             ("StT", state_type),
             ("Dk", Dk),
             ("Dv", Dv),
@@ -514,8 +566,11 @@ def _gated_delta_kernel_impl(
         grid=grid,
         threadgroup=threadgroup,
         output_shapes=[(B, T, Hv, Dv), state.shape],
-        output_dtypes=[input_type, state_type],
+        output_dtypes=[readout_type, state_type],
     )
+    if widen:
+        y = _cast_readout(y, input_type, state_type)
+    return y, new_state
 
 
 def gated_delta_kernel_xtree(
@@ -536,10 +591,13 @@ def gated_delta_kernel_xtree(
     assert mask is None
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
-    return _gated_delta_kernel_xtree(
+    # Mirror the production readout cast so the comparator stays bitwise.
+    widen = _readout_needs_widening(q.dtype, state.dtype)
+    readout_type = mx.float32 if widen else q.dtype
+    y, new_state = _gated_delta_kernel_xtree(
         inputs=[q, k, v, g, beta, state, T],
         template=[
-            ("InT", q.dtype),
+            ("InT", readout_type),
             ("StT", state.dtype),
             ("Dk", Dk),
             ("Dv", Dv),
@@ -549,8 +607,11 @@ def gated_delta_kernel_xtree(
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
-        output_dtypes=[q.dtype, state.dtype],
+        output_dtypes=[readout_type, state.dtype],
     )
+    if widen:
+        y = _cast_readout(y, q.dtype, state.dtype)
+    return y, new_state
 
 
 def gated_delta_kernel_unpacked(
