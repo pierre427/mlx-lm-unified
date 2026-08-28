@@ -747,6 +747,139 @@ class TestArraysCacheRaggedTrim(unittest.TestCase):
         self.assertIsNotNone(record.per_row_fn)
 
 
+class _MaskedRecurrence:
+    """Stand-in for GatedDeltaNet on a bare ArraysCache.
+
+    Live steps honour the mask (masked steps are recurrence no-ops, exactly
+    like the GDN kernel); the replay closure is mask-free and indexed from
+    slab position 0, exactly like GDN's ``_rollback``.
+    """
+
+    def __init__(self, cache):
+        self.cache = cache
+
+    def __call__(self, tokens):
+        steps = tokens.shape[1]
+        mask = self.cache.make_mask(steps)
+        before = self.cache[0]
+
+        def rollback(m):
+            out = before
+            for step in range(m):
+                out = out * 2 + tokens[:, step : step + 1]
+            return [out]
+
+        spans = self.cache.rollback_spans(steps, mask)
+        if self.cache.speculating and spans is not None:
+            self.cache.record_rollback(steps, rollback, [before])
+
+        out = before
+        for step in range(steps):
+            advanced = out * 2 + tokens[:, step : step + 1]
+            out = advanced if mask is None else mx.where(
+                mask[:, step : step + 1], advanced, out
+            )
+        self.cache[0] = out
+        self.cache.advance(steps)
+        return out
+
+
+class TestRollbackSpans(unittest.TestCase):
+    """Per-row spans on a bare ArraysCache: Qwen3.5 and Qwen3-Next."""
+
+    def test_spans_describe_the_geometry(self):
+        cache = ArraysCache(1)
+        self.assertEqual(cache.rollback_spans(4), ())
+
+        padded = ArraysCache(1)
+        padded.prepare(lengths=[4, 2, 3])
+        self.assertEqual(padded.rollback_spans(4), [4, 2, 3])
+        # A span never exceeds the slab width.
+        self.assertEqual(padded.rollback_spans(2), [2, 2, 2])
+
+        left = ArraysCache(1, left_padding=[1, 0])
+        self.assertIsNone(left.rollback_spans(3))
+
+    def test_mask_without_metadata_refuses(self):
+        cache = ArraysCache(1)
+        self.assertIsNone(cache.rollback_spans(3, mask=mx.ones((2, 3), mx.bool_)))
+
+    def test_advance_carries_the_spans(self):
+        cache = ArraysCache(1)
+        cache.prepare(lengths=[5, 2])
+        cache.advance(2)
+        self.assertEqual(cache.rollback_spans(3), [3, 0])
+        cache.finalize()
+        self.assertEqual(cache.rollback_spans(3), ())
+
+    def _padded_run(self):
+        """Record A unpadded, then record B with per-row spans 2 and 1."""
+        cache = ArraysCache(1)
+        cache.start_speculation()
+        cache.cache = [mx.zeros((2, 1), dtype=mx.int32)]
+        layer = _MaskedRecurrence(cache)
+        layer(mx.array([[3], [5]], dtype=mx.int32))
+        cache.prepare(lengths=[2, 1])
+        layer(mx.array([[7, 9], [11, 0]], dtype=mx.int32))
+        cache.finalize()
+        return cache
+
+    def test_padded_forward_credits_each_row_its_own_span(self):
+        cache = self._padded_run()
+        self.assertEqual(cache[0].reshape(-1).tolist(), [35, 21])
+        # Row 1 advanced one token through a two-wide slab.
+        self.assertEqual(cache._row_capacity(2), [3, 2])
+
+    def test_rewind_spanning_records_lands_on_the_right_one(self):
+        cache = self._padded_run()
+        cache.trim_ragged([0, 2])
+        # Row 1 owns one token in B and one in A, so rewinding two puts it
+        # back before A. Crediting it the slab width would stop inside B.
+        self.assertEqual(cache[0].reshape(-1).tolist(), [35, 0])
+
+    def test_partial_rewind_uses_the_rows_own_depth(self):
+        cache = self._padded_run()
+        cache.trim_ragged([0, 1])
+        self.assertEqual(cache[0].reshape(-1).tolist(), [35, 5])
+
+    def test_replay_of_a_wider_row_leaves_the_narrow_row_alone(self):
+        cache = self._padded_run()
+        cache.trim_ragged([1, 0])
+        self.assertEqual(cache[0].reshape(-1).tolist(), [13, 21])
+
+    def test_uniform_trim_respects_the_shortest_row(self):
+        cache = self._padded_run()
+        self.assertEqual(cache.trim(2), 2)
+        self.assertEqual(cache[0].reshape(-1).tolist(), [3, 0])
+        with self.assertRaises(RuntimeError):
+            cache.trim(2)
+
+    def test_unpadded_forward_keeps_the_uniform_record(self):
+        cache = ArraysCache(1)
+        cache.start_speculation()
+        cache.cache = [mx.zeros((2, 1), dtype=mx.int32)]
+        _MaskedRecurrence(cache)(mx.array([[3, 4], [5, 6]], dtype=mx.int32))
+        self.assertIsNone(cache._rollbacks[-1].depths)
+        self.assertEqual(cache._row_capacity(2), [2, 2])
+
+    def test_recording_under_leading_pads_fails_loud(self):
+        cache = ArraysCache(1, left_padding=[1, 0])
+        cache.start_speculation()
+        cache.cache = [mx.zeros((2, 1), dtype=mx.int32)]
+        with self.assertRaises(RuntimeError) as raised:
+            cache.record_rollback(2, lambda m: [mx.zeros((2, 1))], [cache[0]])
+        self.assertIn("rollback_spans", str(raised.exception))
+
+    def test_span_row_count_must_match_the_batch(self):
+        cache = ArraysCache(1)
+        cache.start_speculation()
+        cache.cache = [mx.zeros((2, 1), dtype=mx.int32)]
+        with self.assertRaises(RuntimeError):
+            cache.record_rollback(
+                2, lambda m: [cache[0]], [cache[0]], depths=[2, 2, 2]
+            )
+
+
 class TestQwen4CacheContracts(unittest.TestCase):
     """The production Qwen4 cache types, exercised through this file's API only."""
 

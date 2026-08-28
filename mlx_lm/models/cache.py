@@ -304,6 +304,8 @@ class _RollbackRecord(tuple):
     """
 
     def __new__(cls, num_tokens, fn, snapshot, per_row_fn=None, depths=None):
+        if depths is not None and all(d == num_tokens for d in depths):
+            depths = None
         replayable = num_tokens if depths is None else min(depths)
         record = super().__new__(cls, (replayable, fn, snapshot))
         record.num_tokens = num_tokens
@@ -330,13 +332,8 @@ class _RollbackRecord(tuple):
         return list(self.depths)
 
     def with_depths(self, depths: List[int]):
-        uniform = all(d == self.num_tokens for d in depths)
         return _RollbackRecord(
-            self.num_tokens,
-            self.fn,
-            self.snapshot,
-            self.per_row_fn,
-            None if uniform else depths,
+            self.num_tokens, self.fn, self.snapshot, self.per_row_fn, depths
         )
 
     def exhausted(self) -> bool:
@@ -2004,6 +2001,12 @@ class ArraysCache(_BaseCache):
         # Set when the records were dropped because they no longer describe
         # the live rows (a batch membership change); reported by trim().
         instance._rollback_invalid_reason = None
+        # Host mirrors of the padding metadata, keyed by the array they
+        # mirror. Rollback spans are host-side, and a hybrid model holds tens
+        # of these caches, so reading `lengths` off the device every forward
+        # would be tens of syncs per step.
+        instance._host_lengths = None
+        instance._host_left_padding = None
         # Prefill-time state checkpoints, stored per batch lane: one list per
         # lane of (position, snapshot) pairs, where ``position`` is the lane's
         # absolute token position and ``snapshot`` holds batch-size-1 copies
@@ -2036,7 +2039,71 @@ class ArraysCache(_BaseCache):
         self.speculating = False
         self._rollbacks.clear()
 
-    def record_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
+    def _host_vector(self, field, cached):
+        value = getattr(self, field)
+        if value is None:
+            return None, None
+        if cached is None or cached[0] is not value:
+            cached = (value, [int(v) for v in value.tolist()])
+        return cached, cached[1]
+
+    def _length_vector(self):
+        self._host_lengths, values = self._host_vector("lengths", self._host_lengths)
+        return values
+
+    def _left_padding_vector(self):
+        self._host_left_padding, values = self._host_vector(
+            "left_padding", self._host_left_padding
+        )
+        return values
+
+    def rollback_spans(self, length: int, mask=None):
+        """Tokens this forward advances per row, host-side — or ``None``.
+
+        A record credits each row a depth. Under a padded slab that depth is
+        the row's own valid span, not the slab width: crediting the width lets
+        a later rewind take tokens out of this record that the row never
+        processed, and stop before the older record that really holds them.
+
+        ``()`` means "unpadded, every row advanced ``length``". ``None`` means
+        the geometry is not describable row-wise, and a layer must NOT stage a
+        rollback for it. That covers a mask the cache metadata cannot explain,
+        and a LEADING pad run: replay closures index a row's tokens from slab
+        position 0, so a row whose tokens start later cannot be replayed by a
+        scalar depth.
+        """
+        lengths = self._length_vector()
+        padding = self._left_padding_vector()
+        if padding is not None and max(padding) > 0:
+            return None
+        if lengths is None:
+            # A caller-supplied mask with no metadata behind it: the rows are
+            # padded by an amount this cache cannot name.
+            return None if mask is not None else ()
+        return [min(max(v, 0), length) for v in lengths]
+
+    def _record_depths(self, num_tokens, depths):
+        """Resolve a record's per-row depths, deriving them when not given."""
+        if depths is None:
+            depths = self.rollback_spans(num_tokens)
+            if depths is None:
+                raise RuntimeError(
+                    "Cannot record a rollback for this forward: the padding "
+                    "geometry is not describable per row, so the record would "
+                    "credit rows tokens they never processed. The layer must "
+                    "check rollback_spans() and skip staging when it is None."
+                )
+        if not depths:
+            return None
+        depths = [int(v) for v in depths]
+        if len(depths) != self.batch_size:
+            raise RuntimeError(
+                f"Rollback spans cover {len(depths)} rows but the cache holds "
+                f"{self.batch_size}"
+            )
+        return depths
+
+    def record_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None, depths=None):
         """Recorded by the owning layer during a forward while ``speculating``.
 
         Args:
@@ -2050,10 +2117,14 @@ class ArraysCache(_BaseCache):
             per_row_fn (callable): Optional ``fn(m_list) -> list`` giving every
                 row its own length in one graph. ``trim_ragged`` uses it when
                 present and otherwise replays ``fn`` once per distinct length.
+            depths (list): Optional per-row spans this forward advanced, as
+                ``rollback_spans`` returns them. Derived from the cache's own
+                metadata when omitted, so a layer never does the arithmetic.
         """
+        depths = self._record_depths(num_tokens, depths)
         self._rollback_invalid_reason = None
         self._rollbacks.append(
-            _RollbackRecord(num_tokens, fn, snapshot, per_row_fn)
+            _RollbackRecord(num_tokens, fn, snapshot, per_row_fn, depths)
         )
         # Bound the retained history by what a record still holds for any row.
         total = sum(r.span for r in self._rollbacks)
@@ -2435,16 +2506,28 @@ class ArraysCache(_BaseCache):
 
     def prepare(self, lengths=None, **kwargs):
         self.lengths = mx.array(lengths)
+        if lengths is not None:
+            # Seed the mirror from the host list already in hand.
+            self._host_lengths = (self.lengths, [int(v) for v in lengths])
 
     def finalize(self):
         self.lengths = None
         self.left_padding = None
+        self._host_lengths = None
+        self._host_left_padding = None
 
     def advance(self, N):
+        # Carry the host mirrors arithmetically so no read syncs.
+        lengths = self._length_vector()
+        padding = self._left_padding_vector()
         if self.lengths is not None:
             self.lengths -= N
         if self.left_padding is not None:
             self.left_padding -= N
+        if lengths is not None:
+            self._host_lengths = (self.lengths, [v - N for v in lengths])
+        if padding is not None:
+            self._host_left_padding = (self.left_padding, [v - N for v in padding])
         # Tie the metadata into the state graph: only the layer whose
         # make_mask runs evaluates these decrements, so every other layer
         # otherwise accumulates one dead lazy node per token — each pinning
