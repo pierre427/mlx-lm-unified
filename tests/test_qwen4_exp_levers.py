@@ -959,6 +959,85 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
                     # Non-vacuous: the shared grid really is wider.
                     self.assertGreater(cache._idx // ratio, shortest // ratio)
 
+    def test_qsa_levers_stack_bitwise_across_the_dense_boundary(self):
+        """The three QSA levers together, on a batch that starts dense.
+
+        This is the interaction the individual arms cannot see: the dense
+        short-circuit returns BEFORE pooling but AFTER the raw-key append, so
+        the pooled cache first engages several steps in, on a block grid that
+        already grew.  Blocks are logical and closed, so the retained ones
+        stay valid -- but only a stacked run proves it.
+        """
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2])
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=args.__dict__)
+        ).language_model
+        # 7 and 3 tokens: the merged batch is dense (1 block <= block_topk 2)
+        # and crosses into sparse partway through the schedule.
+        prompts = [[1, 2, 3, 4, 5, 6, 7], [8, 9, 10]]
+        chunks = ([20], [21], [22, 23, 24], [25], [26, 27])
+
+        def run():
+            caches = []
+            for prompt in prompts:
+                cache = model.make_cache()
+                mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+                caches.append(cache)
+            batch = _merge_caches(caches)
+            outputs = []
+            for chunk in chunks:
+                logits = model(
+                    mx.array([list(chunk)] * len(prompts), dtype=mx.int32),
+                    cache=batch,
+                )
+                mx.eval(logits)
+                outputs.append(np.asarray(logits))
+            return batch, outputs
+
+        with count_pooling() as pooled:
+            batch, stock = run()
+        # Non-vacuous on both sides of the boundary: some steps pooled and
+        # the schedule started below it.
+        self.assertIn("_pooled_keys", pooled)
+        self.assertEqual(
+            next(
+                layer.left_padding.tolist()
+                for layer in batch
+                if isinstance(layer, qwen4_exp.BatchQSAKVCache)
+            ),
+            [0, 4],
+        )
+        with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
+            with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+                with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN"):
+                    _, stacked = run()
+        for step, (expected, actual) in enumerate(zip(stock, stacked)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+    def test_shared_topk_cycle_on_a_batch_is_dense_short_circuit_safe(self):
+        # The short-circuit's arming branch stores ``arange(n_blocks)`` as the
+        # shared set; under a batch that has to be per row, and the reuse
+        # steps have to keep matching the stock selection.
+        def run(share):
+            model, batch, _ = self._merged()
+            for layer in batch:
+                if isinstance(layer, qwen4_exp.BatchQSAKVCache):
+                    layer._mtp_share_topk = share
+                    layer._mtp_shared_topk = None
+            return batch, self._decode(model, batch)
+
+        batch, stock = run(True)
+        rows = len(self.PROMPTS)
+        for layer in batch:
+            if isinstance(layer, qwen4_exp.BatchQSAKVCache):
+                self.assertIsNotNone(layer._mtp_shared_topk)
+                self.assertEqual(layer._mtp_shared_topk.shape[0], rows)
+        with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
+            _, fast = run(True)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+
     def test_batch_qsa_cycle_state_survives_filter_and_clears_on_membership(self):
         model, batch, _ = self._merged()
         with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
