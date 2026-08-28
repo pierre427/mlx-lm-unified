@@ -1083,28 +1083,26 @@ class TestPaddedSpeculativeStaging(unittest.TestCase):
         )
         return lengths
 
-    def test_padded_slab_stages_a_per_row_depth(self):
+    def test_padded_slab_records_a_per_row_depth(self):
         model = self._model()
         batch = self._merged(model)
         lengths = self._speculative_slab(model, batch)
         cache = batch[self.PLE_LAYER]
         self.assertIsInstance(cache, Qwen4ArraysCache)
-        staged = cache._ple_rollback
-        self.assertIsNotNone(
-            staged, "a padded speculative forward staged no PLE rollback"
-        )
-        num_tokens, _, _, per_row_fn, depths = staged
-        self.assertEqual(num_tokens, max(lengths))
-        self.assertEqual(depths, lengths)
-        self.assertIsNotNone(per_row_fn)
+        # GDN now records under this geometry too, so the two halves pair up
+        # in one record instead of leaving a staged half behind.
+        self.assertIsNone(cache._ple_rollback)
+        record = cache._rollbacks[-1]
+        self.assertEqual(record.num_tokens, max(lengths))
+        self.assertEqual(record.depths, lengths)
+        self.assertEqual(cache._row_capacity(len(lengths)), lengths)
 
     def test_padded_record_rewinds_each_row_to_its_own_prefix(self):
         """The whole point: reject different draft counts and land right.
 
-        GDN's staging in ``qwen3_5.py`` still disarms under a mask, so its
-        half is stubbed with a no-op replay here and only the PLE slots are
-        asserted.  Everything under test -- the per-row depths, the record's
-        replay, the ragged rewind -- is this module's.
+        GDN records under this geometry now, so the record under test is the
+        real paired PLE+GDN one; the PLE slots are asserted against a
+        single-row reference decode.
         """
         for accepted in ((2, 0), (0, 1), (3, 1), (1, 0)):
             with self.subTest(accepted=accepted):
@@ -1112,10 +1110,6 @@ class TestPaddedSpeculativeStaging(unittest.TestCase):
                 batch = self._merged(model)
                 lengths = self._speculative_slab(model, batch)
                 cache = batch[self.PLE_LAYER]
-                gdn = [cache[0], cache[1]]
-                cache.record_rollback(
-                    max(lengths), lambda m, s=gdn: list(s), list(gdn)
-                )
                 self.assertEqual(cache._row_capacity(len(lengths)), list(lengths))
 
                 for layer in batch:
@@ -1146,14 +1140,22 @@ class TestPaddedSpeculativeStaging(unittest.TestCase):
                         np.asarray(want[self.HISTORY]),
                         f"row {row} token history",
                     )
-                    got = np.asarray(cache[self.CONV][row : row + 1])
-                    ref = np.asarray(want[self.CONV])
-                    scale = float(np.abs(ref).max())
-                    self.assertLess(
-                        float(np.abs(got - ref).max()) / scale,
-                        3e-3,
-                        f"row {row} conv state",
-                    )
+                    # Slots 0 and 1 are GDN's: its replay is mask-free, so
+                    # this is where crediting a row more than its own span
+                    # would show up.
+                    for slot, name in (
+                        (0, "gdn conv"),
+                        (1, "gdn recurrent state"),
+                        (self.CONV, "ple conv"),
+                    ):
+                        got = np.asarray(cache[slot][row : row + 1])
+                        ref = np.asarray(want[slot])
+                        scale = float(np.abs(ref).max()) or 1.0
+                        self.assertLess(
+                            float(np.abs(got - ref).max()) / scale,
+                            3e-3,
+                            f"row {row} {name}",
+                        )
 
     def test_a_pending_ple_half_makes_the_span_untrimmable(self):
         # A staged-but-unrecorded half is invisible to the rewind walker, so
@@ -1163,6 +1165,10 @@ class TestPaddedSpeculativeStaging(unittest.TestCase):
         batch = self._merged(model)
         self._speculative_slab(model, batch)
         cache = batch[self.PLE_LAYER]
+        # GDN records under this geometry now, so a pending half needs an
+        # interrupted forward: stage one without ever reaching record.
+        gdn = [cache[0], cache[1]]
+        cache.stage_ple_rollback(1, lambda m, s=gdn: list(s), list(gdn))
         self.assertIsNotNone(cache._ple_rollback)
         self.assertFalse(cache.is_trimmable())
         for call in (
@@ -1195,6 +1201,8 @@ class TestPaddedSpeculativeStaging(unittest.TestCase):
         batch = self._merged(model)
         self._speculative_slab(model, batch)
         cache = batch[self.PLE_LAYER]
+        gdn = [cache[0], cache[1]]
+        cache.stage_ple_rollback(1, lambda m, s=gdn: list(s), list(gdn))
         self.assertIsNotNone(cache._ple_rollback)
         for layer in batch:
             layer.finalize()

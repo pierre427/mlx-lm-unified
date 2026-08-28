@@ -626,18 +626,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         state = cache[1] if cache else None
         q, k = normalize_gdn_qk(q, k)
 
+        # Gate on the geometry being describable per row, not on it being
+        # unpadded: a right-padded speculative slab is exactly the case that
+        # has to roll back. ``rollback_spans`` returns None where a scalar
+        # depth would lie, and the cache credits each row its own span.
+        spans = ()
+        if cache is not None:
+            describe = getattr(cache, "rollback_spans", None)
+            if describe is not None:
+                spans = describe(S, mask)
+
         if (
             cache is not None
             and getattr(cache, "speculating", False)
-            and mask is None
-            and cache.lengths is None
-            and cache.left_padding is None
+            and spans is not None
         ):
             # Record an exact rollback for speculative decoding: replaying the
             # recurrence from the pre-forward state over the first m of the
             # exact per-token inputs the kernel consumes reproduces the state
             # after m tokens bit-for-bit; the conv state after m tokens is a
             # slice of conv_input. See ArraysCache.record_rollback.
+            # The replay is mask-free, which is exact for a row only up to its
+            # own span: masked steps are no-ops live, and no row has leading
+            # pads here, so positions [0, m) are that row's own tokens.
             n_keep = self.conv_kernel_size - 1
             use_kernel = not self.training
 
