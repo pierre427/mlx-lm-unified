@@ -223,6 +223,28 @@ class TestMergeRowIsolation(unittest.TestCase):
         arrays.cache[0][0:1] = mx.full((1, 4), -99.0)
         self.assertEqual(source.caches[1].cache[0].tolist(), arrays_before)
 
+    def test_single_row_merge_is_write_isolated(self):
+        """B=1 merge can share the source buffer; writes must still not leak.
+
+        ``mx.zeros`` fully overwritten by one slice assign can hand back the
+        assigned buffer, so the merged array and the source can share
+        storage. MLX copies on a slice write while that storage is shared,
+        which is what keeps the source cache intact — pin it here so a change
+        in that behaviour is caught rather than silently corrupting a stored
+        prompt cache.
+        """
+        source = self._prefilled_kv()
+        merged = source.merge([source])
+        before = source.keys[0, 0, :6, 0].tolist()
+        merged.keys[0:1, :, 0:1] = mx.full((1, 2, 1, 4), -99.0)
+        self.assertEqual(source.keys[0, 0, :6, 0].tolist(), before)
+
+        arrays = self._prefilled_arrays()
+        merged_arrays = arrays.merge([arrays])
+        arrays_before = arrays.cache[0].tolist()
+        merged_arrays.cache[0][0:1] = mx.full((1, 4), -99.0)
+        self.assertEqual(arrays.cache[0].tolist(), arrays_before)
+
     def test_replicated_rows_start_equal(self):
         """Replication is only useful if the rows begin identical."""
         source = self._prefilled_qsa()
