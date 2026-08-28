@@ -38,11 +38,13 @@ from .apc import AutomaticPrefixCache, MTPAPCSidecar
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
+    ParallelSampleGenerator,
     StopSequenceMatcher,
     TextStateMachine,
     validate_kv_quantization_args,
     make_stop_matcher,
     make_text_state_machine,
+    prefill_prompt_cache,
     stream_generate,
 )
 from .models.cache import LRUPromptCache, RotatingKVCache, make_prompt_cache
@@ -230,6 +232,8 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    # OpenAI ``n``: how many independent samples to draw from this one prompt.
+    n: int = 1
     prompt_lookup_ngram: int = 0
     prompt_lookup_tokens: int = 8
     prompt_lookup_adaptive: bool = True
@@ -276,6 +280,9 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+    # Which sample (OpenAI choice index) this token belongs to. Always 0 on
+    # the single-sample path.
+    index: int = 0
 
 
 class TimeBudget:
@@ -796,6 +803,42 @@ def _self_mtp_config(
     return config
 
 
+PARALLEL_SAMPLING_MTP_MODES = ("refuse", "plain")
+
+
+def _parallel_sampling_route(args, cli_args, model, *, prompt_tokens=0):
+    """Decide how an ``n>1`` request is served, or refuse it.
+
+    Returns ``("plain", note)``: the samples decode on the plain batched path,
+    one row per sample, sharing one prefill.
+
+    Self-MTP does not compose with ``n>1`` yet. The MTP engine carries a
+    draft-head cache, pending teacher-forced pairs and exact per-cycle rollback
+    beside the target cache, and none of that is batch-carried, so a request
+    that would otherwise be MTP-admitted cannot keep MTP here. The behaviour is
+    explicit rather than silent: ``--parallel-sampling-mtp refuse`` (default)
+    raises, ``plain`` accepts the request with MTP off and says so.
+    """
+    mode = getattr(cli_args, "parallel_sampling_mtp", "refuse")
+    would_use_mtp = (
+        _self_mtp_config(args, cli_args, model, prompt_tokens=prompt_tokens)
+        is not None
+    )
+    if not would_use_mtp:
+        return "plain", None
+    if mode == "plain":
+        return (
+            "plain",
+            "self-MTP disabled for this request: n>1 has no batched MTP path",
+        )
+    raise ValueError(
+        "n>1 is not supported while self-MTP speculation is active for this "
+        "request: the MTP draft-head state is not batch-carried. Send n=1, or "
+        "start the server with --parallel-sampling-mtp plain to decode n>1 "
+        "samples on the plain path with MTP disabled."
+    )
+
+
 def _discard_small_sidecarless_apc_hit_for_mtp(
     cli_args, model, cached_prompt_tokens, mtp_sidecar
 ):
@@ -838,6 +881,99 @@ def _segment_by_state(sm_state, text):
         if sm_state[0] is None:
             break
     return sm_state, segments
+
+
+class _ChoiceAssembler:
+    """Accumulate one choice's text, tool calls and logprobs from raw tokens.
+
+    One instance per OpenAI choice. With ``n>1`` the samples interleave on one
+    response stream, so every piece of assembly state -- the text state machine,
+    the tool buffer, the token list -- has to be per choice.
+    """
+
+    def __init__(self, index, ctx, tool_formatter, logprobs=False, top_logprobs=0):
+        self.index = index
+        self.text_sm = ctx.text_sm
+        self.tool_formatter = tool_formatter
+        self.sm_state = ctx.text_sm.make_state(ctx.initial_state)
+        self.prev_state = ctx.initial_state
+        self.finish_reason = "stop"
+        self.reasoning_text = ""
+        self.made_tool_call = False
+        self.tool_text = ""
+        self.tool_calls = []
+        self.text = ""
+        self.tokens = []
+        self.token_logprobs = []
+        self.top_tokens = []
+        self.terminal_sent = False
+        self._finalized = False
+        self._want_logprobs = logprobs
+        self._want_top_logprobs = top_logprobs
+
+    def feed(self, gen):
+        """Consume one token. Returns the current state name."""
+        # Attribute emitted text per state segment (a decoded token can merge
+        # body bytes with a marker, e.g. "}</tool_call>"), rather than routing
+        # the whole chunk by its single final state.
+        if gen.finish_reason == "stop":
+            self.sm_state, _ = TextStateMachine.discard(self.sm_state)
+            segments = []
+        elif gen.finish_reason == "length":
+            self.sm_state, segments = _segment_by_state(self.sm_state, gen.text)
+            self.sm_state, flushed, flush_state = TextStateMachine.flush(self.sm_state)
+            if flushed:
+                segments.append((flushed, flush_state))
+        else:
+            self.sm_state, segments = _segment_by_state(self.sm_state, gen.text)
+        current_state = self.sm_state[0]
+
+        # Collect the clean text by state: reasoning, tool, or normal.
+        for seg_text, seg_state in segments:
+            if seg_state == "reasoning":
+                self.reasoning_text += seg_text
+            elif seg_state == "tool":
+                self.tool_text += seg_text
+            elif seg_state == "normal":
+                if self.prev_state == "tool":
+                    self.tool_calls.append(self.tool_text)
+                    self.tool_text = ""
+                    self.made_tool_call = True
+                self.text += seg_text
+            self.prev_state = seg_state
+
+        self.tokens.append(gen.token)
+        if self._want_logprobs:
+            self.token_logprobs.append(gen.logprob)
+        if self._want_top_logprobs > 0:
+            self.top_tokens.append(gen.top_tokens)
+
+        if gen.finish_reason is not None:
+            self.finish_reason = gen.finish_reason
+
+        self.prev_state = current_state
+        return current_state
+
+    def has_pending_stream_text(self):
+        return bool(self.text or self.tool_calls or self.reasoning_text)
+
+    def take_stream_payload(self):
+        """Return the text/tool/reasoning accumulated since the last chunk."""
+        payload = (self.text, self.tool_formatter(self.tool_calls), self.reasoning_text)
+        self.reasoning_text = ""
+        self.text = ""
+        self.tool_calls = []
+        return payload
+
+    def finalize(self):
+        if self._finalized:
+            return
+        self._finalized = True
+        if self.prev_state == "tool" and self.tool_text:
+            self.tool_calls.append(self.tool_text)
+            self.made_tool_call = True
+        if self.finish_reason == "stop" and self.made_tool_call:
+            self.finish_reason = "tool_calls"
 
 
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -1059,6 +1195,11 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
+        # n>1 owns its own batch: one shared prefill replicated into n rows.
+        # It runs on the dedicated parallel-sampling path, never mixed into
+        # the continuous batch.
+        if getattr(args, "n", 1) > 1:
+            return False
         # The internal MTP engine owns a target cache plus a separate draft-head
         # cache and exact speculative rollback. BatchGenerator does not carry
         # that second state. This service is configured for one decode lane, so
@@ -1201,7 +1342,9 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
-                        self._serve_single((rqueue, request, args))
+                        self._serve_request(
+                            (rqueue, request, args), generation_stream
+                        )
                         continue
 
                     current_model = args.model
@@ -1345,6 +1488,157 @@ class ResponseGenerator:
                         # It may have already been removed during
                         # generation
                         batch_results.pop(uid, None)
+
+    def _serve_request(self, request, generation_stream=None):
+        """Route one non-batchable request to the single or n-way path."""
+        if getattr(request[2], "n", 1) > 1:
+            self._serve_parallel_samples(request, generation_stream)
+        else:
+            self._serve_single(request)
+
+    def _serve_parallel_samples(self, request, generation_stream=None):
+        """Serve an OpenAI ``n>1`` request: one prefill, n independent samples.
+
+        The prompt is prefilled once at batch size one (reusing any prefix-cache
+        hit), then the finished cache is replicated into one row per sample. Each
+        sample keeps its own sampling draws, its own logits processors and its
+        own continuation; the prefix compute and the prefix cache entry are
+        shared.
+        """
+        rqueue, request, args = request
+        parallel = None
+        try:
+            model = self.model_provider.model
+            tokenizer = self.model_provider.tokenizer
+            n = int(args.n)
+
+            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            _, note = _parallel_sampling_route(
+                args, self.cli_args, model, prompt_tokens=len(prompt)
+            )
+            if note:
+                logging.info("Parallel sampling (n=%d): %s", n, note)
+            if len(prompt) < 1:
+                raise ValueError("n>1 requires a non-empty prompt")
+
+            stop_matcher, text_sm = self._make_state_machine(
+                self.model_provider.model_key,
+                tokenizer,
+                args.stop_words,
+            )
+            ctx = GenerationContext(
+                has_thinking=tokenizer.has_thinking,
+                has_tool_calling=tokenizer.has_tool_calling,
+                tool_parser=tokenizer.tool_parser,
+                text_sm=text_sm,
+                initial_state=initial_state,
+                prompt=prompt,
+            )
+
+            if args.seed is not None:
+                mx.random.seed(args.seed)
+
+            # One sampler object for every row: make_sampler marks it
+            # batch_groupable, so the batch samples all rows in one vectorized
+            # call that draws independently per row. Logits processors are
+            # per-row instances -- they may carry state.
+            sampler = _make_sampler(args, tokenizer)
+            logits_processors = [_make_logits_processors(args) for _ in range(n)]
+
+            # The prefix is shared, so the prefix-cache lookup happens once.
+            self._log_cache_stats()
+            cache, rest = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, prompt
+            )
+            ctx.prompt_cache_count = len(prompt) - len(rest)
+            if not rest:
+                raise ValueError(
+                    "prefix cache returned an empty remainder; n>1 needs at "
+                    "least one uncached token to seed generation"
+                )
+            if cache is None:
+                cache = make_prompt_cache(model)
+            rqueue.put(ctx)
+
+            def progress(processed, total):
+                rqueue.put((processed + ctx.prompt_cache_count, len(prompt)))
+
+            # Prefill everything but the seed token, once.
+            prefill_prompt_cache(
+                model,
+                rest[:-1],
+                cache,
+                prefill_step_size=self.cli_args.prefill_step_size,
+                progress_callback=progress,
+            )
+            progress(len(rest), len(rest))
+            prefix_key = prompt[:-1]
+
+            parallel = ParallelSampleGenerator(
+                model,
+                cache,
+                prompt[-1],
+                n,
+                max_tokens=args.max_tokens,
+                samplers=[sampler] * n,
+                logits_processors=logits_processors,
+                stop_matchers=[stop_matcher] * n,
+                all_tokens=prefix_key,
+                prefill_step_size=self.cli_args.prefill_step_size,
+                stream=generation_stream,
+            )
+            logging.info(
+                "Parallel sampling: n=%d prompt=%d cached=%d",
+                n,
+                len(prompt),
+                ctx.prompt_cache_count,
+            )
+
+            # One detokenizer per sample. Stop sequences are matched inside the
+            # batch (the stop matcher is passed per row), so finish_reason is
+            # already authoritative here.
+            detokenizers = [tokenizer.detokenizer for _ in range(n)]
+            while len(parallel) > 0:
+                for index, r in parallel.next():
+                    detokenizer = detokenizers[index]
+                    if r.finish_reason == "stop":
+                        # Don't decode the final stop token.
+                        detokenizer.finalize()
+                    elif r.finish_reason == "length":
+                        detokenizer.add_token(r.token)
+                        detokenizer.finalize()
+                    else:
+                        detokenizer.add_token(r.token)
+                    rqueue.put(
+                        Response(
+                            detokenizer.last_segment,
+                            r.token,
+                            r.logprobs[r.token].item(),
+                            r.finish_reason,
+                            _format_top_logprobs(
+                                r.logprobs, args.top_logprobs, tokenizer
+                            ),
+                            index,
+                        )
+                    )
+                if ctx._should_stop:
+                    break
+
+            # The rows hold their own copies of the prefix state (merge reads
+            # the source and writes new per-row buffers), so the prefilled cache
+            # becomes the shared prefix entry. Per-sample continuations are
+            # deliberately NOT stored: the samples diverge, and keeping one of
+            # them would bias later prefix hits toward an arbitrary sample.
+            self.prompt_cache.insert_cache(
+                self.model_provider.model_key, prefix_key, cache
+            )
+
+            rqueue.put(None)
+        except Exception as e:
+            rqueue.put(e)
+        finally:
+            if parallel is not None:
+                parallel.close()
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -1639,6 +1933,10 @@ class ResponseGenerator:
 
 
 class APIHandler(BaseHTTPRequestHandler):
+    # OpenAI ``n``. Set from the request body in do_POST; the class default
+    # keeps every other entry point (and older callers) on one sample.
+    n = 1
+
     def __init__(
         self,
         response_generator: ResponseGenerator,
@@ -1831,6 +2129,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
+        self.n = self.body.get("n", 1)
         try:
             self.validate_model_parameters()
         except ValueError as e:
@@ -1876,6 +2175,33 @@ class APIHandler(BaseHTTPRequestHandler):
         if max_val is not None and value > max_val:
             raise ValueError(f"{name} must be at most {max_val}")
 
+    def validate_parallel_sampling(self, cli_args):
+        """Validate ``n`` against the server's parallel-sampling limit.
+
+        Greedy ``n>1`` is refused: at temperature 0 the sampler is argmax, so
+        every sample is the same continuation of the same prompt. Returning n
+        identical choices would bill n times for one answer, so the request is
+        an error rather than a silent duplicate.
+        """
+        if isinstance(self.n, bool):
+            raise ValueError("n must be of type int")
+        self._validate("n", int, min_val=1)
+        if self.n == 1:
+            return
+        max_n = getattr(cli_args, "parallel_sampling_max_n", 1) or 1
+        if max_n < 2:
+            raise ValueError(
+                "n>1 is not enabled on this server; start it with "
+                "--parallel-sampling-max-n N"
+            )
+        if self.n > max_n:
+            raise ValueError(f"n must be at most {max_n}")
+        if self.temperature <= 0:
+            raise ValueError(
+                "n>1 requires temperature > 0: greedy sampling makes every "
+                "sample identical"
+            )
+
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
@@ -1916,6 +2242,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("requested_model", str)
         response_generator = getattr(self, "response_generator", None)
         cli_args = getattr(response_generator, "cli_args", None)
+        self.validate_parallel_sampling(cli_args)
         if getattr(cli_args, "single_model", False):
             configured = cli_args.model
             allowed = {"default_model", configured}
@@ -1962,6 +2289,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
+        index: int = 0,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -2002,7 +2330,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "created": self.created,
             "choices": [
                 {
-                    "index": 0,
+                    "index": index,
                     "finish_reason": finish_reason,
                 },
             ],
@@ -2064,6 +2392,40 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _write_terminal_chunk(self, assembler) -> None:
+        """Emit one choice's closing stream chunk, once."""
+        if assembler.terminal_sent:
+            return
+        assembler.finalize()
+        assembler.terminal_sent = True
+        resp = self.generate_response(
+            assembler.text,
+            assembler.finish_reason,
+            tool_calls=assembler.tool_formatter(assembler.tool_calls),
+            reasoning_text=assembler.reasoning_text,
+            index=assembler.index,
+        )
+        self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+        self.wfile.flush()
+
+    @staticmethod
+    def _merge_choice_responses(responses: List[dict]) -> dict:
+        """Fold per-choice responses into one multi-choice response.
+
+        ``usage`` counts the prompt once and the completions of every choice,
+        which is how the OpenAI API bills ``n>1``.
+        """
+        merged = dict(responses[0])
+        merged["choices"] = [r["choices"][0] for r in responses]
+        usage = merged.get("usage")
+        if usage is not None:
+            completion = sum(r["usage"]["completion_tokens"] for r in responses)
+            usage = dict(usage)
+            usage["completion_tokens"] = completion
+            usage["total_tokens"] = usage["prompt_tokens"] + completion
+            merged["usage"] = usage
+        return merged
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -2110,6 +2472,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            n=max(1, int(getattr(self, "n", 1))),
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -2143,110 +2506,64 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
-        # Tool call formatter
-        tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
-
-        # Initialize the text state machine
-        sm_state = ctx.text_sm.make_state(ctx.initial_state)
-
-        # Variables to save the generated text, tokens, logprobs, tools etc
-        prev_state = ctx.initial_state
-        finish_reason = "stop"
-        reasoning_text = ""
-        made_tool_call = False
-        tool_text = ""
-        tool_calls = []
-        text = ""
-        tokens = []
-        token_logprobs = []
-        top_tokens = []
+        # One assembler per choice; with n>1 the samples interleave on one
+        # stream and each carries its own choice index.
+        n = max(1, int(args.n))
+        assemblers = [
+            _ChoiceAssembler(
+                i,
+                ctx,
+                ToolCallFormatter(ctx.tool_parser, request.tools, self.stream),
+                logprobs=args.logprobs,
+                top_logprobs=args.top_logprobs,
+            )
+            for i in range(n)
+        ]
 
         try:
             for gen in response:
                 logging.debug(gen.text)
 
-                # Advance the text state machine to strip control sequences.
-                # Attribute emitted text per state segment (a decoded token can
-                # merge body bytes with a marker, e.g. "}</tool_call>"), rather
-                # than routing the whole chunk by its single final state.
-                if gen.finish_reason == "stop":
-                    sm_state, _ = TextStateMachine.discard(sm_state)
-                    segments = []
-                elif gen.finish_reason == "length":
-                    sm_state, segments = _segment_by_state(sm_state, gen.text)
-                    sm_state, flushed, flush_state = TextStateMachine.flush(sm_state)
-                    if flushed:
-                        segments.append((flushed, flush_state))
-                else:
-                    sm_state, segments = _segment_by_state(sm_state, gen.text)
-                current_state = sm_state[0]
-
-                # Collect the clean text by state: reasoning, tool, or normal.
-                for seg_text, seg_state in segments:
-                    if seg_state == "reasoning":
-                        reasoning_text += seg_text
-                    elif seg_state == "tool":
-                        tool_text += seg_text
-                    elif seg_state == "normal":
-                        if prev_state == "tool":
-                            tool_calls.append(tool_text)
-                            tool_text = ""
-                            made_tool_call = True
-                        text += seg_text
-                    prev_state = seg_state
-
-                # Add the tokens and logprobs to the vars.
-                tokens.append(gen.token)
-                if args.logprobs:
-                    token_logprobs.append(gen.logprob)
-                if args.top_logprobs > 0:
-                    top_tokens.append(gen.top_tokens)
+                assembler = assemblers[gen.index]
+                current_state = assembler.feed(gen)
 
                 if (
                     self.stream
                     and current_state != "tool"
-                    and (text or tool_calls or reasoning_text)
+                    and assembler.has_pending_stream_text()
                 ):
+                    text, tool_calls, reasoning_text = (
+                        assembler.take_stream_payload()
+                    )
                     resp = self.generate_response(
                         text,
                         None,
-                        tool_calls=tool_formatter(tool_calls),
+                        tool_calls=tool_calls,
                         reasoning_text=reasoning_text,
+                        index=assembler.index,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                     self.wfile.flush()
-                    reasoning_text = ""
-                    text = ""
-                    tool_calls = []
 
-                if gen.finish_reason is not None:
-                    finish_reason = gen.finish_reason
+                # Close a finished sample right away instead of holding its
+                # terminal chunk until every other sample is done.
+                if self.stream and gen.finish_reason is not None:
+                    self._write_terminal_chunk(assembler)
 
-                prev_state = current_state
-
-            if prev_state == "tool" and tool_text:
-                tool_calls.append(tool_text)
-                made_tool_call = True
-
-            if finish_reason == "stop" and made_tool_call:
-                finish_reason = "tool_calls"
+            for assembler in assemblers:
+                assembler.finalize()
+            completion_tokens = sum(len(a.tokens) for a in assemblers)
 
             if self.stream:
-                resp = self.generate_response(
-                    text,
-                    finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
-                    reasoning_text=reasoning_text,
-                )
-                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
-                self.wfile.flush()
+                for assembler in assemblers:
+                    self._write_terminal_chunk(assembler)
                 if (
                     self.stream_options is not None
                     and self.stream_options["include_usage"]
                 ):
                     resp = self.completion_usage_response(
                         len(ctx.prompt),
-                        len(tokens),
+                        completion_tokens,
                         ctx.prompt_cache_count,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -2254,17 +2571,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
             else:
-                resp = self.generate_response(
-                    text,
-                    finish_reason,
-                    len(ctx.prompt),
-                    len(tokens),
-                    ctx.prompt_cache_count,
-                    token_logprobs=token_logprobs,
-                    top_tokens=top_tokens,
-                    tokens=tokens,
-                    reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                resp = self._merge_choice_responses(
+                    [
+                        self.generate_response(
+                            a.text,
+                            a.finish_reason,
+                            len(ctx.prompt),
+                            len(a.tokens),
+                            ctx.prompt_cache_count,
+                            token_logprobs=a.token_logprobs,
+                            top_tokens=a.top_tokens,
+                            tokens=a.tokens,
+                            reasoning_text=a.reasoning_text,
+                            tool_calls=a.tool_formatter(a.tool_calls),
+                            index=a.index,
+                        )
+                        for a in assemblers
+                    ]
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
@@ -2804,6 +3127,26 @@ def setup_arg_parser():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--parallel-sampling-max-n",
+        type=int,
+        default=1,
+        help=(
+            "Largest OpenAI 'n' this server accepts. 1 (the default) refuses "
+            "n>1. Samples share one prefill and decode as one row each."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-sampling-mtp",
+        type=str,
+        default="refuse",
+        choices=list(PARALLEL_SAMPLING_MTP_MODES),
+        help=(
+            "What to do when an n>1 request would otherwise use self-MTP. "
+            "'refuse' (default) rejects it; 'plain' serves the samples with "
+            "MTP disabled. There is no batched MTP path yet."
+        ),
     )
     parser.add_argument(
         "--state-budget-gb",

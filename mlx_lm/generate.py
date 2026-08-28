@@ -1584,6 +1584,52 @@ def prompt_lookup_generate_step(
             _pld_stop_speculation(prompt_cache)
 
 
+def prefill_prompt_cache(
+    model: nn.Module,
+    tokens: Union[mx.array, List[int]],
+    prompt_cache: List[Any],
+    *,
+    prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> List[Any]:
+    """Run ``tokens`` through the model once and leave the state in
+    ``prompt_cache``.
+
+    Unlike :func:`generate_step`, every given token is processed: the caller
+    keeps the seed token it wants generation to start from. Used by the
+    parallel-sampling path, which prefills once at batch size one and then
+    replicates the finished cache into one row per sample.
+
+    Returns the same ``prompt_cache`` list for convenience.
+    """
+    if not isinstance(tokens, mx.array):
+        tokens = mx.array(tokens)
+    progress_callback = progress_callback or (lambda *_: None)
+
+    total = int(tokens.size)
+    with mx.stream(generation_stream):
+        checkpoint_base = max(
+            (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+        )
+        processed = 0
+        progress_callback(processed, total)
+        while processed < total:
+            n_to_process = min(prefill_step_size, total - processed)
+            chunk = tokens[processed : processed + n_to_process]
+            model(chunk[None], cache=prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            processed += n_to_process
+            record_state_checkpoints(prompt_cache, [checkpoint_base + processed])
+            progress_callback(processed, total)
+            mx.clear_cache()
+        if processed > 0:
+            # The prefill boundary is where a prefix-cache trim lands.
+            record_state_checkpoints(
+                prompt_cache, [checkpoint_base + processed], force=True
+            )
+    return prompt_cache
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -2213,12 +2259,14 @@ class PromptProcessingBatch:
         self.max_tokens.extend(batch.max_tokens)
         self.stop_matchers.extend(batch.stop_matchers)
 
-    def _copy(self):
+    def _copy(self, deep: bool = True):
         new_batch = self.__class__.__new__(self.__class__)
         new_batch.model = self.model
         new_batch.uids = list(self.uids)
         new_batch.prompt_trim_rollback_tokens = self.prompt_trim_rollback_tokens
-        new_batch.prompt_cache = copy.deepcopy(self.prompt_cache)
+        new_batch.prompt_cache = (
+            copy.deepcopy(self.prompt_cache) if deep else self.prompt_cache
+        )
         new_batch.tokens = list(self.tokens)
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = list(self.samplers)
@@ -2231,6 +2279,14 @@ class PromptProcessingBatch:
     def split(self, indices: List[int]):
         indices = sorted(indices)
         indices_left = sorted(set(range(len(self.uids))) - set(indices))
+        if not indices_left:
+            # Every row leaves: hand the merged cache over instead of deep
+            # copying it and immediately dropping the original. The two halves
+            # only need independent caches when both keep rows.
+            new_batch = self._copy(deep=False)
+            self.prompt_cache = []
+            self.filter([])
+            return new_batch
         new_batch = self._copy()
         self.filter(indices_left)
         new_batch.filter(indices)
@@ -3425,6 +3481,102 @@ class BatchGenerator:
                 if not generation_responses and prompt_responses:
                     continue
                 return generation_responses
+
+
+class ParallelSampleGenerator:
+    """Decode ``n`` independent samples from one already prefilled prompt cache.
+
+    This is the OpenAI ``n>1`` shape: one prompt, one prefill, ``n`` rows. The
+    caller prefills the prompt once (see :func:`prefill_prompt_cache`) and hands
+    the finished cache here; the cache is replicated into ``n`` batch rows by
+    the same ``merge`` the continuous-batching path uses, so the prefix compute
+    is paid once and each row then keeps its own sampling draws, its own token
+    history and its own continuation.
+
+    Per-row state that must not be shared is the caller's responsibility:
+    ``logits_processors`` must be a fresh list per row (processors may hold
+    mutable state), while a sampler object may be shared — rows sharing one
+    ``batch_groupable`` sampler are sampled in a single vectorized call which
+    draws independently per row.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        prompt_cache: List[Any],
+        seed_token: int,
+        n: int,
+        *,
+        max_tokens: int,
+        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
+        logits_processors: Optional[
+            List[List[Callable[[mx.array, mx.array], mx.array]]]
+        ] = None,
+        stop_matchers: Optional[List[StopSequenceMatcher]] = None,
+        all_tokens: Optional[List[int]] = None,
+        prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
+        stream=None,
+    ):
+        if n < 1:
+            raise ValueError(f"n must be at least 1, got {n}")
+        if logits_processors is not None and len(logits_processors) != n:
+            raise ValueError("logits_processors must have one entry per sample")
+        if logits_processors is not None and len(
+            {id(lp) for lp in logits_processors}
+        ) != len(logits_processors):
+            # A shared list would let one row's processor state follow another.
+            raise ValueError("each sample needs its own logits_processors list")
+
+        self.n = n
+        self._generator = BatchGenerator(
+            model,
+            completion_batch_size=n,
+            prefill_batch_size=n,
+            prefill_step_size=prefill_step_size,
+            stream=stream,
+        )
+        history = list(all_tokens or [])
+        uids = self._generator.insert(
+            prompts=[[int(seed_token)] for _ in range(n)],
+            max_tokens=[max_tokens] * n,
+            # Same leaf objects in every row: merge() reads them and writes new
+            # per-row buffers, so this replicates without a second prefill.
+            caches=[list(prompt_cache) for _ in range(n)],
+            all_tokens=[list(history) for _ in range(n)],
+            samplers=samplers,
+            logits_processors=logits_processors,
+            stop_matchers=stop_matchers,
+        )
+        self._index = {uid: i for i, uid in enumerate(uids)}
+        self._active = set(uids)
+
+    def __len__(self):
+        return len(self._active)
+
+    @property
+    def active_samples(self) -> List[int]:
+        return sorted(self._index[uid] for uid in self._active)
+
+    def next(self) -> List[Tuple[int, "GenerationBatch.Response"]]:
+        """Advance one decode step over all live rows.
+
+        Returns ``(sample_index, response)`` pairs. A row is dropped from the
+        generator once its response carries a ``finish_reason``.
+        """
+        if not self._active:
+            return []
+        _, generation_responses = self._generator.next()
+        results = []
+        for r in generation_responses:
+            index = self._index[r.uid]
+            if r.finish_reason is not None:
+                self._active.discard(r.uid)
+            results.append((index, r))
+        results.sort(key=lambda pair: pair[0])
+        return results
+
+    def close(self):
+        self._generator.close()
 
 
 @dataclass
