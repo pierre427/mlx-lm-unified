@@ -18,6 +18,12 @@ import numpy as np
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
 from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynamic_roll
 from .pipeline import PipelineMixin
+from .qwen4_qsa_nax import (
+    block_sparse_layout_supported,
+    compact_blocks_to_kernel_inputs,
+    nax_kernel_available,
+    nax_qsa_attention,
+)
 from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 from . import qwen3_next
@@ -138,6 +144,28 @@ _QSA_DENSE_SHORTCIRCUIT = _env_flag("MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT")
 # qmv/qmm crossover differs at M=12-15 — regimes a toy-shape test cannot
 # see, so production shapes may not be bit-identical.
 _QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
+
+# MLX_QWEN4_QSA_NAX_KERNEL (2026-08-28): route the sparse QSA attention through
+# the hand-written NAX (MPP matmul2d) block-sparse kernel instead of building
+# the dense [B, 1, L, T] selection mask and calling bf16 masked SDPA.  Off by
+# default; live-toggleable as ``qwen4_qsa_nax_kernel``.  It engages ONLY on an
+# ``explicit`` selection (the sparse path, total > ~2051 cached tokens), a
+# multi-token query (prefill/verify, NOT M=1 decode), a supported layout, and a
+# device where the kernel compiles.  Every other path -- decode, implicit_all,
+# mask_only, unsupported shape, NAX unavailable -- keeps the dense SDPA path
+# bit-identical.  Gate class: TOLERANCE, not bitwise: the kernel keeps fp32
+# accumulation and rounds only P, so it is ~7x MORE accurate than bf16 SDPA
+# (~1.4e-3 rel vs fp32 vs bf16 SDPA's ~1.1e-2).  Near-tie greedy flips vs the
+# OFF path are expected and are the kernel being more accurate, not less.
+_QSA_NAX_KERNEL = _env_flag("MLX_QWEN4_QSA_NAX_KERNEL")
+
+# Minimum query length for the kernel to engage. It tiles M by query heads, so
+# it needs many tokens to amortize its launch: it wins on the 512-wide prefill
+# chunks but LOSES on the small-M speculative-verify shapes at decode (self-MTP
+# verify is num_draft+1 tokens). Measured 2026-08-28, engaging on the M=3
+# verify halved decode (54->16 t/s at 1K). Above this, prefill only; below it,
+# every decode-time shape falls back to dense SDPA, bit-identical to OFF.
+_QSA_NAX_MIN_QUERY = int(os.environ.get("MLX_QWEN4_QSA_NAX_MIN_QUERY", "64"))
 
 
 def _table_matmul(table, x: mx.array) -> mx.array:
@@ -2041,6 +2069,15 @@ class Attention(nn.Module):
         # weight arrays (invalidated by load_weights/update); in __dict__ so
         # it never reaches parameters()/state.
         object.__setattr__(self, "_qsa_fused_cache", None)
+        # Static: whether this attention geometry fits the NAX block-sparse
+        # kernel's tile (head_dim, gqa, block size).  Availability of the
+        # kernel itself is a device probe, checked per forward only when armed.
+        self._nax_layout_ok = block_sparse_layout_supported(
+            self.head_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            block_size=args.indexer_compress_ratio,
+        )
 
     def _fused_projection_table(self):
         modules = (
@@ -2083,7 +2120,20 @@ class Attention(nn.Module):
                     axis=-1,
                 )
         selection = self.indexer(x, mask, cache, projected_qk=fused_index_qk)
-        sparse_mask = selection.dense_mask()
+        # Route the sparse path through the NAX block-sparse kernel when armed.
+        # Only an ``explicit`` (sparse) selection on a multi-token query with a
+        # supported layout on a NAX-capable device qualifies; everything else
+        # keeps the dense masked-SDPA path and its mask, bit-identical.
+        use_nax = (
+            _QSA_NAX_KERNEL
+            and selection.kind == "explicit"
+            and length >= _QSA_NAX_MIN_QUERY
+            and self._nax_layout_ok
+            and nax_kernel_available()
+        )
+        # Do NOT build the dense mask when the kernel is engaged: not
+        # materializing that [B, 1, L, T] array is the point.
+        sparse_mask = None if use_nax else selection.dense_mask()
         if fused_index_qk is None:
             qg = self.q_proj(x)
             k_flat = self.k_proj(x)
@@ -2101,7 +2151,19 @@ class Attention(nn.Module):
         q, k = self.rope(q, offset=offset), self.rope(k, offset=offset)
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-        out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=sparse_mask)
+        if use_nax:
+            ids, counts, n_sel, u_width, q_pos, left_pad, total = (
+                compact_blocks_to_kernel_inputs(selection.compact_blocks())
+            )
+            out = nax_qsa_attention(
+                q, k, v, ids, counts, n_sel, q_pos, left_pad,
+                scale=self.scale, u_width=u_width, total=total,
+                n_kv_heads=self.num_kv_heads,
+            ).astype(q.dtype)
+        else:
+            out = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=sparse_mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
