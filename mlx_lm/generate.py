@@ -1730,7 +1730,19 @@ def stream_generate(
             prompt_cache=kwargs.get("prompt_cache"),
             # The request's own random key. None keeps the global stream, so a
             # caller that supplies none is byte-identical to a keyless build.
-            lane_rng=self_mtp.get("lane_rng"),
+            #
+            # DISABLED 2026-08-28 -- restores service after a production outage.
+            # The server builds the LaneRNG on the request thread, but
+            # generation runs on a worker thread; the key's lazy `mx.random
+            # .split` graph carries a stream from its originating thread, so
+            # the first draw raises "There is no Stream(gpu, 0) in current
+            # thread".  Passing None restores the pre-wiring behaviour (the
+            # global stream), which is what shipped and worked.  Re-enable only
+            # with a cross-thread fix -- materialise the key on the generation
+            # thread, or create the lane there -- and a real serving test, not
+            # a CPU unit test: every unit test builds the lane and generates on
+            # one thread, which is exactly why this was invisible.
+            lane_rng=None,
             mtp_state=self_mtp.get("state"),
             mtp_state_out=self_mtp.get("state_out"),
             logits_processors=kwargs.get("logits_processors"),
