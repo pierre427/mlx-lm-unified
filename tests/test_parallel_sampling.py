@@ -2,16 +2,21 @@
 
 """Tests for OpenAI ``n>1`` parallel sampling (CPU-only, no model weights).
 
-Covers the four things the feature has to get right:
+Covers the things the feature has to get right:
 
   * the API surface -- ``n`` is parsed, bounded, and greedy ``n>1`` is refused
     because argmax makes every sample the same continuation;
+  * admission -- the model has to be batchable and draft-free, the routing
+    decision uses the prefix-cache result the n=1 path uses, and the count cap
+    is backed by a projected state budget, refused before the request is
+    accepted;
   * the composition with self-MTP -- there is no batched MTP path, so an n>1
     request that would use MTP is refused (or explicitly demoted to plain);
   * per-sample independence -- one shared prefill, but separate sampling draws,
     separate token histories and separate logits processors;
   * the wire format -- one choice per sample with its own index, usage summing
-    the completions, and an unchanged single-choice response at n=1.
+    the completions, and an n=1 response pinned byte for byte to what the
+    server sent before parallel sampling existed.
 
 Everything runs on tiny synthetic tensors and a fake model.
 """
