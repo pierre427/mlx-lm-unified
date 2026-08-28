@@ -1683,6 +1683,15 @@ def _mtp_draft_verify_loop_impl(
             # prefix of the next cycle's first draft call. The bonus token
             # stays out: it becomes the next cycle's cur.
             trim_prompt_cache(mtp_cache, k)
+            # Pair the cycle's arming with its exit, AFTER the rewind: called
+            # before it, the hook reports the drafted span the rewind is about
+            # to remove. The loop owns this exit -- a head cache whose own
+            # rewind does not release the cycle would otherwise carry a stale
+            # shared index set, and a ledger that no longer spans the cursor,
+            # into the next forward or into a captured sidecar.
+            end_cycle = getattr(model, "mtp_end_cycle", None)
+            if end_cycle is not None:
+                end_cycle(mtp_cache)
             if n_accept > 0:
                 pending_hs = mx.concatenate(
                     [seed_h, vhidden[:, :n_accept, :]], axis=1
