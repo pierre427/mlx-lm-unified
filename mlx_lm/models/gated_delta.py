@@ -701,6 +701,11 @@ def normalize_gdn_qk(q: mx.array, k: mx.array) -> Tuple[mx.array, mx.array]:
     """
     inv_scale = k.shape[-1] ** -0.5
     eps = 1e-6 * inv_scale**2
+    # Fusing the two rms_norm launches into one (concat q|k, normalize, split)
+    # is bit-identical but measured -0.52% on full-model decode: the two tiny
+    # launches pipeline with adjacent work and are not on the critical path, so
+    # removing one buys nothing and the concat costs a little. Kept as two
+    # calls. See wiki lessons/barrier-profiling-overstates-pipelined-launches.
     q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
     k = inv_scale * mx.fast.rms_norm(k, None, eps)
     return q, k
