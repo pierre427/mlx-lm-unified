@@ -265,5 +265,71 @@ class TestGatedDelta(unittest.TestCase):
         self.assertTrue(mx.array_equal(s_p, s_u))
 
 
+class TestGatedDeltaHeadMapping(unittest.TestCase):
+    """Pin the value-head -> key-head mapping used when Hv > Hk.
+
+    Every GDN model we serve has Hv > Hk (16/32, 16/48, 16/64), so the
+    mapping is live. The HuggingFace reference for both qwen3_next and
+    qwen3_5 expands q/k with ``repeat_interleave``, i.e. value head hv
+    reads key head ``hv // (Hv // Hk)`` (blocked). The alternative tiled
+    mapping ``hv % Hk`` gives a completely different result.
+
+    The kernel-vs-ops tests cannot see a flip of this convention because
+    both paths share it. These cases compare each path against an
+    explicit pre-expansion instead, so a flip fails here.
+    """
+
+    def _inputs(self, B, T, Hk, Hv, Dk, Dv, dtype):
+        mx.random.seed(11)
+        q = _normed((B, T, Hk, Dk), Dk, dtype)
+        k = _normed((B, T, Hk, Dk), Dk, dtype)
+        v = mx.random.normal((B, T, Hv, Dv)).astype(dtype)
+        g = mx.exp(-mx.random.uniform(shape=(B, T, Hv)) * 0.2).astype(mx.float32)
+        beta = mx.random.uniform(shape=(B, T, Hv)).astype(dtype)
+        state = (mx.random.normal((B, Hv, Dv, Dk)) * 0.3).astype(mx.float32)
+        mx.eval(q, k, v, g, beta, state)
+        return q, k, v, g, beta, state
+
+    @staticmethod
+    def _blocked(x, Hk, Hv):
+        return mx.repeat(x, Hv // Hk, -2)
+
+    @staticmethod
+    def _tiled(x, Hk, Hv):
+        return mx.take(x, mx.array([hv % Hk for hv in range(Hv)]), axis=2)
+
+    def _check(self, fn, Hk, Hv):
+        B, T, Dk, Dv = 1, 24, 128, 128
+        q, k, v, g, beta, state = self._inputs(B, T, Hk, Hv, Dk, Dv, mx.float32)
+
+        y, s = fn(q, k, v, g, beta, state, None)
+        # Pre-expanded calls pass Hk == Hv, so no in-path mapping applies.
+        y_b, s_b = fn(
+            self._blocked(q, Hk, Hv), self._blocked(k, Hk, Hv), v, g, beta, state, None
+        )
+        y_t, _ = fn(
+            self._tiled(q, Hk, Hv), self._tiled(k, Hk, Hv), v, g, beta, state, None
+        )
+        mx.eval(y, s, y_b, s_b, y_t)
+
+        self.assertLess(_rel_l2(y, y_b), 1e-5)
+        self.assertLess(_rel_l2(s, s_b), 1e-5)
+        # The two conventions must be far apart, or the case proves nothing.
+        self.assertGreater(_rel_l2(y_b, y_t), 0.1)
+
+    def test_ops_reference_uses_blocked_mapping(self):
+        for Hk, Hv in ((16, 32), (16, 48), (16, 64)):
+            with self.subTest(Hk=Hk, Hv=Hv):
+                self._check(gated_delta_ops, Hk, Hv)
+
+    def test_kernels_use_blocked_mapping(self):
+        if mx.default_device() != mx.gpu:
+            raise unittest.SkipTest("gated delta kernels are GPU only")
+        for fn in (gated_delta_kernel, gated_delta_kernel_unpacked):
+            for Hk, Hv in ((16, 32), (16, 48), (16, 64)):
+                with self.subTest(fn=fn.__name__, Hk=Hk, Hv=Hv):
+                    self._check(fn, Hk, Hv)
+
+
 if __name__ == "__main__":
     unittest.main()
