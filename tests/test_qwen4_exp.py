@@ -953,6 +953,108 @@ class TestQSALeftPaddedBatch(unittest.TestCase):
             mx.eval(model(mx.array([[9], [9]], dtype=mx.int32), cache=batch))
 
 
+class TestBatchedMTPSharedTopK(unittest.TestCase):
+    """QSA top-k sharing across an MTP draft cycle, on a batched head cache.
+
+    The flag and the shared tensor lived only on the single-sequence
+    ``QSAKVCache``, so ``mtp_start_cycle`` silently did nothing once the head
+    cache was merged and every draft step paid the full index projection.
+    Under a batch the shared set is per lane: ``selected[:, -1]`` is already
+    ``[B, k]`` and each row reuses its own LOGICAL blocks.
+    """
+
+    PROMPTS = ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [11, 12, 13, 14, 15])
+    SHAPE_NOISE_BAND = 3e-3
+
+    def _model(self):
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
+        return Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+
+    def _seed_head(self, model, prompt):
+        """Teacher-force one sequence into its own MTP head cache."""
+        trunk = model.make_cache()
+        _, hyper = model.mtp_backbone(mx.array([prompt], dtype=mx.int32), trunk)
+        logits, post = model.mtp_step(
+            hyper[:, :-1],
+            mx.array([prompt[1:]], dtype=mx.int32),
+            (head := model.make_mtp_cache()),
+        )
+        mx.eval(logits, post, head[0].state)
+        return head, post[:, -1:], mx.argmax(logits[:, -1:, :], axis=-1)
+
+    def _cycle(self, model, head, hidden, token, steps=2):
+        model.mtp_start_cycle(head, share_qsa_indices=True)
+        outputs = []
+        for _ in range(steps):
+            logits, hidden = model.mtp_step(hidden, token, head)
+            mx.eval(logits, hidden, head[0].state)
+            outputs.append(np.asarray(logits))
+            token = mx.argmax(logits[:, -1:, :], axis=-1)
+            hidden = hidden[:, -1:]
+        return outputs
+
+    def test_shared_topk_is_per_lane_and_skips_the_second_projection(self):
+        model = self._model()
+        heads, hiddens, tokens = zip(
+            *(self._seed_head(model, prompt) for prompt in self.PROMPTS)
+        )
+        singles = [
+            self._cycle(model, head, hidden, token)
+            for head, hidden, token in zip(heads, hiddens, tokens)
+        ]
+
+        model = self._model()
+        heads, hiddens, tokens = zip(
+            *(self._seed_head(model, prompt) for prompt in self.PROMPTS)
+        )
+        batch = _merge_caches([list(head) for head in heads])
+        cache = batch[0]
+        self.assertIsInstance(cache, BatchQSAKVCache)
+        self.assertEqual(cache.left_padding.tolist(), [0, 5])
+
+        model.mtp_start_cycle(batch, share_qsa_indices=True)
+        self.assertTrue(cache._mtp_share_topk)
+        logits, hidden = model.mtp_step(
+            mx.concatenate(list(hiddens)),
+            mx.concatenate(list(tokens)),
+            batch,
+        )
+        mx.eval(logits, hidden, cache.state)
+        rows = len(self.PROMPTS)
+        self.assertIsNotNone(cache._mtp_shared_topk)
+        self.assertEqual(cache._mtp_shared_topk.shape[0], rows)
+        width = cache.index_keys.shape[1]
+
+        batched = [np.asarray(logits)]
+        token = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits, hidden = model.mtp_step(hidden[:, -1:], token, batch)
+        mx.eval(logits, hidden, cache.state)
+        batched.append(np.asarray(logits))
+        # The point of sharing: step 1 reuses step 0's blocks and never
+        # projects (or appends) an index key of its own.
+        self.assertEqual(cache.index_keys.shape[1], width)
+
+        for step, (got, wants) in enumerate(zip(batched, zip(*singles))):
+            for row, want in enumerate(wants):
+                scale = float(np.abs(want).max())
+                error = float(np.abs(got[row : row + 1] - want).max()) / scale
+                self.assertLess(
+                    error,
+                    self.SHAPE_NOISE_BAND,
+                    f"step {step} row {row}: {error:.3e} of output scale",
+                )
+                self.assertEqual(
+                    int(got[row, -1].argmax()),
+                    int(want[0, -1].argmax()),
+                    f"step {step} row {row}: argmax differs",
+                )
+
+        trim_prompt_cache(batch, 2)
+        self.assertIsNone(cache._mtp_shared_topk)
+        self.assertFalse(cache._mtp_share_topk)
+
+
 class TestPLEPadSafety(unittest.TestCase):
     """PLE state under a padded batch row must equal that row decoded alone.
 

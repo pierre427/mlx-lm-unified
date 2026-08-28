@@ -918,6 +918,57 @@ class BatchQSAKVCache(BatchKVCache):
     def __init__(self, left_padding: List[int], attention_backend=None):
         super().__init__(left_padding, attention_backend=attention_backend)
         self.index_keys = None
+        # Per-lane ephemeral QSA cycle state, the batch form of the fields
+        # QSAKVCache carries.  Both are derived quantities and are deliberately
+        # absent from ``state``: a restore recomputes them.
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
+        self._qsa_pooled_keys = None
+        self._qsa_pooled_ratio = None
+        self._max_left_pad = None
+
+    def max_left_padding(self) -> int:
+        """Host copy of ``left_padding.max()``, keyed by array identity.
+
+        ``left_padding`` is rebound only at membership boundaries (merge,
+        filter, extend, finalize) and mx arrays are immutable, so an identity
+        miss is exactly the set of events that can change the maximum.  The
+        pooled-key bound below needs this every forward and must not sync.
+        """
+        padding = self.left_padding
+        cached = self._max_left_pad
+        if cached is None or cached[0] is not padding:
+            self._max_left_pad = (padding, int(padding.max().item()))
+        return self._max_left_pad[1]
+
+    def _drop_qsa_cycle_state(self):
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
+        self._qsa_pooled_keys = None
+        self._qsa_pooled_ratio = None
+
+    def trim(self, n):
+        n = super().trim(n)
+        # Same contract as QSAKVCache.trim: a rewind ends the MTP draft cycle,
+        # and a block mean is a closed window, so blocks inside EVERY row's
+        # trimmed offset stay exact.  The shortest row bounds that.
+        self._mtp_share_topk = False
+        self._mtp_shared_topk = None
+        if self._qsa_pooled_keys is not None:
+            keep = max(0, self._idx - self.max_left_padding()) // self._qsa_pooled_ratio
+            if keep == 0:
+                self._qsa_pooled_keys = None
+            elif keep < self._qsa_pooled_keys.shape[1]:
+                self._qsa_pooled_keys = mx.contiguous(
+                    self._qsa_pooled_keys[:, :keep]
+                )
+        return n
+
+    def prepare(self, *args, **kwargs):
+        # A right-padded forward pools filler tokens into the tail blocks and
+        # finalize() then rolls them out from under those blocks.
+        self._drop_qsa_cycle_state()
+        super().prepare(*args, **kwargs)
 
     def update_index_keys(self, keys: mx.array):
         self.index_keys = (
@@ -935,6 +986,8 @@ class BatchQSAKVCache(BatchKVCache):
     def state(self, value):
         BatchKVCache.state.fset(self, value[:4])
         self.index_keys = value[4]
+        self._drop_qsa_cycle_state()
+        self._max_left_pad = None
 
     @property
     def nbytes(self):
@@ -946,6 +999,7 @@ class BatchQSAKVCache(BatchKVCache):
         padding = self._right_padding
         if padding is not None and self.index_keys is not None:
             self.index_keys = dynamic_roll(self.index_keys, padding, axis=1)
+        self._drop_qsa_cycle_state()
         super().finalize()
 
     def filter(self, batch_indices):
@@ -954,6 +1008,16 @@ class BatchQSAKVCache(BatchKVCache):
             self.index_keys = self.index_keys[batch_indices]
             if min_left_pad > 0:
                 self.index_keys = self.index_keys[:, min_left_pad:]
+        # Both are indexed by LOGICAL block, so dropping rows is all a filter
+        # owes them; the column shift above does not move a logical block.
+        if self._qsa_pooled_keys is not None:
+            self._qsa_pooled_keys = mx.contiguous(
+                self._qsa_pooled_keys[batch_indices]
+            )
+        if self._mtp_shared_topk is not None:
+            self._mtp_shared_topk = mx.contiguous(
+                self._mtp_shared_topk[batch_indices]
+            )
         super().filter(batch_indices)
 
     def extend(self, other):
@@ -979,6 +1043,9 @@ class BatchQSAKVCache(BatchKVCache):
                     pad(index_b, idx_b, other.offset.shape[0]),
                 ]
             )
+        # The joining rows carry neither, and a partial set has no meaning as
+        # a batch tensor: a join ends the cycle for every lane.
+        self._drop_qsa_cycle_state()
         super().extend(other)
         self.index_keys = merged_index
 
@@ -1133,15 +1200,15 @@ class QSAIndexer(nn.Module):
         )
 
     def _pool_blocks_left_padded(
-        self, all_raw: mx.array, n_blocks: int, starts: mx.array, left_pad
+        self, all_raw: mx.array, starts: mx.array, left_pad
     ) -> mx.array:
-        """Pool logical blocks out of a left-padded physical key ledger.
+        """Pool the logical blocks ``starts`` out of a left-padded ledger.
 
-        Row ``b``'s logical block ``n`` occupies physical columns
-        ``[left_pad[b] + n*r, left_pad[b] + (n+1)*r)``, so gather each row's
-        own columns before pooling.  ``n_blocks`` is sized off the physical
-        width, an upper bound on any row's own block count, so a padded row's
-        trailing gathers run past the ledger and are clamped here.
+        Row ``b``'s logical block at ``start`` occupies physical columns
+        ``[left_pad[b] + start, left_pad[b] + start + r)``, so gather each
+        row's own columns before pooling.  The block grid is sized off the
+        physical width, an upper bound on any row's own block count, so a
+        padded row's trailing gathers run past the ledger and are clamped here.
 
         A clamped block IS pooled and scored -- what it can never do is reach
         the returned mask.  Row ``b``'s deepest query sits at logical
@@ -1178,23 +1245,43 @@ class QSAIndexer(nn.Module):
         # block count; that already implies n_blocks <= block_topk.
         return shared_topk.shape[-1] == n_blocks
 
-    def _pooled_keys(self, all_raw, n_blocks, starts, cache, length) -> mx.array:
+    def _pooled_keys(self, all_raw, n_blocks, starts, cache, length, left_pad):
         ratio = self.compress_ratio
-        if not (_QSA_POOLED_KEY_CACHE and type(cache) is QSAKVCache):
-            return self._pool_blocks(all_raw[:, : n_blocks * ratio], starts)
-        if all_raw.shape[1] != cache.offset + length:
+
+        def pool(first, last):
+            if left_pad is None:
+                return self._pool_blocks(
+                    all_raw[:, first * ratio : last * ratio], starts[first:last]
+                )
+            return self._pool_blocks_left_padded(
+                all_raw, starts[first:last], left_pad
+            )
+
+        if not (
+            _QSA_POOLED_KEY_CACHE and type(cache) in (QSAKVCache, BatchQSAKVCache)
+        ):
+            return pool(0, n_blocks)
+        if left_pad is None and all_raw.shape[1] != cache.offset + length:
             # A raw-key ledger out of step with the KV offset means block
             # positions no longer match token positions; fail loudly instead
-            # of pooling from a shifted history.
+            # of pooling from a shifted history.  (The batch path runs the
+            # same check against the PHYSICAL write index in __call__.)
             raise RuntimeError(
                 "QSA index_keys desync: "
                 f"{all_raw.shape[1]} raw keys != offset {cache.offset} "
                 f"+ {length} new"
             )
+        # A padded row has not closed the block grid's trailing blocks, so
+        # those were pooled from CLAMPED columns and would be reused as real
+        # values once the row does close them.  Retain only the blocks every
+        # row has closed, which the row with the most left padding bounds.
+        closed = n_blocks
+        if left_pad is not None:
+            closed = (all_raw.shape[1] - cache.max_left_padding()) // ratio
         cached = cache._qsa_pooled_keys
         count = 0 if cached is None else cached.shape[1]
         if cached is not None and (
-            count > n_blocks
+            count > closed
             or cache._qsa_pooled_ratio != ratio
             or cached.shape[0] != all_raw.shape[0]
         ):
@@ -1204,11 +1291,11 @@ class QSAIndexer(nn.Module):
         else:
             # A block is final once its last token is written; only blocks
             # closed since the previous call need computing.
-            new = self._pool_blocks(
-                all_raw[:, count * ratio : n_blocks * ratio], starts[count:]
-            )
+            new = pool(count, n_blocks)
             pooled = new if cached is None else mx.concatenate([cached, new], axis=1)
-        cache._qsa_pooled_keys = pooled
+        cache._qsa_pooled_keys = (
+            pooled if closed >= n_blocks else mx.contiguous(pooled[:, :closed])
+        )
         cache._qsa_pooled_ratio = ratio
         return pooled
 
@@ -1325,10 +1412,8 @@ class QSAIndexer(nn.Module):
             (starts + self.compress_ratio - 1)[None, None, :] <= q_pos[..., None]
         )
         if shared_topk is None:
-            pooled = (
-                self._pool_blocks_left_padded(all_raw, n_blocks, starts, left_pad)
-                if left_pad is not None
-                else self._pooled_keys(all_raw, n_blocks, starts, cache, length)
+            pooled = self._pooled_keys(
+                all_raw, n_blocks, starts, cache, length, left_pad
             )
             scores = mx.einsum(
                 "blhd,bnd->blnh", q.astype(mx.float32), pooled.astype(mx.float32)
@@ -1746,9 +1831,13 @@ class Model(nn.Module):
         return [SinkWindowKVCache(window_size, sink_size) for _ in self.mtp.layers]
 
     def mtp_start_cycle(self, mtp_cache, share_qsa_indices: bool = False):
-        """Reset optional QSA top-k sharing at an MTP draft-cycle boundary."""
+        """Reset optional QSA top-k sharing at an MTP draft-cycle boundary.
+
+        Sharing is per lane under a batched head cache: the stored index set
+        is ``[B, k]`` and each row reuses its own blocks.
+        """
         for cache in mtp_cache:
-            if isinstance(cache, QSAKVCache):
+            if isinstance(cache, (QSAKVCache, BatchQSAKVCache)):
                 cache._mtp_share_topk = bool(share_qsa_indices)
                 cache._mtp_shared_topk = None
 

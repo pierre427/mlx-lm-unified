@@ -813,12 +813,15 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
     and the tail term for that path, so each lever is re-checked there rather
     than only on the single-sequence path the rest of this file drives.
 
-    ``_QSA_POOLED_KEY_CACHE`` is the exception: it cannot engage on a batch
-    cache at all, and must not.  Its incremental append keys blocks by index
-    on the assumption that a block, once closed, is final -- true for one
-    sequence, false for a batch, where the shared block count is the widest
-    row's and a padded row's same-indexed block is still open.  The test below
-    pins that non-engagement rather than pretending to exercise the flag.
+    ``_QSA_POOLED_KEY_CACHE`` engages here as of 2026-08-27.  Its incremental
+    append keys blocks by index on the assumption that a block, once closed,
+    is final -- true for one sequence, and true per row for a batch too, since
+    the blocks are LOGICAL.  What is NOT true for a batch is that the shared
+    block grid is closed: it is the widest row's, so a padded row's
+    same-indexed trailing block is still open and was pooled from clamped
+    columns.  The cache therefore retains only the blocks EVERY row has
+    closed, which the row with the most left padding bounds, and recomputes
+    the rest each call.  The tests below pin both halves.
 
     The schedule ends on a four-token chunk so the PADDED row's own logical
     total crosses the 11-token dense boundary (4, 5, 8, 9, 13) instead of
@@ -875,7 +878,9 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
         self.assertEqual(padding, [0, 11])  # 14 vs 3 tokens
         # The comparison is only meaningful where the padded geometry is
         # actually pooled, i.e. where the schedule really does go sparse.
-        self.assertEqual(set(pooled), {"_pool_blocks_left_padded"})
+        self.assertEqual(
+            set(pooled), {"_pooled_keys", "_pool_blocks_left_padded"}
+        )
         # _RMSNORM_FAST is deliberately NOT in this list: it is the one
         # tolerance-class lever in the bundle (mx.fast.rms_norm rounds the
         # normalized value once before the per-stream weight multiply, a
@@ -905,18 +910,72 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
                 f"_RMSNORM_FAST step {step}: {deviation:.3e} vs scale {scale:.3e}",
             )
 
-    def test_pooled_key_cache_cannot_engage_on_a_batch_cache(self):
-        # An engagement check, not a bitwise one.  The incremental pooled
-        # cache is single-sequence-only by construction; if a later change
-        # routed a batch cache through ``_pooled_keys`` this fails rather than
-        # silently pooling a padded row's still-open block.
+    def _qsa_caches(self, batch):
+        return [
+            layer
+            for layer in batch
+            if isinstance(layer, qwen4_exp.BatchQSAKVCache)
+        ]
+
+    def test_pooled_key_cache_is_bitwise_on_a_batch_cache(self):
         _, stock, _ = self._run()
+        model, batch, padding = self._merged()
         with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
-            _, fast, pooled = self._run(count=True)
-        self.assertNotIn("_pooled_keys", pooled)
-        self.assertIn("_pool_blocks_left_padded", pooled)
+            with count_pooling() as pooled:
+                fast = self._decode(model, batch)
         for step, (expected, actual) in enumerate(zip(stock, fast)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
+        self.assertIn("_pooled_keys", pooled)
+        # Engagement, not just routing: something was retained.
+        caches = self._qsa_caches(batch)
+        self.assertTrue(caches)
+        for cache in caches:
+            self.assertIsNotNone(cache._qsa_pooled_keys)
+
+    def test_batch_pooled_cache_retains_only_blocks_every_row_closed(self):
+        # The bound that makes the reuse sound.  A block the padded row has
+        # not closed was pooled from CLAMPED columns; retaining it would hand
+        # that garbage back as a real value once the row does close it.
+        model, batch, padding = self._merged()
+        self.assertEqual(padding, [0, 11])
+        ratio = tiny_args(ple_layer_ids=[2]).indexer_compress_ratio
+        with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
+            for chunk in self.CHUNKS:
+                mx.eval(
+                    model(
+                        mx.array(
+                            [list(chunk)] * len(self.PROMPTS), dtype=mx.int32
+                        ),
+                        cache=batch,
+                    )
+                )
+                for cache in self._qsa_caches(batch):
+                    shortest = cache._idx - max(padding)
+                    self.assertEqual(
+                        cache._qsa_pooled_keys.shape[1],
+                        shortest // ratio,
+                        f"retained past the shortest row at idx {cache._idx}",
+                    )
+                    # Non-vacuous: the shared grid really is wider.
+                    self.assertGreater(cache._idx // ratio, shortest // ratio)
+
+    def test_batch_qsa_cycle_state_survives_filter_and_clears_on_membership(self):
+        model, batch, _ = self._merged()
+        with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
+            self._decode(model, batch)
+        caches = self._qsa_caches(batch)
+        for cache in caches:
+            cache._mtp_shared_topk = mx.zeros((2, 3), dtype=mx.uint32)
+
+        for cache in caches:
+            cache.filter(mx.array([1]))
+            self.assertEqual(cache._qsa_pooled_keys.shape[0], 1)
+            self.assertEqual(cache._mtp_shared_topk.shape[0], 1)
+
+        for cache in caches:
+            cache.prepare(lengths=[2], right_padding=[0])
+            self.assertIsNone(cache._qsa_pooled_keys)
+            self.assertIsNone(cache._mtp_shared_topk)
 
 
 class TestQSADenseShortCircuit(unittest.TestCase):
