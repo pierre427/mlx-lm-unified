@@ -377,6 +377,12 @@ class FileBackedShardedEmbedding(nn.Module):
         self.dequant_backend = os.getenv("MLX_QWEN4_PLE_NVME_DEQUANT", "numpy")
         if self.dequant_backend not in {"numpy", "mx"}:
             raise ValueError("MLX_QWEN4_PLE_NVME_DEQUANT must be numpy or mx")
+        # Counters are always on (integer increments); wall-clock timing
+        # adds two perf_counter calls per foreground lookup, so it is
+        # opt-in for benches.
+        self.stats_timing = (
+            os.getenv("MLX_QWEN4_PLE_NVME_STATS_TIMING") == "1"
+        )
         self.decode_workers = int(
             os.getenv("MLX_QWEN4_PLE_NVME_DECODE_WORKERS", str(DECODE_WORKERS))
         )
@@ -521,7 +527,7 @@ class FileBackedShardedEmbedding(nn.Module):
         return mx.dequantize(w, s, b, group_size=32, bits=4, mode="affine")
 
     def lookup_numpy(self, indices: np.ndarray) -> mx.array:
-        started = time.perf_counter()
+        started = time.perf_counter() if self.stats_timing else None
         shape = indices.shape
         flat = np.asarray(indices, dtype=np.int64).reshape(-1)
         unique, inverse = np.unique(flat, return_inverse=True)
@@ -531,20 +537,23 @@ class FileBackedShardedEmbedding(nn.Module):
             *shape, self.dims
         )
         self._stat_lookups += 1
-        self._stat_rows += int(flat.size)
-        self._stat_unique_rows += int(unique.size)
-        self._stat_bytes += int(unique.size) * self.row_bytes
-        self._stat_elapsed += time.perf_counter() - started
+        self._stat_rows += flat.size
+        self._stat_unique_rows += unique.size
+        self._stat_bytes += unique.size * self.row_bytes
+        if started is not None:
+            self._stat_elapsed += time.perf_counter() - started
         return result
 
     @property
     def stats(self) -> LookupStats:
+        # Hot-path increments may be numpy ints; normalize here (cold path)
+        # so the record is JSON-serializable.
         return LookupStats(
-            self._stat_lookups,
-            self._stat_rows,
-            self._stat_unique_rows,
-            self._stat_bytes,
-            self._stat_elapsed,
+            int(self._stat_lookups),
+            int(self._stat_rows),
+            int(self._stat_unique_rows),
+            int(self._stat_bytes),
+            float(self._stat_elapsed),
         )
 
     def __call__(self, indices: mx.array) -> mx.array:

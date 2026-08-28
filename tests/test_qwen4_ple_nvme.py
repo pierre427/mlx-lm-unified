@@ -368,6 +368,34 @@ class TestQwen4PleNvme(unittest.TestCase):
             mx.array_equal(expected.view(mx.uint16), actual.view(mx.uint16)).item()
         )
 
+    def test_lookup_stats_count_and_timing_is_opt_in(self):
+        file_backed = self.ngram_embedding(self.load_nvme()).ngram_embedding
+        self.assertFalse(file_backed.stats_timing)
+        ids = np.array([[0, 5, 5, 87]])
+        file_backed.lookup_numpy(ids)
+        stats = file_backed.stats
+        self.assertEqual(stats.lookups, 1)
+        self.assertEqual(stats.rows, 4)
+        self.assertEqual(stats.unique_rows, 3)
+        self.assertEqual(stats.bytes_read, 3 * file_backed.row_bytes)
+        self.assertEqual(stats.elapsed_seconds, 0.0)
+        self.assertEqual(
+            {k: type(v) for k, v in vars(stats).items()},
+            {
+                "lookups": int,
+                "rows": int,
+                "unique_rows": int,
+                "bytes_read": int,
+                "elapsed_seconds": float,
+            },
+        )
+
+        with env_var("MLX_QWEN4_PLE_NVME_STATS_TIMING", "1"):
+            timed = self.ngram_embedding(self.load_nvme()).ngram_embedding
+        self.assertTrue(timed.stats_timing)
+        timed.lookup_numpy(ids)
+        self.assertGreater(timed.stats.elapsed_seconds, 0.0)
+
     # ------------------------------------------------------------------
     # Load path
     # ------------------------------------------------------------------
