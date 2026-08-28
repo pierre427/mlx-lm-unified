@@ -231,7 +231,12 @@ class TestQwen4PleNvme(unittest.TestCase):
                     }
                 )
             )
-            with self.assertRaisesRegex(ValueError, "FP8 layout"):
+            # The dedicated "FP8 layout" diagnostic ships with the FP8
+            # checkpoint-ingestion commit, which is intentionally not part of
+            # the q4-only serving port. The q4 builder still refuses the FP8
+            # layout: it sees U8 shard weights where it requires U32-packed
+            # 4-bit words and raises before building a sidecar.
+            with self.assertRaisesRegex(ValueError, "FP8 layout|dtype U8"):
                 builder.collect_shards(fp8_dir)
 
     def test_manifest_geometry_is_validated(self):
