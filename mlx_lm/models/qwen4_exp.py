@@ -157,12 +157,16 @@ _QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
 # accumulation and rounds only P, so it is ~7x MORE accurate than bf16 SDPA
 # (~1.4e-3 rel vs fp32 vs bf16 SDPA's ~1.1e-2).  Near-tie greedy flips vs the
 # OFF path are expected and are the kernel being more accurate, not less.
-# Kept OFF by default 2026-08-28: default-on crashed the threaded server with
-# "There is no Stream(gpu, 0) in current thread" -- the custom Metal kernel is
-# invoked on a thread without the generation stream, the same thread-affinity
-# class as the lane-key outage. The ladder passed because it did not exercise
-# the server's generation-worker-thread boundary. Needs the _run_on_step_thread
-# discipline before it can be default-on. Flag still works for isolated benches.
+# Kept OFF by default 2026-08-28, cause NOT root-caused. A default-on restart
+# served one 200 then the service went down WITHOUT a Python traceback (a kill,
+# not a crash) -- likely a transient over-budget while the kernel's first-use
+# Metal-library compile ran on top of the 108 GB model + the fused-gate-up
+# load-time rebuild. An initial "stream-affinity" diagnosis was WRONG: the
+# cited "no Stream(gpu,0)" errors were stale from an unrelated morning incident;
+# a Codex review showed metal_kernel() captures no stream and the served ladder
+# did cross the HTTP->worker boundary and passed. So this is memory/lifecycle,
+# not threading. Re-test on an isolated server watching memory before default-on.
+# Flag still works for isolated benches.
 _QSA_NAX_KERNEL = _env_flag("MLX_QWEN4_QSA_NAX_KERNEL")
 
 # Minimum query length for the kernel to engage. It tiles M by query heads, so
