@@ -953,6 +953,166 @@ class TestQSALeftPaddedBatch(unittest.TestCase):
             mx.eval(model(mx.array([[9], [9]], dtype=mx.int32), cache=batch))
 
 
+class TestPLERollbackPerRowReplay(unittest.TestCase):
+    """The PLE half of the combined record offers a vectorized ragged replay.
+
+    ``ArraysCache.trim_ragged`` takes ``per_row_fn(lengths)`` when a layer
+    stages one and otherwise replays the scalar ``fn`` once per DISTINCT row
+    length (the plan's interim form a0).  Both PLE states are the window
+    ending at a row's own length, so the vectorized form is one gather.
+    """
+
+    def _staged(self, batch=3, length=4):
+        args = tiny_args(ple_layer_ids=[2])
+        mx.random.seed(5)
+        layer = PLELayer(args, 1, 0)
+        cache = Qwen4ArraysCache(4)
+        cache.start_speculation()
+        captured = {}
+        original = Qwen4ArraysCache.stage_ple_rollback
+
+        def spy(self, num_tokens, fn, snapshot, *, per_row_fn=None):
+            captured.update(fn=fn, per_row_fn=per_row_fn, num_tokens=num_tokens)
+            return original(self, num_tokens, fn, snapshot, per_row_fn=per_row_fn)
+
+        Qwen4ArraysCache.stage_ple_rollback = spy
+        try:
+            hidden = mx.random.normal(
+                (batch, length, args.hidden_size * args.hc_count)
+            )
+            ids = mx.array(
+                [[1 + row * 10 + i for i in range(length)] for row in range(batch)],
+                dtype=mx.int32,
+            )
+            mx.eval(layer(hidden, ids, cache))
+        finally:
+            Qwen4ArraysCache.stage_ple_rollback = original
+        return captured
+
+    def test_per_row_replay_equals_the_scalar_replay_row_by_row(self):
+        captured = self._staged()
+        self.assertIsNotNone(captured["per_row_fn"])
+        lengths = [4, 2, 0]
+        rows = captured["per_row_fn"](lengths)
+        mx.eval(rows)
+        for row, m in enumerate(lengths):
+            scalar = captured["fn"](m)
+            mx.eval(scalar)
+            for slot, (got, want) in enumerate(zip(rows, scalar)):
+                self.assertTrue(
+                    mx.array_equal(
+                        got[row : row + 1], want[row : row + 1]
+                    ).item(),
+                    f"row {row} slot {slot} at m={m}",
+                )
+
+    def test_combined_record_carries_a_per_row_form_only_when_both_halves_do(self):
+        for gdn_rows in (None, lambda lengths: [mx.array(list(lengths))]):
+            with self.subTest(gdn_per_row=gdn_rows is not None):
+                cache = Qwen4ArraysCache(4)
+                cache.start_speculation()
+                cache.stage_ple_rollback(
+                    2,
+                    lambda m: [mx.array([m])],
+                    [None],
+                    per_row_fn=lambda lengths: [mx.array(list(lengths))],
+                )
+                cache.record_rollback(
+                    2, lambda m: [mx.array([m])], [None], per_row_fn=gdn_rows
+                )
+                record = cache._rollbacks[-1]
+                self.assertEqual(
+                    record.per_row_fn is not None, gdn_rows is not None
+                )
+
+
+class TestRaggedRollbackComposition(unittest.TestCase):
+    """One ragged verify rewind across all four Qwen4 state families.
+
+    Rows accept different numbers of drafts, so the trunk must rewind the
+    QSA KV, the raw indexer ledger, the GDN conv+recurrence and the PLE
+    ShortConv+token history by DIFFERENT amounts in one call, and land every
+    row where its own accepted prefix would have left it.  This is the model
+    half of gate 2 in the batch-composition plan; ``tests/test_ragged_trim.py``
+    owns the cache primitives.
+    """
+
+    PROMPTS = ([1, 2, 3, 4, 5, 6, 7], [8, 9, 10])
+    DRAFTS = ([20, 21, 22], [30, 31, 32])
+    ACCEPTED = (2, 0)
+    NEXT = (40, 41)
+    SHAPE_NOISE_BAND = 3e-3
+
+    def _model(self):
+        mx.random.seed(11)
+        return TextModel(tiny_args(ple_layer_ids=[2]))
+
+    def test_ragged_rewind_lands_every_row_on_its_own_accepted_prefix(self):
+        from mlx_lm.models.cache import trim_ragged_prompt_cache
+
+        model = self._model()
+        caches = []
+        for prompt in self.PROMPTS:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        batch = _merge_caches(caches)
+        for layer in batch:
+            layer.start_speculation()
+        mx.eval(model(mx.array(self.DRAFTS, dtype=mx.int32), cache=batch))
+
+        drops = [len(d) - a for d, a in zip(self.DRAFTS, self.ACCEPTED)]
+        self.assertGreater(len(set(drops)), 1, "the rewind is not ragged")
+        self.assertEqual(trim_ragged_prompt_cache(batch, drops), drops)
+        for layer in batch:
+            layer.stop_speculation()
+
+        qsa = [layer for layer in batch if isinstance(layer, BatchQSAKVCache)]
+        self.assertTrue(qsa)
+        for cache in qsa:
+            self.assertEqual(cache.index_keys.shape[1], cache._idx)
+            self.assertEqual(
+                cache.offset.tolist(),
+                [
+                    len(prompt) + accepted
+                    for prompt, accepted in zip(self.PROMPTS, self.ACCEPTED)
+                ],
+            )
+
+        got = np.asarray(
+            model(
+                mx.array([[token] for token in self.NEXT], dtype=mx.int32),
+                cache=batch,
+            )
+        )
+        for row, (prompt, drafts, accepted) in enumerate(
+            zip(self.PROMPTS, self.DRAFTS, self.ACCEPTED)
+        ):
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            if accepted:
+                mx.eval(
+                    model(
+                        mx.array([drafts[:accepted]], dtype=mx.int32), cache=cache
+                    )
+                )
+            want = np.asarray(
+                model(mx.array([[self.NEXT[row]]], dtype=mx.int32), cache=cache)
+            )
+            scale = float(np.abs(want).max())
+            error = float(np.abs(got[row : row + 1] - want).max()) / scale
+            self.assertLess(
+                error,
+                self.SHAPE_NOISE_BAND,
+                f"row {row}: {error:.3e} of output scale",
+            )
+            self.assertEqual(
+                int(got[row, -1].argmax()),
+                int(want[0, -1].argmax()),
+                f"row {row}: argmax differs after the ragged rewind",
+            )
+
+
 class TestBatchedMTPSharedTopK(unittest.TestCase):
     """QSA top-k sharing across an MTP draft cycle, on a batched head cache.
 

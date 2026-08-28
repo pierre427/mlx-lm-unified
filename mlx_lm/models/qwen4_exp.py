@@ -384,17 +384,19 @@ class Qwen4ArraysCache(ArraysCache):
         self._ple_rollback = None
         super().stop_speculation()
 
-    def stage_ple_rollback(self, num_tokens, fn, snapshot):
+    def stage_ple_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
         if self._ple_rollback is not None:
             raise RuntimeError("Qwen4 PLE rollback was staged twice")
-        self._ple_rollback = (num_tokens, fn, snapshot)
+        self._ple_rollback = (num_tokens, fn, snapshot, per_row_fn)
 
-    def record_rollback(self, num_tokens, fn, snapshot):
+    def record_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
         staged = self._ple_rollback
         self._ple_rollback = None
         if staged is None:
-            return super().record_rollback(num_tokens, fn, snapshot)
-        ple_tokens, ple_fn, ple_snapshot = staged
+            return super().record_rollback(
+                num_tokens, fn, snapshot, per_row_fn=per_row_fn
+            )
+        ple_tokens, ple_fn, ple_snapshot, ple_per_row = staged
         if ple_tokens != num_tokens:
             raise RuntimeError(
                 "Qwen4 PLE/GDN rollback span mismatch: "
@@ -404,8 +406,22 @@ class Qwen4ArraysCache(ArraysCache):
         def combined(m):
             return list(fn(m)) + list(ple_fn(m))
 
+        # One record, so the vectorized per-row replay is available only if
+        # BOTH halves stage one; a partial form would rewind the pair by
+        # different rules. GDN (qwen3_5.py) does not stage one yet, so this
+        # composes to None today and the interim per-distinct-length replay
+        # applies.
+        rows = None
+        if per_row_fn is not None and ple_per_row is not None:
+
+            def rows(lengths):
+                return list(per_row_fn(lengths)) + list(ple_per_row(lengths))
+
         return super().record_rollback(
-            num_tokens, combined, list(snapshot) + list(ple_snapshot)
+            num_tokens,
+            combined,
+            list(snapshot) + list(ple_snapshot),
+            per_row_fn=rows,
         )
 
     def extract(self, idx):
@@ -884,10 +900,27 @@ class PLELayer(nn.Module):
                     mx.contiguous(th[:, m : m + cl]),
                 ]
 
+            def _ple_rollback_rows(
+                lengths,
+                ci=conv_input,
+                th=token_history,
+                sl=state_len,
+                cl=context_len,
+            ):
+                # Both states are the window ending at the row's own length,
+                # so the ragged replay is the same gather as the pad-safe
+                # update, in one graph.
+                ends = mx.array(list(lengths))
+                return [
+                    mx.contiguous(_row_tail(ci, ends, sl)),
+                    mx.contiguous(_row_tail(th, ends, cl)),
+                ]
+
             cache.stage_ple_rollback(
                 input_ids.shape[1],
                 _ple_rollback,
                 [previous_conv, previous_tokens],
+                per_row_fn=_ple_rollback_rows,
             )
         return gated + conv
 
@@ -914,6 +947,13 @@ def _apply_rope_positions(x: mx.array, positions: mx.array, dims: int, base: flo
 
 class BatchQSAKVCache(BatchKVCache):
     """Batched QSA cache retaining raw indexer keys beside attention KV."""
+
+    # ``index_keys`` is a per-row ledger parallel to the KV columns, so a
+    # ragged trim rolls it with the same per-row shifts.  The base check that
+    # it is at least as wide as the cursor is wanted: only an MTP draft cycle
+    # may run it short (a shared-top-k step appends no key), and that cache is
+    # rewound uniformly, never raggedly.
+    _RAGGED_TRIM_AUX_ARRAYS = (("index_keys", 1),)
 
     def __init__(self, left_padding: List[int], attention_backend=None):
         super().__init__(left_padding, attention_backend=attention_backend)
@@ -947,13 +987,21 @@ class BatchQSAKVCache(BatchKVCache):
         self._qsa_pooled_keys = None
         self._qsa_pooled_ratio = None
 
-    def trim(self, n):
-        n = super().trim(n)
-        # Same contract as QSAKVCache.trim: a rewind ends the MTP draft cycle,
-        # and a block mean is a closed window, so blocks inside EVERY row's
-        # trimmed offset stay exact.  The shortest row bounds that.
+    def _rewound_qsa_cycle_state(self):
+        """Same contract as QSAKVCache.trim, applied per row.
+
+        A rewind ends the MTP draft cycle.  A block mean is a closed window,
+        so a block inside EVERY row's new offset stays exact -- and the row
+        with the most left padding is the one that bounds that, whether the
+        rewind moved the shared cursor or only the per-row offsets.
+        """
         self._mtp_share_topk = False
         self._mtp_shared_topk = None
+        if self.index_keys is not None and self.index_keys.shape[1] > self._idx:
+            # The next append truncates to the cursor anyway; doing it here
+            # keeps ``ledger width == cursor`` an invariant a reader can rely
+            # on, and drops the bytes now.
+            self.index_keys = mx.contiguous(self.index_keys[:, : self._idx])
         if self._qsa_pooled_keys is not None:
             keep = max(0, self._idx - self.max_left_padding()) // self._qsa_pooled_ratio
             if keep == 0:
@@ -962,7 +1010,16 @@ class BatchQSAKVCache(BatchKVCache):
                 self._qsa_pooled_keys = mx.contiguous(
                     self._qsa_pooled_keys[:, :keep]
                 )
+
+    def trim(self, n):
+        n = super().trim(n)
+        self._rewound_qsa_cycle_state()
         return n
+
+    def trim_ragged(self, n, *, validate: bool = True):
+        drops = super().trim_ragged(n, validate=validate)
+        self._rewound_qsa_cycle_state()
+        return drops
 
     def prepare(self, *args, **kwargs):
         # A right-padded forward pools filler tokens into the tail blocks and
