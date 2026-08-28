@@ -292,17 +292,55 @@ class RaggedTrimUnsupported(RuntimeError):
 
 
 class _RollbackRecord(tuple):
-    """``(num_tokens, fn, snapshot)`` plus an optional per-lane replay.
+    """``(replayable, fn, snapshot)`` plus per-row depth and an optional replay.
 
-    It is a plain 3-tuple for every existing reader (indexing, unpacking and
-    equality are unchanged). ``per_row_fn``, when the layer stages one, takes
-    a list of per-row lengths and rebuilds every row in one graph.
+    Still a plain 3-tuple for every existing reader. ``depths`` holds how many
+    of the record's tokens each row still has applied — rows diverge after a
+    ragged trim, so one scalar cannot describe the stack. ``None`` means every
+    row is still at ``num_tokens``, which is the whole single-sequence and
+    pre-divergence life of a record, so no per-row list is allocated then.
+    Element 0 is the smallest per-row depth: the honest answer to the uniform
+    "how much can I trim?" question every existing reader is asking.
     """
 
-    def __new__(cls, num_tokens, fn, snapshot, per_row_fn=None):
-        record = super().__new__(cls, (num_tokens, fn, snapshot))
+    def __new__(cls, num_tokens, fn, snapshot, per_row_fn=None, depths=None):
+        replayable = num_tokens if depths is None else min(depths)
+        record = super().__new__(cls, (replayable, fn, snapshot))
+        record.num_tokens = num_tokens
         record.per_row_fn = per_row_fn
+        record.depths = depths
         return record
+
+    @property
+    def fn(self):
+        return self[1]
+
+    @property
+    def snapshot(self):
+        return self[2]
+
+    @property
+    def span(self):
+        """Tokens of history this record still holds for some row."""
+        return self.num_tokens if self.depths is None else max(self.depths)
+
+    def depth_list(self, batch_size: int) -> List[int]:
+        if self.depths is None:
+            return [self.num_tokens] * batch_size
+        return list(self.depths)
+
+    def with_depths(self, depths: List[int]):
+        uniform = all(d == self.num_tokens for d in depths)
+        return _RollbackRecord(
+            self.num_tokens,
+            self.fn,
+            self.snapshot,
+            self.per_row_fn,
+            None if uniform else depths,
+        )
+
+    def exhausted(self) -> bool:
+        return self.depths is not None and max(self.depths, default=0) == 0
 
 
 def _row_vector(n, batch_size: int, who: str) -> List[int]:
@@ -314,7 +352,13 @@ def _row_vector(n, batch_size: int, who: str) -> List[int]:
             f"{who} needs one count per row, not a scalar; use trim() for a "
             "uniform rewind"
         )
-    drops = [int(v) for v in n]
+    drops = []
+    for value in n:
+        count = int(value)
+        # Coercing 1.9 to 1 would silently apply a different rewind.
+        if count != value:
+            raise ValueError(f"{who} got a non-integral count: {list(n)}")
+        drops.append(count)
     if len(drops) != batch_size:
         raise ValueError(
             f"{who} got {len(drops)} counts for {batch_size} rows"
@@ -426,7 +470,11 @@ def trim_ragged_prompt_cache(
             "cache entries are not trimmable right now: "
             + ", ".join(not_trimmable)
         )
-    applied = [c.trim_ragged(n, validate=validate) for c in cache]
+    # Preflight every entry before any of them moves: the slab roll is in
+    # place, so a late rejection would leave earlier entries rewound.
+    for c in cache:
+        c.preflight_ragged_trim(n, validate=validate)
+    applied = [c.trim_ragged(n, validate=False) for c in cache]
     first = applied[0]
     for other in applied[1:]:
         if other != first:
@@ -519,6 +567,14 @@ class _BaseCache:
             f"{type(self).__name__} cannot rewind its rows by different "
             "amounts; only a uniform trim() is defined for it"
         )
+
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        """Run ``trim_ragged``'s entry-local checks without mutating anything.
+
+        The group entry points call this on every entry first, so one entry
+        cannot rewind while a later one rejects the same vector.
+        """
+        return self.trim_ragged(n, validate=validate)
 
     def start_speculation(self, rollback_window: Optional[int] = None):
         """Called before draft/verify (or multi-token proposal) steps begin.
@@ -1999,28 +2055,38 @@ class ArraysCache(_BaseCache):
         self._rollbacks.append(
             _RollbackRecord(num_tokens, fn, snapshot, per_row_fn)
         )
-        total = sum(r[0] for r in self._rollbacks)
+        # Bound the retained history by what a record still holds for any row.
+        total = sum(r.span for r in self._rollbacks)
         while (
             len(self._rollbacks) > 1
-            and total - self._rollbacks[0][0] >= self._rollback_window
+            and total - self._rollbacks[0].span >= self._rollback_window
         ):
-            total -= self._rollbacks.popleft()[0]
+            total -= self._rollbacks.popleft().span
 
     def is_trimmable(self):
         # While speculating, every forward records an exact rollback, so the
         # cache is trimmable within the recorded window.
         return self.speculating
 
+    def _row_capacity(self, batch_size: int) -> List[int]:
+        """Tokens each row can still rewind exactly, row by row."""
+        capacity = [0] * batch_size
+        for record in self._rollbacks:
+            for index, depth in enumerate(record.depth_list(batch_size)):
+                capacity[index] += depth
+        return capacity
+
     def _recorded_tokens(self):
         return sum(r[0] for r in self._rollbacks)
 
-    def _rollback_budget_error(self, n):
+    def _rollback_budget_error(self, n, capacity=None):
         detail = ""
         if self._rollback_invalid_reason:
             detail = f" The records were dropped: {self._rollback_invalid_reason}."
+        have = self._recorded_tokens() if capacity is None else capacity
         return RuntimeError(
             f"Cannot trim {n} tokens from ArraysCache: only "
-            f"{self._recorded_tokens()} tokens of exact rollback "
+            f"{have} tokens of exact rollback "
             "are recorded. Recurrent state cannot be trimmed beyond the "
             f"speculative window.{detail}"
         )
@@ -2032,33 +2098,73 @@ class ArraysCache(_BaseCache):
         batch membership makes them un-replayable. Dropping them turns a
         later trim into a loud failure instead of a wrong-shaped restore.
         """
+        self._clear_staged_rollback()
         if self._rollbacks:
             self._rollbacks.clear()
             self._rollback_invalid_reason = reason
 
+    def _clear_staged_rollback(self):
+        """Drop a rollback staged by an interrupted forward.
+
+        No-op here. A subclass that stages part of a record before
+        ``record_rollback`` combines it (see ``Qwen4ArraysCache``) must
+        override this, or the stale half survives a membership change.
+        """
+
     def trim(self, n):
         if n <= 0:
             return 0
-        if self._recorded_tokens() < n:
-            raise self._rollback_budget_error(n)
-        trimmed = 0
-        while trimmed < n:
-            record = self._rollbacks.pop()
-            num_tokens, fn, snapshot = record
-            take = min(n - trimmed, num_tokens)
-            m = num_tokens - take
-            self.cache = list(snapshot) if m == 0 else fn(m)
-            trimmed += take
-            if m > 0:
-                # The record still describes the first m tokens of its chunk
-                # (fn(m') is valid for any m' <= m), so keep it for further trims.
-                self._rollbacks.append(
-                    _RollbackRecord(m, fn, snapshot, record.per_row_fn)
-                )
+        batch = self.batch_size
+        capacity = self._row_capacity(batch)
+        if min(capacity, default=0) < n:
+            raise self._rollback_budget_error(n, min(capacity, default=0))
+        self._rewind_rows([n] * batch, batch, prefer_per_row=False)
         return n
 
     def supports_ragged_trim(self):
         return True
+
+    def _rewind_rows(self, remaining: List[int], batch: int, *, prefer_per_row):
+        """Walk the record stack newest-first, rewinding each row by its own count.
+
+        Rows sit at different depths after a divergent trim, so a record is
+        applied to whatever rows still owe a rewind *and* still have depth in
+        it; a row that has already passed the record contributes nothing and
+        keeps its live state.
+        """
+        stack = self._rollbacks
+        index = len(stack) - 1
+        while max(remaining, default=0) > 0:
+            if index < 0:
+                raise RuntimeError(
+                    "ArraysCache rollback stack was exhausted mid-rewind; "
+                    f"{remaining} tokens per row were still owed"
+                )
+            record = stack[index]
+            depths = record.depth_list(batch)
+            take = [min(remaining[i], depths[i]) for i in range(batch)]
+            if any(take):
+                lengths = [depths[i] - take[i] for i in range(batch)]
+                rows = [i for i in range(batch) if take[i] > 0]
+                if prefer_per_row and record.per_row_fn is not None:
+                    self.cache = self._blend_rows(
+                        list(record.per_row_fn(list(lengths))), rows
+                    )
+                else:
+                    for m in sorted({lengths[i] for i in rows}):
+                        candidate = (
+                            list(record.snapshot) if m == 0 else list(record.fn(m))
+                        )
+                        self.cache = self._blend_rows(
+                            candidate, [i for i in rows if lengths[i] == m]
+                        )
+                stack[index] = record.with_depths(lengths)
+                remaining = [r - t for r, t in zip(remaining, take)]
+            index -= 1
+        # Exhausted records form a suffix: a row reaches an older record only
+        # after using up every newer one.
+        while stack and stack[-1].exhausted():
+            stack.pop()
 
     def _blend_rows(self, candidate, rows: List[int]):
         """Take ``rows`` from ``candidate`` and every other row from the live state."""
@@ -2086,6 +2192,28 @@ class ArraysCache(_BaseCache):
             blended.append(mx.where(mask, new, live))
         return blended
 
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        """Validate a per-row rewind without mutating anything."""
+        batch = self.batch_size
+        drops = _row_vector(n, batch, "ArraysCache.trim_ragged")
+        if max(drops, default=0) == 0:
+            return drops
+        capacity = self._row_capacity(batch)
+        short = [i for i in range(batch) if drops[i] > capacity[i]]
+        if short:
+            detail = ""
+            if self._rollback_invalid_reason:
+                detail = (
+                    f" The records were dropped: {self._rollback_invalid_reason}."
+                )
+            raise RuntimeError(
+                "Cannot rewind ArraysCache rows "
+                f"{short} by {[drops[i] for i in short]}: only "
+                f"{[capacity[i] for i in short]} tokens of exact rollback are "
+                f"recorded for them.{detail}"
+            )
+        return drops
+
     def trim_ragged(self, n, *, validate: bool = True):
         """Rewind row ``i`` of the recurrent state by ``n[i]`` tokens.
 
@@ -2094,37 +2222,10 @@ class ArraysCache(_BaseCache):
         ``a0``). A layer that stages ``per_row_fn`` gets the one-graph form
         instead. Rows with ``n[i] == 0`` keep their live state untouched.
         """
-        drops = _row_vector(n, self.batch_size, "ArraysCache.trim_ragged")
+        drops = self.preflight_ragged_trim(n, validate=validate)
         if max(drops, default=0) == 0:
             return drops
-        if self._recorded_tokens() < max(drops):
-            raise self._rollback_budget_error(max(drops))
-        remaining = list(drops)
-        while max(remaining) > 0:
-            record = self._rollbacks.pop()
-            num_tokens, fn, snapshot = record
-            take = [min(r, num_tokens) for r in remaining]
-            lengths = [num_tokens - t for t in take]
-            rewound = [i for i, m in enumerate(lengths) if m < num_tokens]
-            if record.per_row_fn is not None:
-                self.cache = self._blend_rows(
-                    list(record.per_row_fn(list(lengths))), rewound
-                )
-            else:
-                for m in sorted({lengths[i] for i in rewound}):
-                    candidate = list(snapshot) if m == 0 else list(fn(m))
-                    rows = [i for i in rewound if lengths[i] == m]
-                    self.cache = self._blend_rows(candidate, rows)
-            remaining = [r - t for r, t in zip(remaining, take)]
-            keep = min(lengths)
-            if keep > 0:
-                # Only the shallowest row's remainder is still replayable for
-                # every row, so the retained budget is the minimum. A deeper
-                # row loses capacity it will never need in one cycle, and a
-                # later over-trim fails loud rather than restoring wrongly.
-                self._rollbacks.append(
-                    _RollbackRecord(keep, fn, snapshot, record.per_row_fn)
-                )
+        self._rewind_rows(list(drops), self.batch_size, prefer_per_row=True)
         return drops
 
     def state_checkpoint(self, positions: List[int], force: bool = False):
@@ -2521,8 +2622,14 @@ class CacheList(_BaseCache):
     def supports_ragged_trim(self):
         return all(c.supports_ragged_trim() for c in self.caches)
 
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        for c in self.caches:
+            c.preflight_ragged_trim(n, validate=validate)
+        return n
+
     def trim_ragged(self, n, *, validate: bool = True):
-        applied = [c.trim_ragged(n, validate=validate) for c in self.caches]
+        self.preflight_ragged_trim(n, validate=validate)
+        applied = [c.trim_ragged(n, validate=False) for c in self.caches]
         if any(a != applied[0] for a in applied[1:]):
             raise RuntimeError("CacheList members disagreed on a ragged trim")
         return applied[0]
@@ -2823,6 +2930,10 @@ class BatchQuantizedKVCache(_BaseCache):
     def supports_ragged_trim(self):
         return True
 
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        who = f"{type(self).__name__}.trim_ragged"
+        return _ragged_slab_plan(self, n, who, validate)
+
     def trim_ragged(self, n, *, validate: bool = True):
         """Per-row rewind, identical bookkeeping to ``BatchKVCache``.
 
@@ -2830,8 +2941,9 @@ class BatchQuantizedKVCache(_BaseCache):
         token rows along the sequence axis is exact on the packed
         ``(weight, scale, bias)`` triple.
         """
-        who = f"{type(self).__name__}.trim_ragged"
-        drops, uniform, residual = _ragged_slab_plan(self, n, who, validate)
+        drops, uniform, residual = self.preflight_ragged_trim(
+            n, validate=validate
+        )
         if residual is None:
             return drops
         if uniform:
@@ -3399,19 +3511,38 @@ class BatchKVCache(_BaseCache):
             "would leave any auxiliary per-row ledger out of step with the KV"
         )
 
+    def _check_ragged_trim_aux(self, hi: int, spec):
+        """Check the declared ledgers reach the cursor, before anything moves."""
+        for name, axis in spec or ():
+            ledger = getattr(self, name, None)
+            if ledger is not None and ledger.shape[axis] < hi:
+                raise RuntimeError(
+                    f"{type(self).__name__}.{name} holds "
+                    f"{ledger.shape[axis]} positions but the cursor is at "
+                    f"{hi}: the ledger is already out of step with the KV"
+                )
+
     def _trim_ragged_aux(self, shifts, lo: int, hi: int, spec):
         """Roll the declared auxiliary ledgers with the same per-row shifts."""
         for name, axis in spec or ():
             ledger = getattr(self, name, None)
             if ledger is None:
                 continue
-            if ledger.shape[axis] < hi:
-                raise RuntimeError(
-                    f"{type(self).__name__}.{name} holds "
-                    f"{ledger.shape[axis]} positions but the cursor is at "
-                    f"{hi}: the ledger is already out of step with the KV"
-                )
             setattr(self, name, _roll_rows_right(ledger, shifts, axis, lo, hi))
+
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        """Run every entry-local check without mutating anything.
+
+        The whole plan is validated first because the roll is in place: a
+        raise after K/V moved would leave the rows rolled under the old mask
+        geometry, with ``left_padding``/``offset`` never updated.
+        """
+        spec = self._ragged_trim_aux_spec()
+        who = f"{type(self).__name__}.trim_ragged"
+        drops, uniform, residual = _ragged_slab_plan(self, n, who, validate)
+        if residual is not None and max(residual) > 0:
+            self._check_ragged_trim_aux(self._idx - uniform, spec)
+        return drops, uniform, residual, spec
 
     def trim_ragged(self, n, *, validate: bool = True):
         """Rewind row ``i`` by ``n[i]`` tokens, keeping every row contiguous.
@@ -3427,9 +3558,9 @@ class BatchKVCache(_BaseCache):
         The added left padding is reclaimed by the next ``filter()``, which
         already shifts the batch left by the shared minimum.
         """
-        spec = self._ragged_trim_aux_spec()
-        who = f"{type(self).__name__}.trim_ragged"
-        drops, uniform, residual = _ragged_slab_plan(self, n, who, validate)
+        drops, uniform, residual, spec = self.preflight_ragged_trim(
+            n, validate=validate
+        )
         if residual is None:
             return drops
         self._invalidate_attention_groups()

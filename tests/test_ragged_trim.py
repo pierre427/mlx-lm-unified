@@ -261,11 +261,26 @@ class TestRaggedTrimAuxLedger(unittest.TestCase):
             self.assertEqual(len(live), int(offset))
             self.assertEqual(live[-1], 42.0)
 
-    def test_short_ledger_fails_loud(self):
+    def test_short_ledger_fails_loud_and_changes_nothing(self):
         cache = self._fill(length=6)
         cache.index_keys = cache.index_keys[:, :3]
+        before = {
+            "keys": cache.keys.tolist(),
+            "values": cache.values.tolist(),
+            "index_keys": cache.index_keys.tolist(),
+            "idx": cache._idx,
+            "offset": cache.offset.tolist(),
+            "left_padding": cache.left_padding.tolist(),
+        }
         with self.assertRaises(RuntimeError):
             cache.trim_ragged([0, 1, 3])
+        # The roll is in place, so a late raise must not have moved K/V.
+        self.assertEqual(cache.keys.tolist(), before["keys"])
+        self.assertEqual(cache.values.tolist(), before["values"])
+        self.assertEqual(cache.index_keys.tolist(), before["index_keys"])
+        self.assertEqual(cache._idx, before["idx"])
+        self.assertEqual(cache.offset.tolist(), before["offset"])
+        self.assertEqual(cache.left_padding.tolist(), before["left_padding"])
 
     def test_override_hook_receives_the_shifts(self):
         cache = _HandRolledKVCache([0, 0, 0])
@@ -324,6 +339,40 @@ class TestRaggedTrimUnsupportedClasses(unittest.TestCase):
         self.assertEqual(trim_ragged_prompt_cache(caches, [2, 0]), [2, 0])
         for cache in caches:
             self.assertEqual(cache.offset.tolist(), [3, 5])
+
+    def test_group_preflights_before_any_entry_moves(self):
+        """A late per-row rejection must not leave earlier entries rewound."""
+        kv = BatchKVCache([0, 0])
+        values = _tokens(2, 4)
+        kv.update_and_fetch(values, values)
+        arrays = ArraysCache(1)
+        arrays.start_speculation()
+        layer = _Recurrence(arrays)
+        layer(mx.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=mx.int32))
+        arrays.trim_ragged([0, 4])  # row 1 spends its whole record
+
+        state_before = arrays[0].tolist()
+        with self.assertRaises(RuntimeError):
+            # The KV could do this; the recurrent entry cannot.
+            trim_ragged_prompt_cache([kv, arrays], [0, 1])
+        self.assertEqual(kv._idx, 4)
+        self.assertEqual(kv.offset.tolist(), [4, 4])
+        self.assertEqual(kv.left_padding.tolist(), [0, 0])
+        self.assertEqual(arrays[0].tolist(), state_before)
+
+    def test_group_preflights_a_short_aux_ledger(self):
+        first = BatchKVCache([0, 0])
+        values = _tokens(2, 4)
+        first.update_and_fetch(values, values)
+        second = _LedgerKVCache([0, 0])
+        second.update_and_fetch(values, values)
+        second.update_index_keys(mx.zeros((2, 4, 2)))
+        second.index_keys = second.index_keys[:, :2]
+
+        with self.assertRaises(RuntimeError):
+            trim_ragged_prompt_cache([first, second], [0, 1])
+        self.assertEqual(first.offset.tolist(), [4, 4])
+        self.assertEqual(second.offset.tolist(), [4, 4])
 
     def test_mixed_kv_and_recurrent_cache_group(self):
         """The real trunk shape: attention rows plus recurrent-state rows."""
@@ -419,9 +468,13 @@ class _Recurrence:
 
 
 class TestArraysCacheRaggedTrim(unittest.TestCase):
-    def _run(self, per_row: bool):
+    def _run(self, per_row: bool, batch: int = 0):
         cache = ArraysCache(1)
         cache.start_speculation()
+        if batch:
+            # Speculation starts after prefill, so the first record's snapshot
+            # is real state rather than None.
+            cache.cache = [mx.zeros((batch, 1), dtype=mx.int32)]
         layer = _Recurrence(cache)
         if not per_row:
             # Drop the vectorized form so the a0 path (replay per distinct
@@ -576,6 +629,111 @@ class TestArraysCacheRaggedTrim(unittest.TestCase):
         before = cache[0][0:1].tolist()
         cache.trim_ragged([0, 3])
         self.assertEqual(cache[0][0:1].tolist(), before)
+
+    def test_divergent_then_uniform_rewind(self):
+        """The reported blocker: row 0 must keep the record row 1 used up."""
+        cache = ArraysCache(1)
+        cache.start_speculation()
+        cache.cache = [mx.array([[0.0], [0.0]])]
+
+        def push(count):
+            before = mx.array(cache.cache[0])
+            cache.record_rollback(count, lambda m: [before + m], [before])
+            cache.cache = [before + count]
+
+        push(1)  # record A
+        push(1)  # record B
+        self.assertEqual(cache[0].reshape(-1).tolist(), [2.0, 2.0])
+
+        cache.trim_ragged([0, 1])
+        self.assertEqual(cache[0].reshape(-1).tolist(), [2.0, 1.0])
+        # Row 0 still has both records; row 1 only has A.
+        self.assertEqual(cache._row_capacity(2), [2, 1])
+
+        cache.trim_ragged([1, 1])
+        self.assertEqual(cache[0].reshape(-1).tolist(), [1.0, 0.0])
+
+    def test_rewind_after_divergence_matches_solo_decode(self):
+        """Every row, after any split of its rewind, matches decoding alone."""
+        prompt = [[3, 1], [4, 2]]
+        chunks = [[[7], [8]], [[6, 2], [1, 3]]]  # records of 1 and 2 tokens
+        tail = [[7, 6, 2], [8, 1, 3]]
+
+        for first in ((0, 1), (1, 0), (0, 3), (2, 1), (1, 1), (3, 0)):
+            for second in ((0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)):
+                if any(f + s > 3 for f, s in zip(first, second)):
+                    continue
+                with self.subTest(first=first, second=second):
+                    cache, layer = self._run(per_row=False, batch=2)
+                    layer(mx.array(prompt, dtype=mx.int32))
+                    for chunk in chunks:
+                        layer(mx.array(chunk, dtype=mx.int32))
+                    cache.trim_ragged(list(first))
+                    cache.trim_ragged(list(second))
+                    want = [
+                        self._reference(
+                            prompt[i], tail[i], 3 - first[i] - second[i]
+                        )
+                        for i in range(2)
+                    ]
+                    self.assertEqual(cache[0].reshape(-1).tolist(), want)
+
+    def test_over_trim_after_divergence_fails_loud(self):
+        cache, layer = self._run(per_row=False, batch=2)
+        layer(mx.array([[1], [2]], dtype=mx.int32))
+        layer(mx.array([[3], [4]], dtype=mx.int32))
+        cache.trim_ragged([0, 2])
+        self.assertEqual(cache._row_capacity(2), [2, 0])
+        with self.assertRaises(RuntimeError) as raised:
+            cache.trim_ragged([0, 1])
+        self.assertIn("[1]", str(raised.exception))
+        # The rejected call left the state alone.
+        self.assertEqual(cache._row_capacity(2), [2, 0])
+
+    def test_record_budget_stays_conservative_for_scalar_readers(self):
+        """``r[0]`` answers the uniform question, so it reports the min depth."""
+        cache, layer = self._run(per_row=False, batch=2)
+        layer(mx.array([[1], [2]], dtype=mx.int32))
+        layer(mx.array([[3, 5], [4, 6]], dtype=mx.int32))
+        self.assertEqual(sum(r[0] for r in cache._rollbacks), 3)
+        cache.trim_ragged([0, 2])
+        # Row 1 used up the two-token record; the scalar view must not claim
+        # tokens row 1 no longer has.
+        self.assertEqual(sum(r[0] for r in cache._rollbacks), 1)
+        self.assertEqual(cache._row_capacity(2), [3, 1])
+        # A uniform trim of 1 is what that scalar promises, and it works.
+        self.assertEqual(cache.trim(1), 1)
+
+    def test_uniform_trim_refuses_past_the_shallowest_row(self):
+        cache, layer = self._run(per_row=False, batch=2)
+        layer(mx.array([[1], [2]], dtype=mx.int32))
+        layer(mx.array([[3], [4]], dtype=mx.int32))
+        cache.trim_ragged([0, 2])
+        with self.assertRaises(RuntimeError):
+            cache.trim(1)
+
+    def test_non_integral_counts_are_rejected(self):
+        cache, layer = self._run(per_row=False, batch=2)
+        layer(mx.array([[1], [2]], dtype=mx.int32))
+        with self.assertRaises(ValueError):
+            cache.trim_ragged([-0.5, 1.9])
+        with self.assertRaises(ValueError):
+            cache.trim_ragged([0.0, 1.5])
+        # Integral floats still describe a real rewind.
+        self.assertEqual(cache.trim_ragged([0.0, 1.0]), [0, 1])
+
+    def test_staged_rollback_hook_runs_on_invalidation(self):
+        class _Staged(ArraysCache):
+            cleared = 0
+
+            def _clear_staged_rollback(self):
+                type(self).cleared += 1
+
+        cache = _Staged(1)
+        cache.start_speculation()
+        cache.cache = [mx.array([[1.0], [2.0]])]
+        cache.filter(mx.array([0, 1]))
+        self.assertEqual(_Staged.cleared, 1)
 
     def test_record_shape_stays_a_three_tuple(self):
         cache, layer = self._run(per_row=True)
