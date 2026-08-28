@@ -2360,14 +2360,19 @@ class ArraysCache(_BaseCache):
                     break
 
     def make_mask(self, N: int):
+        # Both bounds apply when both are set: left_padding excludes the pad
+        # prefix and lengths the right-pad tail. Testing left_padding first
+        # and returning made an all-zero left_padding (the batch-size carrier
+        # merge() leaves on an empty batch) suppress the length bound, so a
+        # ragged fresh batch fed its right-pad filler to GDN and PLE.
+        pos = mx.arange(N)
+        mask = None
         if self.left_padding is not None:
-            pos = mx.arange(N)
-            return pos >= self.left_padding[:, None]
-        elif self.lengths is not None:
-            pos = mx.arange(N)
-            return pos < self.lengths[:, None]
-        else:
-            return None
+            mask = pos >= self.left_padding[:, None]
+        if self.lengths is not None:
+            bounded = pos < self.lengths[:, None]
+            mask = bounded if mask is None else mx.logical_and(mask, bounded)
+        return mask
 
     @classmethod
     def merge(cls, caches):
@@ -2375,13 +2380,20 @@ class ArraysCache(_BaseCache):
         B = len(caches)
         cache = cls(n_state)
 
-        # All caches are empty so return early
+        # All caches are empty so return early. The zeros carry the batch
+        # size (``batch_size`` has no arrays to read it from), they are not
+        # real padding — ``make_mask`` conjoins both bounds so they cannot
+        # suppress a later ``prepare(lengths=...)``.
         if all(c.empty() for c in caches):
             cache.left_padding = mx.array([0] * B)
             return cache
 
         for e in range(n_state):
-            c_init = next(iter(c[e] for c in caches if c[e] is not None))
+            # A slot no lane has reached yet stays empty rather than raising.
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                cache[e] = None
+                continue
             shape = list(c_init.shape)
             shape[0] = B
             cache[e] = mx.zeros(shape, c_init.dtype)
