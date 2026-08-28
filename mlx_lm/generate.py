@@ -385,7 +385,22 @@ def maybe_quantize_kv_cache(
                 kv_rotate=kv_rotate,
             )
             c.caches = tuple(leaves)
-        elif hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        elif hasattr(c, "to_quantized"):
+            # A cache that can NEVER be quantized is refused here, before the
+            # offset gate, so the failure lands at setup rather than at the
+            # step where ``offset`` first crosses ``quantized_kv_start``. The
+            # cache owns the reason text; a class that also declares this
+            # attribute must still define ``to_quantized`` (raising
+            # NotImplementedError), or the ``hasattr`` gate above would skip it
+            # and the flag would be a silent no-op.
+            reason = getattr(c, "kv_quantization_unsupported", None)
+            if reason:
+                raise ValueError(
+                    "KV cache quantization is not available for "
+                    f"{type(c).__name__}. {reason}"
+                )
+            if not (c.offset >= quantized_kv_start):
+                continue
             symmetric = key_bits == value_bits and not kv_rotate
             if (
                 isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
@@ -418,9 +433,12 @@ def maybe_quantize_kv_cache(
                         rotate=kv_rotate,
                     )
             except NotImplementedError as exc:
+                # Keep the cache's own reason, when it gave one -- otherwise
+                # the top-level message says only that it declined.
+                detail = str(exc).strip()
                 raise ValueError(
                     "KV cache quantization is not available for "
-                    f"{type(c).__name__}."
+                    f"{type(c).__name__}." + (f" {detail}" if detail else "")
                 ) from exc
 
 

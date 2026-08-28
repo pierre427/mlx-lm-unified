@@ -20,8 +20,18 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from mlx_lm import utils
-from mlx_lm.generate import _merge_caches, _right_pad_prompts
-from mlx_lm.models.cache import SinkWindowKVCache, trim_prompt_cache
+from mlx_lm.generate import (
+    _merge_caches,
+    _right_pad_prompts,
+    maybe_quantize_kv_cache,
+)
+from mlx_lm.models.cache import (
+    CacheList,
+    KVCache,
+    SinkWindowKVCache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 from mlx_lm.models.qwen4_exp import (
     BatchQSAKVCache,
     GatedResidual,
@@ -1890,3 +1900,187 @@ class TestRaggedBatchRecurrentState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQSAKVQuantizationRefused(unittest.TestCase):
+    """``--kv-bits`` over a QSA cache: both classes refuse, neither goes quiet.
+
+    The two classes used to fail in OPPOSITE directions.  ``QSAKVCache``
+    inherited ``KVCache.to_quantized`` and converted into a plain
+    ``QuantizedKVCache``, dropping ``index_keys`` and every ``_QSA_CYCLE_STATE``
+    field, so the indexer's ``cache.update_index_keys(raw)`` hit an object
+    without the method.  ``BatchQSAKVCache`` had no ``to_quantized`` at all, so
+    the ``hasattr`` gate in ``maybe_quantize_kv_cache`` skipped it and the
+    batched path ignored the user's ``--kv-bits`` in silence -- the mode this
+    class exists to keep closed, because silence is the one failure a serving
+    run does not report.
+
+    Refusal, not support: carrying the QSA side state through quantization
+    needs quantized twins of the whole batch ledger protocol and its own
+    equivalence battery.  These tests pin the refusal, and they are what a
+    future implementation has to come back and rewrite deliberately.
+    """
+
+    GROUP = 64
+    BITS = 8
+
+    # A head dim the quantizer actually accepts (divisible by GROUP).  With a
+    # narrower one the old inherited KVCache.to_quantized died on the group
+    # size instead of converting, which would have made these tests pass
+    # against the very bug they exist to pin.
+    DIM = GROUP
+
+    def _single(self, width=8):
+        cache = QSAKVCache()
+        values = mx.zeros((1, 1, width, self.DIM))
+        cache.update_and_fetch(values, values)
+        cache.update_index_keys(
+            mx.zeros((1, width, self.DIM), dtype=mx.float32)
+        )
+        return cache
+
+    def _batch(self, rows=2, width=8):
+        cache = BatchQSAKVCache([0] * rows)
+        values = mx.zeros((rows, 1, width, self.DIM))
+        cache.update_and_fetch(values, values)
+        cache.update_index_keys(mx.zeros((rows, width, self.DIM)))
+        return cache
+
+    def _caches(self):
+        return (self._single(), self._batch())
+
+    def test_the_two_classes_refuse_through_one_object(self):
+        # Identity, not just equal behaviour: bound to one function, the two
+        # classes cannot drift apart into opposite failure modes again.
+        for cls in (QSAKVCache, BatchQSAKVCache):
+            self.assertIn("to_quantized", cls.__dict__, cls.__name__)
+            self.assertTrue(cls.kv_quantization_unsupported, cls.__name__)
+        self.assertIs(
+            QSAKVCache.__dict__["to_quantized"],
+            BatchQSAKVCache.__dict__["to_quantized"],
+        )
+        self.assertEqual(
+            QSAKVCache.kv_quantization_unsupported,
+            BatchQSAKVCache.kv_quantization_unsupported,
+        )
+        # And it is NOT the inherited converter that dropped the ledger.
+        self.assertIsNot(
+            QSAKVCache.__dict__["to_quantized"], KVCache.__dict__["to_quantized"]
+        )
+
+    def test_to_quantized_refuses_on_every_call_shape(self):
+        # maybe_quantize_kv_cache calls the symmetric shape positionally-ish
+        # and the asymmetric/rotated shape with three more kwargs; a refusal
+        # that only covered one would be a crash on the other.
+        shapes = (
+            {"group_size": 64, "bits": 8},
+            {
+                "group_size": 64,
+                "bits": 8,
+                "key_bits": 8,
+                "value_bits": 4,
+                "rotate": True,
+            },
+        )
+        for cache in self._caches():
+            for kwargs in shapes:
+                with self.subTest(cache=type(cache).__name__, shape=len(kwargs)):
+                    with self.assertRaises(NotImplementedError):
+                        cache.to_quantized(**kwargs)
+
+    def _assert_refused(self, cache, **kwargs):
+        prompt_cache = [cache]
+        with self.assertRaises(ValueError) as raised:
+            maybe_quantize_kv_cache(
+                prompt_cache, 0, self.GROUP, self.BITS, **kwargs
+            )
+        message = str(raised.exception)
+        self.assertIn(type(cache).__name__, message)
+        # The reason travels, not just the refusal.
+        self.assertIn("index_keys", message)
+        # Refused whole: not replaced, not half-converted, ledger intact.
+        self.assertIs(prompt_cache[0], cache)
+        self.assertIsNotNone(cache.index_keys)
+        self.assertFalse(hasattr(cache, "bits"))
+
+    def test_single_sequence_refuses_instead_of_dropping_the_ledger(self):
+        cache = self._single()
+        self._assert_refused(cache)
+        # The method the indexer calls every forward is still there -- the old
+        # QuantizedKVCache conversion is exactly what took it away.
+        self.assertTrue(hasattr(cache, "update_index_keys"))
+
+    def test_batched_path_is_not_silently_skipped(self):
+        # THE regression.  Before ``to_quantized`` existed on this class the
+        # hasattr gate skipped it and this call returned cleanly, leaving an
+        # unquantized cache and a user who believed --kv-bits took effect.
+        cache = self._batch()
+        self.assertTrue(hasattr(cache, "to_quantized"))
+        self._assert_refused(cache)
+
+    def test_batched_refusal_is_not_a_stray_array_truthiness_error(self):
+        # A B>1 batch cache reports ``offset`` as an mx.array, so reaching the
+        # ``offset >= quantized_kv_start`` gate at all would raise a confusing
+        # "[convert] Only length-1 arrays" ValueError instead of the reason.
+        cache = self._batch(rows=3)
+        self.assertIsInstance(cache.offset, mx.array)
+        with self.assertRaises(ValueError) as raised:
+            maybe_quantize_kv_cache([cache], 0, self.GROUP, self.BITS)
+        self.assertNotIn("length-1", str(raised.exception))
+
+    def test_asymmetric_and_rotated_requests_are_refused_too(self):
+        for cache in self._caches():
+            with self.subTest(cache=type(cache).__name__, mode="asymmetric"):
+                self._assert_refused(cache, kv_key_bits=8, kv_value_bits=4)
+        for cache in self._caches():
+            with self.subTest(cache=type(cache).__name__, mode="rotated"):
+                self._assert_refused(cache, kv_rotate=True)
+
+    def test_refusal_survives_the_cachelist_recursion(self):
+        # Hybrid models nest their KV leaves one level down, and
+        # maybe_quantize_kv_cache recurses on purpose so nested leaves honor
+        # kv_bits -- which is the recursion that reaches QSA leaves at all.
+        for leaf in self._caches():
+            with self.subTest(cache=type(leaf).__name__):
+                wrapper = CacheList(leaf)
+                with self.assertRaisesRegex(ValueError, "index_keys"):
+                    maybe_quantize_kv_cache(
+                        [wrapper], 0, self.GROUP, self.BITS
+                    )
+                self.assertIs(wrapper.caches[0], leaf)
+
+    def test_refusal_does_not_wait_for_quantized_kv_start(self):
+        # A cache that can NEVER be quantized fails at setup, not at the step
+        # where its offset first crosses the threshold: a server that starts
+        # and then dies mid-stream is strictly worse than one that will not
+        # start.
+        for cache in self._caches():
+            with self.subTest(cache=type(cache).__name__):
+                with self.assertRaisesRegex(ValueError, "index_keys"):
+                    maybe_quantize_kv_cache(
+                        [cache], 1 << 30, self.GROUP, self.BITS
+                    )
+
+    def test_unquantized_serving_is_left_alone(self):
+        # The live bf16 profile: kv_bits=None returns early and must stay a
+        # no-op, refusal or not.
+        for cache in self._caches():
+            with self.subTest(cache=type(cache).__name__):
+                prompt_cache = [cache]
+                maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, None)
+                self.assertIs(prompt_cache[0], cache)
+                self.assertIsNotNone(cache.index_keys)
+
+    def test_the_cache_the_model_actually_builds_is_refused(self):
+        # Against ``make_cache``'s own leaves, so a future make_cache that
+        # hands back some other QSA cache class still has to refuse.
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=tiny_args().__dict__)
+        )
+        prompt_cache = make_prompt_cache(model)
+        self.assertTrue(
+            any(isinstance(c, QSAKVCache) for c in prompt_cache),
+            "the tiny config has no QSA layer, so this asserts nothing",
+        )
+        with self.assertRaisesRegex(ValueError, "index_keys"):
+            maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, self.BITS)

@@ -1016,8 +1016,57 @@ _QSA_CYCLE_STATE = (
 )
 
 
+# QSA caches are NOT quantizable, and both classes have to say so the same way.
+#
+# The attention KV is only half of a QSA cache. Beside it sits ``index_keys``,
+# the raw pre-pooling indexer-key ledger that ``QSAIndexer.__call__`` appends to
+# every forward and pools its block grid from, plus the cross-call state in
+# ``_QSA_CYCLE_STATE``. No quantized cache class carries either, and the two
+# classes used to fail in OPPOSITE directions because of it:
+#
+#   * ``QSAKVCache`` inherited ``KVCache.to_quantized`` and converted into a
+#     plain ``QuantizedKVCache``, DROPPING the ledger and every cycle field --
+#     so the indexer's ``cache.update_index_keys(raw)`` had nothing to call.
+#   * ``BatchQSAKVCache`` had no ``to_quantized`` at all, so the ``hasattr``
+#     gate in ``maybe_quantize_kv_cache`` skipped it and the batched path
+#     ignored the user's ``--kv-bits`` in SILENCE.
+#
+# Both are closed the same way: refuse, out loud, on both classes. Carrying the
+# QSA side state through quantization is a feature, not a bug fix -- it needs
+# quantized twins of the whole batch ledger protocol (merge / filter / extend /
+# extract / ragged trim, all written against unquantized ``keys``) and its own
+# equivalence battery, and nothing serves QSA with quantized KV today.
+_QSA_KV_QUANT_UNSUPPORTED = (
+    "QSA attention caches keep a raw indexer-key ledger (index_keys) and "
+    "cross-call cycle state beside the attention KV, and no quantized cache "
+    "class carries them, so quantizing would leave the indexer without the "
+    "ledger it reads every forward. Serve QSA models with unquantized KV "
+    "(drop --kv-bits)."
+)
+
+
+def _qsa_to_quantized(self, group_size: int = 64, bits: int = 4, **kwargs):
+    """The refusal itself, for anyone who calls ``to_quantized`` directly.
+
+    Both QSA cache classes bind THIS function object rather than each defining
+    their own, so they cannot drift apart again; the regression test asserts
+    that identity. ``**kwargs`` swallows the asymmetric/rotated extension
+    (``key_bits``/``value_bits``/``rotate``) so the refusal is the same on
+    every call shape ``maybe_quantize_kv_cache`` uses.
+    """
+    raise NotImplementedError(_QSA_KV_QUANT_UNSUPPORTED)
+
+
 class BatchQSAKVCache(BatchKVCache):
     """Batched QSA cache retaining raw indexer keys beside attention KV."""
+
+    # Refused identically on both QSA classes -- see _QSA_KV_QUANT_UNSUPPORTED.
+    # The attribute is what ``maybe_quantize_kv_cache`` reads so it can refuse
+    # at setup instead of when ``offset`` first crosses ``quantized_kv_start``;
+    # the method is what a direct caller gets. Defining ``to_quantized`` at all
+    # is also what stops the ``hasattr`` gate from skipping this class quietly.
+    kv_quantization_unsupported = _QSA_KV_QUANT_UNSUPPORTED
+    to_quantized = _qsa_to_quantized
 
     # ``index_keys`` is a per-row ledger parallel to the KV columns, so a
     # ragged trim rolls it with the same per-row shifts.  The base check that
@@ -1292,6 +1341,11 @@ class QSAKVCache(KVCache):
     """KV cache with the raw, pre-pooling indexer keys QSA also requires."""
 
     _QSA_CYCLE_FIELDS = _QSA_CYCLE_STATE
+
+    # The single-sequence twin of the refusal on BatchQSAKVCache: the same
+    # attribute and the same function object, so the two classes agree.
+    kv_quantization_unsupported = _QSA_KV_QUANT_UNSUPPORTED
+    to_quantized = _qsa_to_quantized
 
     def __new__(cls, *args, **kwargs):
         # Same from_state contract as BatchQSAKVCache: __init__ does not run
