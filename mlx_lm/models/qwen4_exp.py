@@ -34,10 +34,37 @@ from .qwen3_next import (
 from .rope_utils import initialize_rope
 
 
-# Opt-in micro-levers, each read once at import.  Off keeps the stock path.
+# Opt-in micro-levers, each read once at import.  Off keeps the stock path,
+# EXCEPT where a lever has been promoted (``default=True``) -- see below.
 _RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
 _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
-_QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN")
+
+# PROMOTED to default-on 2026-08-28; set MLX_QWEN4_QSA_SCATTER_CHOSEN=0 to
+# revert (the server also exposes it live as ``qwen4_qsa_scatter_chosen``).
+#
+# ``dense_mask()`` below builds the chosen-block indicator either by scatter
+# or by a broadcast equality reduction.  The two are BIT-IDENTICAL -- proven
+# by ``argpartition`` returning no duplicate indices, and measured equal by
+# ``mx.array_equal`` over decode, prefill, ragged and left-padded-batch
+# shapes -- so this changes cost only, never a number.
+#
+# The broadcast form materializes a [B, L, K, n_blocks] boolean intermediate.
+# That is quadratic in context (K and n_blocks both grow), and it dominates:
+#
+#   isolated mask build, L=2048, M5 Max, mlx 0.32.2 (per QSA layer-call)
+#     KV  8192   broadcast 20.7 ms   scatter 0.52 ms
+#     KV 16384   broadcast 42.3 ms   scatter 1.14 ms
+#     KV 32768   broadcast 89.9 ms   scatter 2.22 ms   (2.3x the SDPA it feeds)
+#
+#   peak allocation, L=512 (production prefill chunk)
+#     KV 16384   broadcast 1.12 GB   scatter 0.05 GB
+#     KV 32768   broadcast 2.24 GB   scatter 0.09 GB
+#     KV 65536   broadcast 4.48 GB   scatter 0.19 GB
+#
+# The memory ratio is the reason this is a default and not a tuning knob: at
+# 24x, the broadcast form is a long-context OOM hazard on a host already
+# holding a large resident model, and it bought nothing.
+_QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN", default=True)
 _PLE_VECTOR_SHIFT = _env_flag("MLX_QWEN4_PLE_VECTOR_SHIFT")
 _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 
@@ -1561,6 +1588,7 @@ class QSASelection:
         if self.scatter_chosen:
             # ``argpartition`` output has no duplicate indices, so a scatter
             # of ones is equivalent to the one-hot broadcast reduction.
+            # Default since 2026-08-28.
             chosen = mx.put_along_axis(
                 mx.zeros((batch, length, n_blocks), dtype=mx.bool_),
                 selected,
@@ -1568,6 +1596,10 @@ class QSASelection:
                 axis=-1,
             )
         else:
+            # Retained as the reference form the scatter is verified against
+            # (the equality tests pin BOTH arms, so neither is the default),
+            # and as the ``=0`` escape hatch.  Not the shipped path: it costs
+            # a [B, L, K, n_blocks] boolean intermediate for the same bits.
             block_ids = mx.arange(n_blocks)
             chosen = mx.any(
                 selected[..., None] == block_ids[None, None, None, :], axis=-2

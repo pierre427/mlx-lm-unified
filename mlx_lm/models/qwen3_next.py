@@ -40,9 +40,18 @@ class MaterializationTooLarge(RuntimeError):
     """A runtime weight materialization does not fit in device memory."""
 
 
-def _env_flag(name: str) -> bool:
-    """Read one opt-in performance flag once, at import time."""
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "on", "yes"}
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read one performance flag once, at import time.
+
+    ``default=True`` carries a lever that has been PROMOTED into the shipped
+    path: unset means ON, and an operator turns it OFF with ``=0`` instead of
+    on with ``=1``.  An unset or empty value takes ``default``; any set value
+    is parsed, so ``=0`` reverts a promoted lever.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
 
 
 # Compiles the expert-selection chain of EVERY user of

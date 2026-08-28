@@ -298,8 +298,11 @@ class TestQSAScatterChosen(unittest.TestCase):
                 cache.offset += length
             return outputs
 
-        stock = drive()
-        with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN"):
+        # Both arms pinned: the lever is default-ON since 2026-08-28, so a
+        # bare ``stock = drive()`` would compare the scatter form to itself.
+        with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN", False):
+            stock = drive()
+        with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN", True):
             scattered = drive()
         for step, (expected, actual) in enumerate(zip(stock, scattered)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
@@ -915,7 +918,7 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
         # lever bench, not here.
         for flag in ("_QSA_SCATTER_CHOSEN",):
             with self.subTest(flag=flag):
-                with lever(qwen4_exp, flag):
+                with lever(qwen4_exp, flag, True):
                     _, fast, _ = self._run()
                 for step, (expected, actual) in enumerate(zip(stock, fast)):
                     np.testing.assert_array_equal(actual, expected, f"step {step}")
@@ -1020,8 +1023,11 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
                 outputs.append(np.asarray(logits))
             return batch, outputs
 
-        with count_pooling() as pooled:
-            batch, stock = run()
+        # Pinned OFF: the scatter lever is default-ON, and the arm below
+        # turns it on explicitly, so the reference must pin the other side.
+        with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN", False):
+            with count_pooling() as pooled:
+                batch, stock = run()
         # Non-vacuous on both sides of the boundary: some steps pooled and
         # the schedule started below it.
         self.assertIn("_pooled_keys", pooled)
@@ -1035,7 +1041,7 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
         )
         with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
             with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
-                with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN"):
+                with lever(qwen4_exp, "_QSA_SCATTER_CHOSEN", True):
                     _, stacked = run()
         for step, (expected, actual) in enumerate(zip(stock, stacked)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
@@ -1343,7 +1349,19 @@ class TestQSADenseShortCircuit(unittest.TestCase):
             ("_QSA_POOLED_KEY_CACHE", "_QSA_SCATTER_CHOSEN"),
         ):
             with ExitStack() as stack:
+                # Pin scatter explicitly for EVERY combination -- it is
+                # default-ON, so the combinations that OMIT it must still name
+                # the value they mean or they silently test it ON.
+                stack.enter_context(
+                    lever(
+                        qwen4_exp,
+                        "_QSA_SCATTER_CHOSEN",
+                        "_QSA_SCATTER_CHOSEN" in extra,
+                    )
+                )
                 for flag in extra:
+                    if flag == "_QSA_SCATTER_CHOSEN":
+                        continue
                     stack.enter_context(lever(qwen4_exp, flag))
                 stock, _ = self._drive(indexer, chunks)
                 stack.enter_context(lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"))
