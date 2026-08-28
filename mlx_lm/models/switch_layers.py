@@ -31,6 +31,14 @@ def _mlx_version_tuple():
 # keeping it on everywhere.
 _SORTED_GATHER_TAIL_BUG = True
 
+# Minimum routed-assignment count (tokens x top_k) before the expert-major
+# sorted path engages. At 64 with top-10 routing this is M >= 7 tokens, so
+# plain decode (M=1) and MTP verify at k=2 (M=3) never sort -- even though a
+# 2026-08-28 routing probe measured 1.36x expert reuse already present at M=3
+# (results/moe-expert-reuse-20260828.json). Module-level so an A/B can switch
+# it on a resident model; the 64 default is unchanged behaviour.
+_GATHER_SORT_MIN_ASSIGNMENTS = 64
+
 
 def _gather_sort(x, indices):
     *_, M = indices.shape
@@ -212,7 +220,7 @@ class SwitchGLU(nn.Module):
 
         # When we have many tokens, then sort them to make sure that the access
         # of different experts is in order.
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _GATHER_SORT_MIN_ASSIGNMENTS
         idx = indices
         inv_order = None
         if do_sort:
@@ -253,7 +261,7 @@ class SwitchMLP(nn.Module):
 
         # When we have many tokens, then sort them to make sure that the access
         # of different experts is in order.
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _GATHER_SORT_MIN_ASSIGNMENTS
         idx = indices
         inv_order = None
         if do_sort:

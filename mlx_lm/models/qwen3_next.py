@@ -22,6 +22,7 @@ from .base import (
 from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update, normalize_gdn_qk
 from .rope_utils import initialize_rope
+from . import switch_layers as _switch_layers
 from .switch_layers import (
     QuantizedSwitchLinear,
     SwiGLU,
@@ -75,6 +76,14 @@ _MOE_FUSED_GATE_UP = _env_flag("MLX_QWEN4_MOE_FUSED_GATE_UP")
 # kernel family, which accumulates differently on M5 (<= 1.5e-3 of output
 # scale; <= 2e-7 with MLX_ENABLE_TF32=0) => tolerance-level lever.
 _MOE_SHARED_IN_GATHER = _env_flag("MLX_QWEN4_MOE_SHARED_IN_GATHER")
+
+# MLX_QWEN4_FUSED_EXPERT_KERNEL: experimental production-shape kernel for the
+# remaining routed-MoE boundary. Gate/up stay on MLX's gather path; the q4
+# down projection, router weighting, and top-k reduction become one dispatch.
+# It is exact-geometry, default-off, and falls back structurally before a
+# kernel is emitted. See qwen4_fused_moe.py.
+_MOE_FUSED_EXPERT_KERNEL = _env_flag("MLX_QWEN4_FUSED_EXPERT_KERNEL")
+_MOE_FUSED_EXPERT_MODES = ("stock", "scalar", "tile4")
 
 # Both MoE levers are LOAD-TIME weight transforms, not runtime tables. A
 # runtime re-fusion was OOM-killed on the 104 GB serving artifact: the
@@ -178,6 +187,10 @@ def check_materialization_budget(nbytes: int, what: str, headroom: float = 0.15)
     return estimate
 
 
+def switch_layers_sort_min() -> int:
+    """Read the sorted-gather threshold at call time so an A/B can switch it."""
+    return _switch_layers._GATHER_SORT_MIN_ASSIGNMENTS
+
 class FusedGateUpSwitchGLU(nn.Module):
     """SwitchGLU holding gate and up as one [gate|up] projection.
 
@@ -204,9 +217,15 @@ class FusedGateUpSwitchGLU(nn.Module):
         )
         self.activation = activation
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        scores: Optional[mx.array] = None,
+        variant: str = "scalar",
+    ) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= switch_layers_sort_min()
         idx = indices
         inv_order = None
         if do_sort:
@@ -215,14 +234,105 @@ class FusedGateUpSwitchGLU(nn.Module):
             idx = mx.stop_gradient(idx)
         gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
         half = self.hidden_dims
-        x = self.down_proj(
-            self.activation(gate_up[..., half:], gate_up[..., :half]),
-            idx,
-            sorted_indices=do_sort,
+        hidden = self.activation(gate_up[..., half:], gate_up[..., :half])
+        fused = _try_qwen4_fused_down(
+            hidden, idx, scores, self.down_proj, do_sort, variant
         )
+        if fused is not None:
+            return fused
+        x = self.down_proj(hidden, idx, sorted_indices=do_sort)
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)
+        x = x.squeeze(-2)
+        if scores is not None:
+            return (x * scores[..., None]).sum(axis=-2)
+        return x
+
+
+class FusedDownSwitchGLU(SwitchGLU):
+    """Stock split gate/up projections with the experimental fused down tail."""
+
+    def __call__(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        scores: Optional[mx.array] = None,
+        variant: str = "scalar",
+    ) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= switch_layers_sort_min()
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        hidden = self.activation(
+            self.up_proj(x, idx, sorted_indices=do_sort),
+            self.gate_proj(x, idx, sorted_indices=do_sort),
+        )
+        fused = _try_qwen4_fused_down(
+            hidden, idx, scores, self.down_proj, do_sort, variant
+        )
+        if fused is not None:
+            return fused
+        x = self.down_proj(hidden, idx, sorted_indices=do_sort)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        x = x.squeeze(-2)
+        if scores is not None:
+            return (x * scores[..., None]).sum(axis=-2)
+        return x
+
+
+def _try_qwen4_fused_down(
+    hidden, indices, scores, down_proj, sorted_indices, variant="scalar"
+):
+    """Return the fused routed result, or None before dispatch when ineligible."""
+    if (
+        scores is None
+        or sorted_indices
+        or down_proj.training
+        or not isinstance(down_proj, QuantizedSwitchLinear)
+        or "bias" in down_proj
+    ):
+        return None
+
+    from .qwen4_fused_moe import admit_qwen4_fused_down, qwen4_fused_down
+
+    # SwitchLinear preserves its singleton matrix row as [..., top_k, 1, K].
+    # The custom GEMV consumes the equivalent compact [..., top_k, K] view.
+    if hidden.ndim < 3 or hidden.shape[-2] != 1:
+        return None
+    compact_hidden = hidden.squeeze(-2)
+    biases = getattr(down_proj, "biases", None)
+    admission = admit_qwen4_fused_down(
+        compact_hidden,
+        indices,
+        scores,
+        down_proj["weight"],
+        down_proj["scales"],
+        biases,
+        num_experts=down_proj.num_experts,
+        group_size=down_proj.group_size,
+        bits=down_proj.bits,
+        mode=down_proj.mode,
+    )
+    if not admission.accepted:
+        return None
+    return qwen4_fused_down(
+        compact_hidden,
+        indices,
+        scores,
+        down_proj["weight"],
+        down_proj["scales"],
+        biases,
+        num_experts=down_proj.num_experts,
+        group_size=down_proj.group_size,
+        bits=down_proj.bits,
+        mode=down_proj.mode,
+        variant=variant,
+    )
 
 
 def _parts(weights: dict, path: str) -> dict:
@@ -710,7 +820,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.shared_folded = _MOE_SHARED_IN_GATHER and (
             shared_expert_intermediate_size == intermediate_size
         )
-        switch_cls = FusedGateUpSwitchGLU if self.fused_gate_up else SwitchGLU
+        self.fused_expert_kernel_mode = (
+            "scalar"
+            if _MOE_FUSED_EXPERT_KERNEL and not self.shared_folded
+            else "stock"
+        )
+        if self.fused_gate_up:
+            switch_cls = FusedGateUpSwitchGLU
+        else:
+            # This wrapper is weight-layout-identical to SwitchGLU. Keeping it
+            # present in stock mode allows a loaded model to switch modes
+            # without rebuilding or reloading any parameter.
+            switch_cls = FusedDownSwitchGLU
         self.switch_mlp = switch_cls(
             dim,
             intermediate_size,
@@ -723,6 +844,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
         self.sharding_group = None
+
+    @property
+    def fused_expert_kernel_enabled(self):
+        return self.fused_expert_kernel_mode != "stock"
+
+    def set_fused_expert_kernel_mode(self, mode: str):
+        """Select stock/scalar/tile4 for subsequent forwards without reload."""
+        if mode not in _MOE_FUSED_EXPERT_MODES:
+            raise ValueError(
+                f"unknown fused expert mode {mode!r}; "
+                f"expected one of {_MOE_FUSED_EXPERT_MODES}"
+            )
+        if mode != "stock" and self.shared_folded:
+            raise ValueError("fused expert kernels do not support a folded shared row")
+        self.fused_expert_kernel_mode = mode
 
     def __call__(
         self,
@@ -760,8 +896,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             y = (rows[..., : self.top_k, :] * scores[..., None]).sum(axis=-2)
             shared_y = rows[..., self.top_k, :]
         else:
-            y = self.switch_mlp(x, inds)
-            y = (y * scores[..., None]).sum(axis=-2)
+            if self.fused_expert_kernel_enabled and self.sharding_group is None:
+                y = self.switch_mlp(
+                    x,
+                    inds,
+                    scores=scores,
+                    variant=self.fused_expert_kernel_mode,
+                )
+            else:
+                y = self.switch_mlp(x, inds)
+                y = (y * scores[..., None]).sum(axis=-2)
             shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
@@ -771,6 +915,46 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
+
+
+def set_qwen4_fused_expert_mode(model: nn.Module, mode: str) -> int:
+    """Switch every compatible MoE block in a resident model atomically.
+
+    This changes only Python dispatch state; parameters and MLX arrays are
+    untouched. Call it only between requests/benchmark observations because a
+    concurrent forward could otherwise see a mixture of old and new modes.
+    Returns the number of updated sparse blocks.
+    """
+    if mode not in _MOE_FUSED_EXPERT_MODES:
+        raise ValueError(
+            f"unknown fused expert mode {mode!r}; "
+            f"expected one of {_MOE_FUSED_EXPERT_MODES}"
+        )
+    blocks = [
+        module
+        for _, module in model.named_modules()
+        if isinstance(module, Qwen3NextSparseMoeBlock)
+    ]
+    incompatible = [
+        block for block in blocks if mode != "stock" and block.shared_folded
+    ]
+    if incompatible:
+        raise ValueError(
+            f"{len(incompatible)} sparse blocks use a folded shared row; "
+            "select stock mode"
+        )
+    for block in blocks:
+        block.set_fused_expert_kernel_mode(mode)
+    return len(blocks)
+
+
+def qwen4_fused_expert_mode_counts(model: nn.Module) -> dict[str, int]:
+    """Return resident MoE mode counts without evaluating model arrays."""
+    counts = {mode: 0 for mode in _MOE_FUSED_EXPERT_MODES}
+    for _, module in model.named_modules():
+        if isinstance(module, Qwen3NextSparseMoeBlock):
+            counts[module.fused_expert_kernel_mode] += 1
+    return counts
 
 
 class Qwen3NextDecoderLayer(nn.Module):
