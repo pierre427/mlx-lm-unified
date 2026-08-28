@@ -51,10 +51,14 @@ _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
 # The broadcast form materializes a [B, L, K, n_blocks] boolean intermediate.
 # That is quadratic in context (K and n_blocks both grow), and it dominates:
 #
-#   isolated mask build, L=2048, M5 Max, mlx 0.32.2 (per QSA layer-call)
+#   isolated mask build, L=2048, M5 Max, mlx 0.32.2 (per QSA layer-call).
+#   The mask is [B, 1, L, T] and broadcasts over heads, so these are
+#   head-independent: measured 89.9 ms at 16 query heads and 89.85 ms at the
+#   production 24, from separate runs.
 #     KV  8192   broadcast 20.7 ms   scatter 0.52 ms
 #     KV 16384   broadcast 42.3 ms   scatter 1.14 ms
-#     KV 32768   broadcast 89.9 ms   scatter 2.22 ms   (2.3x the SDPA it feeds)
+#     KV 32768   broadcast 89.9 ms   scatter 2.22 ms
+#   At 32K that build is 1.6x the 24-head SDPA it feeds (55.37 ms).
 #
 #   peak allocation, L=512 (production prefill chunk)
 #     KV 16384   broadcast 1.12 GB   scatter 0.05 GB
