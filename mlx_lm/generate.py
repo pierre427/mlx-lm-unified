@@ -1728,6 +1728,9 @@ def stream_generate(
             speculation_router=self_mtp.get("speculation_router"),
             stats=self_mtp.get("stats"),
             prompt_cache=kwargs.get("prompt_cache"),
+            # The request's own random key. None keeps the global stream, so a
+            # caller that supplies none is byte-identical to a keyless build.
+            lane_rng=self_mtp.get("lane_rng"),
             mtp_state=self_mtp.get("state"),
             mtp_state_out=self_mtp.get("state_out"),
             logits_processors=kwargs.get("logits_processors"),

@@ -31,13 +31,16 @@ from mlx_lm.generate import (
     TextStateMachine,
     prefill_prompt_cache,
 )
+from mlx_lm.apc import APCLookup
 from mlx_lm.models.cache import KVCache
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import LaneRNG, make_sampler
 from mlx_lm.server import (
     APIHandler,
     CompletionRequest,
+    RequestCompositionError,
     ResponseGenerator,
     _parallel_sampling_route,
+    _parallel_sampling_state_bytes,
 )
 
 VOCAB = 8
@@ -321,6 +324,30 @@ class TestParallelSamplingRoute(unittest.TestCase):
         )
         self.assertEqual((route, note), ("plain", None))
 
+    def test_a_sidecarless_apc_hit_is_not_refused(self):
+        # The n=1 path would NOT have used MTP here (target state, no draft
+        # state), so n>1 costs the request nothing and must be admitted.
+        route, note = _parallel_sampling_route(
+            self.args(),
+            self.cli,
+            self.model,
+            prompt_tokens=256,
+            cached_prompt_tokens=200,
+            mtp_state=None,
+        )
+        self.assertEqual((route, note), ("plain", None))
+
+    def test_an_apc_hit_with_a_sidecar_is_still_refused(self):
+        with self.assertRaises(ValueError):
+            _parallel_sampling_route(
+                self.args(),
+                self.cli,
+                self.model,
+                prompt_tokens=256,
+                cached_prompt_tokens=200,
+                mtp_state=("mtp-cache", "hidden"),
+            )
+
     def test_n_gt_1_never_joins_the_continuous_batch(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
@@ -379,6 +406,26 @@ class _StubPromptCache:
         return {}
 
 
+class _StubAPC(_StubPromptCache):
+    """A prefix cache that reports an APC hit, with no MTP sidecar."""
+
+    def __init__(self, hit_tokens):
+        super().__init__()
+        self.hit_tokens = hit_tokens
+
+    def lookup(self, model_key, tokens):
+        cache = [KVCache()]
+        prefill_prompt_cache(CoinModel(), list(tokens[: self.hit_tokens]), cache)
+        return APCLookup(
+            cache=cache,
+            remaining_tokens=list(tokens[self.hit_tokens :]),
+            cached_tokens=self.hit_tokens,
+            hit=True,
+            hit_kind="prefix",
+            miss_reason=None,
+        )
+
+
 class CachedCoinModel(CoinModel):
     def make_cache(self):
         return [KVCache()]
@@ -393,13 +440,24 @@ class MTPCoinModel(CachedCoinModel):
 class TestServeParallelSamples(unittest.TestCase):
     """The server path end to end: one prefill, n queued sample streams."""
 
-    def _generator(self, *, self_mtp=False, mtp_mode="refuse"):
+    def _generator(
+        self,
+        *,
+        self_mtp=False,
+        mtp_mode="refuse",
+        is_batchable=True,
+        draft_model=None,
+        state_budget_gb=None,
+    ):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
             model=MTPCoinModel() if self_mtp else CachedCoinModel(),
             tokenizer=_StubTokenizer(),
             model_key=("stub", None, None),
+            is_batchable=is_batchable,
+            draft_model=draft_model,
             cli_args=types.SimpleNamespace(
+                parallel_sampling_state_budget_gb=state_budget_gb,
                 self_mtp=self_mtp,
                 self_mtp_num_draft=1,
                 self_mtp_persistent=True,
@@ -416,6 +474,7 @@ class TestServeParallelSamples(unittest.TestCase):
         )
         generator.prompt_cache = _StubPromptCache()
         generator._state_machine_cache = {}
+        generator._lane_rng_root = LaneRNG(11)
         return generator
 
     @staticmethod
@@ -522,6 +581,86 @@ class TestServeParallelSamples(unittest.TestCase):
         responses = [i for i in items if not isinstance(i, tuple)]
         self.assertEqual(sorted({r.index for r in responses}), [0, 1])
 
+    def test_an_unbatchable_model_is_refused(self):
+        generator = self._generator(is_batchable=False)
+        with self.assertRaises(RequestCompositionError) as cm:
+            self._serve(generator, self._args(n=2))
+        self.assertIn("batchable", str(cm.exception))
+
+    def test_a_draft_model_is_refused(self):
+        generator = self._generator(draft_model=object(), is_batchable=False)
+        with self.assertRaises(RequestCompositionError) as cm:
+            self._serve(generator, self._args(n=2))
+        self.assertIn("draft model", str(cm.exception))
+
+    def test_a_sidecarless_apc_hit_still_serves_n_gt_1(self):
+        # The n=1 path would have decoded this plainly (target state without
+        # matching MTP state), so the n>1 request must not be refused.
+        generator = self._generator(self_mtp=True, mtp_mode="refuse")
+        generator.prompt_cache = _StubAPC(hit_tokens=3)
+        _, items = self._serve(generator, self._args(n=2, max_tokens=2))
+        responses = [i for i in items if not isinstance(i, tuple)]
+        self.assertEqual(sorted({r.index for r in responses}), [0, 1])
+
+    def test_a_request_over_the_state_budget_is_refused(self):
+        # The count cap is not a memory bound: n rows replicate the whole
+        # prefix cache, so the projected state has to be checked.
+        generator = self._generator(state_budget_gb=1e-9)
+        with self.assertRaises(RequestCompositionError) as cm:
+            self._serve(generator, self._args(n=2, max_tokens=4))
+        self.assertIn("budget", str(cm.exception))
+
+    def test_a_request_inside_the_state_budget_is_served(self):
+        generator = self._generator(state_budget_gb=1.0)
+        _, items = self._serve(generator, self._args(n=2, max_tokens=2))
+        responses = [i for i in items if not isinstance(i, tuple)]
+        self.assertEqual(sorted({r.index for r in responses}), [0, 1])
+
+    def test_the_refusal_happens_before_the_request_is_accepted(self):
+        # A refusal that arrived after the context would reach the client as a
+        # broken stream instead of an HTTP error.
+        from queue import Queue
+
+        generator = self._generator(state_budget_gb=1e-9)
+        rqueue = Queue()
+        request = CompletionRequest("text", "hello", [], None, None)
+        generator._serve_parallel_samples((rqueue, request, self._args(n=2)))
+        self.assertIsInstance(rqueue.get(), RequestCompositionError)
+
+
+class TestStateBudgetProjection(unittest.TestCase):
+    """The projection the n>1 admission bound is built on."""
+
+    def _cache(self, tokens):
+        cache = _fresh_cache()
+        prefill_prompt_cache(CoinModel(), list(range(tokens)), cache)
+        return cache
+
+    def test_an_empty_cache_is_not_projected(self):
+        self.assertIsNone(
+            _parallel_sampling_state_bytes(_fresh_cache(), 4, 0, 16)
+        )
+
+    def test_more_samples_project_more_state(self):
+        cache = self._cache(8)
+        small = _parallel_sampling_state_bytes(cache, 2, 8, 16)
+        large = _parallel_sampling_state_bytes(cache, 8, 8, 16)
+        self.assertLess(small, large)
+
+    def test_the_completion_length_counts(self):
+        cache = self._cache(8)
+        short = _parallel_sampling_state_bytes(cache, 2, 8, 0)
+        long = _parallel_sampling_state_bytes(cache, 2, 8, 4096)
+        self.assertLess(short, long)
+
+    def test_the_uncached_prompt_tail_counts(self):
+        # Only part of the prompt is prefilled when the check runs; the
+        # projection has to cover the whole prompt.
+        cache = self._cache(8)
+        measured = _parallel_sampling_state_bytes(cache, 2, 8, 0)
+        whole = _parallel_sampling_state_bytes(cache, 2, 64, 0)
+        self.assertGreater(whole, measured)
+
 
 class _ValidationHarness(APIHandler):
     """APIHandler with just enough state to run parameter validation."""
@@ -577,8 +716,19 @@ class _AssemblyHarness(APIHandler):
     """APIHandler wired to a scripted (ctx, response) so the response-assembly
     loop in ``handle_completion`` runs without a model or a socket."""
 
-    def __init__(self, ctx, raw_stream, *, n=1, stream=False):
+    def __init__(
+        self,
+        ctx,
+        raw_stream,
+        *,
+        n=1,
+        stream=False,
+        stream_options=None,
+        logprobs=False,
+        top_logprobs=0,
+    ):
         self.wfile = io.BytesIO()
+        self.status_codes = []
         self.stream = stream
         self.created = 0
         self.system_fingerprint = "fp-test"
@@ -587,7 +737,7 @@ class _AssemblyHarness(APIHandler):
         self.requested_model = "test-model"
         self.requested_draft_model = None
         self.adapter = None
-        self.stream_options = None
+        self.stream_options = stream_options
         self.n = n
         response = iter(raw_stream)
         self.response_generator = types.SimpleNamespace(
@@ -619,18 +769,18 @@ class _AssemblyHarness(APIHandler):
                 prompt_lookup_gate=0.12,
                 prompt_lookup_rate_gate_probe=32,
                 prompt_lookup_rate_gate_margin=0.0,
-                logprobs=False,
-                top_logprobs=0,
+                logprobs=logprobs,
+                top_logprobs=top_logprobs,
                 seed=None,
                 chat_template_kwargs=None,
             )
         )
 
     def _set_completion_headers(self, status_code=200):
-        pass
+        self.status_codes.append(status_code)
 
     def _set_stream_headers(self, status_code=200):
-        pass
+        self.status_codes.append(status_code)
 
     def send_header(self, *args, **kwargs):
         pass
@@ -638,7 +788,8 @@ class _AssemblyHarness(APIHandler):
     def end_headers(self):
         pass
 
-    def run(self):
+    def raw(self):
+        """Run and return the exact bytes written to the wire."""
         request = CompletionRequest(
             request_type="chat",
             prompt="",
@@ -647,7 +798,10 @@ class _AssemblyHarness(APIHandler):
             role_mapping=None,
         )
         self.handle_completion(request, stop_words=[])
-        raw = self.wfile.getvalue().decode()
+        return self.wfile.getvalue()
+
+    def run(self):
+        raw = self.raw().decode()
         if not self.stream:
             return json.loads(raw)
         return [
@@ -657,21 +811,21 @@ class _AssemblyHarness(APIHandler):
         ]
 
 
-def _ctx():
+def _ctx(prompt_cache_count=0):
     return types.SimpleNamespace(
         tool_parser=None,
         text_sm=TextStateMachine({"normal": []}),
         initial_state="normal",
         prompt=[1, 2, 3],
-        prompt_cache_count=0,
+        prompt_cache_count=prompt_cache_count,
         stop=lambda: None,
     )
 
 
-def _r(text, token, finish_reason=None, index=0):
+def _r(text, token, finish_reason=None, index=0, top_tokens=(), logprob=0.0):
     from mlx_lm.server import Response
 
-    return Response(text, token, 0.0, finish_reason, (), index)
+    return Response(text, token, logprob, finish_reason, top_tokens, index)
 
 
 class TestMultiChoiceWireFormat(unittest.TestCase):
@@ -770,6 +924,190 @@ class TestMultiChoiceWireFormat(unittest.TestCase):
         for index in (0, 1):
             terminal = [c for c in by_index[index] if c["finish_reason"]]
             self.assertEqual(len(terminal), 1)
+
+
+class TestStreamOptions(unittest.TestCase):
+    """``stream_options`` is optional and its keys are optional too."""
+
+    @staticmethod
+    def _chunks(stream_options):
+        stream = [_r("hi", 1), _r(" there", 2, finish_reason="length")]
+        harness = _AssemblyHarness(
+            _ctx(), stream, stream=True, stream_options=stream_options
+        )
+        return harness.raw().decode()
+
+    def test_an_empty_stream_options_still_terminates_the_stream(self):
+        raw = self._chunks({})
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        self.assertNotIn('"usage"', raw)
+
+    def test_include_usage_false_sends_no_usage_chunk(self):
+        raw = self._chunks({"include_usage": False})
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        self.assertNotIn('"usage"', raw)
+
+    def test_include_usage_true_sends_the_usage_chunk(self):
+        raw = self._chunks({"include_usage": True})
+        self.assertIn('"usage"', raw)
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+
+    def test_a_non_dict_stream_options_is_rejected(self):
+        handler = APIHandler.__new__(APIHandler)
+        handler.stream = False
+        handler.stream_options = ["include_usage"]
+        with self.assertRaises(ValueError) as cm:
+            # Only the first two checks are reachable without a full request.
+            APIHandler.validate_model_parameters(handler)
+        self.assertIn("stream_options", str(cm.exception))
+
+
+class TestPreGenerationErrorStatus(unittest.TestCase):
+    """An unsupported combination is a 400; an unknown model stays 404."""
+
+    @staticmethod
+    def _status(error):
+        harness = _AssemblyHarness(_ctx(), [])
+
+        def _raise(*args, **kwargs):
+            raise error
+
+        harness.response_generator.generate = _raise
+        harness.raw()
+        return harness.status_codes[-1]
+
+    def test_request_composition_errors_are_400(self):
+        self.assertEqual(
+            self._status(RequestCompositionError("n>1 needs a batchable model")),
+            400,
+        )
+
+    def test_other_errors_stay_404(self):
+        self.assertEqual(self._status(ValueError("no such model")), 404)
+
+
+# Captured from mlx_lm/server.py at a38e356^ (pre parallel sampling).
+PRE_N_WIRE_BYTES = {
+    "completion_stop": (
+        '{"id": "req-test", "system_fingerprint": "fp-test", "object": "chat.'
+        'completion", "model": "test-model", "created": 0, "choices": [{"inde'
+        'x": 0, "finish_reason": "stop", "message": {"role": "assistant", "co'
+        'ntent": "hi"}}], "usage": {"prompt_tokens": 3, "completion_tokens": '
+        '2, "total_tokens": 5, "prompt_tokens_details": {"cached_tokens": 0}}'
+        '}'
+    ),
+    "completion_length_cached": (
+        '{"id": "req-test", "system_fingerprint": "fp-test", "object": "chat.'
+        'completion", "model": "test-model", "created": 0, "choices": [{"inde'
+        'x": 0, "finish_reason": "length", "message": {"role": "assistant", "'
+        'content": "hi there"}}], "usage": {"prompt_tokens": 3, "completion_t'
+        'okens": 2, "total_tokens": 5, "prompt_tokens_details": {"cached_toke'
+        'ns": 2}}}'
+    ),
+    "completion_logprobs": (
+        '{"id": "req-test", "system_fingerprint": "fp-test", "object": "chat.'
+        'completion", "model": "test-model", "created": 0, "choices": [{"inde'
+        'x": 0, "finish_reason": "stop", "logprobs": {"content": [{"id": 1, "'
+        'token": "hi", "logprob": -0.5, "top_logprobs": [{"id": 1, "token": "'
+        'hi", "logprob": -0.5}]}, {"id": 2, "token": " there", "logprob": -1.'
+        '25, "top_logprobs": [{"id": 2, "token": " there", "logprob": -1.25}]'
+        '}]}, "message": {"role": "assistant", "content": "hi"}}], "usage": {'
+        '"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "prom'
+        'pt_tokens_details": {"cached_tokens": 0}}}'
+    ),
+    "stream_stop": (
+        'data: {"id": "req-test", "system_fingerprint": "fp-test", "object": '
+        '"chat.completion.chunk", "model": "test-model", "created": 0, "choic'
+        'es": [{"index": 0, "finish_reason": null, "delta": {"role": "assista'
+        'nt", "content": "hi"}}]}\n\ndata: {"id": "req-test", "system_fingerpri'
+        'nt": "fp-test", "object": "chat.completion.chunk", "model": "test-mo'
+        'del", "created": 0, "choices": [{"index": 0, "finish_reason": "stop"'
+        ', "delta": {"role": "assistant"}}]}\n\ndata: [DONE]\n\n'
+    ),
+    "stream_usage": (
+        'data: {"id": "req-test", "system_fingerprint": "fp-test", "object": '
+        '"chat.completion.chunk", "model": "test-model", "created": 0, "choic'
+        'es": [{"index": 0, "finish_reason": null, "delta": {"role": "assista'
+        'nt", "content": "hi"}}]}\n\ndata: {"id": "req-test", "system_fingerpri'
+        'nt": "fp-test", "object": "chat.completion.chunk", "model": "test-mo'
+        'del", "created": 0, "choices": [{"index": 0, "finish_reason": "lengt'
+        'h", "delta": {"role": "assistant"}}]}\n\ndata: {"id": "req-test", "sys'
+        'tem_fingerprint": "fp-test", "object": "chat.completion", "model": "'
+        'test-model", "created": 0, "choices": [], "usage": {"prompt_tokens":'
+        ' 3, "completion_tokens": 1, "total_tokens": 4, "prompt_tokens_detail'
+        's": {"cached_tokens": 0}}}\n\ndata: [DONE]\n\n'
+    ),
+}
+
+
+class TestSingleSampleWireBytes(unittest.TestCase):
+    """n=1 serialization is pinned to the bytes it had before n>1 existed.
+
+    The goldens below were captured from ``mlx_lm/server.py`` at ``a38e356^``
+    -- the commit before parallel sampling -- with these same scripted
+    responses. A change in field order, key set, number formatting or chunk
+    framing fails here, so the byte-identity claim is a guard and not a
+    one-time hand check.
+    """
+
+    def _bytes(self, **kwargs):
+        return _AssemblyHarness(**kwargs).raw().decode()
+
+    def test_completion_stop(self):
+        stream = [_r("hi", 1), _r(" there", 2, finish_reason="stop")]
+        self.assertEqual(
+            self._bytes(ctx=_ctx(), raw_stream=stream),
+            PRE_N_WIRE_BYTES["completion_stop"],
+        )
+
+    def test_completion_length_with_cached_tokens(self):
+        stream = [_r("hi", 1), _r(" there", 2, finish_reason="length")]
+        self.assertEqual(
+            self._bytes(ctx=_ctx(prompt_cache_count=2), raw_stream=stream),
+            PRE_N_WIRE_BYTES["completion_length_cached"],
+        )
+
+    def test_completion_with_logprobs(self):
+        stream = [
+            _r(
+                "hi",
+                1,
+                logprob=-0.5,
+                top_tokens=({"id": 1, "token": "hi", "logprob": -0.5},),
+            ),
+            _r(
+                " there",
+                2,
+                finish_reason="stop",
+                logprob=-1.25,
+                top_tokens=({"id": 2, "token": " there", "logprob": -1.25},),
+            ),
+        ]
+        self.assertEqual(
+            self._bytes(
+                ctx=_ctx(), raw_stream=stream, logprobs=True, top_logprobs=1
+            ),
+            PRE_N_WIRE_BYTES["completion_logprobs"],
+        )
+
+    def test_stream_stop(self):
+        stream = [_r("hi", 1), _r(" there", 2, finish_reason="stop")]
+        self.assertEqual(
+            self._bytes(ctx=_ctx(), raw_stream=stream, stream=True),
+            PRE_N_WIRE_BYTES["stream_stop"],
+        )
+
+    def test_stream_with_usage(self):
+        stream = [_r("hi", 1, finish_reason="length")]
+        self.assertEqual(
+            self._bytes(
+                ctx=_ctx(),
+                raw_stream=stream,
+                stream=True,
+                stream_options={"include_usage": True},
+            ),
+            PRE_N_WIRE_BYTES["stream_usage"],
+        )
 
 
 if __name__ == "__main__":

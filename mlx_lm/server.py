@@ -34,7 +34,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .apc import AutomaticPrefixCache, MTPAPCSidecar
+from .apc import AutomaticPrefixCache, MTPAPCSidecar, _walk_cache_entries
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
@@ -48,7 +48,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, RotatingKVCache, make_prompt_cache
-from .sample_utils import make_logits_processors, make_sampler
+from .sample_utils import LaneRNG, make_logits_processors, make_sampler
 from .spec_policy import MAX_DRAFT_TOKENS
 from .speculation_router import DepthCeilingController
 from .utils import _parse_size, load, sharded_load
@@ -63,6 +63,14 @@ def validate_kv_args(args):
         args.kv_group_size,
         args.quantized_kv_start,
     )
+
+
+class RequestCompositionError(ValueError):
+    """The request is well formed but asks for an unsupported combination.
+
+    Mapped to HTTP 400 so a client can tell it apart from an unknown model,
+    which stays 404.
+    """
 
 
 def get_system_fingerprint():
@@ -709,6 +717,29 @@ def _request_output_ceiling(cli_args, chat_template_kwargs=None):
     return getattr(cli_args, name, None)
 
 
+def _make_lane_rng(args, root, sidecar=None):
+    """Build this request's decode lane key.
+
+    A lane draws from its own key, never from the global ``mx.random`` stream,
+    so its tokens do not depend on the traffic decoded beside it.
+
+    * A resumed request continues the stream carried by its APC sidecar, so it
+      does not repeat the draws the earlier turn already made. Two requests
+      that hit the SAME stored sidecar therefore continue the same stream:
+      the snapshot is a position, and equal inputs give equal outputs.
+    * An explicit request ``seed`` reproduces one lane exactly.
+    * Otherwise the lane is forked from the server root, which advances, so
+      concurrent requests never share a key.
+    """
+    carried = getattr(sidecar, "rng_key", None)
+    if carried is not None:
+        return LaneRNG.from_key(carried, int(getattr(sidecar, "rng_draws", 0) or 0))
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        return LaneRNG(int(seed))
+    return root.fork(1)[0]
+
+
 def _self_mtp_config(
     args,
     cli_args,
@@ -717,6 +748,7 @@ def _self_mtp_config(
     cached_prompt_tokens=0,
     prompt_tokens=0,
     mtp_state=None,
+    lane_rng=None,
 ):
     """Return an exact self-MTP route or fail closed to ordinary decoding.
 
@@ -791,6 +823,8 @@ def _self_mtp_config(
         )
     if mtp_state is not None:
         config["state"] = mtp_state
+    if lane_rng is not None:
+        config["lane_rng"] = lane_rng
     window_size = getattr(cli_args, "self_mtp_window_size", 0)
     window_minimum = getattr(cli_args, "self_mtp_window_min_prompt_tokens", 0)
     if (
@@ -806,7 +840,15 @@ def _self_mtp_config(
 PARALLEL_SAMPLING_MTP_MODES = ("refuse", "plain")
 
 
-def _parallel_sampling_route(args, cli_args, model, *, prompt_tokens=0):
+def _parallel_sampling_route(
+    args,
+    cli_args,
+    model,
+    *,
+    prompt_tokens=0,
+    cached_prompt_tokens=0,
+    mtp_state=None,
+):
     """Decide how an ``n>1`` request is served, or refuse it.
 
     Returns ``("plain", note)``: the samples decode on the plain batched path,
@@ -818,10 +860,21 @@ def _parallel_sampling_route(args, cli_args, model, *, prompt_tokens=0):
     that would otherwise be MTP-admitted cannot keep MTP here. The behaviour is
     explicit rather than silent: ``--parallel-sampling-mtp refuse`` (default)
     raises, ``plain`` accepts the request with MTP off and says so.
+
+    Admission is decided from the same inputs the n=1 path uses, prefix-cache
+    result included: a sidecar-less APC hit would not have kept MTP anyway, so
+    such a request is not refused.
     """
     mode = getattr(cli_args, "parallel_sampling_mtp", "refuse")
     would_use_mtp = (
-        _self_mtp_config(args, cli_args, model, prompt_tokens=prompt_tokens)
+        _self_mtp_config(
+            args,
+            cli_args,
+            model,
+            prompt_tokens=prompt_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
+            mtp_state=mtp_state,
+        )
         is not None
     )
     if not would_use_mtp:
@@ -831,12 +884,57 @@ def _parallel_sampling_route(args, cli_args, model, *, prompt_tokens=0):
             "plain",
             "self-MTP disabled for this request: n>1 has no batched MTP path",
         )
-    raise ValueError(
+    raise RequestCompositionError(
         "n>1 is not supported while self-MTP speculation is active for this "
         "request: the MTP draft-head state is not batch-carried. Send n=1, or "
         "start the server with --parallel-sampling-mtp plain to decode n>1 "
         "samples on the plain path with MTP disabled."
     )
+
+
+def _cache_state_bytes(prompt_cache):
+    """Bytes held by one row of this prompt cache, plus its token offset."""
+    nbytes = 0
+    offset = 0
+    for leaf in _walk_cache_entries(prompt_cache):
+        nbytes += int(getattr(leaf, "nbytes", 0))
+        offset = max(offset, int(getattr(leaf, "offset", 0)))
+    return nbytes, offset
+
+
+def _parallel_sampling_state_bytes(prompt_cache, n, prompt_tokens, max_tokens):
+    """Project the state an ``n>1`` request needs, or ``None`` if unmeasurable.
+
+    ``n>1`` replicates the whole prefix cache into one row per sample and each
+    row then grows for its own completion, so the count cap alone is not a
+    memory bound. The per-token cost is measured on the cache in hand; the
+    source cache stays alive as the shared prefix entry, hence ``n + 1``.
+    """
+    nbytes, offset = _cache_state_bytes(prompt_cache)
+    if offset <= 0 or nbytes <= 0:
+        return None
+    per_token = nbytes / offset
+    prefix_bytes = per_token * max(prompt_tokens, offset)
+    return int((n + 1) * prefix_bytes + n * per_token * max(max_tokens, 0))
+
+
+def _state_budget_bytes(cli_args):
+    """The ceiling an ``n>1`` request must project under, or ``None``.
+
+    ``--parallel-sampling-state-budget-gb`` sets it explicitly. Otherwise it is
+    the device's remaining recommended working set, which is what an OOM kill
+    would hit.
+    """
+    explicit = getattr(cli_args, "parallel_sampling_state_budget_gb", None)
+    if explicit:
+        return int(float(explicit) * (1 << 30))
+    if not mx.metal.is_available():
+        return None
+    limit = mx.device_info().get("max_recommended_working_set_size")
+    if not limit:
+        return None
+    headroom = int(limit) - int(mx.get_active_memory())
+    return max(int(0.9 * headroom), 0)
 
 
 def _discard_small_sidecarless_apc_hit_for_mtp(
@@ -996,6 +1094,12 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        # Root of the per-request decode lane keys. Derived from (not drawn
+        # from) the global stream, so it is reproducible for a given process
+        # seed and independent of request traffic.
+        self._lane_rng_root = LaneRNG.from_key(
+            mx.random.split(mx.random.state[0])[1]
+        )
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -1489,6 +1593,25 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
+    def _check_parallel_sampling_state_budget(
+        self, cache, n, prompt_tokens, max_tokens
+    ):
+        """Refuse an ``n>1`` request whose replicated cache would not fit."""
+        budget = _state_budget_bytes(self.cli_args)
+        if budget is None:
+            return
+        projected = _parallel_sampling_state_bytes(
+            cache, n, prompt_tokens, max_tokens
+        )
+        if projected is None or projected <= budget:
+            return
+        raise RequestCompositionError(
+            f"n={n} would need about {projected / (1 << 30):.1f} GB of cache "
+            f"state for a {prompt_tokens}-token prompt and {max_tokens} new "
+            f"tokens, over the {budget / (1 << 30):.1f} GB budget. Send a "
+            f"smaller n, a shorter prompt, or fewer max_tokens."
+        )
+
     def _serve_request(self, request, generation_stream=None):
         """Route one non-batchable request to the single or n-way path."""
         if getattr(request[2], "n", 1) > 1:
@@ -1512,12 +1635,22 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             n = int(args.n)
 
+            # n>1 decodes as a batch, so the model has to be batchable. A
+            # draft model makes it unbatchable and its speculation has no
+            # n-way path: refuse instead of dropping it silently.
+            if self.model_provider.draft_model is not None:
+                raise RequestCompositionError(
+                    "n>1 is not supported with a draft model: speculative "
+                    "decoding has no batched path here. Send n=1, or start "
+                    "the server without --draft-model."
+                )
+            if not self.model_provider.is_batchable:
+                raise RequestCompositionError(
+                    "n>1 needs a batchable model: this model's cache cannot "
+                    "be replicated into per-sample rows. Send n=1."
+                )
+
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            _, note = _parallel_sampling_route(
-                args, self.cli_args, model, prompt_tokens=len(prompt)
-            )
-            if note:
-                logging.info("Parallel sampling (n=%d): %s", n, note)
             if len(prompt) < 1:
                 raise ValueError("n>1 requires a non-empty prompt")
 
@@ -1547,9 +1680,17 @@ class ResponseGenerator:
 
             # The prefix is shared, so the prefix-cache lookup happens once.
             self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
+            if hasattr(self.prompt_cache, "lookup"):
+                lookup = self.prompt_cache.lookup(
+                    self.model_provider.model_key, prompt
+                )
+                cache, rest = lookup.cache, lookup.remaining_tokens
+                mtp_sidecar = lookup.sidecar
+            else:
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                mtp_sidecar = None
             ctx.prompt_cache_count = len(prompt) - len(rest)
             if not rest:
                 raise ValueError(
@@ -1558,20 +1699,57 @@ class ResponseGenerator:
                 )
             if cache is None:
                 cache = make_prompt_cache(model)
-            rqueue.put(ctx)
 
-            def progress(processed, total):
-                rqueue.put((processed + ctx.prompt_cache_count, len(prompt)))
+            # Route with the same inputs the n=1 path uses: the cache result
+            # decides whether MTP would have been admitted at all.
+            _, note = _parallel_sampling_route(
+                args,
+                self.cli_args,
+                model,
+                prompt_tokens=len(prompt),
+                cached_prompt_tokens=ctx.prompt_cache_count,
+                mtp_state=(
+                    mtp_sidecar.state if mtp_sidecar is not None else None
+                ),
+            )
+            if note:
+                logging.info("Parallel sampling (n=%d): %s", n, note)
 
-            # Prefill everything but the seed token, once.
+            # Prefill everything but the seed token, once. The first chunk runs
+            # before the request is accepted so the replicated state can be
+            # measured and refused while a clean error still reaches the
+            # client, instead of an OOM kill mid-stream.
+            head_size = self.cli_args.prefill_step_size
+            body = rest[:-1]
             prefill_prompt_cache(
                 model,
-                rest[:-1],
+                body[:head_size],
                 cache,
-                prefill_step_size=self.cli_args.prefill_step_size,
+                prefill_step_size=head_size,
+            )
+            self._check_parallel_sampling_state_budget(
+                cache, n, len(prompt), args.max_tokens
+            )
+            rqueue.put(ctx)
+
+            prefilled = min(len(body), head_size)
+
+            def progress(processed, total):
+                rqueue.put(
+                    (
+                        processed + prefilled + ctx.prompt_cache_count,
+                        len(prompt),
+                    )
+                )
+
+            prefill_prompt_cache(
+                model,
+                body[head_size:],
+                cache,
+                prefill_step_size=head_size,
                 progress_callback=progress,
             )
-            progress(len(rest), len(rest))
+            progress(len(rest) - prefilled, len(rest))
             prefix_key = prompt[:-1]
 
             parallel = ParallelSampleGenerator(
@@ -1717,6 +1895,11 @@ class ResponseGenerator:
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
+            lane_rng = (
+                _make_lane_rng(args, self._lane_rng_root, mtp_sidecar)
+                if getattr(self.cli_args, "self_mtp", False)
+                else None
+            )
             self_mtp = _self_mtp_config(
                 args,
                 self.cli_args,
@@ -1724,6 +1907,7 @@ class ResponseGenerator:
                 cached_prompt_tokens=ctx.prompt_cache_count,
                 prompt_tokens=len(prompt),
                 mtp_state=(mtp_sidecar.state if mtp_sidecar is not None else None),
+                lane_rng=lane_rng,
             )
             if self_mtp is not None:
                 depth_router = self_mtp.get("speculation_router")
@@ -1874,7 +2058,14 @@ class ResponseGenerator:
                     and covered == cache_offset
                     and 0 < covered <= len(cache_key)
                 ):
-                    sidecar = MTPAPCSidecar(captured["state"], covered)
+                    # Carry the lane key too: a resume that dropped it would
+                    # fall back to the global stream and repeat draws.
+                    sidecar = MTPAPCSidecar(
+                        captured["state"],
+                        covered,
+                        rng_key=captured.get("rng_key"),
+                        rng_draws=int(captured.get("rng_draws") or 0),
+                    )
                 else:
                     logging.warning(
                         "Self-MTP APC sidecar not reusable: captured=%s "
@@ -2086,6 +2277,13 @@ class APIHandler(BaseHTTPRequestHandler):
         )
         self.adapter = self.body.get("adapters", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        # Read before validate_model_parameters runs, so its type is checked
+        # here rather than raising TypeError inside the profile lookup.
+        if self.chat_template_kwargs is not None and not isinstance(
+            self.chat_template_kwargs, dict
+        ):
+            self._bad_request("chat_template_kwargs must be of type dict")
+            return
         sampling_profile = _request_sampling_profile(
             self.response_generator.cli_args, self.chat_template_kwargs
         )
@@ -2136,9 +2334,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # Parameter validation happens before completion/stream headers are
             # emitted, so malformed requests receive a normal JSON 400 instead
             # of a dropped connection after a streaming response has begun.
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self._bad_request(str(e))
             return
 
         # Get stop sequences
@@ -2149,6 +2345,12 @@ class APIHandler(BaseHTTPRequestHandler):
         # Create the completion request
         request = request_factories[self.path]()
         self.handle_completion(request, stop_words)
+
+    def _bad_request(self, message):
+        """Write a JSON 400 for a malformed request body."""
+        self._set_completion_headers(400)
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": message}).encode())
 
     def _validate(
         self,
@@ -2205,6 +2407,8 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
+        if getattr(self, "stream_options", None) is not None:
+            self._validate("stream_options", dict)
         self._validate(
             "max_tokens",
             int,
@@ -2492,7 +2696,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            # An unsupported request composition is a 400; 404 stays for an
+            # unknown model.
+            status = 400 if isinstance(e, RequestCompositionError) else 404
+            self._set_completion_headers(status)
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
@@ -2559,7 +2766,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self._write_terminal_chunk(assembler)
                 if (
                     self.stream_options is not None
-                    and self.stream_options["include_usage"]
+                    and self.stream_options.get("include_usage")
                 ):
                     resp = self.completion_usage_response(
                         len(ctx.prompt),
@@ -3127,6 +3334,16 @@ def setup_arg_parser():
         type=int,
         default=8,
         help="When a request is batchable then process that many prompts in parallel",
+    )
+    parser.add_argument(
+        "--parallel-sampling-state-budget-gb",
+        type=float,
+        default=None,
+        help=(
+            "Cache-state ceiling for one n>1 request. A request whose "
+            "replicated per-sample caches would exceed it is refused. "
+            "Default: the device's remaining recommended working set."
+        ),
     )
     parser.add_argument(
         "--parallel-sampling-max-n",

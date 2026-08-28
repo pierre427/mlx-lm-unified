@@ -74,10 +74,18 @@ class APCLookup:
 
 @dataclass
 class MTPAPCSidecar:
-    """Persistent draft state captured at an exact target-cache boundary."""
+    """Persistent draft state captured at an exact target-cache boundary.
+
+    ``rng_key``/``rng_draws`` carry the decode lane's position in its own
+    random stream, so a resumed request continues that stream instead of
+    repeating draws it already made. They stay ``None``/``0`` for a greedy or
+    keyless lane, which draws nothing.
+    """
 
     state: Any
     covered_tokens: int
+    rng_key: Optional[Any] = None
+    rng_draws: int = 0
 
     @property
     def nbytes(self) -> int:
