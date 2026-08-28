@@ -145,7 +145,7 @@ class TestQSAPooledKeyCache(unittest.TestCase):
                 )[None, None]
             else:
                 mask = None
-            sparse = indexer(chunk, mask, cache)
+            sparse = indexer(chunk, mask, cache).dense_mask()
             if sparse is not None:
                 mx.eval(sparse)
                 outputs.append(np.asarray(sparse))
@@ -202,7 +202,7 @@ class TestQSAPooledKeyCache(unittest.TestCase):
                 if index == 2:
                     cache._mtp_share_topk = True
                     cache._mtp_shared_topk = None
-                sparse = indexer(chunk, mask, cache)
+                sparse = indexer(chunk, mask, cache).dense_mask()
                 mx.eval(sparse)
                 outputs.append(np.asarray(sparse))
                 cache.offset += length
@@ -291,7 +291,7 @@ class TestQSAScatterChosen(unittest.TestCase):
                 if index == 4:
                     cache._mtp_share_topk = True
                     cache._mtp_shared_topk = None
-                sparse = indexer(chunk, mask, cache)
+                sparse = indexer(chunk, mask, cache).dense_mask()
                 mx.eval(sparse)
                 outputs.append(np.asarray(sparse))
                 cache.offset += length
@@ -616,7 +616,7 @@ class TestSharedTopkTrimFix(unittest.TestCase):
         hidden = mx.random.normal((1, 9, args.hidden_size), key=mx.random.key(0))
         mask = (mx.arange(9)[:, None] >= mx.arange(9)[None, :])[None, None]
         with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
-            mx.eval(indexer(hidden, mask, cache))
+            mx.eval(indexer(hidden, mask, cache).dense_mask())
             cache.offset += 9
             cache.offset += 1  # simulate a raw-key/KV desync
             with self.assertRaises(RuntimeError):
@@ -1204,7 +1204,7 @@ class TestQSADenseShortCircuit(unittest.TestCase):
                 mask = (pos[:, None] >= mx.arange(total)[None, :])[None, None]
             else:
                 mask = None
-            sparse = indexer(chunk, mask, cache)
+            sparse = indexer(chunk, mask, cache).dense_mask()
             mx.eval(sparse)
             masks.append(self._dense(sparse, length, total))
             cache.offset += length
@@ -1241,7 +1241,7 @@ class TestQSADenseShortCircuit(unittest.TestCase):
             causal = (
                 mx.arange(total)[:, None] >= mx.arange(total)[None, :]
             )[None, None]
-            sparse = indexer(hidden, causal, QSAKVCache())
+            sparse = indexer(hidden, causal, QSAKVCache()).dense_mask()
             mx.eval(sparse)
             equal = np.array_equal(np.asarray(sparse), np.asarray(causal))
             self.assertEqual(
@@ -1341,7 +1341,7 @@ class TestQSADenseShortCircuit(unittest.TestCase):
             if index == share_at:
                 cache._mtp_share_topk = True
                 cache._mtp_shared_topk = None
-            sparse = indexer(chunk, mask, cache)
+            sparse = indexer(chunk, mask, cache).dense_mask()
             mx.eval(sparse)
             masks.append(self._dense(sparse, length, total))
             cache.offset += length
@@ -1368,12 +1368,12 @@ class TestQSADenseShortCircuit(unittest.TestCase):
         cache = QSAKVCache()
         hidden = mx.random.normal((1, 8, args.hidden_size), key=mx.random.key(3))
         mask = (mx.arange(8)[:, None] >= mx.arange(8)[None, :])[None, None]
-        mx.eval(indexer(hidden, mask, cache))
+        mx.eval(indexer(hidden, mask, cache).dense_mask())
         cache.offset += 8
         cache._mtp_share_topk = True
         cache._mtp_shared_topk = None
         step = mx.random.normal((1, 1, args.hidden_size), key=mx.random.key(4))
-        mx.eval(indexer(step, None, cache))  # total 9, records the shared set
+        mx.eval(indexer(step, None, cache).dense_mask())  # total 9, records the shared set
         cache.offset += 1
         self.assertEqual(cache._mtp_shared_topk.shape[-1], 2)
         # total 10 still has 2 blocks, so the shared set covers them all.
@@ -1392,7 +1392,7 @@ class TestQSADenseShortCircuit(unittest.TestCase):
         mask = (mx.arange(8)[:, None] >= mx.arange(8)[None, :])[None, None]
         cache._mtp_share_topk = True
         with lever(qwen4_exp, "_QSA_DENSE_SHORTCIRCUIT"):
-            self.assertIs(indexer(hidden, mask, cache), mask)
+            self.assertIs(indexer(hidden, mask, cache).dense_mask(), mask)
         cache.offset += 8
         self.assertIsNotNone(cache._mtp_shared_topk)
         np.testing.assert_array_equal(

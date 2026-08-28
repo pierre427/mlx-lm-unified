@@ -1425,6 +1425,250 @@ class QSAKVCache(KVCache):
         return super().nbytes + (0 if self.index_keys is None else self.index_keys.nbytes)
 
 
+@dataclass(frozen=True)
+class QSACompactBlocks:
+    """Sorted, prefix-packed block ids, the shape a gather kernel wants.
+
+    Ids are LOGICAL.  Row ``b``'s physical block start is
+    ``left_padding[b] + block_id * block_size``, or just ``block_id *
+    block_size`` without left padding.  ``[tail_start, tail_stop)`` is the
+    incomplete block no selection names, and may be empty.  ``causal_mask``
+    stays attached because blocks alone are NOT causally complete; see
+    ``QSASelection.dense_mask``.
+    """
+
+    block_ids: mx.array  # [B, L, K], valid prefix ascending, suffix zeroed
+    block_counts: mx.array  # [B, L]
+    tail_start: mx.array  # [B, L], logical, inclusive
+    tail_stop: mx.array  # [B, L], logical, exclusive
+    left_padding: Optional[mx.array]  # [B]
+    block_size: int
+    physical_width: int
+    causal_mask: Optional[mx.array]
+
+    @property
+    def block_valid(self) -> mx.array:
+        """Derived, never stored: a second tensor could desynchronize."""
+        return mx.arange(self.block_ids.shape[-1]) < self.block_counts[..., None]
+
+
+def _compact_qsa_block_ids(
+    selected_block_ids: mx.array,
+    selected_is_valid: mx.array,
+    *,
+    n_blocks: int,
+):
+    """Return sorted, prefix-packed logical ids and their counts.
+
+    ``argpartition`` gives no order, and invalid slots sit anywhere -- with
+    one valid block the first eight slots are invalid -- so a prefix scan of
+    the raw ids would be wrong.  Keying invalid slots at ``n_blocks``, past
+    every real id, sorts them to the end instead.
+    """
+    if selected_block_ids.ndim != 3 or selected_is_valid.ndim != 3:
+        raise ValueError("compaction wants [B, L, K] ids and validity")
+    if selected_block_ids.shape != selected_is_valid.shape:
+        raise ValueError(
+            "compaction shape mismatch: "
+            f"{selected_block_ids.shape} ids vs {selected_is_valid.shape} validity"
+        )
+    width = selected_block_ids.shape[-1]
+    keys = mx.where(
+        selected_is_valid,
+        selected_block_ids.astype(mx.int32),
+        mx.array(n_blocks, dtype=mx.int32),
+    )
+    ids = mx.take_along_axis(
+        selected_block_ids, mx.argsort(keys, axis=-1), axis=-1
+    )
+    counts = mx.sum(selected_is_valid.astype(mx.int32), axis=-1)
+    packed = mx.arange(width) < counts[..., None]
+    return mx.where(packed, ids, mx.zeros_like(ids)), counts
+
+
+@dataclass(frozen=True)
+class QSASelection:
+    """What the indexer chose, before it becomes an attention mask.
+
+    ``dense_mask()`` rebuilds today's mask array operation for operation, so
+    nothing observable changes.  ``compact_blocks()`` is the gather-shaped
+    view and is LAZY: the mask path never calls it and pays nothing.
+
+    Kinds: ``explicit`` is the normal sparse selection, ``implicit_all`` is a
+    dense step whose mask IS the causal mask, and ``mask_only`` is the
+    ``SinkWindowKVCache`` path, which has no QSA blocks at all.
+    """
+
+    kind: str
+    batch: int
+    length: int
+    block_size: int
+    raw_block_ids: Optional[mx.array] = None  # [B, L, K], unsorted, ragged
+    valid_blocks: Optional[mx.array] = None  # [B or 1, L, N]
+    q_positions: Optional[mx.array] = None  # [B or 1, L], logical
+    token_positions: Optional[mx.array] = None  # [B or 1, T], logical
+    causal_mask: Optional[mx.array] = None
+    passthrough_mask: Optional[mx.array] = None
+    left_padding: Optional[mx.array] = None  # [B]
+    offset: Union[int, mx.array] = 0
+    physical_width: int = 0
+    n_blocks: int = 0
+    # Snapshot, so a delayed dense_mask() cannot read a different global.
+    scatter_chosen: bool = False
+
+    def __post_init__(self):
+        # Structural only.  An .item() here would sync the device every step.
+        if self.kind not in ("explicit", "implicit_all", "mask_only"):
+            raise ValueError(f"unknown QSA selection kind {self.kind!r}")
+        if self.kind == "mask_only":
+            return
+        if self.physical_width // self.block_size != self.n_blocks:
+            raise ValueError("block grid does not match the physical width")
+        if self.left_padding is not None and self.left_padding.shape != (
+            self.batch,
+        ):
+            raise ValueError("left padding wants one entry per row")
+        if self.causal_mask is not None and self.causal_mask.shape[-2:] != (
+            self.length,
+            self.physical_width,
+        ):
+            raise ValueError("causal mask must end in [L, physical width]")
+        if self.kind == "implicit_all":
+            return
+        if self.raw_block_ids.ndim != 3 or self.valid_blocks.ndim != 3:
+            raise ValueError("explicit selection wants rank-3 ids and validity")
+        if self.raw_block_ids.shape[:2] != (self.batch, self.length):
+            raise ValueError("selected ids must be [B, L, K]")
+        if self.raw_block_ids.shape[-1] > self.n_blocks:
+            raise ValueError("more selected ids than blocks")
+        if self.valid_blocks.shape[1:] != (self.length, self.n_blocks):
+            raise ValueError("block validity must be [B or 1, L, N]")
+        if self.q_positions.shape[-1] != self.length:
+            raise ValueError("query positions must be [B or 1, L]")
+        if self.token_positions.shape[-1] != self.physical_width:
+            raise ValueError("token positions must span the physical width")
+
+    def dense_mask(self) -> Optional[mx.array]:
+        """Today's QSA mask, rebuilt operation for operation."""
+        if self.kind == "mask_only":
+            return self.passthrough_mask
+        if self.kind == "implicit_all":
+            return self.causal_mask
+        batch, length = self.batch, self.length
+        n_blocks, total = self.n_blocks, self.physical_width
+        selected, valid_blocks = self.raw_block_ids, self.valid_blocks
+        q_pos, token_logical = self.q_positions, self.token_positions
+        if self.scatter_chosen:
+            # ``argpartition`` output has no duplicate indices, so a scatter
+            # of ones is equivalent to the one-hot broadcast reduction.
+            chosen = mx.put_along_axis(
+                mx.zeros((batch, length, n_blocks), dtype=mx.bool_),
+                selected,
+                mx.array(True),
+                axis=-1,
+            )
+        else:
+            block_ids = mx.arange(n_blocks)
+            chosen = mx.any(
+                selected[..., None] == block_ids[None, None, None, :], axis=-2
+            )
+        chosen = chosen & valid_blocks
+        # ``clip`` where the unpadded path clamped: the lower bound only bites
+        # on left padding, whose columns the ``>= 0`` term below removes.
+        token_block = mx.clip(token_logical // self.block_size, 0, n_blocks - 1)
+        selected_tokens = mx.take_along_axis(
+            chosen,
+            mx.broadcast_to(token_block[:, None, :], (batch, length, total)),
+            axis=-1,
+        )
+        complete = ((q_pos + 1) // self.block_size) * self.block_size
+        tail = (token_logical[:, None, :] >= complete[..., None]) & (
+            token_logical[:, None, :] <= q_pos[..., None]
+        )
+        sparse = selected_tokens | tail
+        if self.left_padding is not None:
+            sparse = sparse & (token_logical[:, None, :] >= 0)
+        sparse = sparse[:, None, :, :]
+        # ``create_attention_mask`` deliberately returns ``None`` for a
+        # single-token decode because every cached position is causal.  QSA
+        # still needs its sparse selection mask in that case.
+        #
+        # This conjunction MUST stay last and MUST stay here.  The clip above
+        # can name a block holding future tokens -- ratio 4, total 10, left
+        # padding 1, query 7 clips logical token 8 from block 2 down to the
+        # selected block 1 -- and the tail does not remove it.  Only this
+        # term does, so the selection is not itself an attention mask.
+        return sparse if self.causal_mask is None else self.causal_mask & sparse
+
+    def _logical_coordinates(self):
+        """Rebuild ``(q_pos, token_logical)`` for a kind that never derived them.
+
+        Deliberately NOT shared with ``QSAIndexer.__call__``: the dense path
+        returns before it needs coordinates, and making it compute them would
+        put new work on the hot path.
+        """
+        if self.left_padding is None:
+            return (
+                mx.arange(self.offset, self.offset + self.length)[None, :],
+                mx.arange(self.physical_width)[None, :],
+            )
+        return (
+            self.offset[:, None] + mx.arange(self.length)[None, :],
+            mx.arange(self.physical_width)[None, :] - self.left_padding[:, None],
+        )
+
+    def compact_blocks(self) -> Optional[QSACompactBlocks]:
+        """Sorted, prefix-packed blocks for a future gather kernel.
+
+        Lazy on purpose: sorting up to ``block_topk`` ids on every masked SDPA
+        call would be new hot-path work for no change in output.
+        """
+        if self.kind == "mask_only":
+            # Windowed MTP replaces global QSA outright; it has no blocks.
+            return None
+        if self.kind == "implicit_all":
+            q_pos, _ = self._logical_coordinates()
+            starts = mx.arange(self.n_blocks) * self.block_size
+            valid_blocks = (starts + self.block_size - 1)[
+                None, None, :
+            ] <= q_pos[..., None]
+            ids = mx.broadcast_to(
+                mx.arange(self.n_blocks, dtype=mx.uint32)[None, None, :],
+                (self.batch, self.length, self.n_blocks),
+            )
+        else:
+            q_pos, valid_blocks, ids = (
+                self.q_positions,
+                self.valid_blocks,
+                self.raw_block_ids,
+            )
+        if valid_blocks.shape[0] != ids.shape[0]:
+            valid_blocks = mx.broadcast_to(
+                valid_blocks, (ids.shape[0],) + valid_blocks.shape[1:]
+            )
+        block_ids, counts = _compact_qsa_block_ids(
+            ids,
+            mx.take_along_axis(valid_blocks, ids, axis=-1),
+            n_blocks=self.n_blocks,
+        )
+        tail_stop = q_pos + 1
+        tail_start = (tail_stop // self.block_size) * self.block_size
+        if tail_stop.shape[0] != self.batch:
+            shape = (self.batch, self.length)
+            tail_stop = mx.broadcast_to(tail_stop, shape)
+            tail_start = mx.broadcast_to(tail_start, shape)
+        return QSACompactBlocks(
+            block_ids=block_ids,
+            block_counts=counts,
+            tail_start=tail_start,
+            tail_stop=tail_stop,
+            left_padding=self.left_padding,
+            block_size=self.block_size,
+            physical_width=self.physical_width,
+            causal_mask=self.causal_mask,
+        )
+
+
 class QSAIndexer(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -1573,7 +1817,13 @@ class QSAIndexer(nn.Module):
             # lookup with dense sink+recent attention. The full target keeps
             # native QSA and remains the sole verifier.
             mask = cache.make_mask(length, return_array=True)
-            return None if mask is None else mask[None, None, :, :]
+            return QSASelection(
+                kind="mask_only",
+                batch=batch,
+                length=length,
+                block_size=self.compress_ratio,
+                passthrough_mask=None if mask is None else mask[None, None, :, :],
+            )
         offset = 0 if cache is None else cache.offset
         # This indexer straddles two coordinate systems and ``left_pad`` is the
         # only bridge between them.  A BatchKVCache reports a LOGICAL, per-row
@@ -1637,7 +1887,17 @@ class QSAIndexer(nn.Module):
         # reads.
         n_blocks = total // self.compress_ratio
         if n_blocks == 0:
-            return causal_mask
+            return QSASelection(
+                kind="implicit_all",
+                batch=batch,
+                length=length,
+                block_size=self.compress_ratio,
+                causal_mask=causal_mask,
+                left_padding=left_pad,
+                offset=offset,
+                physical_width=total,
+                n_blocks=n_blocks,
+            )
         if _QSA_DENSE_SHORTCIRCUIT and self._dense_by_construction(
             n_blocks, shared_topk
         ):
@@ -1651,7 +1911,17 @@ class QSAIndexer(nn.Module):
                         mx.arange(n_blocks, dtype=mx.uint32), (batch, n_blocks)
                     )
                 )
-            return causal_mask
+            return QSASelection(
+                kind="implicit_all",
+                batch=batch,
+                length=length,
+                block_size=self.compress_ratio,
+                causal_mask=causal_mask,
+                left_padding=left_pad,
+                offset=offset,
+                physical_width=total,
+                n_blocks=n_blocks,
+            )
 
         if left_pad is not None:
             q_pos = offset[:, None] + mx.arange(length)[None, :]
@@ -1689,43 +1959,25 @@ class QSAIndexer(nn.Module):
             selected = mx.broadcast_to(
                 shared_topk[:, None, :], (batch, length, shared_topk.shape[-1])
             )
-        if _QSA_SCATTER_CHOSEN:
-            # ``argpartition`` output has no duplicate indices, so a scatter
-            # of ones is equivalent to the one-hot broadcast reduction.
-            chosen = mx.put_along_axis(
-                mx.zeros((batch, length, n_blocks), dtype=mx.bool_),
-                selected,
-                mx.array(True),
-                axis=-1,
-            )
-        else:
-            block_ids = mx.arange(n_blocks)
-            chosen = mx.any(
-                selected[..., None] == block_ids[None, None, None, :], axis=-2
-            )
-        chosen = chosen & valid_blocks
-        # ``clip`` where the unpadded path clamped: the lower bound only bites
-        # on left padding, whose columns the ``>= 0`` term below removes.
-        token_block = mx.clip(
-            token_logical // self.compress_ratio, 0, n_blocks - 1
+        # Mask assembly lives in ``QSASelection.dense_mask``.  Selection and
+        # every cache side effect stay here, so the caller sees the same
+        # ledger, pooled-key and shared-top-k state it always did.
+        return QSASelection(
+            kind="explicit",
+            batch=batch,
+            length=length,
+            block_size=self.compress_ratio,
+            raw_block_ids=selected,
+            valid_blocks=valid_blocks,
+            q_positions=q_pos,
+            token_positions=token_logical,
+            causal_mask=causal_mask,
+            left_padding=left_pad,
+            offset=offset,
+            physical_width=total,
+            n_blocks=n_blocks,
+            scatter_chosen=_QSA_SCATTER_CHOSEN,
         )
-        selected_tokens = mx.take_along_axis(
-            chosen,
-            mx.broadcast_to(token_block[:, None, :], (batch, length, total)),
-            axis=-1,
-        )
-        complete = ((q_pos + 1) // self.compress_ratio) * self.compress_ratio
-        tail = (token_logical[:, None, :] >= complete[..., None]) & (
-            token_logical[:, None, :] <= q_pos[..., None]
-        )
-        sparse = selected_tokens | tail
-        if left_pad is not None:
-            sparse = sparse & (token_logical[:, None, :] >= 0)
-        sparse = sparse[:, None, :, :]
-        # ``create_attention_mask`` deliberately returns ``None`` for a
-        # single-token decode because every cached position is causal.  QSA
-        # still needs its sparse selection mask in that case.
-        return sparse if causal_mask is None else causal_mask & sparse
 
 
 class Attention(nn.Module):
@@ -1794,7 +2046,8 @@ class Attention(nn.Module):
                     [width_q, width_q + width_kv, width_q + 2 * width_kv],
                     axis=-1,
                 )
-        sparse_mask = self.indexer(x, mask, cache, projected_qk=fused_index_qk)
+        selection = self.indexer(x, mask, cache, projected_qk=fused_index_qk)
+        sparse_mask = selection.dense_mask()
         if fused_index_qk is None:
             qg = self.q_proj(x)
             k_flat = self.k_proj(x)

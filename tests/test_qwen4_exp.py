@@ -2,6 +2,7 @@
 
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,6 +35,7 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
+from mlx_lm.models import qwen4_exp as qwen4_exp_module
 from mlx_lm.models.qwen4_exp import (
     BatchQSAKVCache,
     GatedResidual,
@@ -43,9 +45,11 @@ from mlx_lm.models.qwen4_exp import (
     PLELayer,
     QSAIndexer,
     QSAKVCache,
+    QSASelection,
     Qwen4ArraysCache,
     TextModel,
     TextModelArgs,
+    _compact_qsa_block_ids,
 )
 
 
@@ -89,6 +93,17 @@ def tiny_args(**overrides):
     )
     values.update(overrides)
     return TextModelArgs(**values)
+
+
+@contextmanager
+def lever_flag(name, value=True):
+    """Flip one import-time micro-lever for the body of a test."""
+    previous = getattr(qwen4_exp_module, name)
+    setattr(qwen4_exp_module, name, value)
+    try:
+        yield
+    finally:
+        setattr(qwen4_exp_module, name, previous)
 
 
 @contextmanager
@@ -201,7 +216,7 @@ class TestQwen4Exp(unittest.TestCase):
         cache = QSAKVCache()
         hidden = mx.random.normal((1, 9, args.hidden_size))
         causal = mx.arange(9)[:, None] >= mx.arange(9)[None, :]
-        sparse = indexer(hidden, causal[None, None], cache)
+        sparse = indexer(hidden, causal[None, None], cache).dense_mask()
         mx.eval(sparse)
         self.assertEqual(sparse.shape, (1, 1, 9, 9))
         self.assertEqual(cache.index_keys.shape, (1, 9, args.indexer_head_dim))
@@ -623,10 +638,11 @@ class TestQSALeftPaddedBatch(unittest.TestCase):
             out = original(
                 indexer, hidden, causal_mask, cache, projected_qk=projected_qk
             )
+            mask = out.dense_mask()
             records.append(
                 (
                     None if causal_mask is None else np.asarray(causal_mask),
-                    None if out is None else np.asarray(out),
+                    None if mask is None else np.asarray(mask),
                 )
             )
             return out
@@ -2198,3 +2214,543 @@ class TestQSAKVQuantizationRefused(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "index_keys"):
             maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, self.BITS)
+
+
+def _oracle_dense_mask(
+    selection, *, causal=True, ignore_validity=False, ignore_padding=False
+):
+    """Rebuild the QSA mask independently, in NumPy, with explicit loops.
+
+    Deliberately shares NO code with ``QSASelection.dense_mask`` or with the
+    production compactor: it re-derives the selected set, the clipped block
+    lookup, the incomplete tail, the left-padding cut and the causal
+    conjunction from the object's own fields.  The keyword switches drop one
+    term at a time so a test can show that term is load-bearing.
+    """
+    ratio = selection.block_size
+    n_blocks = selection.n_blocks
+    batch, length = selection.batch, selection.length
+    total = selection.physical_width
+    ids = np.asarray(selection.raw_block_ids)
+    valid = np.asarray(selection.valid_blocks)
+    q_pos = np.asarray(selection.q_positions)
+    tok_pos = np.asarray(selection.token_positions)
+    padded = selection.left_padding is not None
+    out = np.zeros((batch, 1, length, total), dtype=bool)
+    for row in range(batch):
+        for query in range(length):
+            chosen = {
+                int(i)
+                for i in ids[row, query]
+                if ignore_validity or valid[row % valid.shape[0], query, int(i)]
+            }
+            position = int(q_pos[row % q_pos.shape[0], query])
+            tail_low = ((position + 1) // ratio) * ratio
+            for column in range(total):
+                logical = int(tok_pos[row % tok_pos.shape[0], column])
+                block = min(max(logical // ratio, 0), n_blocks - 1)
+                hit = block in chosen or tail_low <= logical <= position
+                cut = padded and logical < 0 and not ignore_padding
+                out[row, 0, query, column] = hit and not cut
+    if causal and selection.causal_mask is not None:
+        out = out & np.asarray(selection.causal_mask)
+    return out
+
+
+class TestQSASelectionObject(unittest.TestCase):
+    """The gather-sparse step 1 seam: selection is an object, the mask is a
+    method on it, and the compact view is lazy.  Nothing observable changes.
+    """
+
+    RATIO = 4  # tiny_args indexer_compress_ratio; block_topk is 2
+
+    def _model(self):
+        mx.random.seed(11)
+        return TextModel(
+            tiny_args(ple_layer_ids=[], layer_types=["full_attention"] * 4)
+        )
+
+    @contextmanager
+    def _selections(self):
+        """Collect every ``QSASelection`` the indexer returns, in call order."""
+        records = []
+        original = QSAIndexer.__call__
+
+        def spy(indexer, hidden, causal_mask, cache, projected_qk=None):
+            out = original(
+                indexer, hidden, causal_mask, cache, projected_qk=projected_qk
+            )
+            records.append(out)
+            return out
+
+        QSAIndexer.__call__ = spy
+        try:
+            yield records
+        finally:
+            QSAIndexer.__call__ = original
+
+    def _merged(self, model, prompts):
+        caches = []
+        for prompt in prompts:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        return _merge_caches(caches)
+
+    def _drive(self, model, records):
+        """A schedule that reaches every selection kind and both geometries."""
+        cache = model.make_cache()
+        mx.eval(model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache))
+        for chunk in ([4, 5, 6, 7, 8, 9], [10], [11, 12], [13], [14]):
+            mx.eval(model(mx.array([chunk], dtype=mx.int32), cache=cache))
+        batch = self._merged(model, [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15]])
+        for chunk in ([[20, 21], [20, 21]], [[22], [22]], [[23], [23]]):
+            mx.eval(model(mx.array(chunk, dtype=mx.int32), cache=batch))
+        return records
+
+    # ---- 1. the mask is what it always was -----------------------------
+
+    def test_dense_mask_matches_an_independent_numpy_oracle(self):
+        model = self._model()
+        with self._selections() as records:
+            self._drive(model, records)
+        explicit = [s for s in records if s.kind == "explicit"]
+        self.assertTrue(explicit, "the schedule never went sparse")
+        dropped = 0
+        for index, selection in enumerate(explicit):
+            mask = selection.dense_mask()
+            self.assertIsNotNone(mask, f"selection {index}")
+            np.testing.assert_array_equal(
+                np.asarray(mask), _oracle_dense_mask(selection), f"selection {index}"
+            )
+            if selection.causal_mask is not None:
+                causal = np.asarray(selection.causal_mask)
+                dropped += int((causal & ~np.asarray(mask)).sum())
+        # Without this the oracle could be agreeing on a dense mask only.
+        self.assertGreater(dropped, 0, "no causal cell was ever removed")
+
+    def test_every_kind_is_reached_and_tagged(self):
+        model = self._model()
+        with self._selections() as records:
+            self._drive(model, records)
+        kinds = {s.kind for s in records}
+        self.assertIn("explicit", kinds)
+        self.assertIn("implicit_all", kinds)
+        for selection in records:
+            if selection.kind == "implicit_all":
+                # The dense return is the causal mask OBJECT, not a copy.
+                self.assertIs(selection.dense_mask(), selection.causal_mask)
+
+    def test_sink_window_cache_is_mask_only_and_has_no_blocks(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        cache = SinkWindowKVCache(window_size=4, sink_size=2, rollback_window=4)
+        cache.offset = 6
+        selection = indexer(
+            mx.random.normal((1, 1, args.hidden_size)), None, cache
+        )
+        self.assertEqual(selection.kind, "mask_only")
+        # Windowed MTP replaces global QSA; there is nothing to gather.
+        self.assertIsNone(selection.compact_blocks())
+        mask = selection.dense_mask()
+        self.assertTrue(mask is None or mask.ndim == 4)
+
+    # ---- 2. the causal conjunction is load-bearing ----------------------
+
+    def test_clip_names_an_acausal_column_that_only_the_conjunction_removes(self):
+        """The ratio-4 / total-10 / left-pad-1 geometry from the design.
+
+        Row 1 holds one padding column, so physical column 9 is its logical
+        position 8 -- FUTURE for the chunk's first query at logical 7.  The
+        clip maps that column to block 1, which is selected and causally
+        valid for query 7, and the tail range is empty.  Only the final
+        ``causal_mask &`` removes the cell.
+        """
+        model = self._model()
+        with self._selections() as records:
+            batch = self._merged(
+                model, [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15]]
+            )
+            padding = next(
+                layer.left_padding.tolist()
+                for layer in batch
+                if isinstance(layer, BatchQSAKVCache)
+            )
+            self.assertEqual(padding, [0, 1])
+            del records[:]
+            mx.eval(model(mx.array([[20, 21], [20, 21]], dtype=mx.int32), cache=batch))
+        acausal = 0
+        for selection in records:
+            self.assertEqual(selection.kind, "explicit")
+            self.assertEqual(selection.physical_width, 10)
+            self.assertEqual(selection.n_blocks, 2)
+            self.assertEqual(int(np.asarray(selection.q_positions)[1, 0]), 7)
+            self.assertEqual(int(np.asarray(selection.token_positions)[1, 9]), 8)
+            # The mask BEFORE the conjunction: same object, causal mask
+            # dropped, so dense_mask() returns the raw sparse form.
+            raw = np.asarray(replace(selection, causal_mask=None).dense_mask())
+            self.assertTrue(
+                bool(raw[1, 0, 0, 9]),
+                "the clip no longer names the acausal column; this test is vacuous",
+            )
+            acausal += 1
+            self.assertFalse(
+                bool(np.asarray(selection.dense_mask())[1, 0, 0, 9]),
+                "an acausal column survived into the QSA mask",
+            )
+        self.assertGreater(acausal, 0, "no selection was inspected")
+
+    def test_the_raw_sparse_form_still_filters_by_block_validity(self):
+        """``chosen & valid_blocks`` and the left-padding cut are invisible
+        AFTER the causal conjunction -- it subsumes both -- so gate them on
+        the pre-conjunction form, where they do real work.
+        """
+        model = self._model()
+        with self._selections() as records:
+            self._drive(model, records)
+        explicit = [s for s in records if s.kind == "explicit"]
+        self.assertTrue(explicit)
+        loosened = padded = padding_cells = 0
+        for index, selection in enumerate(explicit):
+            raw = np.asarray(replace(selection, causal_mask=None).dense_mask())
+            np.testing.assert_array_equal(
+                raw,
+                _oracle_dense_mask(selection, causal=False),
+                f"selection {index}",
+            )
+            loosened += int(
+                (
+                    _oracle_dense_mask(
+                        selection, causal=False, ignore_validity=True
+                    )
+                    != raw
+                ).sum()
+            )
+            if selection.left_padding is not None:
+                padded += 1
+                # Padding is PER ROW; row 0 usually has none.
+                for row, pad in enumerate(
+                    np.asarray(selection.left_padding).tolist()
+                ):
+                    np.testing.assert_array_equal(
+                        raw[row, ..., :pad],
+                        False,
+                        f"selection {index} row {row} attends its left padding",
+                    )
+                padding_cells += int(
+                    (
+                        _oracle_dense_mask(
+                            selection, causal=False, ignore_padding=True
+                        )
+                        != raw
+                    ).sum()
+                )
+        self.assertGreater(loosened, 0, "the validity filter removed nothing")
+        self.assertGreater(padded, 0, "no left-padded selection was seen")
+        self.assertGreater(padding_cells, 0, "the padding cut removed nothing")
+
+    def test_mtp_shared_top_k_stores_the_raw_selection_not_the_compacted_one(self):
+        """Compaction filters by the CURRENT query's validity.  Dropping
+        invalid slots before caching would change which ids can become valid
+        on a later query, so the cached set must be the raw one."""
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        cache = QSAKVCache()
+        hidden = mx.random.normal((1, 13, args.hidden_size), key=mx.random.key(8))
+        causal = (mx.arange(13)[:, None] >= mx.arange(13)[None, :])[None, None]
+        cache._mtp_share_topk = True
+        cache._mtp_shared_topk = None
+        selection = indexer(hidden, causal, cache)
+        self.assertEqual(selection.kind, "explicit")
+        raw_last = np.asarray(selection.raw_block_ids)[:, -1]
+        np.testing.assert_array_equal(
+            np.asarray(cache._mtp_shared_topk),
+            raw_last,
+            "the shared set is not the raw last-query selection",
+        )
+        compact_last = np.asarray(selection.compact_blocks().block_ids)[:, -1]
+        self.assertFalse(
+            np.array_equal(raw_last, compact_last),
+            "raw and compacted ids coincide here, so this test is vacuous",
+        )
+
+    # ---- 3. the scatter lever is snapshotted, not reread -----------------
+
+    def test_scatter_chosen_is_snapshot_at_selection_time(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        hidden = mx.random.normal((1, 13, args.hidden_size), key=mx.random.key(5))
+        causal = (mx.arange(13)[:, None] >= mx.arange(13)[None, :])[None, None]
+        previous = qwen4_exp_module._QSA_SCATTER_CHOSEN
+        qwen4_exp_module._QSA_SCATTER_CHOSEN = True
+        try:
+            selection = indexer(hidden, causal, QSAKVCache())
+            self.assertEqual(selection.kind, "explicit")
+            self.assertTrue(selection.scatter_chosen)
+        finally:
+            qwen4_exp_module._QSA_SCATTER_CHOSEN = previous
+        # The global is back to stock, but a mask built now must still take
+        # the path the selection was made under.  Both paths give the same
+        # mask, so watch WHICH one runs, not what it returns.
+        self.assertTrue(selection.scatter_chosen)
+        with self._count_scatters() as scatters:
+            scattered = np.asarray(selection.dense_mask())
+        self.assertEqual(scatters, [1], "the snapshot was ignored, the global was read")
+        broadcast = replace(selection, scatter_chosen=False)
+        qwen4_exp_module._QSA_SCATTER_CHOSEN = True
+        try:
+            with self._count_scatters() as scatters:
+                stock = np.asarray(broadcast.dense_mask())
+        finally:
+            qwen4_exp_module._QSA_SCATTER_CHOSEN = previous
+        self.assertEqual(scatters, [], "the global overrode a False snapshot")
+        np.testing.assert_array_equal(scattered, stock)
+
+    @contextmanager
+    def _count_scatters(self):
+        """Count ``mx.put_along_axis`` calls: the scatter path's fingerprint."""
+        calls = []
+        original = mx.put_along_axis
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        mx.put_along_axis = spy
+        try:
+            yield calls
+        finally:
+            mx.put_along_axis = original
+
+    # ---- 4. compaction ---------------------------------------------------
+
+    def _compact(self, ids, valid, n_blocks):
+        packed, counts = _compact_qsa_block_ids(
+            mx.array(ids, dtype=mx.uint32),
+            mx.array(valid, dtype=mx.bool_),
+            n_blocks=n_blocks,
+        )
+        return np.asarray(packed), np.asarray(counts)
+
+    def test_compaction_packs_a_single_valid_id_out_of_the_last_slot(self):
+        """``argpartition`` with one valid block leaves the first slots invalid;
+        a prefix scan of the raw ids would read the wrong thing."""
+        ids = [[[3, 1, 4, 1, 5, 9, 2, 6, 7]]]
+        valid = [[[False] * 8 + [True]]]
+        packed, counts = self._compact(ids, valid, n_blocks=16)
+        self.assertEqual(counts.tolist(), [[1]])
+        self.assertEqual(packed[0, 0, 0], 7)
+        self.assertEqual(packed[0, 0, 1:].tolist(), [0] * 8)
+
+    def test_compaction_sorts_a_mixed_unsorted_selection(self):
+        packed, counts = self._compact(
+            [[[5, 2, 7, 1]]], [[[True, False, True, True]]], n_blocks=8
+        )
+        self.assertEqual(counts.tolist(), [[3]])
+        self.assertEqual(packed[0, 0, :3].tolist(), [1, 5, 7])
+        self.assertEqual(packed[0, 0, 3], 0)
+
+    def test_compaction_handles_empty_full_and_ragged_rows(self):
+        ids = [[[2, 0, 1], [2, 0, 1]], [[1, 2, 0], [0, 2, 1]]]
+        valid = [
+            [[False, False, False], [True, True, True]],
+            [[True, False, True], [False, True, False]],
+        ]
+        packed, counts = self._compact(ids, valid, n_blocks=3)
+        self.assertEqual(counts.tolist(), [[0, 3], [2, 1]])
+        self.assertEqual(packed[0, 0].tolist(), [0, 0, 0])
+        self.assertEqual(packed[0, 1].tolist(), [0, 1, 2])
+        self.assertEqual(packed[1, 0].tolist(), [0, 1, 0])
+        self.assertEqual(packed[1, 1].tolist(), [2, 0, 0])
+
+    def test_compaction_preserves_the_set_capacity_and_dtype(self):
+        rng = np.random.default_rng(7)
+        n_blocks, width = 12, 6
+        ids = np.stack(
+            [
+                [rng.permutation(n_blocks)[:width] for _ in range(3)]
+                for _ in range(2)
+            ]
+        ).astype(np.uint32)
+        valid = rng.random((2, 3, width)) < 0.5
+        source = mx.array(ids)
+        packed, counts = _compact_qsa_block_ids(
+            source, mx.array(valid), n_blocks=n_blocks
+        )
+        self.assertEqual(packed.dtype, source.dtype)
+        self.assertEqual(packed.shape, source.shape)
+        packed, counts = np.asarray(packed), np.asarray(counts)
+        for row in range(2):
+            for query in range(3):
+                count = int(counts[row, query])
+                prefix = packed[row, query, :count].tolist()
+                self.assertEqual(
+                    sorted(prefix), sorted(ids[row, query][valid[row, query]].tolist())
+                )
+                self.assertEqual(prefix, sorted(prefix))
+                self.assertEqual(packed[row, query, count:].tolist(), [0] * (width - count))
+
+    def test_compaction_rejects_mismatched_input(self):
+        with self.assertRaises(ValueError):
+            _compact_qsa_block_ids(
+                mx.zeros((1, 2), dtype=mx.uint32),
+                mx.zeros((1, 2), dtype=mx.bool_),
+                n_blocks=4,
+            )
+        with self.assertRaises(ValueError):
+            _compact_qsa_block_ids(
+                mx.zeros((1, 2, 3), dtype=mx.uint32),
+                mx.zeros((1, 2, 4), dtype=mx.bool_),
+                n_blocks=4,
+            )
+
+    def test_compact_blocks_agrees_with_the_dense_mask(self):
+        """Every compacted block must be one the mask actually attends, and
+        the mask must attend nothing outside the compacted set plus tail."""
+        model = self._model()
+        with self._selections() as records:
+            self._drive(model, records)
+        checked = invalid_before_valid = 0
+        for selection in records:
+            if selection.kind != "explicit":
+                continue
+            compact = selection.compact_blocks()
+            self.assertEqual(
+                compact.block_ids.shape, selection.raw_block_ids.shape
+            )
+            packed = np.asarray(compact.block_ids)
+            counts = np.asarray(compact.block_counts)
+            valid = np.asarray(compact.block_valid)
+            raw = np.asarray(selection.raw_block_ids)
+            block_valid = np.asarray(selection.valid_blocks)
+            q_pos = np.asarray(selection.q_positions)
+            for row in range(selection.batch):
+                for query in range(selection.length):
+                    count = int(counts[row, query])
+                    prefix = packed[row, query, :count].tolist()
+                    expected = sorted(
+                        {
+                            int(i)
+                            for i in raw[row, query]
+                            if block_valid[row % block_valid.shape[0], query, int(i)]
+                        }
+                    )
+                    self.assertEqual(prefix, expected)
+                    self.assertEqual(prefix, sorted(prefix))
+                    self.assertEqual(valid[row, query].tolist(), [True] * count + [False] * (len(packed[row, query]) - count))
+                    position = int(q_pos[row % q_pos.shape[0], query])
+                    self.assertEqual(int(np.asarray(compact.tail_stop)[row, query]), position + 1)
+                    self.assertEqual(
+                        int(np.asarray(compact.tail_start)[row, query]),
+                        ((position + 1) // self.RATIO) * self.RATIO,
+                    )
+                    flags = [
+                        bool(block_valid[row % block_valid.shape[0], query, int(i)])
+                        for i in raw[row, query]
+                    ]
+                    if False in flags and True in flags and flags.index(False) < flags.index(True):
+                        invalid_before_valid += 1
+                    checked += 1
+        self.assertGreater(checked, 0, "no explicit selection was compacted")
+        self.assertGreater(
+            invalid_before_valid,
+            0,
+            "compaction never saw an invalid slot before a valid one",
+        )
+
+    def test_compact_blocks_carries_the_causal_contract(self):
+        model = self._model()
+        with self._selections() as records:
+            batch = self._merged(
+                model, [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15]]
+            )
+            del records[:]
+            mx.eval(model(mx.array([[20, 21], [20, 21]], dtype=mx.int32), cache=batch))
+        for selection in records:
+            compact = selection.compact_blocks()
+            # Blocks alone are not causally complete, so the contract travels
+            # with them: left padding to reach physical columns, and the
+            # causal mask the clip made necessary.
+            self.assertIs(compact.causal_mask, selection.causal_mask)
+            self.assertIs(compact.left_padding, selection.left_padding)
+            self.assertEqual(compact.block_size, self.RATIO)
+            self.assertEqual(compact.physical_width, 10)
+
+    def test_implicit_all_compacts_to_every_causally_valid_block(self):
+        args = tiny_args()
+        indexer = QSAIndexer(args)
+        cache = QSAKVCache()
+        hidden = mx.random.normal((1, 9, args.hidden_size), key=mx.random.key(2))
+        causal = (mx.arange(9)[:, None] >= mx.arange(9)[None, :])[None, None]
+        with lever_flag("_QSA_DENSE_SHORTCIRCUIT"):
+            selection = indexer(hidden, causal, cache)
+        self.assertEqual(selection.kind, "implicit_all")
+        compact = selection.compact_blocks()
+        counts = np.asarray(compact.block_counts)[0].tolist()
+        # Blocks are [0,4) and [4,8): query q closes block b when 4b+3 <= q.
+        self.assertEqual(counts, [0, 0, 0, 1, 1, 1, 1, 2, 2])
+        packed = np.asarray(compact.block_ids)
+        self.assertEqual(packed[0, 7].tolist(), [0, 1])
+        self.assertEqual(packed[0, 3].tolist(), [0, 0])
+
+    # ---- 5. laziness -----------------------------------------------------
+
+    def test_compaction_is_never_called_by_the_mask_path(self):
+        """Sorting up to block_topk ids on every masked SDPA call would be new
+        hot-path work.  The model and dense_mask() must not touch it."""
+        calls = []
+        original = qwen4_exp_module._compact_qsa_block_ids
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        qwen4_exp_module._compact_qsa_block_ids = spy
+        try:
+            model = self._model()
+            with self._selections() as records:
+                self._drive(model, records)
+            for selection in records:
+                mask = selection.dense_mask()
+                if mask is not None:
+                    mx.eval(mask)
+            self.assertEqual(calls, [], "the mask path called the compactor")
+            self.assertTrue(any(s.kind == "explicit" for s in records))
+            # ... and it IS reachable, so the gate above is not vacuous.
+            next(s for s in records if s.kind == "explicit").compact_blocks()
+            self.assertEqual(len(calls), 1)
+        finally:
+            qwen4_exp_module._compact_qsa_block_ids = original
+
+    # ---- 6. structural invariants ----------------------------------------
+
+    def test_structural_invariants_are_asserted(self):
+        base = dict(
+            kind="explicit",
+            batch=1,
+            length=2,
+            block_size=4,
+            raw_block_ids=mx.zeros((1, 2, 2), dtype=mx.uint32),
+            valid_blocks=mx.zeros((1, 2, 2), dtype=mx.bool_),
+            q_positions=mx.zeros((1, 2), dtype=mx.int32),
+            token_positions=mx.zeros((1, 8), dtype=mx.int32),
+            physical_width=8,
+            n_blocks=2,
+        )
+        QSASelection(**base)  # the good shape builds
+        for field, value in (
+            ("n_blocks", 3),
+            ("valid_blocks", mx.zeros((1, 2, 3), dtype=mx.bool_)),
+            ("raw_block_ids", mx.zeros((1, 2), dtype=mx.uint32)),
+            ("token_positions", mx.zeros((1, 7), dtype=mx.int32)),
+            ("left_padding", mx.zeros((2,), dtype=mx.int32)),
+            ("causal_mask", mx.zeros((1, 1, 2, 7), dtype=mx.bool_)),
+            ("kind", "gather"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    QSASelection(**{**base, field: value})
+
+
+if __name__ == "__main__":
+    unittest.main()
