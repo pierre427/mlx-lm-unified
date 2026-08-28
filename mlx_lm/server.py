@@ -1,6 +1,8 @@
 # Copyright © 2023-2026 Apple Inc.
 
 import argparse
+import hmac
+import importlib
 import json
 import logging
 import math
@@ -8,15 +10,17 @@ import os
 import pickle
 import platform
 import socket
+import sys
 import time
 import uuid
 import warnings
+import weakref
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Condition, Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -524,6 +528,307 @@ def _maybe_apply_int8_prefill(args) -> bool:
     apply()
     logging.info("int8 NAX prefill patch applied.")
     return True
+
+
+SOFT_RELOAD_PATH = "/v1/admin/soft_reload"
+EFFECTIVE_CONFIG_PATH = "/v1/admin/config"
+
+# Longest a soft reload waits for in-flight generation before it gives up.
+DEFAULT_SOFT_RELOAD_DRAIN_TIMEOUT = 120.0
+# Longest a new request waits at the closed admission gate before a 503.
+DEFAULT_SOFT_RELOAD_ADMISSION_TIMEOUT = 30.0
+
+
+class SoftReloadError(ValueError):
+    """The requested soft reload is malformed or not permitted (400)."""
+
+
+class SoftReloadRestartRequired(SoftReloadError):
+    """The requested key exists but only a process restart can change it."""
+
+
+class SoftReloadBusy(RuntimeError):
+    """The server could not quiesce, or a reload is already running (503)."""
+
+
+def _reload_flag(value):
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1) and isinstance(value, int):
+        return bool(value)
+    raise SoftReloadError(f"expected a boolean, got {value!r}")
+
+
+def _reload_int(low, high, *, allow_none=False):
+    def check(value):
+        if value is None:
+            if allow_none:
+                return None
+            raise SoftReloadError("expected an integer, got null")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SoftReloadError(f"expected an integer, got {value!r}")
+        if not low <= value <= high:
+            raise SoftReloadError(f"{value} is outside [{low}, {high}]")
+        return value
+
+    return check
+
+
+def _reload_float(low, high):
+    def check(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SoftReloadError(f"expected a number, got {value!r}")
+        value = float(value)
+        if not low <= value <= high:
+            raise SoftReloadError(f"{value} is outside [{low}, {high}]")
+        return value
+
+    return check
+
+
+@dataclass(frozen=True)
+class MutableKey:
+    """One permitted soft-reload target.
+
+    ``kind`` is ``cli_args`` for a serving argument read per request, or
+    ``module`` for a model-code lever constant read inside a forward pass.
+    """
+
+    kind: str
+    attr: str
+    validate: Callable[[Any], Any]
+    module: Optional[str] = None
+
+
+# The soft-reload whitelist. Every entry is checked to be read *per request*
+# (cli_args) or *per forward* (module), so the change takes effect on the next
+# request without rebuilding anything. Nothing outside this registry can be
+# written: the reload route never does a bare setattr from a request body.
+SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
+    # Self-MTP speculative decoding, read by _self_mtp_config per request.
+    "self_mtp": MutableKey("cli_args", "self_mtp", _reload_flag),
+    "self_mtp_num_draft": MutableKey(
+        "cli_args", "self_mtp_num_draft", _reload_int(1, MAX_DRAFT_TOKENS)
+    ),
+    "self_mtp_adaptive_depth_ceiling": MutableKey(
+        "cli_args",
+        "self_mtp_adaptive_depth_ceiling",
+        _reload_int(1, MAX_DRAFT_TOKENS, allow_none=True),
+    ),
+    "self_mtp_persistent": MutableKey(
+        "cli_args", "self_mtp_persistent", _reload_flag
+    ),
+    "self_mtp_rate_gate": MutableKey("cli_args", "self_mtp_rate_gate", _reload_flag),
+    "self_mtp_transformed_verifier": MutableKey(
+        "cli_args", "self_mtp_transformed_verifier", _reload_flag
+    ),
+    "self_mtp_share_qsa_indices": MutableKey(
+        "cli_args", "self_mtp_share_qsa_indices", _reload_flag
+    ),
+    "self_mtp_share_qsa_indices_min_prompt_tokens": MutableKey(
+        "cli_args",
+        "self_mtp_share_qsa_indices_min_prompt_tokens",
+        _reload_int(0, 1 << 22),
+    ),
+    "self_mtp_window_size": MutableKey(
+        "cli_args", "self_mtp_window_size", _reload_int(0, 1 << 22)
+    ),
+    "self_mtp_window_sink_size": MutableKey(
+        "cli_args", "self_mtp_window_sink_size", _reload_int(0, 1 << 16)
+    ),
+    "self_mtp_window_min_prompt_tokens": MutableKey(
+        "cli_args", "self_mtp_window_min_prompt_tokens", _reload_int(0, 1 << 22)
+    ),
+    "self_mtp_apc_retain_min_prompt_tokens": MutableKey(
+        "cli_args", "self_mtp_apc_retain_min_prompt_tokens", _reload_int(0, 1 << 22)
+    ),
+    # Draft-model and prompt-lookup speculation, read per request in do_POST.
+    "num_draft_tokens": MutableKey(
+        "cli_args", "num_draft_tokens", _reload_int(0, MAX_DRAFT_TOKENS)
+    ),
+    "prompt_lookup_ngram": MutableKey(
+        "cli_args", "prompt_lookup_ngram", _reload_int(0, 16)
+    ),
+    "prompt_lookup_tokens": MutableKey(
+        "cli_args", "prompt_lookup_tokens", _reload_int(0, MAX_DRAFT_TOKENS)
+    ),
+    "prompt_lookup_adaptive": MutableKey(
+        "cli_args", "prompt_lookup_adaptive", _reload_flag
+    ),
+    "prompt_lookup_rate_gate": MutableKey(
+        "cli_args", "prompt_lookup_rate_gate", _reload_flag
+    ),
+    "prompt_lookup_warmup": MutableKey(
+        "cli_args", "prompt_lookup_warmup", _reload_int(0, 1 << 20)
+    ),
+    "prompt_lookup_gate": MutableKey(
+        "cli_args", "prompt_lookup_gate", _reload_float(0.0, 1.0)
+    ),
+    "prompt_lookup_rate_gate_probe": MutableKey(
+        "cli_args", "prompt_lookup_rate_gate_probe", _reload_int(1, 1 << 20)
+    ),
+    "prompt_lookup_rate_gate_margin": MutableKey(
+        "cli_args", "prompt_lookup_rate_gate_margin", _reload_float(-1.0, 1.0)
+    ),
+    # Server-side sampling and length defaults, read per request in do_POST.
+    "temp": MutableKey("cli_args", "temp", _reload_float(0.0, 4.0)),
+    "top_p": MutableKey("cli_args", "top_p", _reload_float(0.0, 1.0)),
+    "top_k": MutableKey("cli_args", "top_k", _reload_int(0, 1 << 20)),
+    "min_p": MutableKey("cli_args", "min_p", _reload_float(0.0, 1.0)),
+    "max_tokens": MutableKey("cli_args", "max_tokens", _reload_int(1, 1 << 22)),
+    # Model-code levers whose constant is read inside a forward pass. Each was
+    # checked to be read per call, not bound at module or layer construction.
+    "qwen4_rmsnorm_fast": MutableKey(
+        "module", "_RMSNORM_FAST", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_pooled_key_cache": MutableKey(
+        "module", "_QSA_POOLED_KEY_CACHE", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_scatter_chosen": MutableKey(
+        "module", "_QSA_SCATTER_CHOSEN", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_dense_shortcircuit": MutableKey(
+        "module", "_QSA_DENSE_SHORTCIRCUIT", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_fused_proj": MutableKey(
+        "module", "_QSA_FUSED_PROJ", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_ple_vector_shift": MutableKey(
+        "module", "_PLE_VECTOR_SHIFT", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_ple_gather_concat": MutableKey(
+        "module", "_PLE_GATHER_CONCAT", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_moe_gate_compile": MutableKey(
+        "module", "_MOE_GATE_COMPILE", _reload_flag, "mlx_lm.models.qwen3_next"
+    ),
+}
+
+_RELOAD_NEEDS_MODEL = "requires a model reload; restart the server"
+_RELOAD_NEEDS_BUILD = (
+    "is bound when the batch generator or the prompt cache is built; "
+    "restart the server"
+)
+_RELOAD_NEEDS_PROCESS = "is a process-level setting; restart the server"
+_RELOAD_NEEDS_LAYERS = (
+    "changes the built module or weight layout, not just arithmetic; "
+    "restart the server"
+)
+
+# Keys a caller plausibly wants but which cannot take effect in place. These
+# are refused loudly. Silently accepting one and doing nothing would be worse
+# than refusing: the caller would measure the old configuration under the new
+# label.
+SOFT_RELOAD_RESTART_KEYS: Dict[str, str] = {
+    "model": _RELOAD_NEEDS_MODEL,
+    "adapter_path": _RELOAD_NEEDS_MODEL,
+    "draft_model": _RELOAD_NEEDS_MODEL,
+    "quantization": _RELOAD_NEEDS_MODEL,
+    "quantize": _RELOAD_NEEDS_MODEL,
+    "trust_remote_code": _RELOAD_NEEDS_MODEL,
+    "chat_template": _RELOAD_NEEDS_MODEL,
+    "chat_template_args": _RELOAD_NEEDS_MODEL,
+    "use_default_chat_template": _RELOAD_NEEDS_MODEL,
+    "single_model": _RELOAD_NEEDS_MODEL,
+    "kv_bits": _RELOAD_NEEDS_BUILD,
+    "kv_key_bits": _RELOAD_NEEDS_BUILD,
+    "kv_value_bits": _RELOAD_NEEDS_BUILD,
+    "kv_group_size": _RELOAD_NEEDS_BUILD,
+    "quantized_kv_start": _RELOAD_NEEDS_BUILD,
+    "decode_concurrency": _RELOAD_NEEDS_BUILD,
+    "prompt_concurrency": _RELOAD_NEEDS_BUILD,
+    "prefill_step_size": _RELOAD_NEEDS_BUILD,
+    "prompt_batch_window": _RELOAD_NEEDS_BUILD,
+    "prompt_cache_size": _RELOAD_NEEDS_BUILD,
+    "prompt_cache_bytes": _RELOAD_NEEDS_BUILD,
+    "state_budget_gb": _RELOAD_NEEDS_BUILD,
+    "parallel_sampling_state_budget_gb": _RELOAD_NEEDS_BUILD,
+    "host": _RELOAD_NEEDS_PROCESS,
+    "port": _RELOAD_NEEDS_PROCESS,
+    "pipeline": _RELOAD_NEEDS_PROCESS,
+    "int8_prefill": _RELOAD_NEEDS_PROCESS,
+    "allowed_origins": _RELOAD_NEEDS_PROCESS,
+    "soft_reload_key": _RELOAD_NEEDS_PROCESS,
+    # These read their constant in __init__ / at load, so the built model
+    # already carries the old layout. Flipping the constant would change only
+    # the next model that gets built.
+    "qwen4_moe_shared_in_gather": _RELOAD_NEEDS_LAYERS,
+    "qwen4_moe_fused_gate_up": _RELOAD_NEEDS_LAYERS,
+    "qwen35_gdn_proj_fusion_subclass": _RELOAD_NEEDS_LAYERS,
+}
+
+
+def _soft_reload_target(spec: MutableKey):
+    """Resolve a registry entry to the object that owns the attribute."""
+    if spec.kind == "module":
+        try:
+            return importlib.import_module(spec.module)
+        except ImportError as exc:
+            raise SoftReloadError(
+                f"model module {spec.module} is not importable: {exc}"
+            ) from exc
+    raise SoftReloadError(f"unknown target kind {spec.kind!r}")
+
+
+def read_effective_config(cli_args) -> Dict[str, Any]:
+    """Report the live value of every soft-reloadable key.
+
+    A caller must be able to read back what the server actually runs, not what
+    it believes it set. A module lever that is not imported yet reports
+    ``None``: no model built from it exists, so it has no live value.
+    """
+    values = {}
+    for name, spec in SOFT_RELOAD_KEYS.items():
+        if spec.kind == "cli_args":
+            values[name] = getattr(cli_args, spec.attr, None)
+            continue
+        module = sys.modules.get(spec.module)
+        values[name] = None if module is None else getattr(module, spec.attr, None)
+    return values
+
+
+def plan_soft_reload(cli_args, config: Any) -> List[Tuple[str, MutableKey, Any, Any]]:
+    """Validate a requested config change without applying any of it.
+
+    Returns ``(name, spec, old, new)`` per key. Everything is validated before
+    anything is written, so a rejected request leaves the server untouched and
+    never half-applied.
+    """
+    if not isinstance(config, dict):
+        raise SoftReloadError("config must be a JSON object")
+
+    plan = []
+    for name, value in config.items():
+        if name in SOFT_RELOAD_RESTART_KEYS:
+            raise SoftReloadRestartRequired(
+                f"'{name}' {SOFT_RELOAD_RESTART_KEYS[name]}"
+            )
+        spec = SOFT_RELOAD_KEYS.get(name)
+        if spec is None:
+            raise SoftReloadError(
+                f"'{name}' is not a soft-reloadable key. "
+                f"GET {EFFECTIVE_CONFIG_PATH} lists the permitted keys."
+            )
+        try:
+            new = spec.validate(value)
+        except SoftReloadError as exc:
+            raise SoftReloadError(f"'{name}': {exc}") from None
+        if spec.kind == "cli_args":
+            old = getattr(cli_args, spec.attr, None)
+        else:
+            old = getattr(_soft_reload_target(spec), spec.attr, None)
+        plan.append((name, spec, old, new))
+    return plan
+
+
+def apply_soft_reload(cli_args, plan) -> Dict[str, Dict[str, Any]]:
+    """Write a validated plan and report old -> new per key."""
+    changes = {}
+    for name, spec, old, new in plan:
+        target = cli_args if spec.kind == "cli_args" else _soft_reload_target(spec)
+        setattr(target, spec.attr, new)
+        changes[name] = {"old": old, "new": new}
+    return changes
 
 
 class ModelProvider:
@@ -1100,6 +1405,15 @@ class ResponseGenerator:
         self._lane_rng_root = LaneRNG.from_key(
             mx.random.split(mx.random.state[0])[1]
         )
+
+        # Soft-reload admission gate. ``_paused`` closes the door while a
+        # reload swaps configuration; ``_inflight`` counts requests that have
+        # been handed to the generation thread and not yet finished.
+        self._admission = Condition()
+        self._paused = False
+        self._inflight = 0
+        self._reload_lock = Lock()
+        self.admission_timeout = DEFAULT_SOFT_RELOAD_ADMISSION_TIMEOUT
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -2096,27 +2410,171 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
-        response_queue = Queue()
-        self.requests.put((response_queue, request, generation_args))
+        self._admit_request()
+        released = False
+
+        def _release():
+            nonlocal released
+            if not released:
+                released = True
+                self._retire_request()
 
         def _inner():
-            while True:
-                response = response_queue.get()
-                if response is None:
-                    break
-                if isinstance(response, Exception):
-                    raise response
-                if isinstance(response, tuple):
-                    if progress_callback is not None:
-                        progress_callback(*response)
-                    continue
-                yield response
+            try:
+                while True:
+                    response = response_queue.get()
+                    if response is None:
+                        break
+                    if isinstance(response, Exception):
+                        raise response
+                    if isinstance(response, tuple):
+                        if progress_callback is not None:
+                            progress_callback(*response)
+                        continue
+                    yield response
+            finally:
+                _release()
 
-        ctx = response_queue.get()
-        if isinstance(ctx, Exception):
-            raise ctx
+        try:
+            response_queue = Queue()
+            self.requests.put((response_queue, request, generation_args))
+            ctx = response_queue.get()
+            if isinstance(ctx, Exception):
+                raise ctx
+        except BaseException:
+            _release()
+            raise
 
-        return ctx, _inner()
+        stream = _inner()
+        # The finally above releases the slot on a normal or raised exit. This
+        # covers the remaining case: a caller that drops the generator without
+        # ever starting it, e.g. after the client disconnects.
+        weakref.finalize(stream, _release)
+        return ctx, stream
+
+    def _admit_request(self, timeout: Optional[float] = None):
+        """Take an in-flight slot, waiting while a soft reload holds the gate."""
+        timeout = self.admission_timeout if timeout is None else timeout
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._admission:
+            while self._paused:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SoftReloadBusy(
+                        "server is applying a configuration change; retry shortly"
+                    )
+                self._admission.wait(remaining)
+            self._inflight += 1
+
+    def _retire_request(self):
+        with self._admission:
+            self._inflight = max(0, self._inflight - 1)
+            if self._inflight == 0:
+                self._admission.notify_all()
+
+    @property
+    def inflight(self) -> int:
+        with self._admission:
+            return self._inflight
+
+    def _wait_for_drain(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._admission:
+            while self._inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._admission.wait(remaining)
+            return True
+
+    def clear_prompt_cache(self) -> Dict[str, int]:
+        """Drop every cached prefix. Returns what was dropped."""
+        clear = getattr(self.prompt_cache, "clear", None)
+        if callable(clear):
+            return clear()
+        # A plain LRUPromptCache has no clear(); trimming to zero is equivalent.
+        entries = len(self.prompt_cache)
+        n_bytes = int(getattr(self.prompt_cache, "nbytes", 0))
+        self.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
+        return {"entries": entries, "sidecars": 0, "bytes": n_bytes}
+
+    def soft_reload(
+        self,
+        config: Any,
+        *,
+        drain_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change serving configuration in place, keeping the weights resident.
+
+        The order is fixed and it matters:
+
+        1. validate the whole request against the whitelist, before touching
+           anything, so a bad request cannot half-apply;
+        2. close the admission gate and wait for in-flight generation to
+           finish -- a lever that lands mid-sequence would split one sequence
+           across two numerical regimes;
+        3. apply the change;
+        4. drop the prefix cache. This is not housekeeping. The same tokens
+           under two settings give different state, and some levers change the
+           cache layout, so entries are dropped rather than kept;
+        5. reopen the gate.
+
+        NOT for promotion-grade A/B measurement. The A/B harness runs one
+        process per arm on purpose: that isolates the allocator, the
+        compilation cache, module constants and every KV byte between arms.
+        Soft reload keeps all of it and trades that isolation for speed. Use it
+        for interactive serving and exploratory sweeps. Do not rewrite the
+        benchmark harness onto it.
+        """
+        drain_timeout = (
+            DEFAULT_SOFT_RELOAD_DRAIN_TIMEOUT
+            if drain_timeout is None
+            else float(drain_timeout)
+        )
+        plan = plan_soft_reload(self.cli_args, config)
+
+        if not self._reload_lock.acquire(blocking=False):
+            raise SoftReloadBusy("a soft reload is already in progress")
+        started = time.monotonic()
+        try:
+            with self._admission:
+                self._paused = True
+                inflight_at_start = self._inflight
+            try:
+                if not self._wait_for_drain(drain_timeout):
+                    raise SoftReloadBusy(
+                        f"generation did not drain within {drain_timeout:g}s; "
+                        "nothing was changed"
+                    )
+                changes = apply_soft_reload(self.cli_args, plan)
+                cache_report = self.clear_prompt_cache()
+            finally:
+                with self._admission:
+                    self._paused = False
+                    self._admission.notify_all()
+        finally:
+            self._reload_lock.release()
+
+        logging.info(
+            "Soft reload applied: %s; dropped %d prompt-cache entries.",
+            {name: change["new"] for name, change in changes.items()},
+            cache_report["entries"],
+        )
+        return {
+            "object": "soft_reload",
+            "changed": {k: v for k, v in changes.items() if v["old"] != v["new"]},
+            "unchanged": [k for k, v in changes.items() if v["old"] == v["new"]],
+            "prompt_cache": {
+                "entries_dropped": cache_report["entries"],
+                "sidecars_dropped": cache_report["sidecars"],
+                "bytes_freed": cache_report["bytes"],
+            },
+            "drain": {
+                "inflight_at_start": inflight_at_start,
+                "waited_s": round(time.monotonic() - started, 4),
+            },
+            "effective_config": read_effective_config(self.cli_args),
+        }
 
     @property
     def cli_args(self):
@@ -2173,6 +2631,10 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        if self.path == SOFT_RELOAD_PATH:
+            self.handle_soft_reload()
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -2351,6 +2813,109 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(400)
         self.end_headers()
         self.wfile.write(json.dumps({"error": message}).encode())
+
+    def _json_error(self, status, message):
+        self._set_completion_headers(status)
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": message}).encode())
+
+    def _json_ok(self, payload):
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.flush()
+
+    def _admin_authorized(self):
+        """Gate the admin routes on the configured bearer key.
+
+        The completion API carries no authentication, so there is no house
+        convention to copy; these routes mutate serving state, so they take the
+        bearer header the OpenAI-compatible clients of this server already
+        speak. With no key configured the routes do not exist at all: an
+        unauthenticated write endpoint must never be the default.
+        """
+        key = getattr(self.response_generator.cli_args, "soft_reload_key", None)
+        key = key or os.environ.get("MLX_LM_SOFT_RELOAD_KEY") or None
+        if not key:
+            self._json_error(
+                404,
+                "Soft reload is disabled. Start the server with "
+                "--soft-reload-key (or MLX_LM_SOFT_RELOAD_KEY) to enable it.",
+            )
+            return False
+        header = self.headers.get("Authorization") or ""
+        presented = header[7:] if header.startswith("Bearer ") else ""
+        if not hmac.compare_digest(presented, str(key)):
+            self._json_error(401, "Invalid or missing bearer key.")
+            return False
+        return True
+
+    def _read_json_object(self):
+        """Read a JSON object body. Writes its own error and returns None."""
+        content_length = self.headers.get("Content-Length")
+        try:
+            content_length = int(content_length)
+        except (TypeError, ValueError):
+            self._json_error(411, "Content-Length header is required")
+            return None
+        try:
+            body = json.loads(self.rfile.read(content_length).decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            self._json_error(400, f"Invalid JSON in request body: {e}")
+            return None
+        if not isinstance(body, dict):
+            self._json_error(400, "Request should be a JSON dictionary")
+            return None
+        return body
+
+    def handle_soft_reload(self):
+        """Apply a whitelisted configuration change without a model reload."""
+        if not self._admin_authorized():
+            return
+        body = self._read_json_object()
+        if body is None:
+            return
+        config = body.get("config", {})
+        drain_timeout = body.get("drain_timeout")
+        if drain_timeout is not None and (
+            isinstance(drain_timeout, bool)
+            or not isinstance(drain_timeout, (int, float))
+            or drain_timeout < 0
+        ):
+            self._json_error(400, "drain_timeout must be a non-negative number")
+            return
+        try:
+            report = self.response_generator.soft_reload(
+                config, drain_timeout=drain_timeout
+            )
+        except SoftReloadRestartRequired as e:
+            self._json_error(409, str(e))
+        except SoftReloadError as e:
+            self._json_error(400, str(e))
+        except SoftReloadBusy as e:
+            self._json_error(503, str(e))
+        else:
+            self._json_ok(report)
+
+    def handle_effective_config(self):
+        """Report the live value of every soft-reloadable key."""
+        if not self._admin_authorized():
+            return
+        cli_args = self.response_generator.cli_args
+        self._json_ok(
+            {
+                "object": "effective_config",
+                "effective_config": read_effective_config(cli_args),
+                "restart_required": dict(SOFT_RELOAD_RESTART_KEYS),
+                "prompt_cache": {
+                    "entries": len(self.response_generator.prompt_cache),
+                    "bytes": int(
+                        getattr(self.response_generator.prompt_cache, "nbytes", 0)
+                    ),
+                },
+                "inflight": self.response_generator.inflight,
+            }
+        )
 
     def _validate(
         self,
@@ -2696,9 +3261,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            # An unsupported request composition is a 400; 404 stays for an
-            # unknown model.
-            status = 400 if isinstance(e, RequestCompositionError) else 404
+            # An unsupported request composition is a 400; a closed admission
+            # gate is a 503; 404 stays for an unknown model.
+            if isinstance(e, SoftReloadBusy):
+                status = 503
+            elif isinstance(e, RequestCompositionError):
+                status = 400
+            else:
+                status = 404
             self._set_completion_headers(status)
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
@@ -2882,6 +3452,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
+        elif self.path == EFFECTIVE_CONFIG_PATH:
+            self.handle_effective_config()
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -3072,6 +3644,16 @@ def setup_arg_parser():
         type=lambda x: x.split(","),
         default="*",
         help="Allowed origins (default: *)",
+    )
+    parser.add_argument(
+        "--soft-reload-key",
+        type=str,
+        default=None,
+        help=(
+            "Bearer key that enables the soft-reload admin routes "
+            f"(POST {SOFT_RELOAD_PATH}, GET {EFFECTIVE_CONFIG_PATH}). "
+            "Without it, or MLX_LM_SOFT_RELOAD_KEY, the routes stay disabled."
+        ),
     )
     parser.add_argument(
         "--draft-model",

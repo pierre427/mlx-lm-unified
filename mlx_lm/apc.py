@@ -18,11 +18,14 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Hashable, Iterable, List, Optional
 
+import mlx.core as mx
+
 from .models.cache import (
     ArraysCache,
     CacheList,
     KVCache,
     LRUPromptCache,
+    PromptTrie,
     RotatingKVCache,
     can_trim_prompt_cache,
 )
@@ -108,6 +111,18 @@ def _walk_cache_entries(prompt_cache: Iterable[Any]):
             yield entry
 
 
+def _iter_trie_entries(trie: PromptTrie):
+    """Yield every stored cache entry, whatever the LRU bookkeeping says."""
+    stack = [trie._trie]
+    while stack:
+        node = stack.pop()
+        for token, child in node.items():
+            if token == "__value__":
+                yield child
+            else:
+                stack.append(child)
+
+
 def inspect_apc_capabilities(prompt_cache: List[Any]) -> APCCapabilities:
     """Describe which lossless APC operations a concrete cache supports."""
 
@@ -156,15 +171,15 @@ class AutomaticPrefixCache(LRUPromptCache):
     callers should use ``lookup`` / ``store`` for explicit hit telemetry.
     """
 
+    _STAT_KEYS = ("lookups", "hits", "misses", "cached_tokens", "stores")
+
     def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
         super().__init__(max_size=max_size, max_bytes=max_bytes)
-        self._apc_stats = {
-            "lookups": 0,
-            "hits": 0,
-            "misses": 0,
-            "cached_tokens": 0,
-            "stores": 0,
-        }
+        self._apc_stats = {key: 0 for key in self._STAT_KEYS}
+        # Totals for the whole process. ``_apc_stats`` counts only the entries
+        # the live cache could still serve, so it restarts at every clear.
+        self._apc_lifetime = {key: 0 for key in self._STAT_KEYS}
+        self._apc_clears = 0
 
     @staticmethod
     def key(
@@ -312,9 +327,61 @@ class AutomaticPrefixCache(LRUPromptCache):
             sidecar=sidecar,
         )
 
+    def clear(self, *, release_memory: bool = True) -> dict:
+        """Drop every stored prefix, its MTP sidecar, and its bytes.
+
+        A serving lever can change what a prefix *means*, not only how stale
+        it is: the same tokens under two settings give different state, and
+        some settings change the cache layout itself.  So entries are dropped,
+        never marked stale, and the sidecars go with them.
+
+        Safe to call on a live server.  The new trie and LRU are built first
+        and then rebound, so a concurrent reader sees either the old cache or
+        the empty one and never a half-emptied one.  It does not stop a
+        request that is already generating from storing its own result
+        afterwards; drain first when that matters.
+        """
+        entries = list(_iter_trie_entries(self._trie))
+        report = {
+            "entries": len(entries),
+            "sidecars": sum(
+                1 for entry in entries if getattr(entry, "sidecar", None) is not None
+            ),
+            "bytes": int(self._n_bytes),
+        }
+
+        fresh_trie = PromptTrie()
+        fresh_lru = LRUPromptCache.CacheOrder(list(self._lru._ordering))
+        self._trie = fresh_trie
+        self._lru = fresh_lru
+        self._n_bytes = 0
+        self._n_bytes_by_type = {key: 0 for key in fresh_lru._ordering}
+
+        # Release the arrays the detached entries still hold. Rebind, never
+        # mutate in place: a caller may hold the same list.
+        for entry in entries:
+            entry.prompt_cache = []
+            entry.sidecar = None
+            entry.nbytes = 0
+        entries.clear()
+
+        for key in self._STAT_KEYS:
+            self._apc_lifetime[key] += self._apc_stats[key]
+            self._apc_stats[key] = 0
+        self._apc_clears += 1
+
+        if release_memory:
+            mx.clear_cache()
+        return report
+
     @property
     def apc_stats(self):
-        return dict(self._apc_stats)
+        stats = dict(self._apc_stats)
+        stats["clears"] = self._apc_clears
+        stats["lifetime"] = dict(self._apc_lifetime)
+        for key in self._STAT_KEYS:
+            stats["lifetime"][key] += self._apc_stats[key]
+        return stats
 
 
 # Short public spelling for server integrations.
