@@ -377,86 +377,11 @@ class Qwen4ArraysCache(ArraysCache):
     """Four-state PLE+GDN cache with one atomic speculative rollback."""
 
     def __new__(cls, *args, **kwargs):
+        # __init__ never runs on the from_state path, so anything a method
+        # reachable from there touches has to be set here.
         instance = super().__new__(cls, *args, **kwargs)
         instance._ple_rollback = None
-        # Host mirrors of the padding metadata, each keyed by the mx array it
-        # mirrors.  Rollback spans are host-side by contract (they size a
-        # record's per-row depth), and there are 36 of these caches in the
-        # release config, so reading ``lengths`` off the device every forward
-        # would be 36 syncs per verify.  ``prepare`` seeds them from the host
-        # list it is already given and ``advance`` carries them arithmetically,
-        # so the only sync is an assignment from somewhere else.
-        instance._host_lengths = None
-        instance._host_left_padding = None
         return instance
-
-    def _host_vector(self, field, cached):
-        value = getattr(self, field)
-        if value is None:
-            return None, None
-        if cached is None or cached[0] is not value:
-            cached = (value, [int(v) for v in value.tolist()])
-        return cached, cached[1]
-
-    def _length_vector(self):
-        self._host_lengths, values = self._host_vector(
-            "lengths", self._host_lengths
-        )
-        return values
-
-    def _left_padding_vector(self):
-        self._host_left_padding, values = self._host_vector(
-            "left_padding", self._host_left_padding
-        )
-        return values
-
-    def prepare(self, lengths=None, **kwargs):
-        super().prepare(lengths=lengths, **kwargs)
-        if lengths is not None:
-            self._host_lengths = (self.lengths, [int(v) for v in lengths])
-
-    def advance(self, N):
-        lengths = self._length_vector()
-        padding = self._left_padding_vector()
-        super().advance(N)
-        if lengths is not None:
-            self._host_lengths = (self.lengths, [v - N for v in lengths])
-        if padding is not None:
-            self._host_left_padding = (
-                self.left_padding, [v - N for v in padding]
-            )
-
-    def finalize(self):
-        super().finalize()
-        self._host_lengths = None
-        self._host_left_padding = None
-
-    def rollback_spans(self, length: int, mask=None):
-        """Tokens this forward advances per row, host-side -- or ``None``.
-
-        A rollback record credits each row a depth, and under a padded slab
-        that depth is the row's own valid span, not the slab width: crediting
-        the slab width lets a later rewind take tokens out of this record that
-        the row never processed, and stop before the older record that really
-        holds them.
-
-        ``()`` means "unpadded, every row advanced ``length``".  ``None`` means
-        the geometry cannot be described row-wise and a layer must NOT stage a
-        rollback for it -- the honest disarm, since the alternative is a record
-        that lies.  That happens for a mask the cache metadata does not
-        explain, and for a LEADING pad run: both this cache's replay closures
-        and GDN's index a row's tokens from slab position 0, so a row whose
-        tokens start later cannot be replayed by a scalar depth.
-        """
-        lengths = self._length_vector()
-        padding = self._left_padding_vector()
-        if padding is not None and max(padding) > 0:
-            return None
-        if lengths is None:
-            # A caller-supplied mask with no metadata behind it: the rows are
-            # padded by an amount this cache cannot name.
-            return None if mask is not None else ()
-        return [min(max(v, 0), length) for v in lengths]
 
     def start_speculation(self, rollback_window=None):
         self._ple_rollback = None
@@ -485,11 +410,11 @@ class Qwen4ArraysCache(ArraysCache):
         """
         if self._ple_rollback is not None:
             raise RuntimeError(
-                f"{who}: the last Qwen4 forward staged a PLE rollback that "
+                f"{who}: a Qwen4 forward staged a PLE rollback that "
                 "GatedDeltaNet never recorded, so that span's PLE and GDN "
-                "halves cannot be restored together. Under a padded "
-                "speculative forward this means the GDN staging predicate in "
-                "qwen3_5.py still disarms where the PLE one no longer does."
+                "halves cannot be restored together. The two stage on the "
+                "same geometry test, so this means the forward was "
+                "interrupted between them (qwen4_exp.py, qwen3_5.py)."
             )
 
     def is_trimmable(self):
@@ -504,19 +429,15 @@ class Qwen4ArraysCache(ArraysCache):
         self._refuse_pending_ple("Qwen4ArraysCache.trim_ragged")
         return super().preflight_ragged_trim(n, validate=validate)
 
-    def stage_ple_rollback(
-        self, num_tokens, fn, snapshot, *, per_row_fn=None, depths=None
-    ):
+    def stage_ple_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
         if self._ple_rollback is not None:
             raise RuntimeError(
                 "Qwen4 PLE rollback was staged twice without a GDN record in "
                 "between. PLE and GDN roll back as ONE record, so a forward "
                 "that stages the PLE half must reach GatedDeltaNet's "
-                "record_rollback in the same forward. If this fired under a "
-                "padded (masked / lengths-bearing) speculative forward, the "
-                "GDN half in qwen3_5.py still disarms its staging there."
+                "record_rollback in the same forward."
             )
-        self._ple_rollback = (num_tokens, fn, snapshot, per_row_fn, depths)
+        self._ple_rollback = (num_tokens, fn, snapshot, per_row_fn)
 
     def record_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
         staged = self._ple_rollback
@@ -525,7 +446,7 @@ class Qwen4ArraysCache(ArraysCache):
             return super().record_rollback(
                 num_tokens, fn, snapshot, per_row_fn=per_row_fn
             )
-        ple_tokens, ple_fn, ple_snapshot, ple_per_row, depths = staged
+        ple_tokens, ple_fn, ple_snapshot, ple_per_row = staged
         if ple_tokens != num_tokens:
             raise RuntimeError(
                 "Qwen4 PLE/GDN rollback span mismatch: "
@@ -537,35 +458,22 @@ class Qwen4ArraysCache(ArraysCache):
 
         # One record, so the vectorized per-row replay is available only if
         # BOTH halves stage one; a partial form would rewind the pair by
-        # different rules. GDN (qwen3_5.py) does not stage one yet, so this
-        # composes to None today and the interim per-distinct-length replay
-        # applies.
+        # different rules.
         rows = None
         if per_row_fn is not None and ple_per_row is not None:
 
             def rows(lengths):
                 return list(per_row_fn(lengths)) + list(ple_per_row(lengths))
 
-        result = super().record_rollback(
+        # The per-row depths are ArraysCache's to derive: it reads the same
+        # padding metadata this forward staged against, and both halves record
+        # before advance(), so there is one implementation, not two.
+        return super().record_rollback(
             num_tokens,
             combined,
             list(snapshot) + list(ple_snapshot),
             per_row_fn=rows,
         )
-        if depths:
-            # A padded slab: row i advanced by its own span, so the record has
-            # to say so. GDN's own closures are already per-row correct here
-            # (masked steps are recurrence no-ops and its conv window is
-            # indexed from slab position 0), so only the DEPTHS are Qwen4's to
-            # fix up -- which keeps qwen3_5.py out of the per-row bookkeeping.
-            batch = len(depths)
-            if batch != self.batch_size:
-                raise RuntimeError(
-                    f"Qwen4 rollback spans cover {batch} rows but the cache "
-                    f"holds {self.batch_size}"
-                )
-            self._rollbacks[-1] = self._rollbacks[-1].with_depths(list(depths))
-        return result
 
     def extract(self, idx):
         cache = type(self)(len(self.cache))
@@ -1073,7 +981,6 @@ class PLELayer(nn.Module):
                 _ple_rollback,
                 [previous_conv, previous_tokens],
                 per_row_fn=_ple_rollback_rows,
-                depths=spans,
             )
         return gated + conv
 
@@ -1098,6 +1005,17 @@ def _apply_rope_positions(x: mx.array, positions: mx.array, dims: int, base: flo
     return mx.concatenate([rotated.astype(x.dtype), tail], axis=-1)
 
 
+# THE armed cross-call QSA state, shared by both cache types. Everything here
+# is derived from the block grid and the row set, so nothing here may outlive a
+# change to either -- see release_qsa_cycle.
+_QSA_CYCLE_STATE = (
+    ("_mtp_share_topk", False),
+    ("_mtp_shared_topk", None),
+    ("_qsa_pooled_keys", None),
+    ("_qsa_pooled_ratio", None),
+)
+
+
 class BatchQSAKVCache(BatchKVCache):
     """Batched QSA cache retaining raw indexer keys beside attention KV."""
 
@@ -1107,18 +1025,24 @@ class BatchQSAKVCache(BatchKVCache):
     # may run it short (a shared-top-k step appends no key), and that cache is
     # rewound uniformly, never raggedly.
     _RAGGED_TRIM_AUX_ARRAYS = (("index_keys", 1),)
+    _QSA_CYCLE_FIELDS = _QSA_CYCLE_STATE
+
+    def __new__(cls, *args, **kwargs):
+        # ``from_state`` builds through ``cls.__new__(cls)`` and assigns
+        # ``state``, so __init__ never runs on the prompt-cache load path.
+        # Every attribute a method reachable from there reads has to be set
+        # here: the state setter alone routes through release_qsa_cycle, which
+        # reads all four cycle fields, and through max_left_padding.
+        instance = super().__new__(cls)
+        instance.index_keys = None
+        instance._max_left_pad = None
+        for name, blank in cls._QSA_CYCLE_FIELDS:
+            setattr(instance, name, blank)
+        return instance
 
     def __init__(self, left_padding: List[int], attention_backend=None):
+        # __new__ owns the QSA fields; it runs on both construction paths.
         super().__init__(left_padding, attention_backend=attention_backend)
-        self.index_keys = None
-        # Per-lane ephemeral QSA cycle state, the batch form of the fields
-        # QSAKVCache carries.  Both are derived quantities and are deliberately
-        # absent from ``state``: a restore recomputes them.
-        self._mtp_share_topk = False
-        self._mtp_shared_topk = None
-        self._qsa_pooled_keys = None
-        self._qsa_pooled_ratio = None
-        self._max_left_pad = None
 
     def max_left_padding(self) -> int:
         """Host copy of ``left_padding.max()``, keyed by array identity.
@@ -1134,16 +1058,9 @@ class BatchQSAKVCache(BatchKVCache):
             self._max_left_pad = (padding, int(padding.max().item()))
         return self._max_left_pad[1]
 
-    # THE armed cross-call state. Everything here is derived from the block
-    # grid and the row set, so nothing here may outlive a change to either.
-    _QSA_CYCLE_FIELDS = (
-        ("_mtp_share_topk", False),
-        ("_mtp_shared_topk", None),
-        ("_qsa_pooled_keys", None),
-        ("_qsa_pooled_ratio", None),
-    )
-
-    def release_qsa_cycle(self, who: str, *, rows=None, keep_pooled=True):
+    def release_qsa_cycle(
+        self, who: str, *, rows=None, keep_pooled=True, cursor_final=True
+    ):
         """The ONE exit for armed QSA state. Every lifecycle method routes here.
 
         This class has now been bitten three times by armed state outliving
@@ -1170,6 +1087,9 @@ class BatchQSAKVCache(BatchKVCache):
         Post-condition: with the cycle released the raw-key ledger must span
         exactly the cursor. Only a live shared-top-k cycle may run it short,
         and that cycle is over by the time this returns.
+        ``cursor_final=False`` defers just that check for the one caller whose
+        cursor is still provisional -- the ``state`` setter, where ``_idx`` is
+        the allocated buffer width until ``meta_state`` lands the real one.
         """
         pooled, ratio = self._qsa_pooled_keys, self._qsa_pooled_ratio
         # Blank everything first, so a field added to _QSA_CYCLE_FIELDS later
@@ -1188,7 +1108,8 @@ class BatchQSAKVCache(BatchKVCache):
                     else mx.contiguous(pooled[:, :keep])
                 )
                 self._qsa_pooled_ratio = ratio
-        self._reconcile_index_ledger(who)
+        if cursor_final:
+            self._reconcile_index_ledger(who)
 
     def _reconcile_index_ledger(self, who: str):
         """``len(index_keys) == cursor``, or say exactly why not.
@@ -1243,8 +1164,23 @@ class BatchQSAKVCache(BatchKVCache):
         self.index_keys = value[4]
         self._max_left_pad = None
         # A restore replaces the contents wholesale, so the pooled keys are
-        # not this cache's any more even at an unchanged row count.
-        self.release_qsa_cycle("BatchQSAKVCache.state", keep_pooled=False)
+        # not this cache's any more even at an unchanged row count. The ledger
+        # check waits for meta_state, which lands the real cursor.
+        self.release_qsa_cycle(
+            "BatchQSAKVCache.state", keep_pooled=False, cursor_final=False
+        )
+
+    @property
+    def meta_state(self):
+        return BatchKVCache.meta_state.fget(self)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        BatchKVCache.meta_state.fset(self, value)
+        if value:
+            # ``_idx`` is only now the real cursor, so this is where a restored
+            # ledger can be checked against it at all.
+            self._reconcile_index_ledger("BatchQSAKVCache.meta_state")
 
     @property
     def nbytes(self):
@@ -1355,20 +1291,20 @@ class BatchQSAKVCache(BatchKVCache):
 class QSAKVCache(KVCache):
     """KV cache with the raw, pre-pooling indexer keys QSA also requires."""
 
+    _QSA_CYCLE_FIELDS = _QSA_CYCLE_STATE
+
+    def __new__(cls, *args, **kwargs):
+        # Same from_state contract as BatchQSAKVCache: __init__ does not run
+        # on the prompt-cache load path.
+        instance = super().__new__(cls)
+        instance.index_keys = None
+        for name, blank in cls._QSA_CYCLE_FIELDS:
+            setattr(instance, name, blank)
+        return instance
+
     def __init__(self):
+        # __new__ owns the QSA fields; it runs on both construction paths.
         super().__init__()
-        self.index_keys = None
-        # Ephemeral MTP-cycle state.  Step zero computes QSA top-k normally;
-        # later chained draft steps may reuse those block indices and skip the
-        # index projection.  This is deliberately absent from ``state``: a
-        # cache snapshot is a sequence snapshot, not an in-flight draft cycle.
-        self._mtp_share_topk = False
-        self._mtp_shared_topk = None
-        # Ephemeral pooled+layernormed+roped block keys, derived from
-        # ``index_keys`` (MLX_QWEN4_QSA_POOLED_KEY_CACHE).  Also absent from
-        # ``state``: a restore simply recomputes them.
-        self._qsa_pooled_keys = None
-        self._qsa_pooled_ratio = None
 
     def update_index_keys(self, keys: mx.array):
         self.index_keys = keys if self.index_keys is None else mx.concatenate([self.index_keys[:, : self.offset], keys], axis=1)

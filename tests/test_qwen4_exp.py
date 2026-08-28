@@ -971,18 +971,9 @@ class TestPLERollbackPerRowReplay(unittest.TestCase):
         captured = {}
         original = Qwen4ArraysCache.stage_ple_rollback
 
-        def spy(self, num_tokens, fn, snapshot, *, per_row_fn=None, depths=None):
-            captured.update(
-                fn=fn, per_row_fn=per_row_fn, num_tokens=num_tokens, depths=depths
-            )
-            return original(
-                self,
-                num_tokens,
-                fn,
-                snapshot,
-                per_row_fn=per_row_fn,
-                depths=depths,
-            )
+        def spy(self, num_tokens, fn, snapshot, *, per_row_fn=None):
+            captured.update(fn=fn, per_row_fn=per_row_fn, num_tokens=num_tokens)
+            return original(self, num_tokens, fn, snapshot, per_row_fn=per_row_fn)
 
         Qwen4ArraysCache.stage_ple_rollback = spy
         try:
@@ -1033,6 +1024,74 @@ class TestPLERollbackPerRowReplay(unittest.TestCase):
                 self.assertEqual(
                     record.per_row_fn is not None, gdn_rows is not None
                 )
+
+
+class TestQSACacheFromState(unittest.TestCase):
+    """The prompt-cache load path builds through ``__new__``, not ``__init__``.
+
+    ``_BaseCache.from_state`` does ``cls.__new__(cls)`` and then assigns
+    ``state`` and ``meta_state``, so every attribute a method reachable from
+    there reads has to be set in ``__new__``.  Both QSA caches route their
+    ``state`` setter through ``release_qsa_cycle``, which reads all four cycle
+    fields, so an ``__init__``-only default raised ``AttributeError`` on any
+    saved cache.  The ledger check has to wait for ``meta_state``: until then
+    ``_idx`` is the allocated buffer width, not the cursor.
+    """
+
+    def _batch(self, rows=2, width=4):
+        cache = BatchQSAKVCache([0] * rows)
+        values = mx.broadcast_to(
+            mx.arange(width, dtype=mx.float32).reshape(1, 1, width, 1),
+            (rows, 1, width, 2),
+        )
+        cache.update_and_fetch(values, values)
+        cache.update_index_keys(
+            mx.broadcast_to(
+                mx.arange(width, dtype=mx.float32).reshape(1, width, 1),
+                (rows, width, 2),
+            )
+        )
+        return cache
+
+    def test_new_sets_every_attribute_the_load_path_reads(self):
+        for cls in (BatchQSAKVCache, QSAKVCache):
+            with self.subTest(cache=cls.__name__):
+                bare = cls.__new__(cls)
+                for name, blank in cls._QSA_CYCLE_FIELDS:
+                    self.assertEqual(getattr(bare, name), blank, name)
+                self.assertIsNone(bare.index_keys)
+        self.assertIsNone(Qwen4ArraysCache.__new__(Qwen4ArraysCache)._ple_rollback)
+
+    def test_batch_cache_round_trips_and_still_takes_the_cycle_hooks(self):
+        cache = self._batch()
+        restored = BatchQSAKVCache.from_state(cache.state, cache.meta_state)
+        self.assertEqual(restored._idx, cache._idx)
+        self.assertEqual(restored.index_keys.shape[1], restored._idx)
+        # The hooks are the part that broke: exercise them on the restored
+        # object, not just the construction.
+        restored.release_qsa_cycle("test")
+        restored.trim(1)
+        restored.filter(mx.array([0]))
+        self.assertEqual(restored.index_keys.shape[1], restored._idx)
+        self.assertIsNone(restored._mtp_shared_topk)
+
+    def test_single_cache_round_trips_and_still_takes_the_cycle_hooks(self):
+        cache = QSAKVCache()
+        values = mx.zeros((1, 1, 4, 2))
+        cache.update_and_fetch(values, values)
+        cache.update_index_keys(mx.zeros((1, 4, 2)))
+        restored = QSAKVCache.from_state(cache.state, cache.meta_state)
+        self.assertEqual(restored.offset, 4)
+        restored.release_qsa_cycle("test")
+        restored.trim(1)
+        self.assertEqual(restored.index_keys.shape[1], restored.offset)
+
+    def test_restoring_a_short_ledger_is_reported(self):
+        cache = self._batch()
+        state = list(cache.state)
+        state[4] = state[4][:, :-1]
+        with self.assertRaisesRegex(RuntimeError, "un-ledgered KV"):
+            BatchQSAKVCache.from_state(tuple(state), cache.meta_state)
 
 
 class TestPaddedSpeculativeStaging(unittest.TestCase):
@@ -1180,21 +1239,33 @@ class TestPaddedSpeculativeStaging(unittest.TestCase):
                 call()
 
     def test_leading_pads_disarm_staging_rather_than_lie(self):
-        # Both this cache's replay closures and GDN's index a row's tokens
-        # from slab position 0, so a row whose tokens start later cannot be
-        # replayed by a scalar depth. Refuse to stage rather than record it.
-        cache = Qwen4ArraysCache(4)
-        cache.start_speculation()
-        cache.left_padding = mx.array([0, 2])
-        self.assertIsNone(cache.rollback_spans(4, mx.zeros((2, 4), mx.bool_)))
-        cache.left_padding = mx.array([0, 0])
-        cache.prepare(lengths=[4, 2])
-        self.assertEqual(cache.rollback_spans(4, mx.zeros((2, 4), mx.bool_)), [4, 2])
+        """PLE must consult ``rollback_spans`` and skip when it refuses.
 
-    def test_a_caller_mask_with_no_metadata_disarms_staging(self):
-        cache = Qwen4ArraysCache(4)
-        self.assertEqual(cache.rollback_spans(3), ())
-        self.assertIsNone(cache.rollback_spans(3, mx.zeros((2, 3), mx.bool_)))
+        The refusal rule itself is ``ArraysCache``'s and is covered in
+        tests/test_ragged_trim.py; what is asserted here is that this layer
+        obeys it, because a leading pad run would otherwise be staged with a
+        replay closure that indexes the row from slab position 0.
+        """
+        args = tiny_args(ple_layer_ids=[2])
+        mx.random.seed(5)
+        layer = PLELayer(args, 1, 0)
+        hidden = mx.random.normal((2, 4, args.hidden_size * args.hc_count))
+        ids = mx.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=mx.int32)
+
+        refuses = Qwen4ArraysCache(4)
+        refuses.start_speculation()
+        refuses.left_padding = mx.array([0, 2])
+        self.assertIsNone(refuses.rollback_spans(4, refuses.make_mask(4)))
+        mx.eval(layer(hidden, ids, refuses, refuses.make_mask(4)))
+        self.assertIsNone(
+            refuses._ple_rollback, "staged a span it cannot replay"
+        )
+
+        stages = Qwen4ArraysCache(4)
+        stages.start_speculation()
+        stages.prepare(lengths=[4, 2])
+        mx.eval(layer(hidden, ids, stages, stages.make_mask(4)))
+        self.assertIsNotNone(stages._ple_rollback)
 
     def test_membership_change_drops_a_staged_ple_half(self):
         model = self._model()
