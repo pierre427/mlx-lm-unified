@@ -3,6 +3,7 @@
 import copy
 import importlib
 import inspect
+import json
 import math
 import os
 import sys
@@ -128,6 +129,25 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
+def _dtype_registry() -> Dict[str, Any]:
+    """Every mx dtype keyed by its ``str()``. Built once, on first use.
+
+    ``str(mx.bool_)`` is ``"mlx.core.bool"``, so a name cannot be turned back
+    into the attribute by string surgery.
+    """
+    global _DTYPE_BY_NAME
+    if _DTYPE_BY_NAME is None:
+        _DTYPE_BY_NAME = {
+            str(value): value
+            for value in (getattr(mx, name, None) for name in dir(mx))
+            if isinstance(value, mx.Dtype)
+        }
+    return _DTYPE_BY_NAME
+
+
+_DTYPE_BY_NAME: Optional[Dict[str, Any]] = None
+
+
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
     """
     Save a pre-computed prompt cache to a file.
@@ -141,8 +161,21 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
+    # safetensors cannot hold a zero-sized array (mlx < 0.32.1 refuses one
+    # outright), and cache states use them as "no value" sentinels. Carry
+    # their shape and dtype in the metadata and rebuild them on load.
+    empty = {
+        key: (str(value.dtype), list(value.shape))
+        for key, value in cache_data.items()
+        if isinstance(value, mx.array) and value.size == 0
+    }
+    for key in empty:
+        del cache_data[key]
     cache_classes = [_cache_class_token(type(c)) for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
+    if empty:
+        # Appended, so a cache with no empty arrays writes the older layout.
+        cache_metadata.append(json.dumps(empty))
     cache_metadata = dict(tree_flatten(cache_metadata))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
 
@@ -161,9 +194,15 @@ def load_prompt_cache(file_name, return_metadata=False):
             the metadata if requested.
     """
     arrays, cache_metadata = mx.load(file_name, return_metadata=True)
-    arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
-    info, metadata, classes = cache_metadata
+    info, metadata, classes = cache_metadata[:3]
+    arrays = dict(arrays)
+    if len(cache_metadata) > 3:
+        # Rebuild the zero-sized entries before unflattening: a missing index
+        # would silently become {} instead of the array the state expects.
+        for key, (dtype, shape) in json.loads(cache_metadata[3]).items():
+            arrays[key] = mx.zeros(tuple(shape), dtype=_dtype_registry()[dtype])
+    arrays = tree_unflatten(list(arrays.items()))
     cache = [
         _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)

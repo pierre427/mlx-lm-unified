@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import copy
+import json
 import os
 import tempfile
 import unittest
@@ -1194,6 +1195,155 @@ class TestModelLocalCacheClasses(unittest.TestCase):
             save_prompt_cache(cache_file, cache)
         loaded_cache = load_prompt_cache(cache_file)
         self._assert_caches_equal(cache, loaded_cache)
+
+
+class TestEmptyArrayRoundTrip(unittest.TestCase):
+    """Zero-sized state entries must survive save/load.
+
+    safetensors cannot hold a zero-sized array -- mlx < 0.32.1 refuses one
+    outright -- and cache states use them as "no value" sentinels, so saving
+    any cache with an unfilled state slot used to fail. They are carried in
+    the metadata now and rebuilt on load.
+    """
+
+    def setUp(self):
+        self.test_dir_fid = tempfile.TemporaryDirectory()
+        self.test_dir = self.test_dir_fid.name
+        self.device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.set_default_device(self.device)
+        self.test_dir_fid.cleanup()
+
+    def _round_trip(self, cache, name="cache", metadata={}):
+        path = os.path.join(self.test_dir, f"{name}.safetensors")
+        save_prompt_cache(path, cache, metadata)
+        return load_prompt_cache(path, return_metadata=bool(metadata))
+
+    def _assert_entries_match(self, original, loaded):
+        from mlx.utils import tree_flatten
+
+        self.assertEqual(len(original), len(loaded))
+        for entry, (want, got) in enumerate(zip(original, loaded)):
+            self.assertIs(type(got), type(want))
+            flat_want = tree_flatten(want.state)
+            flat_got = tree_flatten(got.state)
+            self.assertEqual(
+                [k for k, _ in flat_want], [k for k, _ in flat_got], f"entry {entry}"
+            )
+            for (key, a), (_, b) in zip(flat_want, flat_got):
+                self.assertEqual(a.shape, b.shape, f"entry {entry} {key} shape")
+                self.assertEqual(a.dtype, b.dtype, f"entry {entry} {key} dtype")
+                self.assertTrue(
+                    mx.array_equal(a, b).item(), f"entry {entry} {key} values"
+                )
+
+    def _arrays_cache(self, entries):
+        cache = ArraysCache(len(entries))
+        cache.cache = list(entries)
+        return cache
+
+    def test_empty_state_slot_round_trips(self):
+        cache = [self._arrays_cache([mx.zeros((1, 0, 4)), mx.arange(6.0).reshape(1, 6)])]
+        loaded = self._round_trip(cache, "empty_slot")
+        self._assert_entries_match(cache, loaded)
+        # The zero dimension is preserved, not collapsed away.
+        self.assertEqual(loaded[0][0].shape, (1, 0, 4))
+        self.assertIsNone(loaded[0].left_padding)
+        self.assertIsNone(loaded[0].lengths)
+
+    def test_no_zero_sized_tensor_is_written(self):
+        """The portability property, independent of the mlx in use.
+
+        mlx >= 0.32.1 tolerates a zero-sized tensor, so a round-trip alone
+        passes here whether or not the sentinel is stripped. Assert on the
+        file: nothing zero-sized reaches safetensors, and the spec that
+        rebuilds it is present.
+        """
+        cache = [
+            self._arrays_cache([mx.zeros((1, 0, 4)), mx.arange(6.0).reshape(1, 6)])
+        ]
+        path = os.path.join(self.test_dir, "no_zero_sized.safetensors")
+        save_prompt_cache(path, cache)
+        arrays, raw = mx.load(path, return_metadata=True)
+
+        self.assertTrue(arrays, "everything was stripped")
+        for key, value in arrays.items():
+            self.assertGreater(value.size, 0, f"{key} was written zero-sized")
+        spec = [raw[key] for key in raw if key.split(".")[0] == "3"]
+        self.assertEqual(len(spec), 1, "no empty-array spec was recorded")
+        self.assertIn("0.0.0", json.loads(spec[0]))
+
+    def test_every_entry_empty_round_trips(self):
+        cache = [self._arrays_cache([mx.zeros((0,)), mx.zeros((2, 0))])]
+        loaded = self._round_trip(cache, "all_empty")
+        self._assert_entries_match(cache, loaded)
+
+    def test_partially_populated_cache_round_trips(self):
+        keys = mx.random.uniform(shape=(1, 4, 6, 8))
+        kv = KVCache()
+        kv.update_and_fetch(keys, keys)
+        arrays = self._arrays_cache(
+            [mx.arange(4.0).reshape(1, 4), mx.zeros((1, 0, 8)), mx.zeros((1, 3))]
+        )
+        cache = [kv, arrays]
+        loaded = self._round_trip(cache, "partial")
+        self._assert_entries_match(cache, loaded)
+        self.assertEqual(loaded[0].offset, kv.offset)
+
+    def test_cache_list_with_mixed_members_round_trips(self):
+        keys = mx.random.uniform(shape=(1, 2, 5, 4))
+        kv = KVCache()
+        kv.update_and_fetch(keys, keys)
+        arrays = self._arrays_cache([mx.zeros((1, 0, 4)), mx.arange(3.0).reshape(1, 3)])
+        cache = [CacheList(kv, arrays)]
+        loaded = self._round_trip(cache, "cache_list")
+
+        self.assertIsInstance(loaded[0], CacheList)
+        self.assertEqual(len(loaded[0].caches), 2)
+        self._assert_entries_match(cache[0].caches, loaded[0].caches)
+
+    def test_dtypes_and_zero_dims_are_exact(self):
+        cache = [
+            self._arrays_cache(
+                [
+                    mx.zeros((1, 0, 4), mx.bfloat16),
+                    mx.zeros((0,), mx.bool_),
+                    mx.arange(6).reshape(1, 6).astype(mx.uint32),
+                    mx.zeros((0, 3, 0), mx.float16),
+                ]
+            )
+        ]
+        loaded = self._round_trip(cache, "dtypes")
+        self._assert_entries_match(cache, loaded)
+
+    def test_reloaded_cache_keeps_working(self):
+        arrays = self._arrays_cache([mx.zeros((1, 0, 4)), mx.arange(3.0).reshape(1, 3)])
+        loaded = self._round_trip([arrays], "usable")[0]
+        # A restored cache is a live cache: its slots take new state.
+        loaded[0] = mx.ones((1, 2, 4))
+        self.assertEqual(loaded[0].shape, (1, 2, 4))
+        self.assertEqual(loaded.rollback_spans(3), ())
+
+    def test_user_metadata_is_not_polluted(self):
+        cache = [self._arrays_cache([mx.zeros((1, 0, 4))])]
+        loaded, metadata = self._round_trip(
+            cache, "metadata", metadata={"model": "tiny", "n": "3"}
+        )
+        self.assertEqual(metadata, {"model": "tiny", "n": "3"})
+        self._assert_entries_match(cache, loaded)
+
+    def test_cache_without_empty_arrays_keeps_the_old_layout(self):
+        keys = mx.random.uniform(shape=(1, 2, 4, 4))
+        kv = KVCache()
+        kv.update_and_fetch(keys, keys)
+        path = os.path.join(self.test_dir, "no_empties.safetensors")
+        save_prompt_cache(path, [kv])
+        _, raw = mx.load(path, return_metadata=True)
+        # Nothing is appended, so a reader that predates this stays correct.
+        self.assertFalse(any(key.split(".")[0] == "3" for key in raw))
+        self._assert_entries_match([kv], load_prompt_cache(path))
 
 
 if __name__ == "__main__":
