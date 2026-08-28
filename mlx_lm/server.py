@@ -1419,8 +1419,18 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_error = None
+        self._generation_thread = Thread(target=self._run_generation)
         self._generation_thread.start()
+
+    def _run_generation(self):
+        """Thread body. Keeps the reason generation stopped, so that
+        health_report can name it instead of only reporting a dead thread."""
+        try:
+            self._generate()
+        except BaseException as e:
+            self._generation_error = e
+            logging.error("Generation thread stopped: %r", e, exc_info=True)
 
     def stop_and_join(self):
         self._stop = True
@@ -1428,6 +1438,47 @@ class ResponseGenerator:
 
     def join(self):
         self._generation_thread.join()
+
+    def health_report(self) -> Dict[str, Any]:
+        """Report whether generation is still running.
+
+        Only an unrequested exit is a fault. A soft reload closes admission
+        and a shutdown stops the thread on purpose, so both stay healthy: a
+        supervisor must not kill a server that does what it was told.
+        """
+        thread = getattr(self, "_generation_thread", None)
+        stopping = getattr(self, "_stop", False)
+        # A plain bool read. The health path never waits on the gate.
+        paused = getattr(self, "_paused", False)
+
+        # No thread means none was ever started (a generator built for a
+        # test). Nothing died, so there is nothing to report as dead.
+        if thread is None or thread.is_alive():
+            report = {"healthy": True, "status": "ok"}
+            if stopping:
+                report["state"] = "stopping"
+            elif paused:
+                report["state"] = "reloading"
+            return report
+
+        if stopping:
+            return {"healthy": True, "status": "ok", "state": "stopped"}
+
+        error = getattr(self, "_generation_error", None)
+        return {
+            "healthy": False,
+            "status": "error",
+            "state": "dead",
+            "reason": (
+                f"generation thread stopped: {error!r}"
+                if error is not None
+                else "generation thread is not running"
+            ),
+        }
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.health_report()["healthy"]
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -3462,11 +3513,20 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_health_check(self):
         """
         Handle a GET request for the /health endpoint.
+
+        200 says the process listens AND the generation thread still runs;
+        503 says that thread stopped on its own. The endpoint answered 200
+        unconditionally before, so a dead generator read as healthy. This is
+        liveness, not the serving path: only a real completion proves that
+        generation still answers.
         """
-        self._set_completion_headers(200)
+        report = self.response_generator.health_report()
+        self._set_completion_headers(200 if report["healthy"] else 503)
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.write(
+            json.dumps({k: v for k, v in report.items() if k != "healthy"}).encode()
+        )
         self.wfile.flush()
 
     def handle_models_request(self):
