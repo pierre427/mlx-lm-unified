@@ -971,9 +971,18 @@ class TestPLERollbackPerRowReplay(unittest.TestCase):
         captured = {}
         original = Qwen4ArraysCache.stage_ple_rollback
 
-        def spy(self, num_tokens, fn, snapshot, *, per_row_fn=None):
-            captured.update(fn=fn, per_row_fn=per_row_fn, num_tokens=num_tokens)
-            return original(self, num_tokens, fn, snapshot, per_row_fn=per_row_fn)
+        def spy(self, num_tokens, fn, snapshot, *, per_row_fn=None, depths=None):
+            captured.update(
+                fn=fn, per_row_fn=per_row_fn, num_tokens=num_tokens, depths=depths
+            )
+            return original(
+                self,
+                num_tokens,
+                fn,
+                snapshot,
+                per_row_fn=per_row_fn,
+                depths=depths,
+            )
 
         Qwen4ArraysCache.stage_ple_rollback = spy
         try:
@@ -1024,6 +1033,274 @@ class TestPLERollbackPerRowReplay(unittest.TestCase):
                 self.assertEqual(
                     record.per_row_fn is not None, gdn_rows is not None
                 )
+
+
+class TestPaddedSpeculativeStaging(unittest.TestCase):
+    """PLE rollback staging under the uniform-width verify geometry.
+
+    The old predicate required ``mask is None and lengths is None and
+    left_padding is None``, so it disarmed on exactly the forward that has to
+    roll back: a right-padded speculative slab where rows propose different
+    numbers of draft tokens.  PLE advanced every row and staged nothing.
+
+    Staging is now gated on the geometry being DESCRIBABLE per row instead.
+    The record has to carry each row's OWN span as its depth: crediting every
+    row the slab width lets a later rewind take tokens out of this record that
+    a short row never processed, and stop before the older record that holds
+    them.
+    """
+
+    PROMPTS = ([1, 2, 3, 4, 5, 6, 7], [8, 9, 10])
+    PROPOSALS = ([20, 21, 22], [30])  # Codex's [3, 1] in a width-3 slab
+    PLE_LAYER = 1
+    CONV, HISTORY = 2, 3
+
+    def _model(self):
+        mx.random.seed(11)
+        return TextModel(tiny_args(ple_layer_ids=[2]))
+
+    def _merged(self, model):
+        caches = []
+        for prompt in self.PROMPTS:
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt], dtype=mx.int32), cache=cache))
+            caches.append(cache)
+        return _merge_caches(caches)
+
+    def _speculative_slab(self, model, batch, proposals=None):
+        """Run one right-padded speculative slab, as the verify forward does."""
+        proposals = proposals or self.PROPOSALS
+        lengths = [len(p) for p in proposals]
+        width = max(lengths)
+        for layer in batch:
+            layer.start_speculation()
+            layer.prepare(
+                lengths=lengths,
+                right_padding=[width - length for length in lengths],
+            )
+        mx.eval(
+            model(_right_pad_prompts(proposals, max_length=width), cache=batch)
+        )
+        return lengths
+
+    def test_padded_slab_stages_a_per_row_depth(self):
+        model = self._model()
+        batch = self._merged(model)
+        lengths = self._speculative_slab(model, batch)
+        cache = batch[self.PLE_LAYER]
+        self.assertIsInstance(cache, Qwen4ArraysCache)
+        staged = cache._ple_rollback
+        self.assertIsNotNone(
+            staged, "a padded speculative forward staged no PLE rollback"
+        )
+        num_tokens, _, _, per_row_fn, depths = staged
+        self.assertEqual(num_tokens, max(lengths))
+        self.assertEqual(depths, lengths)
+        self.assertIsNotNone(per_row_fn)
+
+    def test_padded_record_rewinds_each_row_to_its_own_prefix(self):
+        """The whole point: reject different draft counts and land right.
+
+        GDN's staging in ``qwen3_5.py`` still disarms under a mask, so its
+        half is stubbed with a no-op replay here and only the PLE slots are
+        asserted.  Everything under test -- the per-row depths, the record's
+        replay, the ragged rewind -- is this module's.
+        """
+        for accepted in ((2, 0), (0, 1), (3, 1), (1, 0)):
+            with self.subTest(accepted=accepted):
+                model = self._model()
+                batch = self._merged(model)
+                lengths = self._speculative_slab(model, batch)
+                cache = batch[self.PLE_LAYER]
+                gdn = [cache[0], cache[1]]
+                cache.record_rollback(
+                    max(lengths), lambda m, s=gdn: list(s), list(gdn)
+                )
+                self.assertEqual(cache._row_capacity(len(lengths)), list(lengths))
+
+                for layer in batch:
+                    layer.finalize()
+                drops = [l - a for l, a in zip(lengths, accepted)]
+                cache.trim_ragged(drops)
+
+                for row, take in enumerate(accepted):
+                    reference = model.make_cache()
+                    mx.eval(
+                        model(
+                            mx.array([self.PROMPTS[row]], dtype=mx.int32),
+                            cache=reference,
+                        )
+                    )
+                    if take:
+                        mx.eval(
+                            model(
+                                mx.array(
+                                    [self.PROPOSALS[row][:take]], dtype=mx.int32
+                                ),
+                                cache=reference,
+                            )
+                        )
+                    want = reference[self.PLE_LAYER]
+                    np.testing.assert_array_equal(
+                        np.asarray(cache[self.HISTORY][row : row + 1]),
+                        np.asarray(want[self.HISTORY]),
+                        f"row {row} token history",
+                    )
+                    got = np.asarray(cache[self.CONV][row : row + 1])
+                    ref = np.asarray(want[self.CONV])
+                    scale = float(np.abs(ref).max())
+                    self.assertLess(
+                        float(np.abs(got - ref).max()) / scale,
+                        3e-3,
+                        f"row {row} conv state",
+                    )
+
+    def test_a_pending_ple_half_makes_the_span_untrimmable(self):
+        # A staged-but-unrecorded half is invisible to the rewind walker, so
+        # with older records on the stack a trim would take this forward's
+        # tokens out of THOSE. Refuse instead.
+        model = self._model()
+        batch = self._merged(model)
+        self._speculative_slab(model, batch)
+        cache = batch[self.PLE_LAYER]
+        self.assertIsNotNone(cache._ple_rollback)
+        self.assertFalse(cache.is_trimmable())
+        for call in (
+            lambda: cache.trim(1),
+            lambda: cache.trim_ragged([1, 0]),
+            lambda: cache.preflight_ragged_trim([1, 0]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "qwen3_5.py"):
+                call()
+
+    def test_leading_pads_disarm_staging_rather_than_lie(self):
+        # Both this cache's replay closures and GDN's index a row's tokens
+        # from slab position 0, so a row whose tokens start later cannot be
+        # replayed by a scalar depth. Refuse to stage rather than record it.
+        cache = Qwen4ArraysCache(4)
+        cache.start_speculation()
+        cache.left_padding = mx.array([0, 2])
+        self.assertIsNone(cache.rollback_spans(4, mx.zeros((2, 4), mx.bool_)))
+        cache.left_padding = mx.array([0, 0])
+        cache.prepare(lengths=[4, 2])
+        self.assertEqual(cache.rollback_spans(4, mx.zeros((2, 4), mx.bool_)), [4, 2])
+
+    def test_a_caller_mask_with_no_metadata_disarms_staging(self):
+        cache = Qwen4ArraysCache(4)
+        self.assertEqual(cache.rollback_spans(3), ())
+        self.assertIsNone(cache.rollback_spans(3, mx.zeros((2, 3), mx.bool_)))
+
+    def test_membership_change_drops_a_staged_ple_half(self):
+        model = self._model()
+        batch = self._merged(model)
+        self._speculative_slab(model, batch)
+        cache = batch[self.PLE_LAYER]
+        self.assertIsNotNone(cache._ple_rollback)
+        for layer in batch:
+            layer.finalize()
+        cache.filter([0])
+        self.assertIsNone(
+            cache._ple_rollback,
+            "a stale closure over old-batch tensors survived the filter",
+        )
+        self.assertTrue(cache.is_trimmable())
+
+
+class TestMTPCycleAbort(unittest.TestCase):
+    """Arming shared top-k needs a paired exit, including on the abort path."""
+
+    def _armed(self):
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
+        model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+        trunk = model.make_cache()
+        prompt = list(range(1, 11))
+        _, hyper = model.mtp_backbone(mx.array([prompt], dtype=mx.int32), trunk)
+        head = model.make_mtp_cache()
+        logits, post = model.mtp_step(
+            hyper[:, :-1], mx.array([prompt[1:]], dtype=mx.int32), head
+        )
+        model.mtp_start_cycle(head, share_qsa_indices=True)
+        for _ in range(2):
+            token = mx.argmax(logits[:, -1:, :], axis=-1)
+            logits, post = model.mtp_step(post[:, -1:], token, head)
+            mx.eval(logits, post, head[0].state)
+        return model, head
+
+    def test_ending_a_cycle_without_rewinding_reports_the_ledger(self):
+        model, head = self._armed()
+        cache = head[0]
+        self.assertLess(cache.index_keys.shape[1], cache.offset)
+        with self.assertRaisesRegex(RuntimeError, "un-ledgered KV"):
+            model.mtp_end_cycle(head)
+
+    def test_ending_a_cycle_after_the_rewind_is_clean(self):
+        model, head = self._armed()
+        cache = head[0]
+        trim_prompt_cache(head, 2)
+        model.mtp_end_cycle(head)
+        self.assertIsNone(cache._mtp_shared_topk)
+        self.assertFalse(cache._mtp_share_topk)
+        self.assertEqual(cache.index_keys.shape[1], cache.offset)
+
+    def _armed_batch(self):
+        mx.random.seed(11)
+        args = tiny_args(ple_layer_ids=[2], mtp_num_hidden_layers=1)
+        model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+        heads, hiddens, tokens = [], [], []
+        for prompt in (list(range(1, 11)), [11, 12, 13, 14, 15]):
+            trunk = model.make_cache()
+            _, hyper = model.mtp_backbone(
+                mx.array([prompt], dtype=mx.int32), trunk
+            )
+            head = model.make_mtp_cache()
+            logits, post = model.mtp_step(
+                hyper[:, :-1], mx.array([prompt[1:]], dtype=mx.int32), head
+            )
+            mx.eval(logits, post, head[0].state)
+            heads.append(head)
+            hiddens.append(post[:, -1:])
+            tokens.append(mx.argmax(logits[:, -1:, :], axis=-1))
+        batch = _merge_caches(heads)
+        model.mtp_start_cycle(batch, share_qsa_indices=True)
+        hidden = mx.concatenate(hiddens)
+        token = mx.concatenate(tokens)
+        for _ in range(2):
+            logits, hidden = model.mtp_step(hidden, token, batch)
+            mx.eval(logits, hidden, batch[0].state)
+            token = mx.argmax(logits[:, -1:, :], axis=-1)
+            hidden = hidden[:, -1:]
+        return model, batch
+
+    def test_ending_a_batched_cycle_without_rewinding_reports_the_ledger(self):
+        model, batch = self._armed_batch()
+        cache = batch[0]
+        self.assertIsInstance(cache, BatchQSAKVCache)
+        self.assertLess(cache.index_keys.shape[1], cache._idx)
+        with self.assertRaisesRegex(RuntimeError, "un-ledgered KV"):
+            model.mtp_end_cycle(batch)
+
+    def test_ending_a_batched_cycle_after_the_rewind_is_clean(self):
+        model, batch = self._armed_batch()
+        cache = batch[0]
+        trim_prompt_cache(batch, 2)
+        model.mtp_end_cycle(batch)
+        self.assertIsNone(cache._mtp_shared_topk)
+        self.assertEqual(cache.index_keys.shape[1], cache._idx)
+
+    def test_starting_a_cycle_ends_the_previous_one(self):
+        # Arming is the only hook the loop is guaranteed to reach, so it must
+        # be idempotent: an abandoned cycle cannot leak its index set forward.
+        model, head = self._armed()
+        cache = head[0]
+        trim_prompt_cache(head, 2)
+        stale = cache._mtp_shared_topk
+        cache._mtp_shared_topk = stale if stale is not None else mx.zeros(
+            (1, 2), dtype=mx.uint32
+        )
+        model.mtp_start_cycle(head, share_qsa_indices=False)
+        self.assertIsNone(cache._mtp_shared_topk)
+        self.assertFalse(cache._mtp_share_topk)
 
 
 class TestRaggedRollbackComposition(unittest.TestCase):

@@ -1038,23 +1038,140 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
         for step, (expected, actual) in enumerate(zip(stock, fast)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
 
-    def test_batch_qsa_cycle_state_survives_filter_and_clears_on_membership(self):
-        model, batch, _ = self._merged()
+    def test_filter_drops_shared_topk_and_rebounds_the_pooled_keys(self):
+        """Filtering can shrink the block grid under an armed index set.
+
+        Dropping the common left padding moves the cursor back, so a retained
+        ``_mtp_shared_topk`` can hold ids past the new ``n_blocks`` -- which
+        ``_QSA_SCATTER_CHOSEN`` would scatter out of bounds.  The pooled keys
+        are indexed by LOGICAL block instead, so they only need re-bounding.
+        """
+        model, batch, padding = self._merged()
         with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
             self._decode(model, batch)
         caches = self._qsa_caches(batch)
+        self.assertTrue(caches)
+        ratio = tiny_args(ple_layer_ids=[2]).indexer_compress_ratio
         for cache in caches:
+            cache._mtp_share_topk = True
             cache._mtp_shared_topk = mx.zeros((2, 3), dtype=mx.uint32)
-
-        for cache in caches:
+            before = cache._qsa_pooled_keys.shape[1]
+            grid = cache._idx // ratio
             cache.filter(mx.array([1]))
-            self.assertEqual(cache._qsa_pooled_keys.shape[0], 1)
-            self.assertEqual(cache._mtp_shared_topk.shape[0], 1)
-
-        for cache in caches:
-            cache.prepare(lengths=[2], right_padding=[0])
-            self.assertIsNone(cache._qsa_pooled_keys)
+            # Non-vacuous: the filter really did shrink the shared grid.
+            self.assertLess(cache._idx // ratio, grid)
             self.assertIsNone(cache._mtp_shared_topk)
+            self.assertFalse(cache._mtp_share_topk)
+            pooled = cache._qsa_pooled_keys
+            self.assertIsNotNone(pooled, "the pooled keys stayed valid")
+            self.assertEqual(pooled.shape[0], 1)
+            self.assertLessEqual(pooled.shape[1], before)
+            self.assertLessEqual(
+                pooled.shape[1],
+                (cache._idx - cache.max_left_padding()) // ratio,
+            )
+
+    def test_pooled_cache_engages_after_a_rewind_moved_the_left_padding(self):
+        """A ragged rewind grows ``left_padding`` per row.
+
+        With no pooled tensor live at that moment the release path never
+        touches the host mirror of the maximum, so the first LATER sparse
+        forward is the one that has to notice.  A stale maximum would make the
+        retained-block bound too generous and hand back a clamped block.
+        """
+
+        def run(use_lever):
+            model, batch, _ = self._merged()
+            caches = self._qsa_caches(batch)
+            for chunk in self.CHUNKS[:2]:
+                mx.eval(
+                    model(
+                        mx.array([list(chunk)] * len(self.PROMPTS), dtype=mx.int32),
+                        cache=batch,
+                    )
+                )
+            for cache in caches:
+                self.assertIsNone(cache._qsa_pooled_keys)
+                before = cache.max_left_padding()
+                cache.trim_ragged([1, 2])
+                self.assertGreater(cache.max_left_padding(), before)
+            outputs = []
+            # The lever goes on only AFTER the rewind, so the rewind really
+            # does happen with no pooled tensor live.
+            with ExitStack() as stack:
+                if use_lever:
+                    stack.enter_context(
+                        lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE")
+                    )
+                for chunk in self.CHUNKS[2:]:
+                    logits = model(
+                        mx.array(
+                            [list(chunk)] * len(self.PROMPTS), dtype=mx.int32
+                        ),
+                        cache=batch,
+                    )
+                    mx.eval(logits)
+                    outputs.append(np.asarray(logits))
+            return caches, outputs
+
+        _, stock = run(False)
+        caches, fast = run(True)
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+        ratio = tiny_args(ple_layer_ids=[2]).indexer_compress_ratio
+        for cache in caches:
+            self.assertIsNotNone(cache._qsa_pooled_keys)
+            self.assertLessEqual(
+                cache._qsa_pooled_keys.shape[1],
+                (cache._idx - cache.max_left_padding()) // ratio,
+            )
+
+    def test_every_lifecycle_exit_disarms_the_shared_topk(self):
+        """One hook, every exit.  Missing one is how this bug recurred."""
+
+        def armed():
+            model, batch, _ = self._merged()
+            with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
+                self._decode(model, batch)
+            caches = self._qsa_caches(batch)
+            for cache in caches:
+                cache._mtp_share_topk = True
+                cache._mtp_shared_topk = mx.zeros((2, 3), dtype=mx.uint32)
+            return batch, caches
+
+        exits = {
+            "trim": lambda c: c.trim(2),
+            "trim_ragged": lambda c: c.trim_ragged([1, 2]),
+            "filter": lambda c: c.filter(mx.array([0, 1])),
+            "prepare": lambda c: c.prepare(lengths=[2, 2], right_padding=[0, 0]),
+            "finalize": lambda c: c.finalize(),
+            "state": lambda c: setattr(c, "state", c.state),
+            "extend": lambda c: c.extend(qwen4_exp.BatchQSAKVCache([0])),
+            "mtp_end_cycle": None,
+        }
+        for name, action in exits.items():
+            with self.subTest(exit=name):
+                batch, caches = armed()
+                for cache in caches:
+                    self.assertIsNotNone(cache._mtp_shared_topk)
+                if action is None:
+                    model = Model(
+                        ModelArgs(
+                            model_type="qwen4_exp",
+                            text_config=tiny_args(ple_layer_ids=[2]).__dict__,
+                        )
+                    )
+                    model.mtp_end_cycle(caches)
+                else:
+                    for cache in caches:
+                        action(cache)
+                for cache in caches:
+                    self.assertIsNone(
+                        cache._mtp_shared_topk, f"{name} left an armed set"
+                    )
+                    self.assertFalse(
+                        cache._mtp_share_topk, f"{name} left the flag armed"
+                    )
 
 
 class TestQSADenseShortCircuit(unittest.TestCase):

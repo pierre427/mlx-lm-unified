@@ -376,6 +376,88 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
 class Qwen4ArraysCache(ArraysCache):
     """Four-state PLE+GDN cache with one atomic speculative rollback."""
 
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls, *args, **kwargs)
+        instance._ple_rollback = None
+        # Host mirrors of the padding metadata, each keyed by the mx array it
+        # mirrors.  Rollback spans are host-side by contract (they size a
+        # record's per-row depth), and there are 36 of these caches in the
+        # release config, so reading ``lengths`` off the device every forward
+        # would be 36 syncs per verify.  ``prepare`` seeds them from the host
+        # list it is already given and ``advance`` carries them arithmetically,
+        # so the only sync is an assignment from somewhere else.
+        instance._host_lengths = None
+        instance._host_left_padding = None
+        return instance
+
+    def _host_vector(self, field, cached):
+        value = getattr(self, field)
+        if value is None:
+            return None, None
+        if cached is None or cached[0] is not value:
+            cached = (value, [int(v) for v in value.tolist()])
+        return cached, cached[1]
+
+    def _length_vector(self):
+        self._host_lengths, values = self._host_vector(
+            "lengths", self._host_lengths
+        )
+        return values
+
+    def _left_padding_vector(self):
+        self._host_left_padding, values = self._host_vector(
+            "left_padding", self._host_left_padding
+        )
+        return values
+
+    def prepare(self, lengths=None, **kwargs):
+        super().prepare(lengths=lengths, **kwargs)
+        if lengths is not None:
+            self._host_lengths = (self.lengths, [int(v) for v in lengths])
+
+    def advance(self, N):
+        lengths = self._length_vector()
+        padding = self._left_padding_vector()
+        super().advance(N)
+        if lengths is not None:
+            self._host_lengths = (self.lengths, [v - N for v in lengths])
+        if padding is not None:
+            self._host_left_padding = (
+                self.left_padding, [v - N for v in padding]
+            )
+
+    def finalize(self):
+        super().finalize()
+        self._host_lengths = None
+        self._host_left_padding = None
+
+    def rollback_spans(self, length: int, mask=None):
+        """Tokens this forward advances per row, host-side -- or ``None``.
+
+        A rollback record credits each row a depth, and under a padded slab
+        that depth is the row's own valid span, not the slab width: crediting
+        the slab width lets a later rewind take tokens out of this record that
+        the row never processed, and stop before the older record that really
+        holds them.
+
+        ``()`` means "unpadded, every row advanced ``length``".  ``None`` means
+        the geometry cannot be described row-wise and a layer must NOT stage a
+        rollback for it -- the honest disarm, since the alternative is a record
+        that lies.  That happens for a mask the cache metadata does not
+        explain, and for a LEADING pad run: both this cache's replay closures
+        and GDN's index a row's tokens from slab position 0, so a row whose
+        tokens start later cannot be replayed by a scalar depth.
+        """
+        lengths = self._length_vector()
+        padding = self._left_padding_vector()
+        if padding is not None and max(padding) > 0:
+            return None
+        if lengths is None:
+            # A caller-supplied mask with no metadata behind it: the rows are
+            # padded by an amount this cache cannot name.
+            return None if mask is not None else ()
+        return [min(max(v, 0), length) for v in lengths]
+
     def start_speculation(self, rollback_window=None):
         self._ple_rollback = None
         super().start_speculation(rollback_window)
@@ -384,10 +466,57 @@ class Qwen4ArraysCache(ArraysCache):
         self._ple_rollback = None
         super().stop_speculation()
 
-    def stage_ple_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
+    def _clear_staged_rollback(self):
+        """Drop a PLE half staged by a forward that never reached GDN.
+
+        ``ArraysCache._invalidate_rollbacks`` calls this on every membership
+        change; without it the stale closure would restore old-batch tensors
+        into the new membership on the next trim.
+        """
+        self._ple_rollback = None
+
+    def _refuse_pending_ple(self, who: str):
+        """A staged-but-unrecorded PLE half makes the span unrestorable.
+
+        The rewind walks RECORDS, so a forward whose PLE half never reached
+        ``record_rollback`` is invisible to it: with older records on the
+        stack a trim would silently take its tokens out of those instead of
+        this forward, restoring the wrong state. Fail here instead.
+        """
         if self._ple_rollback is not None:
-            raise RuntimeError("Qwen4 PLE rollback was staged twice")
-        self._ple_rollback = (num_tokens, fn, snapshot, per_row_fn)
+            raise RuntimeError(
+                f"{who}: the last Qwen4 forward staged a PLE rollback that "
+                "GatedDeltaNet never recorded, so that span's PLE and GDN "
+                "halves cannot be restored together. Under a padded "
+                "speculative forward this means the GDN staging predicate in "
+                "qwen3_5.py still disarms where the PLE one no longer does."
+            )
+
+    def is_trimmable(self):
+        return super().is_trimmable() and self._ple_rollback is None
+
+    def trim(self, n):
+        self._refuse_pending_ple("Qwen4ArraysCache.trim")
+        return super().trim(n)
+
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        # trim_ragged() routes through preflight, so this covers both.
+        self._refuse_pending_ple("Qwen4ArraysCache.trim_ragged")
+        return super().preflight_ragged_trim(n, validate=validate)
+
+    def stage_ple_rollback(
+        self, num_tokens, fn, snapshot, *, per_row_fn=None, depths=None
+    ):
+        if self._ple_rollback is not None:
+            raise RuntimeError(
+                "Qwen4 PLE rollback was staged twice without a GDN record in "
+                "between. PLE and GDN roll back as ONE record, so a forward "
+                "that stages the PLE half must reach GatedDeltaNet's "
+                "record_rollback in the same forward. If this fired under a "
+                "padded (masked / lengths-bearing) speculative forward, the "
+                "GDN half in qwen3_5.py still disarms its staging there."
+            )
+        self._ple_rollback = (num_tokens, fn, snapshot, per_row_fn, depths)
 
     def record_rollback(self, num_tokens, fn, snapshot, *, per_row_fn=None):
         staged = self._ple_rollback
@@ -396,7 +525,7 @@ class Qwen4ArraysCache(ArraysCache):
             return super().record_rollback(
                 num_tokens, fn, snapshot, per_row_fn=per_row_fn
             )
-        ple_tokens, ple_fn, ple_snapshot, ple_per_row = staged
+        ple_tokens, ple_fn, ple_snapshot, ple_per_row, depths = staged
         if ple_tokens != num_tokens:
             raise RuntimeError(
                 "Qwen4 PLE/GDN rollback span mismatch: "
@@ -417,12 +546,26 @@ class Qwen4ArraysCache(ArraysCache):
             def rows(lengths):
                 return list(per_row_fn(lengths)) + list(ple_per_row(lengths))
 
-        return super().record_rollback(
+        result = super().record_rollback(
             num_tokens,
             combined,
             list(snapshot) + list(ple_snapshot),
             per_row_fn=rows,
         )
+        if depths:
+            # A padded slab: row i advanced by its own span, so the record has
+            # to say so. GDN's own closures are already per-row correct here
+            # (masked steps are recurrence no-ops and its conv window is
+            # indexed from slab position 0), so only the DEPTHS are Qwen4's to
+            # fix up -- which keeps qwen3_5.py out of the per-row bookkeeping.
+            batch = len(depths)
+            if batch != self.batch_size:
+                raise RuntimeError(
+                    f"Qwen4 rollback spans cover {batch} rows but the cache "
+                    f"holds {self.batch_size}"
+                )
+            self._rollbacks[-1] = self._rollbacks[-1].with_depths(list(depths))
+        return result
 
     def extract(self, idx):
         cache = type(self)(len(self.cache))
@@ -866,13 +1009,17 @@ class PLELayer(nn.Module):
             gated = mx.where(mask[..., None], gated, 0)
             normed = mx.where(mask[..., None], normed, 0)
         conv = self._short_conv(normed, cache, mask)
-        if (
-            isinstance(cache, Qwen4ArraysCache)
-            and cache.speculating
-            and mask is None
-            and cache.lengths is None
-            and cache.left_padding is None
-        ):
+        spans = (
+            cache.rollback_spans(input_ids.shape[1], mask)
+            if isinstance(cache, Qwen4ArraysCache) and cache.speculating
+            else None
+        )
+        if spans is not None:
+            # Staging is gated on the geometry being DESCRIBABLE per row, not
+            # on it being unpadded: a right-padded speculative slab (the
+            # uniform-width verify, where rows propose different draft counts)
+            # is exactly the case that has to roll back, and the old
+            # ``mask is None`` predicate disarmed precisely there.
             state_len = self.short_conv_state_len
             conv_base = previous_conv
             if conv_base is None:
@@ -888,9 +1035,14 @@ class PLELayer(nn.Module):
                     self.ple_embedding.eos_token_id,
                     dtype=mx.int64,
                 )
-            token_history = mx.concatenate(
-                [token_base, input_ids.astype(mx.int64)], axis=1
-            )
+            staged_ids = input_ids.astype(mx.int64)
+            if mask is not None:
+                # The same substitution the live history update makes, so a
+                # replayed window is the window that was stored.
+                staged_ids = mx.where(
+                    mask, staged_ids, self.ple_embedding.eos_token_id
+                )
+            token_history = mx.concatenate([token_base, staged_ids], axis=1)
 
             def _ple_rollback(
                 m, ci=conv_input, th=token_history, sl=state_len, cl=context_len
@@ -921,6 +1073,7 @@ class PLELayer(nn.Module):
                 _ple_rollback,
                 [previous_conv, previous_tokens],
                 per_row_fn=_ple_rollback_rows,
+                depths=spans,
             )
         return gated + conv
 
@@ -981,51 +1134,96 @@ class BatchQSAKVCache(BatchKVCache):
             self._max_left_pad = (padding, int(padding.max().item()))
         return self._max_left_pad[1]
 
-    def _drop_qsa_cycle_state(self):
-        self._mtp_share_topk = False
-        self._mtp_shared_topk = None
-        self._qsa_pooled_keys = None
-        self._qsa_pooled_ratio = None
+    # THE armed cross-call state. Everything here is derived from the block
+    # grid and the row set, so nothing here may outlive a change to either.
+    _QSA_CYCLE_FIELDS = (
+        ("_mtp_share_topk", False),
+        ("_mtp_shared_topk", None),
+        ("_qsa_pooled_keys", None),
+        ("_qsa_pooled_ratio", None),
+    )
 
-    def _rewound_qsa_cycle_state(self):
-        """Same contract as QSAKVCache.trim, applied per row.
+    def release_qsa_cycle(self, who: str, *, rows=None, keep_pooled=True):
+        """The ONE exit for armed QSA state. Every lifecycle method routes here.
 
-        A rewind ends the MTP draft cycle.  A block mean is a closed window,
-        so a block inside EVERY row's new offset stays exact -- and the row
-        with the most left padding is the one that bounds that, whether the
-        rewind moved the shared cursor or only the per-row offsets.
+        This class has now been bitten three times by armed state outliving
+        the geometry it was computed against (the live ``trim()`` desync, the
+        aborted draft cycle, the filtered block ids), so the rules below are
+        stated once and derived from the CURRENT geometry -- never from which
+        method called:
+
+        * **The MTP shared top-k always dies.** It is a cycle-local set of
+          block ids with no geometry-independent meaning: ``filter`` can shrink
+          the physical grid under it (dropping the common left padding), which
+          leaves ids past ``n_blocks`` that ``_QSA_SCATTER_CHOSEN`` would
+          scatter out of bounds. There is no safe rewind for it, only a reset.
+        * **The pooled keys are re-bounded, not dropped.** They are indexed by
+          LOGICAL block per row, so they survive anything that does not change
+          a row's own logical content -- and the bound that expresses this,
+          ``(cursor - max left padding) // ratio``, is read off the live state
+          after the caller has updated it. That covers a rewind (offsets
+          shrink), a filter (rows subset, then re-bound) and ``finalize`` (the
+          right-padding roll only ever invalidates blocks past the shortest
+          row). ``keep_pooled=False`` is for the one case where the cache stops
+          being the same cache at all: a ``state`` restore.
+
+        Post-condition: with the cycle released the raw-key ledger must span
+        exactly the cursor. Only a live shared-top-k cycle may run it short,
+        and that cycle is over by the time this returns.
         """
-        self._mtp_share_topk = False
-        self._mtp_shared_topk = None
-        if self.index_keys is not None and self.index_keys.shape[1] > self._idx:
-            # The next append truncates to the cursor anyway; doing it here
-            # keeps ``ledger width == cursor`` an invariant a reader can rely
-            # on, and drops the bytes now.
-            self.index_keys = mx.contiguous(self.index_keys[:, : self._idx])
-        if self._qsa_pooled_keys is not None:
-            keep = max(0, self._idx - self.max_left_padding()) // self._qsa_pooled_ratio
-            if keep == 0:
-                self._qsa_pooled_keys = None
-            elif keep < self._qsa_pooled_keys.shape[1]:
-                self._qsa_pooled_keys = mx.contiguous(
-                    self._qsa_pooled_keys[:, :keep]
+        pooled, ratio = self._qsa_pooled_keys, self._qsa_pooled_ratio
+        # Blank everything first, so a field added to _QSA_CYCLE_FIELDS later
+        # is cleared by default and only what is re-derived below survives.
+        for name, blank in self._QSA_CYCLE_FIELDS:
+            setattr(self, name, blank)
+        if keep_pooled and pooled is not None:
+            if rows is not None:
+                pooled = mx.contiguous(pooled[rows])
+            if not ratio:
+                raise RuntimeError("QSA pooled keys are cached without a ratio")
+            keep = max(0, self._idx - self.max_left_padding()) // ratio
+            if keep and pooled.shape[0] == self.offset.shape[0]:
+                self._qsa_pooled_keys = (
+                    pooled if keep >= pooled.shape[1]
+                    else mx.contiguous(pooled[:, :keep])
                 )
+                self._qsa_pooled_ratio = ratio
+        self._reconcile_index_ledger(who)
+
+    def _reconcile_index_ledger(self, who: str):
+        """``len(index_keys) == cursor``, or say exactly why not.
+
+        A ledger WIDER than the cursor is the normal aftermath of a rewind and
+        is simply cut. A ledger NARROWER than the cursor means a shared-top-k
+        cycle skipped raw-key appends for KV that is still in the cache: the
+        13-vs-12 shape of the live desync this class shipped once already.
+        """
+        if self.index_keys is None:
+            return
+        width = self.index_keys.shape[1]
+        if width > self._idx:
+            self.index_keys = mx.contiguous(self.index_keys[:, : self._idx])
+        elif width < self._idx:
+            raise RuntimeError(
+                f"{who}: the QSA raw-key ledger holds {width} positions but "
+                f"the cursor is at {self._idx}. A shared-top-k draft cycle "
+                "left un-ledgered KV behind and was ended without rewinding "
+                "the drafted span."
+            )
 
     def trim(self, n):
         n = super().trim(n)
-        self._rewound_qsa_cycle_state()
+        self.release_qsa_cycle("BatchQSAKVCache.trim")
         return n
 
     def trim_ragged(self, n, *, validate: bool = True):
         drops = super().trim_ragged(n, validate=validate)
-        self._rewound_qsa_cycle_state()
+        self.release_qsa_cycle("BatchQSAKVCache.trim_ragged")
         return drops
 
     def prepare(self, *args, **kwargs):
-        # A right-padded forward pools filler tokens into the tail blocks and
-        # finalize() then rolls them out from under those blocks.
-        self._drop_qsa_cycle_state()
         super().prepare(*args, **kwargs)
+        self.release_qsa_cycle("BatchQSAKVCache.prepare")
 
     def update_index_keys(self, keys: mx.array):
         self.index_keys = (
@@ -1043,8 +1241,10 @@ class BatchQSAKVCache(BatchKVCache):
     def state(self, value):
         BatchKVCache.state.fset(self, value[:4])
         self.index_keys = value[4]
-        self._drop_qsa_cycle_state()
         self._max_left_pad = None
+        # A restore replaces the contents wholesale, so the pooled keys are
+        # not this cache's any more even at an unchanged row count.
+        self.release_qsa_cycle("BatchQSAKVCache.state", keep_pooled=False)
 
     @property
     def nbytes(self):
@@ -1056,8 +1256,8 @@ class BatchQSAKVCache(BatchKVCache):
         padding = self._right_padding
         if padding is not None and self.index_keys is not None:
             self.index_keys = dynamic_roll(self.index_keys, padding, axis=1)
-        self._drop_qsa_cycle_state()
         super().finalize()
+        self.release_qsa_cycle("BatchQSAKVCache.finalize")
 
     def filter(self, batch_indices):
         min_left_pad = self.left_padding[batch_indices].min().item()
@@ -1065,17 +1265,9 @@ class BatchQSAKVCache(BatchKVCache):
             self.index_keys = self.index_keys[batch_indices]
             if min_left_pad > 0:
                 self.index_keys = self.index_keys[:, min_left_pad:]
-        # Both are indexed by LOGICAL block, so dropping rows is all a filter
-        # owes them; the column shift above does not move a logical block.
-        if self._qsa_pooled_keys is not None:
-            self._qsa_pooled_keys = mx.contiguous(
-                self._qsa_pooled_keys[batch_indices]
-            )
-        if self._mtp_shared_topk is not None:
-            self._mtp_shared_topk = mx.contiguous(
-                self._mtp_shared_topk[batch_indices]
-            )
         super().filter(batch_indices)
+        # After super(), so the bound is read off the new cursor and padding.
+        self.release_qsa_cycle("BatchQSAKVCache.filter", rows=batch_indices)
 
     def extend(self, other):
         index_a, index_b = self.index_keys, other.index_keys
@@ -1100,13 +1292,17 @@ class BatchQSAKVCache(BatchKVCache):
                     pad(index_b, idx_b, other.offset.shape[0]),
                 ]
             )
-        # The joining rows carry neither, and a partial set has no meaning as
-        # a batch tensor: a join ends the cycle for every lane.
-        self._drop_qsa_cycle_state()
         super().extend(other)
         self.index_keys = merged_index
+        # The joining rows carry neither, and a partial set has no meaning as
+        # a batch tensor: a join ends the cycle for every lane. The row-count
+        # change makes the release drop the pooled keys on its own.
+        self._max_left_pad = None
+        self.release_qsa_cycle("BatchQSAKVCache.extend")
 
     def extract(self, idx):
+        # A row leaves as a standalone sequence, so its ledger must be whole.
+        self._reconcile_index_ledger("BatchQSAKVCache.extract")
         cache = QSAKVCache()
         padding = self.left_padding[idx].item()
         end = self._idx
@@ -1178,25 +1374,43 @@ class QSAKVCache(KVCache):
         self.index_keys = keys if self.index_keys is None else mx.concatenate([self.index_keys[:, : self.offset], keys], axis=1)
         return self.index_keys
 
-    def trim(self, n):
-        n = super().trim(n)
-        # A rewind ends any MTP draft cycle.  A stale shared top-k would make
-        # the next uncycled ``mtp_step`` skip its raw-key append and desync
-        # ``index_keys`` from the KV offset; ``mtp_start_cycle`` re-arms it.
+    def release_qsa_cycle(self, who: str, *, keep_pooled: bool = True):
+        """Single-sequence twin of ``BatchQSAKVCache.release_qsa_cycle``.
+
+        A rewind ends any MTP draft cycle.  A stale shared top-k would make
+        the next uncycled ``mtp_step`` skip its raw-key append and desync
+        ``index_keys`` from the KV offset; ``mtp_start_cycle`` re-arms it.
+        A block mean is a closed window over ``ratio`` tokens, so every block
+        fully inside the trimmed offset stays exact and only the tail is cut.
+        """
         self._mtp_share_topk = False
         self._mtp_shared_topk = None
         if self.index_keys is not None:
-            self.index_keys = mx.contiguous(self.index_keys[:, : self.offset])
+            width = self.index_keys.shape[1]
+            if width < self.offset:
+                raise RuntimeError(
+                    f"{who}: the QSA raw-key ledger holds {width} positions "
+                    f"but the offset is {self.offset}. A shared-top-k draft "
+                    "cycle left un-ledgered KV behind and was ended without "
+                    "rewinding the drafted span."
+                )
+            if width > self.offset:
+                self.index_keys = mx.contiguous(
+                    self.index_keys[:, : self.offset]
+                )
         if self._qsa_pooled_keys is not None:
-            # A block mean is a closed window over ``ratio`` tokens, so every
-            # block fully inside the trimmed offset stays exact.
-            keep = self.offset // self._qsa_pooled_ratio
+            keep = 0 if not keep_pooled else self.offset // self._qsa_pooled_ratio
             if keep == 0:
                 self._qsa_pooled_keys = None
+                self._qsa_pooled_ratio = None
             elif keep < self._qsa_pooled_keys.shape[1]:
                 self._qsa_pooled_keys = mx.contiguous(
                     self._qsa_pooled_keys[:, :keep]
                 )
+
+    def trim(self, n):
+        n = super().trim(n)
+        self.release_qsa_cycle("QSAKVCache.trim")
         return n
 
     @classmethod
@@ -1887,12 +2101,35 @@ class Model(nn.Module):
             return [QSAKVCache() for _ in self.mtp.layers]
         return [SinkWindowKVCache(window_size, sink_size) for _ in self.mtp.layers]
 
+    def mtp_end_cycle(self, mtp_cache):
+        """Disarm QSA top-k sharing at the end of an MTP draft cycle.
+
+        The paired hook for ``mtp_start_cycle``. Arming has to be undone by
+        SOMETHING even when the cycle is abandoned -- an abort, an exception,
+        a stream that disconnects mid-draft -- because a surviving armed flag
+        makes the next forward reuse a stale index set and build a silently
+        wrong mask, with no desync check on that branch to catch it. Call it
+        AFTER the drafted span is rewound; called before, it reports the
+        un-ledgered KV the cycle left behind instead of hiding it.
+        """
+        for cache in mtp_cache:
+            if isinstance(cache, BatchQSAKVCache):
+                cache.release_qsa_cycle("Model.mtp_end_cycle")
+            elif isinstance(cache, QSAKVCache):
+                cache.release_qsa_cycle("Model.mtp_end_cycle")
+
     def mtp_start_cycle(self, mtp_cache, share_qsa_indices: bool = False):
         """Reset optional QSA top-k sharing at an MTP draft-cycle boundary.
 
         Sharing is per lane under a batched head cache: the stored index set
         is ``[B, k]`` and each row reuses its own blocks.
+
+        Ending the previous cycle first makes arming idempotent and self
+        healing: a cycle that was abandoned without reaching a rewind cannot
+        leak its index set into this one, and its un-ledgered KV is reported
+        here rather than several forwards later.
         """
+        self.mtp_end_cycle(mtp_cache)
         for cache in mtp_cache:
             if isinstance(cache, (QSAKVCache, BatchQSAKVCache)):
                 cache._mtp_share_topk = bool(share_qsa_indices)
