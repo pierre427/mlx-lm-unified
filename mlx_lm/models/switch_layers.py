@@ -36,8 +36,12 @@ _SORTED_GATHER_TAIL_BUG = True
 # plain decode (M=1) and MTP verify at k=2 (M=3) never sort -- even though a
 # 2026-08-28 routing probe measured 1.36x expert reuse already present at M=3
 # (results/moe-expert-reuse-20260828.json). Module-level so an A/B can switch
-# it on a resident model; the 64 default is unchanged behaviour.
-_GATHER_SORT_MIN_ASSIGNMENTS = 64
+# it on a resident model.
+# Default 20 (2026-08-28): engages the sorted path at M>=2, capturing the
+# +2.08% MTP-verify win (bit-identical output, non-overlapping IQRs at n=12).
+# 20 not lower: sorting at M=1 costs ~0.78% and reuse there is exactly 1.00x,
+# so decode (M=1, 10 assignments) stays unsorted.
+_GATHER_SORT_MIN_ASSIGNMENTS = 20
 
 
 def _gather_sort(x, indices):

@@ -77,7 +77,11 @@ _MOE_GATE_COMPILE_MAX_TOKENS = 8
 # tensor the checkpoint ships and run them as ONE gather matmul. Halves
 # routed dispatches per layer and doubles N-tile fill. The wide matmul may
 # regroup accumulation => tolerance-level lever.
-_MOE_FUSED_GATE_UP = _env_flag("MLX_QWEN4_MOE_FUSED_GATE_UP")
+# Default-on 2026-08-28: ~+3.6% prefill, clean greedy digest (unlike
+# moe_shared_in_gather, which stays off). A 0.32.2 remeasure is still pending,
+# so the magnitude is the 0.32.0 figure; set MLX_QWEN4_MOE_FUSED_GATE_UP=0 to
+# revert.
+_MOE_FUSED_GATE_UP = _env_flag("MLX_QWEN4_MOE_FUSED_GATE_UP", default=True)
 
 # MLX_QWEN4_MOE_SHARED_IN_GATHER: fold the shared expert into the routed
 # table as expert index E, so top_k+1 rows go through one dispatch. The
