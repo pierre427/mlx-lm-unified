@@ -97,6 +97,16 @@ class TestLaneRNGFactory(unittest.TestCase):
         self.assertIs(config["lane_rng"], lane)
 
 
+@unittest.skip(
+    "Lane-key wiring is disabled in generate.py (c1bcb51) after it took the "
+    "service down: the server builds the LaneRNG on the request thread while "
+    "generation runs on a worker thread, and mlx-lm binds generation_stream to "
+    "its creating thread, so the first draw raised 'There is no Stream(gpu, 0) "
+    "in current thread'. These assertions are correct for the intended "
+    "behaviour -- un-skip them together with the wiring, once the lane is built "
+    "on the generation thread (see Rapid-MLX's _run_on_step_thread discipline, "
+    "wiki lessons/single-thread-tests-cannot-see-cross-thread-state.md)."
+)
 class TestStreamGenerateForwardsTheLane(unittest.TestCase):
     """``stream_generate`` is the only door into the MTP engine from serving."""
 
