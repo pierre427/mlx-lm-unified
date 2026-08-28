@@ -589,5 +589,58 @@ class TestArraysCacheRaggedTrim(unittest.TestCase):
         self.assertIsNotNone(record.per_row_fn)
 
 
+class TestQwen4CacheContracts(unittest.TestCase):
+    """The production Qwen4 cache types, exercised through this file's API only."""
+
+    def test_qwen4_arrays_cache_ragged_trim(self):
+        from mlx_lm.models.qwen4_exp import Qwen4ArraysCache
+
+        # Two state slots, staged the way the PLE+GDN pair combines them.
+        cache = Qwen4ArraysCache(2)
+        cache.start_speculation()
+        before = [mx.array([[1], [2]]), mx.array([[10], [20]])]
+        cache.cache = [mx.array(a) for a in before]
+
+        def gdn(m):
+            return [before[0] + m]
+
+        def ple(m):
+            return [before[1] + 100 * m]
+
+        cache.stage_ple_rollback(3, ple, [before[1]])
+        cache.record_rollback(3, gdn, [before[0]])
+        cache.cache = [before[0] + 3, before[1] + 300]
+
+        cache.trim_ragged([0, 2])
+        # Row 0 keeps all three tokens, row 1 rewinds to one.
+        self.assertEqual(cache[0].reshape(-1).tolist(), [4, 3])
+        self.assertEqual(cache[1].reshape(-1).tolist(), [310, 120])
+
+    def test_batch_qsa_cache_declares_its_ledger_or_fails_loud(self):
+        from mlx_lm.models.qwen4_exp import BatchQSAKVCache
+
+        cache = BatchQSAKVCache([0, 0])
+        values = _tokens(2, 4)
+        cache.update_and_fetch(values, values)
+        cache.update_index_keys(
+            mx.broadcast_to(
+                mx.arange(4, dtype=mx.float32).reshape(1, 4, 1), (2, 4, 2)
+            )
+        )
+        try:
+            cache.trim_ragged([0, 2])
+        except RaggedTrimUnsupported:
+            # Not wired yet: the ledger contract must be declared in
+            # qwen4_exp.py before batched MTP can reject a draft.
+            return
+        # Once declared, the raw index keys must stay in step with the KV.
+        self.assertEqual(cache.index_keys.shape[1], cache._idx)
+        left = cache.left_padding.tolist()
+        for row, offset in enumerate(cache.offset.tolist()):
+            live = cache.index_keys[row, int(left[row]) : cache._idx, 0].tolist()
+            self.assertEqual(len(live), int(offset))
+            self.assertEqual(live, [float(p) for p in range(int(offset))])
+
+
 if __name__ == "__main__":
     unittest.main()
