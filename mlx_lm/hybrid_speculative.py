@@ -1626,14 +1626,16 @@ def _extend_self_mtp_cache_group(target: Sequence[Any], other: Sequence[Any]) ->
 
 def _prepare_self_mtp_cache_group(caches, lengths, right_padding) -> None:
     for cache in caches:
-        cache.prepare(lengths=lengths, right_padding=right_padding)
+        prepare = getattr(cache, "prepare_self_mtp_step", cache.prepare)
+        prepare(lengths=lengths, right_padding=right_padding)
 
 
 def _finalize_self_mtp_cache_group(caches) -> None:
     first_error = None
     for cache in caches:
         try:
-            cache.finalize()
+            finalize = getattr(cache, "finalize_self_mtp_step", cache.finalize)
+            finalize()
         except BaseException as exc:  # noqa: BLE001 - finish every cache entry
             if first_error is None:
                 first_error = exc

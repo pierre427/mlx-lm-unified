@@ -81,7 +81,7 @@ def _tree_arrays(value):
             yield from _tree_arrays(item)
 
 
-def _prepare_lane(model, uid, prompt):
+def _prepare_lane(model, uid, prompt, *, share_qsa_indices=False):
     return prepare_self_mtp_lane(
         mx.array(prompt, mx.uint32),
         model,
@@ -98,7 +98,7 @@ def _prepare_lane(model, uid, prompt):
         accept_rule="residual",
         logits_processors=[],
         prefill_step_size=4,
-        share_qsa_indices=False,
+        share_qsa_indices=share_qsa_indices,
     )[0]
 
 
@@ -130,6 +130,44 @@ def _forced_cycle(model, prompts, accepts, uids=None):
 
 
 class TestBatchedSelfMTPQSA(unittest.TestCase):
+    def test_batched_proposal_reuses_per_lane_topk_and_disarms_cycle(self):
+        mx.random.seed(43)
+        model = _tiny_qwen4_model()
+        lanes = [
+            _prepare_lane(model, uid, prompt, share_qsa_indices=True)
+            for uid, prompt in enumerate(([1, 2, 3, 4, 5], [7, 8, 9, 10, 11, 12]))
+        ]
+        batch = attach_self_mtp_lanes(model, None, lanes)
+        qsa_caches = [
+            cache
+            for cache in batch.caches.draft
+            if isinstance(cache, BatchQSAKVCache)
+        ]
+        self.assertTrue(qsa_caches)
+
+        mtp_step = model.mtp_step
+        calls = 0
+
+        def checked_mtp_step(hidden, tokens, cache):
+            nonlocal calls
+            if calls == 1:
+                self.assertTrue(
+                    all(item._mtp_shared_topk is not None for item in qsa_caches)
+                )
+                self.assertTrue(
+                    all(item._mtp_shared_topk.shape[0] == 2 for item in qsa_caches)
+                )
+            result = mtp_step(hidden, tokens, cache)
+            calls += 1
+            return result
+
+        model.mtp_step = checked_mtp_step
+        propose_batched_self_mtp(model, batch)
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(all(cache._mtp_shared_topk is None for cache in qsa_caches))
+        self.assertTrue(all(not cache._mtp_share_topk for cache in qsa_caches))
+
     def test_shared_topk_uses_each_rows_last_valid_query(self):
         cache = BatchQSAKVCache([0, 0, 0])
         cache.prepare(right_padding=[0, 2, 1])

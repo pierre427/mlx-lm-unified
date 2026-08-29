@@ -1238,7 +1238,13 @@ class BatchQSAKVCache(BatchKVCache):
         return self._max_left_pad[1]
 
     def release_qsa_cycle(
-        self, who: str, *, rows=None, keep_pooled=True, cursor_final=True
+        self,
+        who: str,
+        *,
+        rows=None,
+        keep_pooled=True,
+        cursor_final=True,
+        keep_shared=False,
     ):
         """The ONE exit for armed QSA state. Every lifecycle method routes here.
 
@@ -1248,11 +1254,14 @@ class BatchQSAKVCache(BatchKVCache):
         stated once and derived from the CURRENT geometry -- never from which
         method called:
 
-        * **The MTP shared top-k always dies.** It is a cycle-local set of
-          block ids with no geometry-independent meaning: ``filter`` can shrink
-          the physical grid under it (dropping the common left padding), which
-          leaves ids past ``n_blocks`` that ``_QSA_SCATTER_CHOSEN`` would
-          scatter out of bounds. There is no safe rewind for it, only a reset.
+        * **The MTP shared top-k dies at every membership or cycle boundary.**
+          It is a cycle-local set of block ids with no geometry-independent
+          meaning: ``filter`` can shrink the physical grid under it (dropping
+          the common left padding), which leaves ids past ``n_blocks`` that
+          ``_QSA_SCATTER_CHOSEN`` would scatter out of bounds. The only
+          exception is a prepare/finalize pair inside the same ragged MTP
+          draft cycle: that pair changes physical padding but not the rows or
+          their logical block ids, so ``keep_shared=True`` preserves the set.
         * **The pooled keys are re-bounded, not dropped.** They are indexed by
           LOGICAL block per row, so they survive anything that does not change
           a row's own logical content -- and the bound that expresses this,
@@ -1264,17 +1273,21 @@ class BatchQSAKVCache(BatchKVCache):
           being the same cache at all: a ``state`` restore.
 
         Post-condition: with the cycle released the raw-key ledger must span
-        exactly the cursor. Only a live shared-top-k cycle may run it short,
-        and that cycle is over by the time this returns.
-        ``cursor_final=False`` defers just that check for the one caller whose
-        cursor is still provisional -- the ``state`` setter, where ``_idx`` is
-        the allocated buffer width until ``meta_state`` lands the real one.
+        exactly the cursor. Only a live shared-top-k cycle may run it short.
+        ``cursor_final=False`` defers that check either while such a cycle is
+        still live, or for the ``state`` setter where ``_idx`` remains the
+        allocated buffer width until ``meta_state`` lands the real one.
         """
         pooled, ratio = self._qsa_pooled_keys, self._qsa_pooled_ratio
+        share_topk = self._mtp_share_topk
+        shared_topk = self._mtp_shared_topk
         # Blank everything first, so a field added to _QSA_CYCLE_FIELDS later
         # is cleared by default and only what is re-derived below survives.
         for name, blank in self._QSA_CYCLE_FIELDS:
             setattr(self, name, blank)
+        if keep_shared:
+            self._mtp_share_topk = share_topk
+            self._mtp_shared_topk = shared_topk
         if keep_pooled and pooled is not None:
             if rows is not None:
                 pooled = mx.contiguous(pooled[rows])
@@ -1324,6 +1337,16 @@ class BatchQSAKVCache(BatchKVCache):
     def prepare(self, *args, **kwargs):
         super().prepare(*args, **kwargs)
         self.release_qsa_cycle("BatchQSAKVCache.prepare")
+
+    def prepare_self_mtp_step(self, *args, **kwargs):
+        if not self._mtp_share_topk:
+            return self.prepare(*args, **kwargs)
+        super().prepare(*args, **kwargs)
+        self.release_qsa_cycle(
+            "BatchQSAKVCache.prepare_self_mtp_step",
+            cursor_final=False,
+            keep_shared=True,
+        )
 
     def last_valid_query(self, values: mx.array) -> mx.array:
         """Gather each row's final non-padding query from ``[B, L, ...]``."""
@@ -1384,12 +1407,24 @@ class BatchQSAKVCache(BatchKVCache):
             0 if self.index_keys is None else self.index_keys.nbytes
         )
 
-    def finalize(self):
+    def _finalize(self, *, keep_shared=False):
         padding = self._right_padding
         if padding is not None and self.index_keys is not None:
             self.index_keys = dynamic_roll(self.index_keys, padding, axis=1)
         super().finalize()
-        self.release_qsa_cycle("BatchQSAKVCache.finalize")
+        self.release_qsa_cycle(
+            "BatchQSAKVCache.finalize",
+            cursor_final=not keep_shared,
+            keep_shared=keep_shared,
+        )
+
+    def finalize(self):
+        self._finalize()
+
+    def finalize_self_mtp_step(self):
+        if not self._mtp_share_topk:
+            return self.finalize()
+        self._finalize(keep_shared=True)
 
     def filter(self, batch_indices):
         min_left_pad = self.left_padding[batch_indices].min().item()
