@@ -41,6 +41,43 @@ class TestSelfMTPLaneAdmissionController(unittest.TestCase):
         self.assertEqual(decision.stage, "fewer_lanes")
         self.assertTrue(all(decision.draft_depths[i] == 2 for i in decision.mtp_indices))
 
+    def test_saturation_cap_binds_when_memory_would_admit_more(self):
+        # A dense 27B (~18 GiB resident) leaves far more free than Flash-Next's
+        # PLE operating point, so the memory envelope alone would admit ~40
+        # lanes at short context -- past the measured throughput knee.  The
+        # compute-saturation cap holds N at 16 regardless of free memory.
+        decision = self.controller.decide([256] * 64, 95.0)
+        self.assertEqual(len(decision.mtp_indices), 16)
+        self.assertEqual(decision.stage, "fewer_lanes")
+        self.assertTrue(all(decision.draft_depths[i] == 2 for i in decision.mtp_indices))
+        # Uncapped, the same budget admits many more than the cap.
+        uncapped = SelfMTPLaneAdmissionController(saturation_lane_cap=None)
+        self.assertGreater(len(uncapped.decide([256] * 64, 95.0).mtp_indices), 16)
+
+    def test_saturation_cap_is_configurable(self):
+        controller = SelfMTPLaneAdmissionController(saturation_lane_cap=8)
+        self.assertEqual(len(controller.decide([256] * 64, 95.0).mtp_indices), 8)
+
+    def test_dense_transient_admits_fewer_lanes(self):
+        # The MoE-calibrated 1.76 GiB/lane under-models a dense 27B (~3.1 GiB).
+        # A dense-calibrated controller admits fewer lanes for the same budget.
+        moe = SelfMTPLaneAdmissionController(saturation_lane_cap=None)
+        dense = SelfMTPLaneAdmissionController(
+            saturation_lane_cap=None, transient_gib_per_lane=3.1
+        )
+        self.assertLess(
+            len(dense.decide([256] * 64, 60.0).mtp_indices),
+            len(moe.decide([256] * 64, 60.0).mtp_indices),
+        )
+
+    def test_transient_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "transient"):
+            SelfMTPLaneAdmissionController(transient_gib_per_lane=0.0)
+
+    def test_saturation_cap_rejects_non_positive(self):
+        with self.assertRaisesRegex(ValueError, "saturation lane cap"):
+            SelfMTPLaneAdmissionController(saturation_lane_cap=0)
+
     def test_measured_ceiling_at_sixteen_k_is_four_lanes(self):
         decision = self.controller.decide([16 * 1024] * 5, self.free)
         self.assertEqual(len(decision.mtp_indices), 4)

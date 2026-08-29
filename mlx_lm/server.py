@@ -1210,6 +1210,19 @@ class SelfMTPLaneAdmissionController:
     not a claim about allocator internals.  Inputs that cannot be measured are
     queued rather than guessed.
 
+    Memory is not the only ceiling.  The M=(k+1)N verify forward saturates the
+    GPU near a fixed lane count; past it, aggregate throughput falls even when
+    memory permits more lanes.  A dense Qwen3.8-27B (~18 GiB resident) leaves
+    ~95 GiB free, so the memory envelope alone would admit N~40 at short
+    context -- 2.5x past the measured throughput peak (N=16: 270 t/s agg;
+    N=40: 52 t/s).  ``SATURATION_LANE_CAP`` bounds the admitted subset so the
+    N~16 knee holds regardless of how much memory is free.  At Flash-Next's
+    72.5 GiB PLE operating point the memory envelope already caps near 16 at
+    1K, so this cap is a no-op there and only binds when free memory is large.
+    The k=2 transient is calibrated on Flash-Next (MoE, 6B active); a dense
+    27B measures ~3.1 GiB/lane, so ``transient_gib_per_lane`` is configurable
+    for dense deployments at long context where the transient dominates.
+
     ``decide`` is stateless on purpose.  The server calls it at every decode
     cycle boundary with fresh free memory and current per-lane contexts, so
     lane joins/leaves and cache growth are always reflected in the next plan.
@@ -1221,19 +1234,32 @@ class SelfMTPLaneAdmissionController:
     DRIVER_ALLOWANCE_GIB = 4.0
     CACHE_GIB_PER_1K_TOKENS = 0.44
     K2_TRANSIENT_GIB_PER_LANE = 1.76
+    SATURATION_LANE_CAP = 16
 
     def __init__(
         self,
         *,
         service_reserve_gib: float = SERVICE_RESERVE_GIB,
         driver_allowance_gib: float = DRIVER_ALLOWANCE_GIB,
+        transient_gib_per_lane: float = K2_TRANSIENT_GIB_PER_LANE,
+        saturation_lane_cap: Optional[int] = SATURATION_LANE_CAP,
     ):
         if service_reserve_gib < self.SERVICE_RESERVE_GIB:
             raise ValueError("self-MTP service reserve must be at least 16 GiB")
         if driver_allowance_gib < 0:
             raise ValueError("self-MTP driver allowance must be non-negative")
+        if not math.isfinite(transient_gib_per_lane) or transient_gib_per_lane <= 0:
+            raise ValueError("self-MTP transient GiB per lane must be positive")
+        if saturation_lane_cap is not None and (
+            isinstance(saturation_lane_cap, bool)
+            or not isinstance(saturation_lane_cap, int)
+            or saturation_lane_cap < 1
+        ):
+            raise ValueError("self-MTP saturation lane cap must be a positive int or None")
         self.service_reserve_gib = float(service_reserve_gib)
         self.driver_allowance_gib = float(driver_allowance_gib)
+        self.transient_gib_per_lane = float(transient_gib_per_lane)
+        self.saturation_lane_cap = saturation_lane_cap
 
     @property
     def hard_reserve_gib(self) -> float:
@@ -1257,7 +1283,7 @@ class SelfMTPLaneAdmissionController:
             cache_gib,
         )
         transient_scale = {0: 1.0 / 3.0, 1: 0.5, 2: 1.0}[draft_depth]
-        return context_gib + self.K2_TRANSIENT_GIB_PER_LANE * transient_scale
+        return context_gib + self.transient_gib_per_lane * transient_scale
 
     def _fit(
         self,
@@ -1266,10 +1292,14 @@ class SelfMTPLaneAdmissionController:
         cache_gib: Sequence[float],
         draft_depth: int,
         usable_gib: float,
+        max_lanes: Optional[int] = None,
     ) -> Tuple[Tuple[int, ...], float]:
         # Admit the cheapest lanes first; retain their original relative order
         # in the returned batch.  One long request therefore cannot force a
-        # wider unsafe M=3N forward or evict several short safe lanes.
+        # wider unsafe M=3N forward or evict several short safe lanes.  The
+        # compute-saturation cap stops admitting once ``max_lanes`` cheapest
+        # lanes fit, so a large free-memory envelope cannot widen the M=(k+1)N
+        # forward past the throughput knee.
         ranked = sorted(
             indices,
             key=lambda i: (
@@ -1280,6 +1310,8 @@ class SelfMTPLaneAdmissionController:
         chosen = []
         used = 0.0
         for i in ranked:
+            if max_lanes is not None and len(chosen) >= max_lanes:
+                break
             cost = self.lane_gib(contexts[i], draft_depth, cache_gib[i])
             if used + cost <= usable_gib:
                 chosen.append(i)
@@ -1348,7 +1380,8 @@ class SelfMTPLaneAdmissionController:
 
         if max_draft == 2:
             chosen, used = self._fit(
-                mtp_candidates, contexts, cache_gib, 2, usable
+                mtp_candidates, contexts, cache_gib, 2, usable,
+                self.saturation_lane_cap,
             )
             if chosen:
                 for i in chosen:
@@ -1363,7 +1396,10 @@ class SelfMTPLaneAdmissionController:
                     tuple(modes), tuple(depths), stage, used, usable
                 )
 
-        chosen, used = self._fit(mtp_candidates, contexts, cache_gib, 1, usable)
+        chosen, used = self._fit(
+            mtp_candidates, contexts, cache_gib, 1, usable,
+            self.saturation_lane_cap,
+        )
         if chosen:
             for i in chosen:
                 modes[i] = "self_mtp"
@@ -1835,7 +1871,19 @@ class ResponseGenerator:
         self._state_machine_cache = {}
         # The generation thread creates and evaluates this root before use.
         self._lane_rng_root = None
-        self._self_mtp_admission_controller = SelfMTPLaneAdmissionController()
+        _cli = self.model_provider.cli_args
+        _max_lanes = int(getattr(_cli, "self_mtp_max_lanes", 0) or 0)
+        _transient = getattr(_cli, "self_mtp_lane_transient_gib", None)
+        self._self_mtp_admission_controller = SelfMTPLaneAdmissionController(
+            saturation_lane_cap=(
+                _max_lanes if _max_lanes >= 1
+                else SelfMTPLaneAdmissionController.SATURATION_LANE_CAP
+            ),
+            transient_gib_per_lane=(
+                float(_transient) if _transient
+                else SelfMTPLaneAdmissionController.K2_TRANSIENT_GIB_PER_LANE
+            ),
+        )
         self._self_mtp_admission = _make_self_mtp_admission_callback(
             self._self_mtp_admission_controller,
             max_draft=min(
@@ -4471,6 +4519,32 @@ def setup_arg_parser():
         choices=range(1, 8),
         metavar="{1..7}",
         help="MTP draft depth. Qwen4 is trained at depth 1 (default: 1).",
+    )
+    parser.add_argument(
+        "--self-mtp-max-lanes",
+        type=int,
+        default=16,
+        metavar="N",
+        help=(
+            "Compute-saturation ceiling on concurrent batched self-MTP lanes. "
+            "The M=(k+1)N verify forward saturates the GPU near this many "
+            "lanes; past it aggregate throughput falls even when memory "
+            "permits more. Measured knee for the dense Qwen3.8-27B is 16 "
+            "(N=16: 270 t/s agg vs N=40: 52). Default: 16. Raise for lighter "
+            "(MoE) models that saturate later; the memory envelope still caps."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-lane-transient-gib",
+        type=float,
+        default=None,
+        metavar="GIB",
+        help=(
+            "Per-lane k=2 verify-transient the admission controller budgets. "
+            "Unset uses the MoE-calibrated 1.76 GiB; dense models measure "
+            "higher (~3.1 GiB for Qwen3.8-27B). Raise so fewer lanes are "
+            "admitted at long context where the transient dominates."
+        ),
     )
     parser.add_argument(
         "--self-mtp-adaptive-depth-ceiling",
