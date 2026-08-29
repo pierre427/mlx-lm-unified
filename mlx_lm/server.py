@@ -1124,7 +1124,12 @@ def _self_mtp_config(
         not transformed_verifier or sampling.xtc_probability > 0.0
     ):
         return None
-    if getattr(cli_args, "kv_bits", None) is not None:
+    quantized_kv = getattr(cli_args, "kv_bits", None) is not None
+    allow_quantized_kv = getattr(cli_args, "self_mtp_allow_quantized_kv", False)
+    if quantized_kv and not allow_quantized_kv:
+        # Quantized KV self-MTP is opt-in: the batched transaction is bit-exact
+        # on a quantized target cache (proven via the batched-B1 oracle), but it
+        # stays behind --self-mtp-allow-quantized-kv until promoted by default.
         return None
     share_qsa_minimum = getattr(
         cli_args, "self_mtp_share_qsa_indices_min_prompt_tokens", 0
@@ -1141,6 +1146,10 @@ def _self_mtp_config(
         "accept_rule": "residual",
         "state_out": {},
     }
+    if quantized_kv:
+        # Tag so the BatchGenerator constructor admits the quantized cache; the
+        # cache is already built quantized by _make_new_cache.
+        config["allow_quantized_kv"] = True
     if transformed_verifier:
         config["top_p"] = sampling.top_p
         config["top_k"] = sampling.top_k
@@ -4571,6 +4580,17 @@ def setup_arg_parser():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Measure once and fall back when self-MTP is slower (default: on).",
+    )
+    parser.add_argument(
+        "--self-mtp-allow-quantized-kv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow self-MTP (single-lane and batched) to run with a quantized "
+            "KV target cache when --kv-bits is set (default: off). The batched "
+            "transaction is bit-exact on quantized caches; windowed MTP stays "
+            "unbatchable regardless."
+        ),
     )
     parser.add_argument(
         "--self-mtp-window-size",

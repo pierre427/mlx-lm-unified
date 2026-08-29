@@ -3273,8 +3273,16 @@ class BatchGenerator:
                 raise ValueError("runtime rate gating is not batchable")
             if self.self_mtp.get("speculation_router") is not None:
                 raise ValueError("adaptive per-lane MTP depth is not batchable")
-            if max_kv_size is not None or kv_bits is not None:
-                raise ValueError("bounded or quantized KV caches are not MTP batchable")
+            if max_kv_size is not None:
+                raise ValueError("bounded (windowed) KV caches are not MTP batchable")
+            if kv_bits is not None and not self.self_mtp.get("allow_quantized_kv"):
+                # Quantized KV is opt-in for self-MTP (allow_quantized_kv). The
+                # batched transaction is bit-exact on a quantized target cache;
+                # this refusal is the policy gate, not a capability limit.
+                raise ValueError(
+                    "quantized KV caches are not MTP batchable unless "
+                    "allow_quantized_kv is set in the self-MTP config"
+                )
         self.max_tokens = max_tokens
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.logits_processors = logits_processors or []
