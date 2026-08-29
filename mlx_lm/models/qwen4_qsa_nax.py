@@ -31,6 +31,12 @@ SOURCE = r"""
     constexpr int NKS = DS / 16;
     constexpr int NNT = DS / 32;
 
+    // Query length, KV length and ids stride are runtime uniforms, not template
+    // constants: every prefill-chunk width then shares ONE compiled pipeline.
+    const int L   = dims[0];   // query length
+    const int TOT = dims[1];   // KV length (physical_width)
+    const int U   = dims[2];   // per-token ids stride (u_width)
+
     const ushort sg   = simdgroup_index_in_threadgroup;
     const ushort lane = thread_index_in_simdgroup;
     const uint  tok   = threadgroup_position_in_grid.y;   // query token
@@ -233,7 +239,7 @@ SOURCE = r"""
 _KERNEL = mx.fast.metal_kernel(
     name="nax_qsa_attn_b",
     input_names=["q", "k", "v", "ids", "counts", "n_sel", "qpos", "left_pad",
-                 "scale"],
+                 "scale", "dims"],
     output_names=["out"],
     header=HEADER,
     source=SOURCE,
@@ -383,11 +389,11 @@ def nax_qsa_attention(q, k, v, ids, counts, n_sel, q_pos, left_pad, *,
             ),
             mx.contiguous(left_pad.astype(mx.int32)),
             mx.array([scale], dtype=mx.float32),
+            mx.array([length, total, u_width], dtype=mx.int32),
         ],
         template=[
-            ("T", q.dtype), ("D", dim), ("L", length), ("TOT", total),
-            ("U", u_width), ("NQH", nqh), ("NKVH", n_kv_heads), ("GQA", gqa),
-            ("BS", BLOCK),
+            ("T", q.dtype), ("D", dim), ("NQH", nqh), ("NKVH", n_kv_heads),
+            ("GQA", gqa), ("BS", BLOCK),
         ],
         grid=(128, length, batch * n_kv_heads),
         threadgroup=(128, 1, 1),
