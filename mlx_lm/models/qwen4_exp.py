@@ -1325,6 +1325,23 @@ class BatchQSAKVCache(BatchKVCache):
         super().prepare(*args, **kwargs)
         self.release_qsa_cycle("BatchQSAKVCache.prepare")
 
+    def last_valid_query(self, values: mx.array) -> mx.array:
+        """Gather each row's final non-padding query from ``[B, L, ...]``."""
+        if values.ndim < 2 or values.shape[0] != self.offset.shape[0]:
+            raise ValueError("QSA query values must have shape [batch, length, ...]")
+        length = values.shape[1]
+        if length == 0:
+            raise ValueError("QSA query values cannot have zero length")
+        padding = self._right_padding
+        if padding is None:
+            return values[:, -1]
+        invalid = mx.any((padding < 0) | (padding >= length))
+        if bool(invalid.item()):
+            raise ValueError("QSA right padding must leave one valid query per row")
+        rows = mx.arange(values.shape[0], dtype=mx.int32)
+        positions = length - padding.astype(mx.int32) - 1
+        return values[rows, positions]
+
     def update_index_keys(self, keys: mx.array):
         self.index_keys = (
             keys
@@ -2089,7 +2106,12 @@ class QSAIndexer(nn.Module):
             k = min(self.block_topk, n_blocks)
             selected = mx.argpartition(scores, kth=n_blocks - k, axis=-1)[..., -k:]
             if cache is not None and getattr(cache, "_mtp_share_topk", False):
-                cache._mtp_shared_topk = mx.contiguous(selected[:, -1])
+                shared = (
+                    cache.last_valid_query(selected)
+                    if isinstance(cache, BatchQSAKVCache)
+                    else selected[:, -1]
+                )
+                cache._mtp_shared_topk = mx.contiguous(shared)
         else:
             selected = mx.broadcast_to(
                 shared_topk[:, None, :], (batch, length, shared_topk.shape[-1])

@@ -9,7 +9,9 @@ import math
 import os
 import pickle
 import platform
+import re
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -27,6 +29,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -537,6 +540,10 @@ EFFECTIVE_CONFIG_PATH = "/v1/admin/config"
 DEFAULT_SOFT_RELOAD_DRAIN_TIMEOUT = 120.0
 # Longest a new request waits at the closed admission gate before a 503.
 DEFAULT_SOFT_RELOAD_ADMISSION_TIMEOUT = 30.0
+# Bounded generation-thread backoff when a serve slice makes no progress
+# (every self-MTP lane queued/paused, or the memory probe unavailable), and
+# the ordinary idle poll interval. Queueing is fine; hot retry is not.
+BATCH_IDLE_BACKOFF_SECONDS = 0.1
 
 
 class SoftReloadError(ValueError):
@@ -1041,11 +1048,30 @@ def _make_lane_rng(args, root, sidecar=None):
     """
     carried = getattr(sidecar, "rng_key", None)
     if carried is not None:
-        return LaneRNG.from_key(carried, int(getattr(sidecar, "rng_draws", 0) or 0))
-    seed = getattr(args, "seed", None)
-    if seed is not None:
-        return LaneRNG(int(seed))
-    return root.fork(1)[0]
+        # Rebuild the carried KEY on this thread. Evaluating a descendant of a
+        # lazy key created by another thread does not remove its stream ancestry.
+        carried = mx.array(carried.tolist(), dtype=carried.dtype)
+        lane = LaneRNG.from_key(
+            carried, int(getattr(sidecar, "rng_draws", 0) or 0)
+        )
+    else:
+        seed = getattr(args, "seed", None)
+        if seed is None and root is None:
+            raise RuntimeError("generation-thread lane RNG root is not initialized")
+        lane = LaneRNG(int(seed)) if seed is not None else root.fork(1)[0]
+    # This helper is called by the generation thread.  Materializing here is
+    # intentional: a key lazily created or restored on the HTTP/main thread
+    # must not first execute on a different Metal stream inside generation.
+    mx.eval(lane.key)
+    return lane
+
+
+def _make_generation_thread_lane_rng_root():
+    """Create and materialize the unseeded root on the generation thread."""
+    key = mx.random.split(mx.random.state[0])[1]
+    root = LaneRNG.from_key(key)
+    mx.eval(root.key)
+    return root
 
 
 def _self_mtp_config(
@@ -1145,7 +1171,374 @@ def _self_mtp_config(
     return config
 
 
-PARALLEL_SAMPLING_MTP_MODES = ("refuse", "plain")
+@dataclass(frozen=True)
+class SelfMTPLaneAdmission:
+    """One cycle-boundary memory decision for batched self-MTP.
+
+    ``modes`` and ``draft_depths`` are aligned with the caller's lane order.
+    An MTP lane has depth 1 or 2, a plain lane has depth 0, and a queued lane
+    has depth ``None``.  The decision is immutable so the exact budget checked
+    for a cycle can be logged or asserted without later membership changes
+    rewriting it.
+    """
+
+    modes: Tuple[Literal["self_mtp", "plain", "queue"], ...]
+    draft_depths: Tuple[Optional[int], ...]
+    stage: Literal["full", "fewer_lanes", "lower_k", "plain", "queue"]
+    estimated_gib: float
+    usable_gib: float
+
+    @property
+    def mtp_indices(self) -> Tuple[int, ...]:
+        return tuple(i for i, mode in enumerate(self.modes) if mode == "self_mtp")
+
+
+class SelfMTPLaneAdmissionController:
+    """Fail-closed memory/context policy for the M=(k+1)N verify forward.
+
+    The production PLE-offload operating point is about 72.5 GiB resident on
+    a 128 GiB host, leaving about 55.5 GiB free.  A 20 GiB hard margin (16 GiB
+    service reserve plus 4 GiB for the driver) leaves 35.5 GiB for lane cache
+    growth and the verify transient.  The linear envelope below is calibrated
+    so that this operating point admits N=16 around 1K and N=4 around 16K:
+
+      cache/context share: 0.44 GiB per 1K tokens per lane
+      k=2 verify transient: 1.76 GiB per lane
+
+    Reducing k from 2 to 1 halves only the verify transient.  Plain M=N keeps
+    one third of the k=2 verify transient.  This is deliberately an envelope,
+    not a claim about allocator internals.  Inputs that cannot be measured are
+    queued rather than guessed.
+
+    ``decide`` is stateless on purpose.  The server calls it at every decode
+    cycle boundary with fresh free memory and current per-lane contexts, so
+    lane joins/leaves and cache growth are always reflected in the next plan.
+    """
+
+    BASE_RESIDENT_GIB = 72.5
+    HOST_MEMORY_GIB = 128.0
+    SERVICE_RESERVE_GIB = 16.0
+    DRIVER_ALLOWANCE_GIB = 4.0
+    CACHE_GIB_PER_1K_TOKENS = 0.44
+    K2_TRANSIENT_GIB_PER_LANE = 1.76
+
+    def __init__(
+        self,
+        *,
+        service_reserve_gib: float = SERVICE_RESERVE_GIB,
+        driver_allowance_gib: float = DRIVER_ALLOWANCE_GIB,
+    ):
+        if service_reserve_gib < self.SERVICE_RESERVE_GIB:
+            raise ValueError("self-MTP service reserve must be at least 16 GiB")
+        if driver_allowance_gib < 0:
+            raise ValueError("self-MTP driver allowance must be non-negative")
+        self.service_reserve_gib = float(service_reserve_gib)
+        self.driver_allowance_gib = float(driver_allowance_gib)
+
+    @property
+    def hard_reserve_gib(self) -> float:
+        return self.service_reserve_gib + self.driver_allowance_gib
+
+    def lane_gib(
+        self, context_tokens: int, draft_depth: int, cache_gib: float = 0.0
+    ) -> float:
+        """Conservative cache plus transient cost for one lane."""
+        if isinstance(context_tokens, bool) or not isinstance(context_tokens, int):
+            raise ValueError("context_tokens must be an integer")
+        if context_tokens < 0:
+            raise ValueError("context_tokens must be non-negative")
+        if draft_depth not in (0, 1, 2):
+            raise ValueError("draft_depth must be 0, 1, or 2")
+        cache_gib = float(cache_gib)
+        if not math.isfinite(cache_gib) or cache_gib < 0:
+            raise ValueError("cache_gib must be finite and non-negative")
+        context_gib = max(
+            self.CACHE_GIB_PER_1K_TOKENS * (context_tokens / 1024.0),
+            cache_gib,
+        )
+        transient_scale = {0: 1.0 / 3.0, 1: 0.5, 2: 1.0}[draft_depth]
+        return context_gib + self.K2_TRANSIENT_GIB_PER_LANE * transient_scale
+
+    def _fit(
+        self,
+        indices: Sequence[int],
+        contexts: Sequence[int],
+        cache_gib: Sequence[float],
+        draft_depth: int,
+        usable_gib: float,
+    ) -> Tuple[Tuple[int, ...], float]:
+        # Admit the cheapest lanes first; retain their original relative order
+        # in the returned batch.  One long request therefore cannot force a
+        # wider unsafe M=3N forward or evict several short safe lanes.
+        ranked = sorted(
+            indices,
+            key=lambda i: (
+                self.lane_gib(contexts[i], draft_depth, cache_gib[i]),
+                i,
+            ),
+        )
+        chosen = []
+        used = 0.0
+        for i in ranked:
+            cost = self.lane_gib(contexts[i], draft_depth, cache_gib[i])
+            if used + cost <= usable_gib:
+                chosen.append(i)
+                used += cost
+        return tuple(sorted(chosen)), used
+
+    def decide(
+        self,
+        context_tokens: Sequence[int],
+        free_memory_gib: float,
+        *,
+        eligible: Optional[Sequence[bool]] = None,
+        cache_gib: Optional[Sequence[float]] = None,
+        max_draft: int = 2,
+    ) -> SelfMTPLaneAdmission:
+        """Return the next-cycle plan in the frozen degradation order.
+
+        Excluded lanes route directly to plain decode.  For eligible lanes the
+        controller tries, in order: the largest safe k=2 subset; if no k=2
+        lane fits, the largest safe k=1 subset; if none fits, one safe plain
+        lane; otherwise queue.  Thus lowering k never jumps ahead of admitting
+        fewer full-depth lanes.
+        """
+        contexts = tuple(context_tokens)
+        if eligible is None:
+            eligible = (True,) * len(contexts)
+        else:
+            eligible = tuple(eligible)
+        if len(eligible) != len(contexts):
+            raise ValueError("eligible must align with context_tokens")
+        if cache_gib is None:
+            cache_gib = (0.0,) * len(contexts)
+        else:
+            cache_gib = tuple(cache_gib)
+        if len(cache_gib) != len(contexts):
+            raise ValueError("cache_gib must align with context_tokens")
+        if max_draft not in (1, 2):
+            raise ValueError("max_draft must be 1 or 2")
+
+        modes: List[Literal["self_mtp", "plain", "queue"]] = [
+            "plain" if not ok else "queue" for ok in eligible
+        ]
+        depths: List[Optional[int]] = [0 if not ok else None for ok in eligible]
+        mtp_candidates = [i for i, ok in enumerate(eligible) if ok]
+        if not mtp_candidates:
+            return SelfMTPLaneAdmission(
+                tuple(modes), tuple(depths), "plain", 0.0, 0.0
+            )
+
+        try:
+            free = float(free_memory_gib)
+            valid = math.isfinite(free) and free >= 0
+            # Validate every candidate before choosing a subset.  Partially
+            # trusting a malformed context vector would make the estimate
+            # lane-order-dependent and is not fail closed.
+            for i in mtp_candidates:
+                self.lane_gib(contexts[i], 2, cache_gib[i])
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+            free = 0.0
+        usable = max(free - self.hard_reserve_gib, 0.0) if valid else 0.0
+        if not valid:
+            return SelfMTPLaneAdmission(
+                tuple(modes), tuple(depths), "queue", 0.0, usable
+            )
+
+        if max_draft == 2:
+            chosen, used = self._fit(
+                mtp_candidates, contexts, cache_gib, 2, usable
+            )
+            if chosen:
+                for i in chosen:
+                    modes[i] = "self_mtp"
+                    depths[i] = 2
+                stage = (
+                    "full"
+                    if len(chosen) == len(mtp_candidates)
+                    else "fewer_lanes"
+                )
+                return SelfMTPLaneAdmission(
+                    tuple(modes), tuple(depths), stage, used, usable
+                )
+
+        chosen, used = self._fit(mtp_candidates, contexts, cache_gib, 1, usable)
+        if chosen:
+            for i in chosen:
+                modes[i] = "self_mtp"
+                depths[i] = 1
+            stage = (
+                "lower_k"
+                if max_draft == 2
+                else "full" if len(chosen) == len(mtp_candidates) else "fewer_lanes"
+            )
+            return SelfMTPLaneAdmission(tuple(modes), tuple(depths), stage, used, usable)
+
+        chosen, used = self._fit(mtp_candidates, contexts, cache_gib, 0, usable)
+        if chosen:
+            # The degradation contract says "drop a lane to plain" before
+            # queue/reject.  Admit only the cheapest lane here; the remainder
+            # stays queued for a later cycle rather than widening M=N without
+            # a fresh batch-level budget check.
+            i = chosen[0]
+            modes[i] = "plain"
+            depths[i] = 0
+            used = self.lane_gib(contexts[i], 0, cache_gib[i])
+            return SelfMTPLaneAdmission(
+                tuple(modes), tuple(depths), "plain", used, usable
+            )
+
+        return SelfMTPLaneAdmission(
+            tuple(modes), tuple(depths), "queue", 0.0, usable
+        )
+
+
+def _system_available_memory_bytes() -> Optional[int]:
+    """Return reclaimable system memory without using allocator headroom."""
+    try:
+        if platform.system() == "Darwin":
+            result = subprocess.run(
+                ["/usr/bin/vm_stat"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            match = re.search(r"page size of (\d+) bytes", result.stdout)
+            if match is None:
+                return None
+            page_size = int(match.group(1))
+            counts = {}
+            for line in result.stdout.splitlines()[1:]:
+                if ":" not in line:
+                    continue
+                name, value = line.split(":", 1)
+                counts[name] = int(value.strip().rstrip("."))
+            pages = sum(
+                counts.get(name, 0)
+                for name in ("Pages free", "Pages inactive", "Pages speculative")
+            )
+            return pages * page_size if pages > 0 else None
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return pages * page_size if pages > 0 and page_size > 0 else None
+    except (
+        KeyError,
+        OSError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return None
+
+
+def _current_self_mtp_free_memory_gib() -> Optional[float]:
+    """Return actual available system memory for this admission boundary."""
+    available = _system_available_memory_bytes()
+    if available is None or available <= 0:
+        return None
+    return available / float(1 << 30)
+
+
+def _make_self_mtp_admission_callback(
+    controller: Optional[SelfMTPLaneAdmissionController] = None,
+    free_memory: Callable[[], Optional[float]] = _current_self_mtp_free_memory_gib,
+    *,
+    max_draft: int = 2,
+) -> Callable[
+    [Sequence[Tuple[int, int, int, bool, float]]],
+    Mapping[int, Union[int, str]],
+]:
+    """Adapt the pure controller to the generator's cycle-boundary seam.
+
+    The generator calls this before every proposal, when no transaction is
+    open.  It owns the resulting detach/pause/plain migration; the server owns
+    the policy and the live memory measurement.  Rows are
+    ``(uid, logical_context_len, current_k, active, cache_gib)`` and include
+    paused or joining lanes, so retained cache rows participate before merge.
+    """
+    controller = controller or SelfMTPLaneAdmissionController()
+
+    def admit(rows):
+        rows = tuple(rows)
+        if not rows:
+            return {}
+        current_free = free_memory()
+        decision = controller.decide(
+            [int(row[1]) for row in rows],
+            math.nan if current_free is None else current_free,
+            cache_gib=[float(row[4]) if len(row) > 4 else 0.0 for row in rows],
+            max_draft=max_draft,
+        )
+        actions: Dict[int, Union[int, str]] = {}
+        for row, mode, depth in zip(rows, decision.modes, decision.draft_depths):
+            uid = int(row[0])
+            actions[uid] = int(depth) if mode == "self_mtp" else mode
+        return actions
+
+    return admit
+
+
+def _batched_self_mtp_config(
+    args,
+    cli_args,
+    model,
+    *,
+    cached_prompt_tokens=0,
+    prompt_tokens=0,
+    mtp_state=None,
+    lane_rng=None,
+):
+    """Return a fixed-depth persistent config eligible for an MTP batch.
+
+    These exclusions are intentionally stricter than single-lane self-MTP.
+    Every uncertain or unsupported combination falls back to the plain batch
+    kind; in particular shared-QSA remains excluded even after its padded-query
+    seam lands, until that mode is promoted separately.
+    """
+    config = _self_mtp_config(
+        args,
+        cli_args,
+        model,
+        cached_prompt_tokens=cached_prompt_tokens,
+        prompt_tokens=prompt_tokens,
+        mtp_state=mtp_state,
+        lane_rng=lane_rng,
+    )
+    if config is None:
+        return None
+    if not config.get("persistent"):
+        return None
+    if config.get("window_size") is not None:
+        return None
+    if config.get("rate_gate"):
+        return None
+    if config.get("speculation_router") is not None:
+        return None
+    if config.get("share_qsa_indices"):
+        return None
+    if config.get("num_draft") not in (1, 2):
+        return None
+    return config
+
+
+def _batch_kind_key(model_identity, self_mtp=None):
+    """The exact cohort key: plain and self-MTP lanes never mix."""
+    if self_mtp is None:
+        return (model_identity, "plain")
+    return (
+        model_identity,
+        "self_mtp",
+        bool(self_mtp["persistent"]),
+        int(self_mtp["num_draft"]),
+        self_mtp.get("window_size", "native"),
+        bool(self_mtp.get("share_qsa_indices", False)),
+    )
+
+
+PARALLEL_SAMPLING_MTP_MODES = ("mtp", "plain", "refuse")
 
 
 def _parallel_sampling_route(
@@ -1156,48 +1549,39 @@ def _parallel_sampling_route(
     prompt_tokens=0,
     cached_prompt_tokens=0,
     mtp_state=None,
+    has_logits_processors=False,
 ):
-    """Decide how an ``n>1`` request is served, or refuse it.
+    """Choose the n-way plain or persistent batched-self-MTP engine.
 
-    Returns ``("plain", note)``: the samples decode on the plain batched path,
-    one row per sample, sharing one prefill.
-
-    Self-MTP does not compose with ``n>1`` yet. The MTP engine carries a
-    draft-head cache, pending teacher-forced pairs and exact per-cycle rollback
-    beside the target cache, and none of that is batch-carried, so a request
-    that would otherwise be MTP-admitted cannot keep MTP here. The behaviour is
-    explicit rather than silent: ``--parallel-sampling-mtp refuse`` (default)
-    raises, ``plain`` accepts the request with MTP off and says so.
-
-    Admission is decided from the same inputs the n=1 path uses, prefix-cache
-    result included: a sidecar-less APC hit would not have kept MTP anyway, so
-    such a request is not refused.
+    Eligibility is evaluated after the shared APC lookup.  A sidecar-less
+    target-cache hit and every frozen exclusion stay plain.  ``refuse`` and
+    ``plain`` remain explicit compatibility policies; the default is now the
+    implemented MTP path rather than the old global refusal.
     """
-    mode = getattr(cli_args, "parallel_sampling_mtp", "refuse")
-    would_use_mtp = (
-        _self_mtp_config(
-            args,
-            cli_args,
-            model,
-            prompt_tokens=prompt_tokens,
-            cached_prompt_tokens=cached_prompt_tokens,
-            mtp_state=mtp_state,
-        )
-        is not None
+    mode = getattr(cli_args, "parallel_sampling_mtp", "mtp")
+    config = _batched_self_mtp_config(
+        args,
+        cli_args,
+        model,
+        prompt_tokens=prompt_tokens,
+        cached_prompt_tokens=cached_prompt_tokens,
+        mtp_state=mtp_state,
     )
-    if not would_use_mtp:
+    if config is None:
         return "plain", None
+    if has_logits_processors:
+        return "plain", "logits processors require fail-closed plain decode"
     if mode == "plain":
         return (
             "plain",
-            "self-MTP disabled for this request: n>1 has no batched MTP path",
+            "self-MTP disabled for this request by parallel-sampling policy",
         )
-    raise RequestCompositionError(
-        "n>1 is not supported while self-MTP speculation is active for this "
-        "request: the MTP draft-head state is not batch-carried. Send n=1, or "
-        "start the server with --parallel-sampling-mtp plain to decode n>1 "
-        "samples on the plain path with MTP disabled."
-    )
+    if mode == "refuse":
+        raise RequestCompositionError(
+            "n>1 self-MTP was refused by --parallel-sampling-mtp refuse. "
+            "Use 'mtp' for batched self-MTP or 'plain' for ordinary decode."
+        )
+    return "self_mtp", None
 
 
 def _cache_state_bytes(prompt_cache):
@@ -1224,6 +1608,53 @@ def _parallel_sampling_state_bytes(prompt_cache, n, prompt_tokens, max_tokens):
     per_token = nbytes / offset
     prefix_bytes = per_token * max(prompt_tokens, offset)
     return int((n + 1) * prefix_bytes + n * per_token * max(max_tokens, 0))
+
+
+def _parallel_self_mtp_required_gib(
+    controller, prompt_cache, n, prompt_tokens, draft_depth, mtp_state=None
+):
+    """Budget source retention, n lane caches, and M=(k+1)N transient.
+
+    ``mtp_state`` is the request's restored draft sidecar, when present. Every
+    MTP lane (``draft_depth > 0``) also carries its own draft cache, so an
+    additive per-lane draft floor is included: the sidecar's measured bytes
+    scaled to the full prompt when available, else the single-MTP-layer share
+    of the projected per-row target cost (measured or envelope, whichever is
+    larger — a cache miss measures 0 but still allocates a draft cache).
+    Plain projections (``draft_depth == 0``) allocate no draft rows and take
+    no draft floor.
+    """
+    nbytes, offset = _cache_state_bytes(prompt_cache)
+    measured = (nbytes / offset * prompt_tokens / float(1 << 30)) if offset else 0.0
+    envelope = controller.CACHE_GIB_PER_1K_TOKENS * (prompt_tokens / 1024.0)
+    cache_per_row = max(measured, envelope)
+    draft_per_row = 0.0
+    if draft_depth > 0:
+        draft_bytes = 0
+        draft_offset = 0
+        if mtp_state is not None:
+            for leaf in mtp_state[0]:
+                draft_bytes += int(getattr(leaf, "nbytes", 0))
+                draft_offset = max(draft_offset, int(getattr(leaf, "offset", 0)))
+        if draft_offset > 0:
+            draft_per_row = (
+                draft_bytes / draft_offset * prompt_tokens / float(1 << 30)
+            )
+        else:
+            layers = max(len(list(prompt_cache or ())), 1)
+            draft_per_row = cache_per_row / layers
+    transient = controller.lane_gib(0, draft_depth)
+    return (n + 1) * cache_per_row + n * (draft_per_row + transient)
+
+
+def _parallel_prompt_cache_key(prompt, prompt_cache, self_mtp):
+    """Return the exact token span covered by the retained source cache."""
+    if self_mtp is None:
+        return list(prompt[:-1])
+    _, covered = _cache_state_bytes(prompt_cache)
+    if not 0 < covered <= len(prompt):
+        raise RuntimeError("parallel self-MTP source cache has an invalid prompt cursor")
+    return list(prompt[:covered])
 
 
 def _state_budget_bytes(cli_args):
@@ -1402,11 +1833,15 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
-        # Root of the per-request decode lane keys. Derived from (not drawn
-        # from) the global stream, so it is reproducible for a given process
-        # seed and independent of request traffic.
-        self._lane_rng_root = LaneRNG.from_key(
-            mx.random.split(mx.random.state[0])[1]
+        # The generation thread creates and evaluates this root before use.
+        self._lane_rng_root = None
+        self._self_mtp_admission_controller = SelfMTPLaneAdmissionController()
+        self._self_mtp_admission = _make_self_mtp_admission_callback(
+            self._self_mtp_admission_controller,
+            max_draft=min(
+                int(getattr(self.model_provider.cli_args, "self_mtp_num_draft", 2)),
+                2,
+            ),
         )
 
         # Soft-reload admission gate. ``_paused`` closes the door while a
@@ -1430,6 +1865,7 @@ class ResponseGenerator:
         """Thread body. Keeps the reason generation stopped, so that
         health_report can name it instead of only reporting a dead thread."""
         try:
+            self._lane_rng_root = _make_generation_thread_lane_rng_root()
             self._generate()
         except BaseException as e:
             self._generation_error = e
@@ -1672,15 +2108,11 @@ class ResponseGenerator:
         # the continuous batch.
         if getattr(args, "n", 1) > 1:
             return False
-        # The internal MTP engine owns a target cache plus a separate draft-head
-        # cache and exact speculative rollback. BatchGenerator does not carry
-        # that second state. This service is configured for one decode lane, so
-        # route every request through the single-stream admission path whenever
-        # self-MTP is enabled; ineligible requests still fail closed to plain
-        # generate_step there.
-        if getattr(self.cli_args, "self_mtp", False):
-            return False
-        if args.seed is not None:
+        # Seeded ordinary batches still share the global sampler stream.  A
+        # potentially eligible self-MTP request is allowed through this static
+        # precheck because its exact route is decided after APC lookup and its
+        # LaneRNG is built/evaluated on this generation thread.
+        if args.seed is not None and not getattr(self.cli_args, "self_mtp", False):
             return False
         # Prompt-lookup speculative decoding runs on the single-stream path.
         if getattr(args, "prompt_lookup_ngram", 0):
@@ -1701,6 +2133,8 @@ class ResponseGenerator:
         current_sampling = None
         current_tokenizer = None
         current_model_key = None
+        current_batch_kind = None
+        current_self_mtp = None
         batch_generator = None
         drain_batch = False
         batch_results = {}
@@ -1717,13 +2151,24 @@ class ResponseGenerator:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
             mx.random.seed(seed)
 
+        # True when the last serve slice made no progress (every self-MTP lane
+        # queued/paused by admission, or the memory probe unavailable). The
+        # next queue poll then blocks for a bounded interval instead of
+        # busy-spinning admission (and its vm_stat probe) at 100% CPU; a new
+        # request still wakes the loop immediately.
+        batch_idle = False
+
         while not self._stop:
             request = None
             if not drain_batch:
                 timeout = (
                     None
-                    if (batch_generator is not None and len(batch_results) > 0)
-                    else 0.1
+                    if (
+                        batch_generator is not None
+                        and len(batch_results) > 0
+                        and not batch_idle
+                    )
+                    else BATCH_IDLE_BACKOFF_SECONDS
                 )
                 request = get_next_request(timeout=timeout)
 
@@ -1752,10 +2197,47 @@ class ResponseGenerator:
                     )
 
                     self._log_cache_stats()
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
-                    )
+                    if hasattr(self.prompt_cache, "lookup"):
+                        lookup = self.prompt_cache.lookup(current_model_key, prompt)
+                        cache, rest = lookup.cache, lookup.remaining_tokens
+                        mtp_sidecar = lookup.sidecar
+                    else:
+                        cache, rest = self.prompt_cache.fetch_nearest_cache(
+                            current_model_key, prompt
+                        )
+                        mtp_sidecar = None
                     prompt_cache_count = len(prompt) - len(rest)
+                    mtp_state = (
+                        mtp_sidecar.state if mtp_sidecar is not None else None
+                    )
+                    self_mtp = _batched_self_mtp_config(
+                        args,
+                        self.cli_args,
+                        self.model_provider.model,
+                        prompt_tokens=len(prompt),
+                        cached_prompt_tokens=prompt_cache_count,
+                        mtp_state=mtp_state,
+                    )
+                    if self_mtp is not None and current_self_mtp is not None:
+                        # A dynamically lowered fixed-depth cohort remains one
+                        # batch kind.  New lanes enter at its current depth;
+                        # the cycle callback may raise/lower all named lanes at
+                        # the next transaction boundary.
+                        self_mtp = dict(self_mtp)
+                        self_mtp["num_draft"] = current_self_mtp["num_draft"]
+                    candidate_kind = _batch_kind_key(current_model_key, self_mtp)
+                    # A seeded request which became plain after APC/exclusion
+                    # cannot enter the global-RNG plain batch.
+                    if self_mtp is None and args.seed is not None:
+                        drain_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        del cache
+                        continue
+                    if candidate_kind != current_batch_kind:
+                        drain_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        del cache
+                        continue
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -1776,6 +2258,11 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    lane_rng = (
+                        _make_lane_rng(args, self._lane_rng_root, mtp_sidecar)
+                        if self_mtp is not None
+                        else None
+                    )
                     (uid,) = batch_generator.insert_segments(
                         segments=[segments],
                         max_tokens=[args.max_tokens],
@@ -1784,6 +2271,9 @@ class ResponseGenerator:
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                         stop_matchers=[stop_matcher],
+                        self_mtp_configs=[self_mtp] if self_mtp is not None else None,
+                        mtp_states=[mtp_state] if self_mtp is not None else None,
+                        lane_rngs=[lane_rng] if self_mtp is not None else None,
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -1791,6 +2281,7 @@ class ResponseGenerator:
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "mtp": self_mtp is not None,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -1819,9 +2310,76 @@ class ResponseGenerator:
                         )
                         continue
 
+                    # The batch kind is unknowable until tokenization and APC
+                    # lookup.  Probe that exact route before constructing a
+                    # generator; the request itself is re-queued below and
+                    # performs a fresh owned lookup when inserted.
+                    try:
+                        prompt, _, _, _ = self._tokenize(tokenizer, request, args)
+                        if hasattr(self.prompt_cache, "lookup"):
+                            lookup = self.prompt_cache.lookup(
+                                self.model_provider.model_key, prompt
+                            )
+                            probe_cache = lookup.cache
+                            probe_rest = lookup.remaining_tokens
+                            probe_sidecar = lookup.sidecar
+                        else:
+                            probe_cache, probe_rest = (
+                                self.prompt_cache.fetch_nearest_cache(
+                                    self.model_provider.model_key, prompt
+                                )
+                            )
+                            probe_sidecar = None
+                        cached_prompt_tokens = len(prompt) - len(probe_rest)
+                        mtp_state = (
+                            probe_sidecar.state
+                            if probe_sidecar is not None
+                            else None
+                        )
+                        current_self_mtp = _batched_self_mtp_config(
+                            args,
+                            self.cli_args,
+                            model,
+                            prompt_tokens=len(prompt),
+                            cached_prompt_tokens=cached_prompt_tokens,
+                            mtp_state=mtp_state,
+                        )
+                        del probe_cache
+                        if current_self_mtp is not None:
+                            free_gib = _current_self_mtp_free_memory_gib()
+                            initial = self._self_mtp_admission_controller.decide(
+                                [len(prompt)],
+                                math.nan if free_gib is None else free_gib,
+                                max_draft=int(current_self_mtp["num_draft"]),
+                            )
+                            if initial.modes[0] == "self_mtp":
+                                current_self_mtp = dict(current_self_mtp)
+                                current_self_mtp["num_draft"] = int(
+                                    initial.draft_depths[0]
+                                )
+                            elif initial.modes[0] == "plain":
+                                current_self_mtp = None
+                            else:
+                                raise RequestCompositionError(
+                                    "self-MTP admission cannot preserve the "
+                                    "20 GiB hard memory reserve; request queued/"
+                                    "rejected before decode"
+                                )
+                        if current_self_mtp is None and args.seed is not None:
+                            self._serve_request(
+                                (rqueue, request, args), generation_stream
+                            )
+                            continue
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+
                     current_model = args.model
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
+                    current_batch_kind = _batch_kind_key(
+                        current_model_key, current_self_mtp
+                    )
                     batch_results = {}
                     try:
                         kv_budget_bytes = None
@@ -1849,6 +2407,12 @@ class ResponseGenerator:
                             kv_budget_bytes=kv_budget_bytes,
                             kv_cost=kv_cost,
                             stream=generation_stream,
+                            self_mtp=current_self_mtp,
+                            mtp_admission=(
+                                self._self_mtp_admission
+                                if current_self_mtp is not None
+                                else None
+                            ),
                         )
                     except Exception as e:
                         # Probe or constructor failure (rotating-cache
@@ -1875,16 +2439,20 @@ class ResponseGenerator:
                         current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
+                        current_batch_kind = None
+                        current_self_mtp = None
                         batch_generator.close()
                         batch_generator = None
                         drain_batch = False
                     continue
 
                 uids_to_remove = []
+                batch_idle = True
                 for _ in self._time_budget:
                     prompt_responses, gen_responses = batch_generator.next()
                     if not prompt_responses and not gen_responses:
                         break
+                    batch_idle = False
 
                     # Progress report for prompt processing
                     for r in prompt_responses:
@@ -1942,12 +2510,43 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key,
-                                r.all_tokens[:],
-                                r.prompt_cache,
-                                cache_type="assistant",
-                            )
+                            sidecar = None
+                            if result.get("mtp") and getattr(r, "mtp_state", None):
+                                carried_rng = getattr(r, "lane_rng", None)
+                                rng_key = getattr(carried_rng, "key", carried_rng)
+                                rng_draws = int(
+                                    getattr(
+                                        r,
+                                        "rng_draws",
+                                        getattr(carried_rng, "draws", 0),
+                                    )
+                                    or 0
+                                )
+                                if rng_key is not None:
+                                    mx.eval(rng_key)
+                                sidecar = MTPAPCSidecar(
+                                    r.mtp_state,
+                                    len(r.all_tokens),
+                                    rng_key=rng_key,
+                                    rng_draws=rng_draws,
+                                )
+                            if isinstance(
+                                self.prompt_cache, AutomaticPrefixCache
+                            ):
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                    sidecar=sidecar,
+                                )
+                            else:
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                )
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
@@ -1960,6 +2559,13 @@ class ResponseGenerator:
                         # It may have already been removed during
                         # generation
                         batch_results.pop(uid, None)
+
+                if batch_idle and drain_batch and len(batch_results) > 0:
+                    # A draining batch skips the queue poll (and its bounded
+                    # timeout), so a fully queued/paused membership would
+                    # otherwise busy-spin admission here. Sleep the same
+                    # bounded interval instead.
+                    time.sleep(BATCH_IDLE_BACKOFF_SECONDS)
 
     def _check_parallel_sampling_state_budget(
         self, cache, n, prompt_tokens, max_tokens
@@ -2070,7 +2676,7 @@ class ResponseGenerator:
 
             # Route with the same inputs the n=1 path uses: the cache result
             # decides whether MTP would have been admitted at all.
-            _, note = _parallel_sampling_route(
+            parallel_kind, note = _parallel_sampling_route(
                 args,
                 self.cli_args,
                 model,
@@ -2079,46 +2685,132 @@ class ResponseGenerator:
                 mtp_state=(
                     mtp_sidecar.state if mtp_sidecar is not None else None
                 ),
+                has_logits_processors=any(logits_processors),
             )
             if note:
                 logging.info("Parallel sampling (n=%d): %s", n, note)
 
-            # Prefill everything but the seed token, once. The first chunk runs
-            # before the request is accepted so the replicated state can be
-            # measured and refused while a clean error still reaches the
-            # client, instead of an OOM kill mid-stream.
-            head_size = self.cli_args.prefill_step_size
-            body = rest[:-1]
-            prefill_prompt_cache(
-                model,
-                body[:head_size],
-                cache,
-                prefill_step_size=head_size,
-            )
-            self._check_parallel_sampling_state_budget(
-                cache, n, len(prompt), args.max_tokens
-            )
-            rqueue.put(ctx)
-
-            prefilled = min(len(body), head_size)
-
-            def progress(processed, total):
-                rqueue.put(
-                    (
-                        processed + prefilled + ctx.prompt_cache_count,
-                        len(prompt),
-                    )
+            self_mtp = None
+            lane_rng = None
+            mtp_prompt = None
+            parallel_admission = None
+            mtp_state = mtp_sidecar.state if mtp_sidecar is not None else None
+            if parallel_kind == "self_mtp":
+                self_mtp = _batched_self_mtp_config(
+                    args,
+                    self.cli_args,
+                    model,
+                    prompt_tokens=len(prompt),
+                    cached_prompt_tokens=ctx.prompt_cache_count,
+                    mtp_state=mtp_state,
                 )
+                free_gib = _current_self_mtp_free_memory_gib()
+                usable = (
+                    max(
+                        free_gib
+                        - self._self_mtp_admission_controller.hard_reserve_gib,
+                        0.0,
+                    )
+                    if free_gib is not None
+                    else 0.0
+                )
+                # OpenAI n is indivisible: partial-lane admission would return
+                # fewer choices.  Try all lanes at k=2, then k=1, then plain;
+                # otherwise reject before a verify forward is submitted.
+                chosen_depth = None
+                configured_depth = min(int(self_mtp["num_draft"]), 2)
+                for depth in range(configured_depth, 0, -1):
+                    projected = _parallel_self_mtp_required_gib(
+                        self._self_mtp_admission_controller,
+                        cache,
+                        n,
+                        len(prompt),
+                        depth,
+                        mtp_state=mtp_state,
+                    )
+                    if projected <= usable:
+                        chosen_depth = depth
+                        break
+                if chosen_depth is None:
+                    plain_projected = _parallel_self_mtp_required_gib(
+                        self._self_mtp_admission_controller,
+                        cache,
+                        n,
+                        len(prompt),
+                        0,
+                    )
+                    if plain_projected <= usable:
+                        logging.info(
+                            "Parallel self-MTP degraded to plain: n=%d "
+                            "prompt=%d usable=%.2f GiB",
+                            n,
+                            len(prompt),
+                            usable,
+                        )
+                        self_mtp = None
+                        parallel_kind = "plain"
+                    else:
+                        raise RequestCompositionError(
+                            "parallel self-MTP cannot preserve the 20 GiB hard "
+                            "memory reserve even after k=1 and plain fallback; "
+                            "send a smaller n or shorter prompt"
+                        )
+                else:
+                    self_mtp = dict(self_mtp)
+                    self_mtp["num_draft"] = chosen_depth
+                    lane_rng = _make_lane_rng(
+                        args, self._lane_rng_root, mtp_sidecar
+                    )
+                    mtp_prompt = rest
+                    # Admission is not one-shot: the generator re-budgets at
+                    # every cycle boundary against fresh system free memory,
+                    # capped at this request's configured depth, so the lanes
+                    # can drop k, migrate to plain, or pause under pressure.
+                    parallel_admission = _make_self_mtp_admission_callback(
+                        self._self_mtp_admission_controller,
+                        max_draft=configured_depth,
+                    )
 
-            prefill_prompt_cache(
-                model,
-                body[head_size:],
-                cache,
-                prefill_step_size=head_size,
-                progress_callback=progress,
+            if parallel_kind == "plain":
+                # Prefill everything but the seed token, once. The first chunk
+                # runs before acceptance so replicated state can be refused
+                # cleanly instead of OOM-killing the process mid-stream.
+                head_size = self.cli_args.prefill_step_size
+                body = rest[:-1]
+                prefill_prompt_cache(
+                    model,
+                    body[:head_size],
+                    cache,
+                    prefill_step_size=head_size,
+                )
+                self._check_parallel_sampling_state_budget(
+                    cache, n, len(prompt), args.max_tokens
+                )
+                prefilled = min(len(body), head_size)
+
+                def progress(processed, total):
+                    rqueue.put(
+                        (
+                            processed + prefilled + ctx.prompt_cache_count,
+                            len(prompt),
+                        )
+                    )
+
+                prefill_prompt_cache(
+                    model,
+                    body[head_size:],
+                    cache,
+                    prefill_step_size=head_size,
+                    progress_callback=progress,
+                )
+                progress(len(rest) - prefilled, len(rest))
+
+            rqueue.put(ctx)
+            parallel_history = (
+                prompt[: ctx.prompt_cache_count]
+                if self_mtp is not None
+                else list(prompt[:-1])
             )
-            progress(len(rest) - prefilled, len(rest))
-            prefix_key = prompt[:-1]
 
             parallel = ParallelSampleGenerator(
                 model,
@@ -2129,12 +2821,20 @@ class ResponseGenerator:
                 samplers=[sampler] * n,
                 logits_processors=logits_processors,
                 stop_matchers=[stop_matcher] * n,
-                all_tokens=prefix_key,
+                all_tokens=parallel_history,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 stream=generation_stream,
+                self_mtp=self_mtp,
+                mtp_state=mtp_state if self_mtp is not None else None,
+                lane_rng=lane_rng,
+                mtp_prompt=mtp_prompt,
+                mtp_admission=(
+                    parallel_admission if self_mtp is not None else None
+                ),
             )
             logging.info(
-                "Parallel sampling: n=%d prompt=%d cached=%d",
+                "Parallel sampling: kind=%s n=%d prompt=%d cached=%d",
+                parallel_kind,
                 n,
                 len(prompt),
                 ctx.prompt_cache_count,
@@ -2145,7 +2845,16 @@ class ResponseGenerator:
             # already authoritative here.
             detokenizers = [tokenizer.detokenizer for _ in range(n)]
             while len(parallel) > 0:
-                for index, r in parallel.next():
+                step_responses = parallel.next()
+                if not step_responses:
+                    # Every lane is paused by cycle-boundary admission (or the
+                    # memory probe is unavailable): back off boundedly instead
+                    # of busy-spinning admission and its vm_stat probe.
+                    if ctx._should_stop:
+                        break
+                    time.sleep(BATCH_IDLE_BACKOFF_SECONDS)
+                    continue
+                for index, r in step_responses:
                     detokenizer = detokenizers[index]
                     if r.finish_reason == "stop":
                         # Don't decode the final stop token.
@@ -2175,8 +2884,14 @@ class ResponseGenerator:
             # becomes the shared prefix entry. Per-sample continuations are
             # deliberately NOT stored: the samples diverge, and keeping one of
             # them would bias later prefix hits toward an arbitrary sample.
+            # The key is derived HERE, after lane preparation advanced the
+            # retained cache, so the stored span and its key always agree
+            # (self-MTP retains the fully prefilled prompt; plain retains
+            # exactly prompt[:-1]).
             self.prompt_cache.insert_cache(
-                self.model_provider.model_key, prefix_key, cache
+                self.model_provider.model_key,
+                _parallel_prompt_cache_key(prompt, cache, self_mtp),
+                cache,
             )
 
             rqueue.put(None)
@@ -4002,12 +4717,12 @@ def setup_arg_parser():
     parser.add_argument(
         "--parallel-sampling-mtp",
         type=str,
-        default="refuse",
+        default="mtp",
         choices=list(PARALLEL_SAMPLING_MTP_MODES),
         help=(
             "What to do when an n>1 request would otherwise use self-MTP. "
-            "'refuse' (default) rejects it; 'plain' serves the samples with "
-            "MTP disabled. There is no batched MTP path yet."
+            "'mtp' (default) uses persistent batched self-MTP; 'plain' serves "
+            "with MTP disabled; 'refuse' rejects the composition."
         ),
     )
     parser.add_argument(

@@ -51,6 +51,7 @@ from .models.cache import (
     can_trim_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
+    trim_ragged_prompt_cache,
 )
 from .sample_utils import LaneRNG, draw_key, make_sampler, make_transformed_logprobs
 from .spec_policy import draft_depth_for
@@ -294,6 +295,175 @@ class HybridStats(_PromptLookupStatsBase):
                 f"(acceptance {self.draft_accepted / max(self.draft_proposed, 1):.1%})"
             )
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class MTPToken:
+    """One token authorized by a self-MTP target verification row."""
+
+    token: int
+    logprobs: mx.array
+    from_draft: bool
+
+
+@dataclass
+class SelfMTPCachePair:
+    target: List[Any]   # standalone when detached, merged when attached
+    draft: List[Any]    # persistent MTP-head cache
+
+
+@dataclass
+class SelfMTPLane:
+    uid: int
+    cur: int                         # committed, emitted, not in target cache
+    seed_h: mx.array                 # [1, 1, H], hidden that predicted cur
+    pending_hs: Optional[mx.array]   # [1, p, H]
+    pending_ts: List[int]            # length p
+    token_prefix: mx.array           # committed processor history before cur
+    rng: Optional[LaneRNG]
+    ntoks: int
+    max_tokens: int
+    num_draft: int
+    sampling_temp: float
+    accept_rule: str
+    logprob_transform: Optional[Callable]
+    logits_processors: List[Callable]
+    stats: HybridStats
+    share_qsa_indices: bool = False
+
+
+@dataclass
+class DetachedSelfMTPLane:
+    lane: SelfMTPLane
+    caches: SelfMTPCachePair
+
+
+@dataclass
+class BatchedSelfMTPState:
+    lanes: List[SelfMTPLane]          # row order is authoritative
+    caches: SelfMTPCachePair          # both groups are merged
+    membership_epoch: int
+    proposal_open: bool = False
+    _open_proposal: Optional["SelfMTPCycleResult"] = field(
+        default=None, repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True)
+class SelfMTPCycleResult:
+    membership_epoch: int
+    lane_uids: Tuple[int, ...]
+    draft_depths: Tuple[int, ...]       # k_i
+    accepted_lengths: Tuple[int, ...]   # a_i
+    target_drops: Tuple[int, ...]       # k_i - a_i
+    head_drops: Tuple[int, ...]         # k_i
+    outputs: Tuple[Tuple[MTPToken, ...], ...]
+    # Private cycle tensors retained until commit.
+    _old_curs: Tuple[int, ...] = field(default=(), repr=False, compare=False)
+    _old_seed_hs: Tuple[mx.array, ...] = field(
+        default=(), repr=False, compare=False
+    )
+    _drafts: Tuple[Tuple[int, ...], ...] = field(
+        default=(), repr=False, compare=False
+    )
+    _vhidden: Tuple[mx.array, ...] = field(default=(), repr=False, compare=False)
+    _logprobs: Tuple[mx.array, ...] = field(default=(), repr=False, compare=False)
+    _bonuses: Tuple[int, ...] = field(default=(), repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class GreedyBatchDiagnostic:
+    """Classify cross-shape greedy flips without treating near ties as bugs."""
+
+    compared: int
+    flip_positions: Tuple[int, ...]
+    near_tie_flip_positions: Tuple[int, ...]
+    non_near_tie_flip_positions: Tuple[int, ...]
+    max_relative_error: float
+
+
+def classify_greedy_batch_divergence(
+    single_logits: mx.array,
+    batched_logits: mx.array,
+    *,
+    shape_noise_band: float = 3e-3,
+) -> GreedyBatchDiagnostic:
+    """Return the diagnostic used by the real-hardware digest battery.
+
+    The reference top-1/top-2 margin is compared with the documented Qwen4
+    cross-shape noise band. A token flip inside that margin is recorded as a
+    near tie; a flip outside it is a logical divergence and must fail the
+    gate. This helper deliberately does not claim logits are bit-identical.
+    """
+    if shape_noise_band < 0:
+        raise ValueError("shape_noise_band must be non-negative")
+    if single_logits.shape != batched_logits.shape or single_logits.ndim < 1:
+        raise ValueError(
+            "single_logits and batched_logits must have the same [..., V] shape"
+        )
+    vocab = int(single_logits.shape[-1])
+    if vocab < 2:
+        raise ValueError("greedy divergence classification requires V >= 2")
+
+    single = single_logits.reshape((-1, vocab)).astype(mx.float32)
+    batched = batched_logits.reshape((-1, vocab)).astype(mx.float32)
+    if not bool(mx.all(mx.isfinite(single)).item()) or not bool(
+        mx.all(mx.isfinite(batched)).item()
+    ):
+        raise ValueError("greedy divergence classification requires finite logits")
+
+    flips: List[int] = []
+    near: List[int] = []
+    non_near: List[int] = []
+    max_relative_error = 0.0
+    for pos in range(int(single.shape[0])):
+        want = single[pos]
+        got = batched[pos]
+        scale = float(mx.max(mx.abs(want)).item())
+        denom = max(scale, float(mx.finfo(mx.float32).smallest_normal))
+        absolute_error = float(mx.max(mx.abs(got - want)).item())
+        error = absolute_error / denom
+        max_relative_error = max(max_relative_error, error)
+        want_token = int(mx.argmax(want).item())
+        got_token = int(mx.argmax(got).item())
+        if want_token == got_token:
+            continue
+        flips.append(pos)
+        ordered = mx.sort(want)
+        margin = float((ordered[-1] - ordered[-2]).item())
+        noise_limit = shape_noise_band * scale
+        if margin <= noise_limit and absolute_error <= noise_limit:
+            near.append(pos)
+        else:
+            non_near.append(pos)
+    return GreedyBatchDiagnostic(
+        compared=int(single.shape[0]),
+        flip_positions=tuple(flips),
+        near_tie_flip_positions=tuple(near),
+        non_near_tie_flip_positions=tuple(non_near),
+        max_relative_error=max_relative_error,
+    )
+
+
+def require_only_near_tie_greedy_flips(
+    single_logits: mx.array,
+    batched_logits: mx.array,
+    *,
+    shape_noise_band: float = 3e-3,
+) -> GreedyBatchDiagnostic:
+    """Classify a digest mismatch and fail on every non-near-tie flip."""
+    diagnostic = classify_greedy_batch_divergence(
+        single_logits,
+        batched_logits,
+        shape_noise_band=shape_noise_band,
+    )
+    if diagnostic.non_near_tie_flip_positions:
+        raise AssertionError(
+            "batched greedy output diverged outside the documented near-tie "
+            "band at flattened positions "
+            f"{diagnostic.non_near_tie_flip_positions}"
+        )
+    return diagnostic
 
 
 def hybrid_generate_step(
@@ -1283,7 +1453,7 @@ def _batched_residual_verify(
     target_at = mx.take_along_axis(logprobs[:k], d, axis=-1)[:, 0]
     draft_at = mx.take_along_axis(mx.stack(draft_logprobs), d, axis=-1)[:, 0]
     ratios = mx.exp(mx.minimum(target_at - draft_at, 0.0))
-    us = mx.random.uniform(shape=(k,), key=draw_key(rng))
+    us = _draw_mtp_acceptance_uniforms(k, rng=rng)
     mx.eval(ratios, us)
     ratios, us = ratios.tolist(), us.tolist()
     n_accept = 0
@@ -1300,6 +1470,13 @@ def _batched_residual_verify(
     else:
         bonus = _sample_from_logprobs(logprobs[n_accept], sampling_temp, rng=rng)
     return n_accept, bonus
+
+
+def _draw_mtp_acceptance_uniforms(k: int, *, rng=None) -> mx.array:
+    """Draw one lane's native acceptance vector, never a padded batch shape."""
+    if k < 0:
+        raise ValueError("acceptance width must be non-negative")
+    return mx.random.uniform(shape=(k,), key=draw_key(rng))
 
 
 def _accept_sampled_draft(
@@ -1341,7 +1518,7 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float, *, rng
     ``drafts``. Returns ``(n_accept, bonus)``.
     """
     k = len(drafts)
-    etas = mx.random.uniform(shape=(k,), key=draw_key(rng))
+    etas = _draw_mtp_acceptance_uniforms(k, rng=rng)
     mx.eval(etas)
     p_cums = [1.0]
     p_cum = 1.0
@@ -1377,6 +1554,711 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float, *, rng
             rng=rng,
         )
     return tau, bonus
+
+
+def _self_mtp_cache_offset(cache) -> int:
+    offset = getattr(cache, "offset", 0)
+    if isinstance(offset, mx.array):
+        if int(offset.size) != 1:
+            raise ValueError("detached self-MTP caches must contain exactly one row")
+        return int(offset.item())
+    return int(offset)
+
+
+def _self_mtp_group_offset(caches: Sequence[Any]) -> int:
+    return max((_self_mtp_cache_offset(c) for c in caches), default=0)
+
+
+def _reject_unsupported_self_mtp_caches(caches: Sequence[Any]) -> None:
+    unsupported = [
+        type(cache).__name__
+        for cache in caches
+        if "SinkWindow" in type(cache).__name__
+        or "Quantized" in type(cache).__name__
+    ]
+    if unsupported:
+        raise ValueError(
+            "batched self-MTP excludes windowed and quantized caches; got "
+            + ", ".join(unsupported)
+        )
+
+
+def _validate_detached_self_mtp(detached: DetachedSelfMTPLane) -> None:
+    lane = detached.lane
+    if lane.pending_hs is not None or lane.pending_ts:
+        raise ValueError("a detached self-MTP lane must have no pending pairs")
+    if lane.seed_h is None or lane.seed_h.ndim != 3 or lane.seed_h.shape[:2] != (1, 1):
+        raise ValueError("a detached lane seed_h must have shape [1, 1, H]")
+    if not detached.caches.target or not detached.caches.draft:
+        raise ValueError("a detached self-MTP lane requires target and draft caches")
+    _reject_unsupported_self_mtp_caches(detached.caches.target)
+    _reject_unsupported_self_mtp_caches(detached.caches.draft)
+    covered = _self_mtp_group_offset(detached.caches.target)
+    draft_offset = _self_mtp_group_offset(detached.caches.draft)
+    if covered <= 0 or draft_offset != covered - 1:
+        raise ValueError(
+            "detached self-MTP cache mismatch: target covers "
+            f"{covered} tokens but draft covers {draft_offset} pairs"
+        )
+
+
+def _merge_self_mtp_cache_groups(groups: Sequence[Sequence[Any]]) -> List[Any]:
+    if not groups:
+        return []
+    width = len(groups[0])
+    if width == 0 or any(len(group) != width for group in groups):
+        raise ValueError("self-MTP cache groups must have the same non-zero width")
+    merged = []
+    for rows in zip(*groups):
+        merge = getattr(type(rows[0]), "merge", None)
+        if merge is None:
+            raise ValueError(f"{type(rows[0]).__name__} cannot merge cache rows")
+        merged.append(merge(list(rows)))
+    return merged
+
+
+def _extend_self_mtp_cache_group(target: Sequence[Any], other: Sequence[Any]) -> None:
+    if len(target) != len(other):
+        raise ValueError("cannot extend self-MTP cache groups of different widths")
+    for cache, incoming in zip(target, other):
+        cache.extend(incoming)
+
+
+def _prepare_self_mtp_cache_group(caches, lengths, right_padding) -> None:
+    for cache in caches:
+        cache.prepare(lengths=lengths, right_padding=right_padding)
+
+
+def _finalize_self_mtp_cache_group(caches) -> None:
+    first_error = None
+    for cache in caches:
+        try:
+            cache.finalize()
+        except BaseException as exc:  # noqa: BLE001 - finish every cache entry
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _eval_self_mtp_lane_state(detached: DetachedSelfMTPLane) -> None:
+    values = [c.state for c in detached.caches.target]
+    values.extend(c.state for c in detached.caches.draft)
+    values.append(detached.lane.seed_h)
+    if detached.lane.rng is not None:
+        values.append(detached.lane.rng.key)
+    mx.eval(*values)
+
+
+def _lane_mtp_logprobs(lane: SelfMTPLane, logits: mx.array) -> mx.array:
+    if lane.logprob_transform is not None:
+        return lane.logprob_transform(logits)
+    return _temperature_logprobs(logits, lane.sampling_temp)
+
+
+def prepare_self_mtp_lane(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    uid: int,
+    max_tokens: int,
+    prompt_cache: Optional[List[Any]],
+    mtp_state: Optional[Tuple[List[Any], mx.array]],
+    lane_rng: Optional[LaneRNG],
+    num_draft: int,
+    sampling_temp: float,
+    sampling_top_p: float,
+    sampling_top_k: int,
+    sampling_min_p: float,
+    accept_rule: str,
+    logits_processors: List[Callable],
+    prefill_step_size: int,
+    share_qsa_indices: bool,
+) -> Tuple[DetachedSelfMTPLane, MTPToken]:
+    """Prefill one canonical persistent self-MTP lane without attaching it."""
+    if getattr(model, "mtp", None) is None:
+        raise ValueError("model has no MTP head")
+    if max_tokens <= 0:
+        raise ValueError("prepare_self_mtp_lane requires max_tokens > 0")
+    if num_draft < 1:
+        raise ValueError("prepare_self_mtp_lane requires num_draft >= 1")
+    if prefill_step_size <= 0:
+        raise ValueError("prefill_step_size must be positive")
+    if accept_rule not in ("exact", "residual", "block"):
+        raise ValueError(
+            f"accept_rule must be 'exact', 'residual', or 'block'; got {accept_rule!r}"
+        )
+    if lane_rng is not None and not isinstance(lane_rng, LaneRNG):
+        raise TypeError("lane_rng must be a sample_utils.LaneRNG")
+    if prompt.ndim != 1 or int(prompt.size) == 0:
+        raise ValueError("prompt must be a non-empty rank-1 token array")
+
+    transform = _make_sampling_transform(
+        sampling_temp, sampling_top_p, sampling_top_k, sampling_min_p
+    )
+    if transform is not None and accept_rule != "residual":
+        raise ValueError(
+            "transformed sampling supports only accept_rule='residual'"
+        )
+
+    target_cache = prompt_cache if prompt_cache is not None else make_prompt_cache(model)
+    _reject_unsupported_self_mtp_caches(target_cache)
+    if mtp_state is None:
+        draft_cache = model.make_mtp_cache()
+        restored_seed_h = None
+    else:
+        draft_cache, restored_seed_h = _restore_mtp_state(target_cache, mtp_state)
+    _reject_unsupported_self_mtp_caches(draft_cache)
+
+    processor_prompt = prompt.astype(mx.uint32)
+    y = processor_prompt
+    prev_h = restored_seed_h
+    with mx.stream(generation_stream):
+        while y.size > 1:
+            n = min(prefill_step_size, int(y.size) - 1)
+            _, h_chunk = _mtp_backbone(model, y[:n][None], target_cache)
+            if prev_h is None:
+                hs, ts = h_chunk[:, :-1], y[1:n][None]
+            else:
+                hs = mx.concatenate([prev_h, h_chunk[:, :-1]], axis=1)
+                ts = y[:n][None]
+            if ts.size > 0:
+                model.mtp_step(hs, ts, draft_cache)
+            prev_h = h_chunk[:, -1:, :]
+            mx.eval([c.state for c in target_cache], [c.state for c in draft_cache])
+            y = y[n:]
+            mx.clear_cache()
+        if prev_h is not None:
+            model.mtp_step(prev_h, y[None], draft_cache)
+        logit_hidden, hidden = _mtp_backbone(model, y[None], target_cache)
+        seed_h = hidden[:, -1:, :]
+        logits = model.logits(logit_hidden[:, -1:, :])[0, -1]
+        logits = _apply_logits_processors(logits_processors, processor_prompt, logits)
+        first_lp = transform(logits) if transform is not None else _temperature_logprobs(
+            logits, sampling_temp
+        )
+        cur = _sample_from_logprobs(first_lp, sampling_temp, rng=lane_rng)
+
+    stats = HybridStats()
+    stats.plain_tokens = 1
+    lane = SelfMTPLane(
+        uid=int(uid),
+        cur=cur,
+        seed_h=seed_h,
+        pending_hs=None,
+        pending_ts=[],
+        token_prefix=processor_prompt,
+        rng=lane_rng,
+        ntoks=1,
+        max_tokens=int(max_tokens),
+        num_draft=int(num_draft),
+        sampling_temp=float(sampling_temp),
+        accept_rule=accept_rule,
+        logprob_transform=transform,
+        logits_processors=list(logits_processors or []),
+        stats=stats,
+        share_qsa_indices=bool(share_qsa_indices),
+    )
+    detached = DetachedSelfMTPLane(
+        lane=lane,
+        caches=SelfMTPCachePair(target=target_cache, draft=draft_cache),
+    )
+    _eval_self_mtp_lane_state(detached)
+    _validate_detached_self_mtp(detached)
+    return detached, MTPToken(cur, first_lp, False)
+
+
+def attach_self_mtp_lanes(
+    model: nn.Module,
+    batch: Optional[BatchedSelfMTPState],
+    joining: Sequence[DetachedSelfMTPLane],
+) -> BatchedSelfMTPState:
+    """Attach canonical rows at a transaction boundary and restart rollback."""
+    joining = list(joining)
+    if batch is not None and batch.proposal_open:
+        raise RuntimeError("cannot attach self-MTP lanes while a proposal is open")
+    if not joining:
+        if batch is None:
+            raise ValueError("cannot create an empty self-MTP batch")
+        return batch
+    for detached in joining:
+        _validate_detached_self_mtp(detached)
+
+    old_lanes = [] if batch is None else batch.lanes
+    uids = [lane.uid for lane in old_lanes] + [item.lane.uid for item in joining]
+    if len(set(uids)) != len(uids):
+        raise ValueError("self-MTP lane uid values must be unique")
+    configured = {lane.num_draft for lane in old_lanes}
+    configured.update(item.lane.num_draft for item in joining)
+    if len(configured) != 1:
+        raise ValueError("adaptive per-lane self-MTP depth is excluded")
+    share_modes = {lane.share_qsa_indices for lane in old_lanes}
+    share_modes.update(item.lane.share_qsa_indices for item in joining)
+    if len(share_modes) != 1:
+        raise ValueError("mixed shared-QSA modes cannot enter one self-MTP batch")
+
+    incoming = SelfMTPCachePair(
+        target=_merge_self_mtp_cache_groups([item.caches.target for item in joining]),
+        draft=_merge_self_mtp_cache_groups([item.caches.draft for item in joining]),
+    )
+    if batch is None or not batch.lanes:
+        epoch = 1 if batch is None else batch.membership_epoch + 1
+        result = BatchedSelfMTPState(
+            lanes=[item.lane for item in joining],
+            caches=incoming,
+            membership_epoch=epoch,
+        )
+    else:
+        _stop_all_speculation(batch.caches.target)
+        try:
+            _extend_self_mtp_cache_group(batch.caches.target, incoming.target)
+            _extend_self_mtp_cache_group(batch.caches.draft, incoming.draft)
+            batch.lanes.extend(item.lane for item in joining)
+            batch.membership_epoch += 1
+            result = batch
+        except Exception:
+            # The cache extend primitives fail closed and membership rollback
+            # cannot safely reconstruct a partially extended heterogeneous set.
+            raise
+    _start_speculation_or_cleanup(
+        result.caches.target,
+        result.caches.target,
+        "batched self-MTP requires ragged-trimmable target caches",
+    )
+    return result
+
+
+def propose_batched_self_mtp(
+    model: nn.Module,
+    batch: BatchedSelfMTPState,
+) -> SelfMTPCycleResult:
+    """Open one batched draft/verify transaction over the current membership."""
+    if batch.proposal_open:
+        raise RuntimeError("a self-MTP proposal is already open")
+    if not batch.lanes:
+        raise ValueError("cannot propose on an empty self-MTP batch")
+    n_lanes = len(batch.lanes)
+    lane_uids = tuple(lane.uid for lane in batch.lanes)
+    if len(set(lane_uids)) != n_lanes:
+        raise ValueError("self-MTP batch contains duplicate lane uid values")
+
+    k_vector = tuple(
+        min(lane.num_draft, max(lane.max_tokens - lane.ntoks - 1, 0))
+        for lane in batch.lanes
+    )
+    active_share_modes = {
+        lane.share_qsa_indices
+        for lane, k in zip(batch.lanes, k_vector)
+        if k > 1
+    }
+    if len(active_share_modes) > 1:
+        raise ValueError("mixed shared-QSA modes cannot share a draft cycle")
+
+    drafts: List[List[int]] = [[] for _ in batch.lanes]
+    draft_logprobs: List[List[mx.array]] = [[] for _ in batch.lanes]
+    draft_h = [lane.seed_h for lane in batch.lanes]
+    draft_steps = [0] * n_lanes
+    max_k = max(k_vector)
+    if max_k > 0:
+        start_cycle = getattr(model, "mtp_start_cycle", None)
+        if start_cycle is not None:
+            start_cycle(
+                batch.caches.draft,
+                bool(active_share_modes and next(iter(active_share_modes))),
+            )
+        try:
+            first_lengths = [
+                len(lane.pending_ts) + 1 if k > 0 else 0
+                for lane, k in zip(batch.lanes, k_vector)
+            ]
+            width = max(first_lengths)
+            hidden_rows = []
+            token_rows = []
+            for lane, valid in zip(batch.lanes, first_lengths):
+                if valid:
+                    if lane.pending_hs is None:
+                        if lane.pending_ts:
+                            raise RuntimeError("pending token list has no hidden tensor")
+                        hs = lane.seed_h
+                    else:
+                        if lane.pending_hs.shape[1] != len(lane.pending_ts):
+                            raise RuntimeError("pending hidden/token lengths disagree")
+                        hs = mx.concatenate([lane.pending_hs, lane.seed_h], axis=1)
+                    ts = mx.array([lane.pending_ts + [lane.cur]], mx.uint32)
+                else:
+                    hs = mx.zeros_like(lane.seed_h)
+                    ts = mx.zeros((1, 1), mx.uint32)
+                pad = width - valid if valid else width - 1
+                hidden_rows.append(mx.pad(hs, [(0, 0), (0, pad), (0, 0)]))
+                token_rows.append(mx.pad(ts, [(0, 0), (0, pad)]))
+            right_padding = [width - valid for valid in first_lengths]
+            _prepare_self_mtp_cache_group(
+                batch.caches.draft, first_lengths, right_padding
+            )
+            try:
+                d_logits, post = model.mtp_step(
+                    mx.concatenate(hidden_rows),
+                    mx.concatenate(token_rows),
+                    batch.caches.draft,
+                )
+            finally:
+                _finalize_self_mtp_cache_group(batch.caches.draft)
+            for row, (lane, k, valid) in enumerate(
+                zip(batch.lanes, k_vector, first_lengths)
+            ):
+                if k == 0:
+                    continue
+                pos = valid - 1
+                draft_h[row] = post[row : row + 1, pos : pos + 1, :]
+                lp = _lane_mtp_logprobs(lane, d_logits[row, pos])
+                token = _sample_from_logprobs(lp, lane.sampling_temp, rng=lane.rng)
+                drafts[row].append(token)
+                draft_logprobs[row].append(lp)
+                draft_steps[row] += 1
+                lane.pending_hs = None
+                lane.pending_ts = []
+
+            for depth in range(1, max_k):
+                lengths = [1 if depth < k else 0 for k in k_vector]
+                right_padding = [1 - length for length in lengths]
+                hidden = mx.concatenate(draft_h)
+                tokens = mx.array(
+                    [[drafts[row][-1] if lengths[row] else 0] for row in range(n_lanes)],
+                    mx.uint32,
+                )
+                _prepare_self_mtp_cache_group(
+                    batch.caches.draft, lengths, right_padding
+                )
+                try:
+                    d_logits, post = model.mtp_step(
+                        hidden, tokens, batch.caches.draft
+                    )
+                finally:
+                    _finalize_self_mtp_cache_group(batch.caches.draft)
+                for row, (lane, active) in enumerate(zip(batch.lanes, lengths)):
+                    if not active:
+                        continue
+                    draft_h[row] = post[row : row + 1, -1:, :]
+                    lp = _lane_mtp_logprobs(lane, d_logits[row, -1])
+                    token = _sample_from_logprobs(
+                        lp, lane.sampling_temp, rng=lane.rng
+                    )
+                    drafts[row].append(token)
+                    draft_logprobs[row].append(lp)
+                    draft_steps[row] += 1
+        finally:
+            if any(draft_steps):
+                trim_ragged_prompt_cache(
+                    batch.caches.draft, draft_steps, validate=False
+                )
+            end_cycle = getattr(model, "mtp_end_cycle", None)
+            if end_cycle is not None:
+                end_cycle(batch.caches.draft)
+        if tuple(draft_steps) != k_vector:
+            raise RuntimeError(
+                f"draft head advanced {tuple(draft_steps)}, expected {k_vector}"
+            )
+
+    valid_lengths = tuple(k + 1 for k in k_vector)
+    width = max(valid_lengths)
+    right_padding = tuple(width - valid for valid in valid_lengths)
+    verify_rows = [
+        [lane.cur] + row + [0] * (width - len(row) - 1)
+        for lane, row in zip(batch.lanes, drafts)
+    ]
+    verify_ids = mx.array(verify_rows, mx.uint32)
+    _prepare_self_mtp_cache_group(
+        batch.caches.target, valid_lengths, right_padding
+    )
+    try:
+        vlogit_hidden, batched_hidden = _mtp_backbone(
+            model, verify_ids, batch.caches.target
+        )
+        batched_logits = model.logits(vlogit_hidden)
+    finally:
+        _finalize_self_mtp_cache_group(batch.caches.target)
+
+    old_curs = tuple(lane.cur for lane in batch.lanes)
+    old_seed_hs = tuple(lane.seed_h for lane in batch.lanes)
+    accepted: List[int] = []
+    bonuses: List[int] = []
+    lane_logprobs: List[mx.array] = []
+    lane_hiddens: List[mx.array] = []
+    output_rows: List[Tuple[MTPToken, ...]] = []
+    for row, (lane, k, valid) in enumerate(
+        zip(batch.lanes, k_vector, valid_lengths)
+    ):
+        processed = []
+        for pos in range(valid):
+            processor_tokens = mx.concatenate(
+                [
+                    lane.token_prefix,
+                    mx.array([lane.cur] + drafts[row][:pos], mx.uint32),
+                ]
+            )
+            processed.append(
+                _apply_logits_processors(
+                    lane.logits_processors,
+                    processor_tokens,
+                    batched_logits[row, pos],
+                )
+            )
+        logprobs = _lane_mtp_logprobs(lane, mx.stack(processed))
+        hidden = batched_hidden[row : row + 1, :valid, :]
+        lane_logprobs.append(logprobs)
+        lane_hiddens.append(hidden)
+
+        if k == 0:
+            n_accept = 0
+            bonus = _sample_from_logprobs(
+                logprobs[0], lane.sampling_temp, rng=lane.rng
+            )
+        elif lane.sampling_temp > 0:
+            if lane.logprob_transform is not None:
+                n_accept, bonus = _batched_residual_verify(
+                    logprobs,
+                    draft_logprobs[row],
+                    drafts[row],
+                    lane.sampling_temp,
+                    rng=lane.rng,
+                )
+            elif lane.accept_rule == "block":
+                n_accept, bonus = _block_verify(
+                    logprobs,
+                    draft_logprobs[row],
+                    drafts[row],
+                    lane.sampling_temp,
+                    rng=lane.rng,
+                )
+            elif lane.accept_rule == "exact":
+                sampled = mx.random.categorical(logprobs, key=draw_key(lane.rng))
+                mx.eval(sampled)
+                sampled = sampled.tolist()
+                n_accept = 0
+                while n_accept < k and sampled[n_accept] == drafts[row][n_accept]:
+                    n_accept += 1
+                bonus = int(sampled[n_accept])
+            else:
+                n_accept = 0
+                while n_accept < k and _accept_sampled_draft(
+                    logprobs[n_accept],
+                    draft_logprobs[row][n_accept],
+                    drafts[row][n_accept],
+                    rng=lane.rng,
+                ):
+                    n_accept += 1
+                if n_accept < k:
+                    bonus = _residual_sample(
+                        logprobs[n_accept],
+                        draft_logprobs[row][n_accept],
+                        lane.sampling_temp,
+                        rng=lane.rng,
+                    )
+                else:
+                    bonus = _sample_from_logprobs(
+                        logprobs[n_accept], lane.sampling_temp, rng=lane.rng
+                    )
+        else:
+            targets = mx.argmax(logprobs, axis=-1).tolist()
+            n_accept = 0
+            while n_accept < k and targets[n_accept] == drafts[row][n_accept]:
+                n_accept += 1
+            bonus = int(targets[n_accept])
+
+        accepted.append(n_accept)
+        bonuses.append(bonus)
+        output_rows.append(
+            tuple(
+                [
+                    MTPToken(drafts[row][pos], logprobs[pos], True)
+                    for pos in range(n_accept)
+                ]
+                + [MTPToken(bonus, logprobs[n_accept], False)]
+            )
+        )
+
+    target_drops = tuple(k - a for k, a in zip(k_vector, accepted))
+    trim_ragged_prompt_cache(
+        batch.caches.target, target_drops, validate=False
+    )
+    proposal = SelfMTPCycleResult(
+        membership_epoch=batch.membership_epoch,
+        lane_uids=lane_uids,
+        draft_depths=k_vector,
+        accepted_lengths=tuple(accepted),
+        target_drops=target_drops,
+        head_drops=k_vector,
+        outputs=tuple(output_rows),
+        _old_curs=old_curs,
+        _old_seed_hs=old_seed_hs,
+        _drafts=tuple(tuple(row) for row in drafts),
+        _vhidden=tuple(lane_hiddens),
+        _logprobs=tuple(lane_logprobs),
+        _bonuses=tuple(bonuses),
+    )
+    batch.proposal_open = True
+    batch._open_proposal = proposal
+    return proposal
+
+
+def commit_batched_self_mtp(
+    batch: BatchedSelfMTPState,
+    proposal: SelfMTPCycleResult,
+    *,
+    emitted_counts: Sequence[int],
+    terminal: Sequence[bool],
+) -> None:
+    """Commit exactly the delivered prefix of one open proposal."""
+    if not batch.proposal_open or batch._open_proposal is not proposal:
+        raise RuntimeError("commit requires the currently open self-MTP proposal")
+    if proposal.membership_epoch != batch.membership_epoch:
+        raise RuntimeError("self-MTP membership changed during an open proposal")
+    if proposal.lane_uids != tuple(lane.uid for lane in batch.lanes):
+        raise RuntimeError("self-MTP lane order changed during an open proposal")
+    n_lanes = len(batch.lanes)
+    if len(emitted_counts) != n_lanes or len(terminal) != n_lanes:
+        raise ValueError("commit vectors must have one entry per lane")
+
+    emitted = tuple(int(value) for value in emitted_counts)
+    terminal = tuple(bool(value) for value in terminal)
+    delivery_drops = []
+    for row, (count, is_terminal, outputs, accepted) in enumerate(
+        zip(emitted, terminal, proposal.outputs, proposal.accepted_lengths)
+    ):
+        if count < 0 or count > len(outputs):
+            raise ValueError(f"lane {row} emitted_count {count} is out of range")
+        if not is_terminal and count != len(outputs):
+            raise ValueError("a nonterminal lane must consume its entire proposal")
+        if is_terminal and count < len(outputs) and count > accepted:
+            raise ValueError("a terminal prefix cannot skip part of the bonus token")
+        # A terminal short prefix also drops the final emitted token, which
+        # becomes ``cur`` and must stay outside the target cache.
+        delivery_drops.append(
+            accepted - count + 1 if is_terminal and count <= accepted else 0
+        )
+
+    if any(delivery_drops):
+        trim_ragged_prompt_cache(
+            batch.caches.target, delivery_drops, validate=False
+        )
+
+    for row, lane in enumerate(batch.lanes):
+        accepted = proposal.accepted_lengths[row]
+        count = emitted[row]
+        old_cur = proposal._old_curs[row]
+        old_seed_h = proposal._old_seed_hs[row]
+        drafts = list(proposal._drafts[row])
+        hidden = proposal._vhidden[row]
+        consumed_accepted = min(count, accepted)
+
+        if terminal[row] and count <= accepted:
+            # The cycle ends at the last emitted token: it becomes ``cur``
+            # (outside the target cache), ``seed_h`` is the hidden that
+            # predicts it, and pending pairs stop one token before it.
+            if count > 0:
+                lane.pending_hs = mx.concatenate(
+                    [old_seed_h, hidden[:, : count - 1, :]], axis=1
+                )
+                lane.pending_ts = [old_cur] + drafts[: count - 1]
+                lane.seed_h = hidden[:, count - 1 : count, :]
+                lane.cur = proposal.outputs[row][count - 1].token
+                lane.token_prefix = mx.concatenate(
+                    [
+                        lane.token_prefix,
+                        mx.array(lane.pending_ts, mx.uint32),
+                    ]
+                )
+            # count == 0 keeps the pre-cycle state: the delivery trim
+            # already rolled the target cache back to before ``cur``.
+        else:
+            new_hs = mx.concatenate(
+                [old_seed_h, hidden[:, :accepted, :]], axis=1
+            )
+            new_ts = [old_cur] + drafts[:accepted]
+            if lane.pending_ts:
+                # A k == 0 lane skips the draft flush, so pairs retained
+                # from the prior cycle are still owed to the draft cache.
+                new_hs = mx.concatenate([lane.pending_hs, new_hs], axis=1)
+                new_ts = lane.pending_ts + new_ts
+            lane.pending_hs = new_hs
+            lane.pending_ts = new_ts
+            lane.seed_h = hidden[:, accepted : accepted + 1, :]
+            lane.cur = proposal._bonuses[row]
+            lane.token_prefix = mx.concatenate(
+                [
+                    lane.token_prefix,
+                    mx.array([old_cur] + drafts[:accepted], mx.uint32),
+                ]
+            )
+
+        lane.ntoks += count
+        lane.stats.cycles += 1
+        lane.stats.draft_cycles += 1
+        lane.stats.draft_proposed += proposal.draft_depths[row]
+        lane.stats.draft_accepted += consumed_accepted
+        if count > accepted:
+            lane.stats.bonus_tokens += 1
+
+    batch.proposal_open = False
+    batch._open_proposal = None
+
+
+def detach_self_mtp_lanes(
+    model: nn.Module,
+    batch: BatchedSelfMTPState,
+    indices: Sequence[int],
+) -> Tuple[BatchedSelfMTPState, List[DetachedSelfMTPLane]]:
+    """Extract canonical rows before filtering the old batch membership."""
+    if batch.proposal_open:
+        raise RuntimeError("cannot detach self-MTP lanes while a proposal is open")
+    requested = [int(index) for index in indices]
+    if len(set(requested)) != len(requested):
+        raise ValueError("detach indices must be unique")
+    if any(index < 0 or index >= len(batch.lanes) for index in requested):
+        raise IndexError("detach index is outside the self-MTP batch")
+    if not requested:
+        return batch, []
+
+    _stop_all_speculation(batch.caches.target)
+    detached: List[DetachedSelfMTPLane] = []
+    for index in requested:
+        lane = batch.lanes[index]
+        caches = SelfMTPCachePair(
+            target=[cache.extract(index) for cache in batch.caches.target],
+            draft=[cache.extract(index) for cache in batch.caches.draft],
+        )
+        if lane.pending_hs is not None and lane.pending_ts:
+            model.mtp_step(
+                lane.pending_hs,
+                mx.array([lane.pending_ts], mx.uint32),
+                caches.draft,
+            )
+        lane.pending_hs = None
+        lane.pending_ts = []
+        item = DetachedSelfMTPLane(lane=lane, caches=caches)
+        _eval_self_mtp_lane_state(item)
+        _validate_detached_self_mtp(item)
+        detached.append(item)
+
+    leaving = set(requested)
+    keep = [index for index in range(len(batch.lanes)) if index not in leaving]
+    if keep:
+        for cache in batch.caches.target:
+            cache.filter(keep)
+        for cache in batch.caches.draft:
+            cache.filter(keep)
+        batch.lanes = [batch.lanes[index] for index in keep]
+        batch.membership_epoch += 1
+        _start_speculation_or_cleanup(
+            batch.caches.target,
+            batch.caches.target,
+            "batched self-MTP requires ragged-trimmable target caches",
+        )
+    else:
+        batch.lanes = []
+        batch.caches = SelfMTPCachePair(target=[], draft=[])
+        batch.membership_epoch += 1
+    return batch, detached
 
 
 def _mtp_draft_verify_loop_impl(

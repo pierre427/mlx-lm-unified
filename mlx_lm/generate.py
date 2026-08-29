@@ -11,7 +11,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -35,7 +35,11 @@ from .models.cache import (
     record_state_checkpoints,
     trim_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import (
+    LaneRNG,
+    draw_key,
+    make_sampler,
+)
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -1763,21 +1767,9 @@ def stream_generate(
             speculation_router=self_mtp.get("speculation_router"),
             stats=self_mtp.get("stats"),
             prompt_cache=kwargs.get("prompt_cache"),
-            # The request's own random key. None keeps the global stream, so a
-            # caller that supplies none is byte-identical to a keyless build.
-            #
-            # DISABLED 2026-08-28 -- restores service after a production outage.
-            # The server builds the LaneRNG on the request thread, but
-            # generation runs on a worker thread; the key's lazy `mx.random
-            # .split` graph carries a stream from its originating thread, so
-            # the first draw raises "There is no Stream(gpu, 0) in current
-            # thread".  Passing None restores the pre-wiring behaviour (the
-            # global stream), which is what shipped and worked.  Re-enable only
-            # with a cross-thread fix -- materialise the key on the generation
-            # thread, or create the lane there -- and a real serving test, not
-            # a CPU unit test: every unit test builds the lane and generates on
-            # one thread, which is exactly why this was invisible.
-            lane_rng=None,
+            # The server reconstructs and evaluates this key on the generation
+            # thread before entering this function.
+            lane_rng=self_mtp.get("lane_rng"),
             mtp_state=self_mtp.get("state"),
             mtp_state_out=self_mtp.get("state_out"),
             logits_processors=kwargs.get("logits_processors"),
@@ -2529,6 +2521,10 @@ class GenerationBatch:
         finish_reason: Optional[str]
         prompt_cache: Optional[List[Any]]
         all_tokens: Optional[List[int]]
+        from_draft: bool = False
+        mtp_state: Optional[Tuple[List[Any], mx.array]] = None
+        lane_rng: Optional[LaneRNG] = None
+        rng_draws: int = 0
 
     def __init__(
         self,
@@ -2804,6 +2800,411 @@ class GenerationBatch:
         )
 
 
+@dataclass
+class _PausedMTPGenerationLane:
+    detached: Any
+    initial_output: Optional[Any]
+    stop_matcher: StopSequenceMatcher
+    matcher_state: Any
+    num_tokens: int
+
+
+class MTPGenerationBatch:
+    """Scheduler wrapper for Agent A's batched self-MTP transaction."""
+
+    Response = GenerationBatch.Response
+
+    def __init__(
+        self,
+        model: nn.Module,
+        detached_lanes: Sequence[Any],
+        initial_outputs: Sequence[Any],
+        stop_matchers: Sequence[StopSequenceMatcher],
+        *,
+        mtp_admission: Optional[
+            Callable[
+                [Sequence[Tuple[int, int, int, bool, float]]],
+                Mapping[int, Union[int, str]],
+            ]
+        ] = None,
+    ):
+        if len(detached_lanes) != len(initial_outputs):
+            raise ValueError("initial_outputs must have one entry per MTP lane")
+        if len(detached_lanes) != len(stop_matchers):
+            raise ValueError("stop_matchers must have one entry per MTP lane")
+
+        from .hybrid_speculative import (
+            BatchedSelfMTPState,
+            SelfMTPCachePair,
+            attach_self_mtp_lanes,
+        )
+
+        self.model = model
+        if detached_lanes:
+            self.state = attach_self_mtp_lanes(model, None, list(detached_lanes))
+        else:
+            self.state = BatchedSelfMTPState([], SelfMTPCachePair([], []), 0)
+        self.stop_matchers = list(stop_matchers)
+        self._matcher_states = [m.make_state() for m in stop_matchers]
+        self._num_tokens = [0] * len(detached_lanes)
+        self._initial_outputs = list(initial_outputs)
+        self._paused: Dict[int, _PausedMTPGenerationLane] = {}
+        self._plain_ready: List[_PausedMTPGenerationLane] = []
+        self.mtp_admission = mtp_admission
+
+    def __len__(self):
+        return len(self.state.lanes)
+
+    @property
+    def uids(self):
+        return [lane.uid for lane in self.state.lanes]
+
+    @property
+    def prompt_cache(self):
+        return self.state.caches.target
+
+    @property
+    def cache_nbytes(self):
+        total = sum(
+            cache.nbytes
+            for cache in self.state.caches.target + self.state.caches.draft
+        )
+        total += sum(
+            cache.nbytes
+            for paused in self._paused.values()
+            for cache in paused.detached.caches.target + paused.detached.caches.draft
+        )
+        return total
+
+    @property
+    def tokens(self):
+        return [self._prefix_tokens(lane) for lane in self.state.lanes]
+
+    @property
+    def max_tokens(self):
+        return [lane.max_tokens for lane in self.state.lanes]
+
+    @staticmethod
+    def _prefix_tokens(lane):
+        values = lane.token_prefix.tolist()
+        if values and isinstance(values[0], list):
+            values = values[0]
+        return [int(token) for token in values]
+
+    def mtp_cycle_state(self):
+        active_bytes = sum(
+            cache.nbytes
+            for cache in self.state.caches.target + self.state.caches.draft
+        )
+        active_cache_gib = (
+            active_bytes / max(len(self.state.lanes), 1) / float(1 << 30)
+        )
+        rows = [
+            (
+                lane.uid,
+                len(self._prefix_tokens(lane)) + 1,
+                lane.num_draft,
+                True,
+                active_cache_gib,
+            )
+            for lane in self.state.lanes
+        ]
+        rows.extend(
+            (
+                uid,
+                len(self._prefix_tokens(paused.detached.lane)) + 1,
+                paused.detached.lane.num_draft,
+                False,
+                sum(
+                    cache.nbytes
+                    for cache in (
+                        paused.detached.caches.target
+                        + paused.detached.caches.draft
+                    )
+                )
+                / float(1 << 30),
+            )
+            for uid, paused in self._paused.items()
+        )
+        return rows
+
+    def set_num_draft(self, depths: Union[int, Mapping[int, int]]):
+        if self.state.proposal_open:
+            raise RuntimeError("cannot change MTP depth while a proposal is open")
+        if isinstance(depths, int):
+            depths = {uid: depths for uid in self.uids}
+        unknown = set(depths) - set(self.uids) - set(self._paused)
+        if unknown:
+            raise KeyError(f"unknown MTP lane uids: {sorted(unknown)}")
+        desired = {
+            int(depths.get(lane.uid, lane.num_draft)) for lane in self.state.lanes
+        }
+        if len(desired) > 1:
+            raise ValueError("adaptive per-lane self-MTP depth is excluded")
+        for lane in self.state.lanes:
+            if lane.uid in depths:
+                depth = int(depths[lane.uid])
+                if depth < 1:
+                    raise ValueError("MTP draft depth must be positive")
+                lane.num_draft = depth
+        for uid, paused in self._paused.items():
+            if uid in depths:
+                depth = int(depths[uid])
+                if depth < 1:
+                    raise ValueError("MTP draft depth must be positive")
+                paused.detached.lane.num_draft = depth
+
+    def _detach_packages(self, indices: Sequence[int]):
+        from .hybrid_speculative import detach_self_mtp_lanes
+
+        indices = sorted(set(int(i) for i in indices))
+        if not indices:
+            return []
+        old_matchers = self.stop_matchers
+        old_states = self._matcher_states
+        old_counts = self._num_tokens
+        old_initial = self._initial_outputs
+        self.state, detached = detach_self_mtp_lanes(self.model, self.state, indices)
+        packages = [
+            _PausedMTPGenerationLane(
+                lane,
+                old_initial[idx],
+                old_matchers[idx],
+                old_states[idx],
+                old_counts[idx],
+            )
+            for idx, lane in zip(indices, detached)
+        ]
+        keep = [i for i in range(len(old_matchers)) if i not in set(indices)]
+        self.stop_matchers = [old_matchers[i] for i in keep]
+        self._matcher_states = [old_states[i] for i in keep]
+        self._num_tokens = [old_counts[i] for i in keep]
+        self._initial_outputs = [old_initial[i] for i in keep]
+        return packages
+
+    def _attach_packages(self, packages: Sequence[_PausedMTPGenerationLane]):
+        if not packages:
+            return
+        from .hybrid_speculative import attach_self_mtp_lanes
+
+        if self.state.lanes:
+            depths = {lane.num_draft for lane in self.state.lanes}
+            if len(depths) != 1:
+                raise RuntimeError("active self-MTP lanes have mixed draft depths")
+            depth = depths.pop()
+            for package in packages:
+                package.detached.lane.num_draft = depth
+        self.state = attach_self_mtp_lanes(
+            self.model, self.state, [package.detached for package in packages]
+        )
+        self.stop_matchers.extend(package.stop_matcher for package in packages)
+        self._matcher_states.extend(package.matcher_state for package in packages)
+        self._num_tokens.extend(package.num_tokens for package in packages)
+        self._initial_outputs.extend(package.initial_output for package in packages)
+
+    def _apply_admission(self):
+        if self.mtp_admission is None:
+            return
+        decisions = dict(self.mtp_admission(tuple(self.mtp_cycle_state())) or {})
+        drop = [
+            i
+            for i, uid in enumerate(self.uids)
+            if decisions.get(uid) in ("queue", "plain")
+        ]
+        for package in self._detach_packages(drop):
+            mode = decisions.get(package.detached.lane.uid)
+            if mode == "plain":
+                self._plain_ready.append(package)
+            else:
+                self._paused[package.detached.lane.uid] = package
+
+        self.set_num_draft(
+            {uid: value for uid, value in decisions.items() if isinstance(value, int)}
+        )
+
+        joining = []
+        for uid, value in decisions.items():
+            if isinstance(value, int) and uid in self._paused:
+                joining.append(self._paused.pop(uid))
+        self._attach_packages(joining)
+
+    def take_plain_fallbacks(self):
+        ready, self._plain_ready = self._plain_ready, []
+        return ready
+
+    def extend(self, batch):
+        if not isinstance(batch, MTPGenerationBatch):
+            raise TypeError("MTPGenerationBatch can extend only another MTP batch")
+        packages = batch._detach_packages(range(len(batch)))
+        packages.extend(batch._paused.values())
+        batch._paused.clear()
+        if self.mtp_admission is None:
+            self._attach_packages(packages)
+            return
+        for package in packages:
+            uid = package.detached.lane.uid
+            if uid in self._paused or uid in self.uids:
+                raise ValueError(f"duplicate self-MTP lane uid {uid}")
+            self._paused[uid] = package
+        # Joining cache rows participate in the same cycle-boundary decision
+        # before merge/extend allocates the wider verify batch.
+        self._apply_admission()
+
+    def extract_cache(self, idx: int) -> List[Any]:
+        if self.state.proposal_open:
+            raise RuntimeError("cannot extract an MTP cache during a proposal")
+        if not (0 <= idx < len(self)):
+            raise IndexError(idx)
+        packages = self._detach_packages(range(len(self)))
+        result = copy.deepcopy(packages[idx].detached.caches.target)
+        self._attach_packages(packages)
+        return result
+
+    def filter(self, keep: List[int]):
+        keep = sorted(set(keep))
+        drop = [i for i in range(len(self)) if i not in set(keep)]
+        self._detach_packages(drop)
+
+    def extract_uid(self, uid: int):
+        if uid in self.uids:
+            idx = self.uids.index(uid)
+            return self.extract_cache(idx), self.tokens[idx]
+        if uid in self._paused:
+            lane = self._paused[uid].detached
+            return copy.deepcopy(lane.caches.target), self._prefix_tokens(lane.lane)
+        raise KeyError(uid)
+
+    def remove_uids(self, uids):
+        requested = set(uids)
+        drop = [i for i, uid in enumerate(self.uids) if uid in requested]
+        self._detach_packages(drop)
+        for uid in requested:
+            self._paused.pop(uid, None)
+
+    @staticmethod
+    def _finish_reason(
+        token: int,
+        count: int,
+        maximum: int,
+        matcher_state,
+        matcher: StopSequenceMatcher,
+    ):
+        reason = "length" if count >= maximum else None
+        matcher_state, matched = StopSequenceMatcher.match(
+            matcher_state, matcher._trie, token
+        )
+        if matched:
+            reason = "stop"
+        return matcher_state, reason
+
+    def _complete_responses(self, terminal_indices, last_response_by_index):
+        packages = self._detach_packages(terminal_indices)
+        for idx, package in zip(sorted(terminal_indices), packages):
+            response = last_response_by_index[idx]
+            lane = package.detached.lane
+            response.prompt_cache = package.detached.caches.target
+            response.all_tokens = self._prefix_tokens(lane)
+            response.mtp_state = (package.detached.caches.draft, lane.seed_h)
+            response.lane_rng = lane.rng
+            response.rng_draws = lane.rng.draws if lane.rng is not None else 0
+
+    def _emit_initial(self):
+        responses = []
+        terminal = []
+        last = {}
+        for i, output in enumerate(self._initial_outputs):
+            if output is None:
+                continue
+            self._initial_outputs[i] = None
+            self._num_tokens[i] += 1
+            self._matcher_states[i], reason = self._finish_reason(
+                output.token,
+                self._num_tokens[i],
+                self.max_tokens[i],
+                self._matcher_states[i],
+                self.stop_matchers[i],
+            )
+            response = self.Response(
+                uid=self.uids[i],
+                token=output.token,
+                logprobs=output.logprobs,
+                finish_reason=reason,
+                prompt_cache=None,
+                all_tokens=None,
+                from_draft=output.from_draft,
+            )
+            responses.append(response)
+            if reason is not None:
+                terminal.append(i)
+                last[i] = response
+        if terminal:
+            self._complete_responses(terminal, last)
+        return responses
+
+    def next(self) -> List[Response]:
+        if any(output is not None for output in self._initial_outputs):
+            return self._emit_initial()
+
+        self._apply_admission()
+        if not self.state.lanes:
+            return []
+
+        from .hybrid_speculative import (
+            commit_batched_self_mtp,
+            propose_batched_self_mtp,
+        )
+
+        proposal = propose_batched_self_mtp(self.model, self.state)
+        emitted_counts = []
+        terminal = []
+        responses = []
+        last = {}
+        for i, outputs in enumerate(proposal.outputs):
+            emitted = 0
+            is_terminal = False
+            for output in outputs:
+                emitted += 1
+                self._num_tokens[i] += 1
+                self._matcher_states[i], reason = self._finish_reason(
+                    output.token,
+                    self._num_tokens[i],
+                    self.max_tokens[i],
+                    self._matcher_states[i],
+                    self.stop_matchers[i],
+                )
+                response = self.Response(
+                    uid=self.uids[i],
+                    token=output.token,
+                    logprobs=output.logprobs,
+                    finish_reason=reason,
+                    prompt_cache=None,
+                    all_tokens=None,
+                    from_draft=output.from_draft,
+                )
+                responses.append(response)
+                last[i] = response
+                if reason is not None:
+                    is_terminal = True
+                    break
+            emitted_counts.append(emitted)
+            terminal.append(is_terminal)
+
+        commit_batched_self_mtp(
+            self.state,
+            proposal,
+            emitted_counts=emitted_counts,
+            terminal=terminal,
+        )
+        terminal_indices = [i for i, value in enumerate(terminal) if value]
+        if terminal_indices:
+            self._complete_responses(terminal_indices, last)
+        return responses
+
+    @classmethod
+    def empty(cls, model, *, mtp_admission=None):
+        return cls(model, [], [], [], mtp_admission=mtp_admission)
+
+
 class BatchGenerator:
     """
     A batch generator implements continuous batching.
@@ -2838,6 +3239,13 @@ class BatchGenerator:
         quantized_kv_start: int = 0,
         stream=None,
         prompt_trim_rollback_tokens: int = 0,
+        self_mtp: Optional[dict] = None,
+        mtp_admission: Optional[
+            Callable[
+                [Sequence[Tuple[int, int, int, bool, float]]],
+                Mapping[int, Union[int, str]],
+            ]
+        ] = None,
     ):
         if kv_bits is not None and quantized_kv_start != 0:
             # Validated before any state is set, so a rejected config never
@@ -2854,6 +3262,19 @@ class BatchGenerator:
                 "the continuous-batching path."
             )
         self.model = model
+        self.self_mtp = dict(self_mtp) if self_mtp is not None else None
+        self.mtp_admission = mtp_admission
+        if self.self_mtp is not None:
+            if not self.self_mtp.get("persistent", True):
+                raise ValueError("batched self-MTP requires persistent_mtp=True")
+            if self.self_mtp.get("window_size") is not None:
+                raise ValueError("windowed MTP is not batchable")
+            if self.self_mtp.get("rate_gate", False):
+                raise ValueError("runtime rate gating is not batchable")
+            if self.self_mtp.get("speculation_router") is not None:
+                raise ValueError("adaptive per-lane MTP depth is not batchable")
+            if max_kv_size is not None or kv_bits is not None:
+                raise ValueError("bounded or quantized KV caches are not MTP batchable")
         self.max_tokens = max_tokens
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.logits_processors = logits_processors or []
@@ -2947,9 +3368,18 @@ class BatchGenerator:
             prefill_step_size=prefill_step_size,
             prompt_trim_rollback_tokens=self.prompt_trim_rollback_tokens,
         )
-        self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
+        if self.self_mtp is None:
+            self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
+        else:
+            self._generation_batch = MTPGenerationBatch.empty(
+                self.model, mtp_admission=self.mtp_admission
+            )
+        self._plain_fallback_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
         self._currently_processing = []
+        self._mtp_states = {}
+        self._mtp_lane_rngs = {}
+        self._mtp_configs = {}
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -3015,6 +3445,9 @@ class BatchGenerator:
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
+        mtp_states: Optional[List[Optional[Tuple[List[Any], mx.array]]]] = None,
+        lane_rngs: Optional[List[Optional[LaneRNG]]] = None,
+        self_mtp_configs: Optional[List[dict]] = None,
     ):
         return self.insert_segments(
             [[p] for p in prompts],
@@ -3024,6 +3457,9 @@ class BatchGenerator:
             samplers,
             logits_processors,
             stop_matchers,
+            mtp_states,
+            lane_rngs,
+            self_mtp_configs,
         )
 
     def insert_segments(
@@ -3037,6 +3473,9 @@ class BatchGenerator:
             List[List[Callable[[mx.array, mx.array], mx.array]]]
         ] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
+        mtp_states: Optional[List[Optional[Tuple[List[Any], mx.array]]]] = None,
+        lane_rngs: Optional[List[Optional[LaneRNG]]] = None,
+        self_mtp_configs: Optional[List[dict]] = None,
     ):
         uids = []
 
@@ -3047,6 +3486,16 @@ class BatchGenerator:
             [self.logits_processors] * len(segments)
         )
         stop_matchers = stop_matchers or ([self._default_stop_matcher] * len(segments))
+        mtp_states = mtp_states or [None] * len(segments)
+        lane_rngs = lane_rngs or [None] * len(segments)
+        self_mtp_configs = self_mtp_configs or [{} for _ in segments]
+        for name, values in (
+            ("mtp_states", mtp_states),
+            ("lane_rngs", lane_rngs),
+            ("self_mtp_configs", self_mtp_configs),
+        ):
+            if len(values) != len(segments):
+                raise ValueError(f"{name} must have one entry per sequence")
 
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
@@ -3081,7 +3530,7 @@ class BatchGenerator:
                                 "max_kv_size) or an unquantized generator."
                             )
 
-        for seq, m, c, at, s, lp, sm in zip(
+        for seq, m, c, at, s, lp, sm, mtp_state, lane_rng, mtp_config in zip(
             segments,
             max_tokens,
             caches,
@@ -3089,6 +3538,9 @@ class BatchGenerator:
             samplers,
             logits_processors,
             stop_matchers,
+            mtp_states,
+            lane_rngs,
+            self_mtp_configs,
         ):
             seq = list(seq)
             if len(seq[-1]) != 1:
@@ -3097,6 +3549,13 @@ class BatchGenerator:
             self._unprocessed_sequences.append(
                 (self._uid_count, seq, m, c, at, s, lp, sm)
             )
+            if self.self_mtp is not None:
+                # The plain batch path never consumes or clears these maps;
+                # populating them per request would leak entries for the
+                # lifetime of a plain generator.
+                self._mtp_states[self._uid_count] = mtp_state
+                self._mtp_lane_rngs[self._uid_count] = lane_rng
+                self._mtp_configs[self._uid_count] = dict(mtp_config)
             uids.append(self._uid_count)
             self._uid_count += 1
 
@@ -3126,12 +3585,267 @@ class BatchGenerator:
             )
         return new_cache
 
+    @staticmethod
+    def _validate_mtp_config(config):
+        if not config.get("persistent", True):
+            raise ValueError("batched self-MTP requires persistent_mtp=True")
+        if config.get("window_size") is not None:
+            raise ValueError("windowed MTP is not batchable")
+        if config.get("rate_gate", False):
+            raise ValueError("runtime rate gating is not batchable")
+        if config.get("speculation_router") is not None:
+            raise ValueError("adaptive per-lane MTP depth is not batchable")
+        if config.get("xtc_probability", 0.0) > 0.0:
+            raise ValueError("stochastic XTC is not batchable with self-MTP")
+
+    def _admit_mtp_joining(self, n: int) -> int:
+        """Budget joining lanes' caches BEFORE ``_make_mtp_batch`` allocates.
+
+        The admission callback sees the live rows plus the first ``n`` queued
+        sequences (context, configured depth, retained cache bytes) and the
+        gate admits the longest queue prefix whose lanes were approved (an MTP
+        depth or plain; ``queue`` stops the prefix). A lane approved only as
+        plain is still prepared here — the merge-boundary admission pass then
+        migrates it — while a queued lane allocates nothing this cycle.
+        """
+        if n <= 0 or self.mtp_admission is None:
+            return n
+        rows = list(self._generation_batch.mtp_cycle_state())
+        joining = []
+        for sequence in list(self._unprocessed_sequences)[:n]:
+            uid, segments, _maximum, prompt_cache, history = sequence[:5]
+            config = dict(self.self_mtp or {})
+            config.update(self._mtp_configs.get(uid, {}))
+            prompt_len = sum(len(segment) for segment in segments)
+            context = len(history) + prompt_len
+            target_bytes = 0
+            covered = 0
+            for leaf in prompt_cache:
+                target_bytes += int(getattr(leaf, "nbytes", 0))
+                covered = max(covered, int(getattr(leaf, "offset", 0)))
+            # Preparation prefills the uncached suffix into the target cache,
+            # so budget the post-prepare size, not the restored size.
+            if covered > 0:
+                target_bytes = int(target_bytes * (max(context, covered) / covered))
+            # A restored APC sidecar's draft cache is retained alongside the
+            # target cache and re-allocated during preparation; budget its
+            # actual bytes BEFORE that allocation, not only at the later
+            # merge-boundary check. A lane without a measurable sidecar still
+            # allocates a fresh single-layer draft cache during preparation,
+            # so it takes at least one layer's share of the projected target.
+            draft_bytes = 0
+            draft_covered = 0
+            mtp_state = self._mtp_states.get(uid)
+            if mtp_state is not None:
+                for leaf in mtp_state[0]:
+                    draft_bytes += int(getattr(leaf, "nbytes", 0))
+                    draft_covered = max(
+                        draft_covered, int(getattr(leaf, "offset", 0))
+                    )
+            if draft_covered > 0:
+                draft_bytes = int(
+                    draft_bytes * (max(context, draft_covered) / draft_covered)
+                )
+            else:
+                layers = max(sum(1 for _ in prompt_cache), 1)
+                draft_bytes = max(draft_bytes, target_bytes // layers)
+            cache_gib = (target_bytes + draft_bytes) / float(1 << 30)
+            joining.append(
+                (
+                    int(uid),
+                    context,
+                    int(config.get("num_draft", 1)),
+                    False,
+                    cache_gib,
+                )
+            )
+        decisions = dict(self.mtp_admission(tuple(rows + joining)) or {})
+        admitted = 0
+        for row in joining:
+            decision = decisions.get(row[0])
+            if isinstance(decision, int) or decision == "plain":
+                admitted += 1
+            else:
+                break
+        return admitted
+
+    def _make_mtp_batch(self, n: int):
+        from .hybrid_speculative import prepare_self_mtp_lane
+
+        sequences = [self._unprocessed_sequences.popleft() for _ in range(n)]
+        detached = []
+        initial = []
+        stop_matchers = []
+        progress = []
+        for (
+            uid,
+            segments,
+            maximum,
+            prompt_cache,
+            history,
+            _,
+            processors,
+            matcher,
+        ) in sequences:
+            prompt = [token for segment in segments for token in segment]
+            config = dict(self.self_mtp or {})
+            config.update(self._mtp_configs.pop(uid, {}))
+            self._validate_mtp_config(config)
+            processors = list(processors or [])
+            prefix = mx.array(history, dtype=mx.uint32)
+            prepare_processors = [
+                (
+                    lambda y, logits, processor=processor: processor(
+                        mx.concatenate([prefix, y]), logits
+                    )
+                )
+                for processor in processors
+            ]
+            lane, first = prepare_self_mtp_lane(
+                mx.array(prompt, dtype=mx.uint32),
+                self.model,
+                uid=uid,
+                max_tokens=maximum,
+                prompt_cache=prompt_cache,
+                mtp_state=self._mtp_states.pop(uid, None),
+                lane_rng=self._mtp_lane_rngs.pop(uid, None),
+                num_draft=int(config.get("num_draft", 1)),
+                sampling_temp=float(config.get("sampling_temp", 0.0)),
+                sampling_top_p=float(config.get("top_p", 1.0)),
+                sampling_top_k=int(config.get("top_k", 0)),
+                sampling_min_p=float(config.get("min_p", 0.0)),
+                accept_rule=config.get("accept_rule", "residual"),
+                logits_processors=prepare_processors,
+                prefill_step_size=int(
+                    config.get("prefill_step_size", self.prefill_step_size)
+                ),
+                share_qsa_indices=bool(config.get("share_qsa_indices", False)),
+            )
+            lane.lane.token_prefix = mx.array(history + prompt, dtype=mx.uint32)
+            lane.lane.logits_processors = processors
+            detached.append(lane)
+            initial.append(first)
+            stop_matchers.append(matcher)
+            total = len(history) + len(prompt)
+            progress.append(PromptProcessingBatch.Response(uid, (total, total), True, True))
+        return (
+            MTPGenerationBatch(
+                self.model,
+                detached,
+                initial,
+                stop_matchers,
+                mtp_admission=self.mtp_admission,
+            ),
+            progress,
+        )
+
+    @staticmethod
+    def _plain_sampler_for_mtp_lane(lane):
+        def sample(logprobs):
+            if lane.sampling_temp <= 0:
+                return mx.argmax(logprobs, axis=-1)
+            if lane.logprob_transform is not None:
+                transformed = lane.logprob_transform(logprobs)
+            else:
+                transformed = logprobs / float(lane.sampling_temp)
+            return mx.random.categorical(transformed, key=draw_key(lane.rng))
+
+        sample.batch_groupable = False
+        return sample
+
+    def _migrate_plain_fallbacks(self):
+        """Move plain-approved MTP lanes into the plain batch.
+
+        Returns the responses this migration itself must emit: a lane that
+        joined and was routed to plain at the merge boundary still carries its
+        prepared-but-unemitted first token (``initial_output``, already
+        counted in ``lane.ntoks``). It is delivered here exactly once, so the
+        response neither drops that token nor double-subtracts it from the
+        remaining budget; with ``max_tokens=1`` it is the lane's entire,
+        terminal output.
+        """
+        if self.self_mtp is None:
+            return []
+        responses = []
+        for package in self._generation_batch.take_plain_fallbacks():
+            lane = package.detached.lane
+            matcher_state = package.matcher_state
+            initial = package.initial_output
+            if initial is not None:
+                matcher_state, reason = MTPGenerationBatch._finish_reason(
+                    initial.token,
+                    package.num_tokens + 1,
+                    lane.max_tokens,
+                    matcher_state,
+                    package.stop_matcher,
+                )
+                response = MTPGenerationBatch.Response(
+                    uid=lane.uid,
+                    token=initial.token,
+                    logprobs=initial.logprobs,
+                    finish_reason=reason,
+                    prompt_cache=None,
+                    all_tokens=None,
+                    from_draft=initial.from_draft,
+                )
+                responses.append(response)
+                if reason is not None:
+                    # Terminal on its prepared token: complete exactly like
+                    # the MTP path's ``_complete_responses``.
+                    response.prompt_cache = package.detached.caches.target
+                    response.all_tokens = MTPGenerationBatch._prefix_tokens(lane)
+                    response.mtp_state = (
+                        package.detached.caches.draft,
+                        lane.seed_h,
+                    )
+                    response.lane_rng = lane.rng
+                    response.rng_draws = (
+                        lane.rng.draws if lane.rng is not None else 0
+                    )
+                    continue
+            remaining = lane.max_tokens - lane.ntoks
+            if remaining <= 0:
+                continue
+            plain = GenerationBatch(
+                self.model,
+                [lane.uid],
+                mx.array([lane.cur], dtype=mx.uint32),
+                _merge_caches([package.detached.caches.target]),
+                [MTPGenerationBatch._prefix_tokens(lane)],
+                [self._plain_sampler_for_mtp_lane(lane)],
+                self.sampler,
+                [lane.logits_processors],
+                [package.stop_matcher],
+                [remaining],
+            )
+            plain._matcher_states[0] = matcher_state
+            self._plain_fallback_batch.extend(plain)
+        return responses
+
+    def mtp_cycle_state(self):
+        if self.self_mtp is None:
+            return []
+        return self._generation_batch.mtp_cycle_state()
+
+    def set_mtp_num_draft(self, depths: Union[int, Mapping[int, int]]):
+        if self.self_mtp is None:
+            raise RuntimeError("BatchGenerator is not in self-MTP mode")
+        self._generation_batch.set_num_draft(depths)
+
     def _find_uids(self, uids):
         uids = set(uids)
         results = {}
         for i, uid_i in enumerate(self._generation_batch.uids):
             if uid_i in uids:
                 results[uid_i] = (2, i)
+        if self.self_mtp is not None:
+            active = set(self._generation_batch.uids)
+            for uid_i, *_ in self._generation_batch.mtp_cycle_state():
+                if uid_i in uids and uid_i not in active:
+                    results[uid_i] = (2, -1)
+        for i, uid_i in enumerate(self._plain_fallback_batch.uids):
+            if uid_i in uids:
+                results[uid_i] = (3, i)
         for i, uid_i in enumerate(self._prompt_batch.uids):
             if uid_i in uids:
                 results[uid_i] = (1, i)
@@ -3151,10 +3865,19 @@ class BatchGenerator:
                     self._prompt_batch.tokens[idx],
                 )
             else:
-                results[uid] = (
-                    self._generation_batch.extract_cache(idx),
-                    self._generation_batch.tokens[idx],
-                )
+                if stage == 2:
+                    if self.self_mtp is not None:
+                        results[uid] = self._generation_batch.extract_uid(uid)
+                    else:
+                        results[uid] = (
+                            self._generation_batch.extract_cache(idx),
+                            self._generation_batch.tokens[idx],
+                        )
+                else:
+                    results[uid] = (
+                        self._plain_fallback_batch.extract_cache(idx),
+                        self._plain_fallback_batch.tokens[idx],
+                    )
         return results
 
     def remove(self, uids, return_prompt_caches=False):
@@ -3166,29 +3889,52 @@ class BatchGenerator:
             set(range(len(self._unprocessed_sequences))),
             set(range(len(self._prompt_batch))),
             set(range(len(self._generation_batch))),
+            set(range(len(self._plain_fallback_batch))),
         )
-        for stage, idx in self._find_uids(uids).values():
-            keep[stage].remove(idx)
+        found = self._find_uids(uids)
+        for stage, idx in found.values():
+            if idx >= 0:
+                keep[stage].remove(idx)
 
         if len(keep[0]) < len(self._unprocessed_sequences):
             self._unprocessed_sequences = deque(
                 x for i, x in enumerate(self._unprocessed_sequences) if i in keep[0]
             )
+            for uid in uids:
+                self._mtp_states.pop(uid, None)
+                self._mtp_lane_rngs.pop(uid, None)
+                self._mtp_configs.pop(uid, None)
         if len(keep[1]) < len(self._prompt_batch):
             self._prompt_batch.filter(sorted(keep[1]))
             self._currently_processing = [
                 x for i, x in enumerate(self._currently_processing) if i in keep[1]
             ]
-        if len(keep[2]) < len(self._generation_batch):
+        if self.self_mtp is not None:
+            self._generation_batch.remove_uids(uids)
+        elif len(keep[2]) < len(self._generation_batch):
             self._generation_batch.filter(sorted(keep[2]))
+        if len(keep[3]) < len(self._plain_fallback_batch):
+            self._plain_fallback_batch.filter(sorted(keep[3]))
 
         return caches
 
     @property
     def prompt_cache_nbytes(self):
         total = sum(c.nbytes for p in self._unprocessed_sequences for c in p[3])
+        # Queued lanes also retain their restored draft sidecars in
+        # ``_mtp_states`` until preparation consumes them.
+        total += sum(
+            int(getattr(leaf, "nbytes", 0))
+            for state in self._mtp_states.values()
+            if state is not None
+            for leaf in state[0]
+        )
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
-        total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        if self.self_mtp is None:
+            total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        else:
+            total += self._generation_batch.cache_nbytes
+        total += sum(c.nbytes for c in self._plain_fallback_batch.prompt_cache)
         return total
 
     def _make_batch(self, n: int):
@@ -3447,7 +4193,43 @@ class BatchGenerator:
             admitted = 1
         return admitted
 
+    def _next_mtp(self):
+        generation_responses = []
+        prompt_responses = []
+
+        if self._generation_batch.mtp_cycle_state():
+            generation_responses.extend(self._generation_batch.next())
+        generation_responses.extend(self._migrate_plain_fallbacks())
+        if len(self._plain_fallback_batch) > 0:
+            generation_responses.extend(self._plain_fallback_batch.next())
+
+        if generation_responses:
+            self._gen_tokens_counter += len(generation_responses)
+            self._steps_counter += 1
+            if self._steps_counter % 512 == 0:
+                mx.clear_cache()
+
+        occupied = (
+            len(self._generation_batch.mtp_cycle_state())
+            + len(self._plain_fallback_batch)
+        )
+        n = min(
+            self.completion_batch_size - occupied,
+            len(self._unprocessed_sequences),
+        )
+        n = self._budget_admissible(n)
+        n = self._admit_mtp_joining(n)
+        if n > 0:
+            batch, progress = self._make_mtp_batch(n)
+            self._generation_batch.extend(batch)
+            prompt_responses.extend(progress)
+
+        return prompt_responses, generation_responses
+
     def _next(self):
+        if self.self_mtp is not None:
+            return self._next_mtp()
+
         generation_responses = []
         prompt_responses = []
 
@@ -3584,6 +4366,16 @@ class ParallelSampleGenerator:
         all_tokens: Optional[List[int]] = None,
         prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
         stream=None,
+        self_mtp: Optional[dict] = None,
+        mtp_state: Optional[Tuple[List[Any], mx.array]] = None,
+        lane_rng: Optional[LaneRNG] = None,
+        mtp_prompt: Optional[Sequence[int]] = None,
+        mtp_admission: Optional[
+            Callable[
+                [Sequence[Tuple[int, int, int, bool, float]]],
+                Mapping[int, Union[int, str]],
+            ]
+        ] = None,
     ):
         if n < 1:
             raise ValueError(f"n must be at least 1, got {n}")
@@ -3596,25 +4388,122 @@ class ParallelSampleGenerator:
             raise ValueError("each sample needs its own logits_processors list")
 
         self.n = n
-        self._generator = BatchGenerator(
-            model,
-            completion_batch_size=n,
-            prefill_batch_size=n,
-            prefill_step_size=prefill_step_size,
-            stream=stream,
-        )
         history = list(all_tokens or [])
-        uids = self._generator.insert(
-            prompts=[[int(seed_token)] for _ in range(n)],
-            max_tokens=[max_tokens] * n,
-            # Same leaf objects in every row: merge() reads them and writes new
-            # per-row buffers, so this replicates without a second prefill.
-            caches=[list(prompt_cache) for _ in range(n)],
-            all_tokens=[list(history) for _ in range(n)],
-            samplers=samplers,
-            logits_processors=logits_processors,
-            stop_matchers=stop_matchers,
-        )
+        if self_mtp is None:
+            self._generator = BatchGenerator(
+                model,
+                completion_batch_size=n,
+                prefill_batch_size=n,
+                prefill_step_size=prefill_step_size,
+                stream=stream,
+            )
+            uids = self._generator.insert(
+                prompts=[[int(seed_token)] for _ in range(n)],
+                max_tokens=[max_tokens] * n,
+                # merge() reads these leaves and creates independent rows.
+                caches=[list(prompt_cache) for _ in range(n)],
+                all_tokens=[list(history) for _ in range(n)],
+                samplers=samplers,
+                logits_processors=logits_processors,
+                stop_matchers=stop_matchers,
+            )
+        else:
+            # Route processor-bearing requests to plain BEFORE any self-MTP
+            # validation can raise: this branch must fail closed, never crash.
+            processors = logits_processors or [[] for _ in range(n)]
+            if any(processors):
+                # The server normally routes this case to plain before prefill.
+                # Keep the direct generator API fail-closed too.
+                self_mtp = None
+                self._generator = BatchGenerator(
+                    model,
+                    completion_batch_size=n,
+                    prefill_batch_size=n,
+                    prefill_step_size=prefill_step_size,
+                    stream=stream,
+                )
+                uids = self._generator.insert(
+                    prompts=[[int(seed_token)] for _ in range(n)],
+                    max_tokens=[max_tokens] * n,
+                    caches=[list(prompt_cache) for _ in range(n)],
+                    all_tokens=[list(history) for _ in range(n)],
+                    samplers=samplers,
+                    logits_processors=processors,
+                    stop_matchers=stop_matchers,
+                )
+                self._index = {uid: i for i, uid in enumerate(uids)}
+                self._active = set(uids)
+                return
+            if lane_rng is None:
+                raise ValueError("parallel self-MTP requires a generation-thread LaneRNG")
+            config = dict(self_mtp)
+            BatchGenerator._validate_mtp_config(config)
+            lane_rngs = lane_rng.fork(n)
+            mx.eval([rng.key for rng in lane_rngs])
+            matchers = stop_matchers or [StopSequenceMatcher() for _ in range(n)]
+            prompt_tail = list(mtp_prompt) if mtp_prompt is not None else [seed_token]
+
+            from .hybrid_speculative import MTPToken, prepare_self_mtp_lane
+
+            canonical, first = prepare_self_mtp_lane(
+                mx.array(prompt_tail, dtype=mx.uint32),
+                model,
+                uid=0,
+                max_tokens=max_tokens,
+                prompt_cache=prompt_cache,
+                mtp_state=mtp_state,
+                lane_rng=lane_rngs[0],
+                num_draft=int(config.get("num_draft", 1)),
+                sampling_temp=float(config.get("sampling_temp", 0.0)),
+                sampling_top_p=float(config.get("top_p", 1.0)),
+                sampling_top_k=int(config.get("top_k", 0)),
+                sampling_min_p=float(config.get("min_p", 0.0)),
+                accept_rule=config.get("accept_rule", "residual"),
+                logits_processors=processors[0],
+                prefill_step_size=prefill_step_size,
+                share_qsa_indices=bool(config.get("share_qsa_indices", False)),
+            )
+            canonical.lane.token_prefix = mx.array(
+                history + prompt_tail, dtype=mx.uint32
+            )
+            lanes = [canonical]
+            first_outputs = [first]
+            for uid in range(1, n):
+                lane = copy.deepcopy(canonical)
+                lane.lane.uid = uid
+                lane.lane.rng = lane_rngs[uid]
+                lane.lane.logits_processors = processors[uid]
+                if lane.lane.sampling_temp > 0:
+                    token = mx.random.categorical(
+                        first.logprobs, key=draw_key(lane_rngs[uid])
+                    )
+                    mx.eval(token)
+                    token = int(token.item())
+                else:
+                    token = int(mx.argmax(first.logprobs).item())
+                lane.lane.cur = token
+                lanes.append(lane)
+                first_outputs.append(MTPToken(token, first.logprobs, False))
+
+            self._generator = BatchGenerator(
+                model,
+                completion_batch_size=n,
+                prefill_batch_size=n,
+                prefill_step_size=prefill_step_size,
+                stream=stream,
+                self_mtp=config,
+                mtp_admission=mtp_admission,
+            )
+            # The admission callback re-budgets at every cycle boundary, so the
+            # lanes can drop k, migrate to plain, or pause under pressure.
+            self._generator._generation_batch = MTPGenerationBatch(
+                model,
+                lanes,
+                first_outputs,
+                matchers,
+                mtp_admission=mtp_admission,
+            )
+            uids = list(range(n))
         self._index = {uid: i for i, uid in enumerate(uids)}
         self._active = set(uids)
 
