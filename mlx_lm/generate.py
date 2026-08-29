@@ -3273,8 +3273,16 @@ class BatchGenerator:
                 raise ValueError("runtime rate gating is not batchable")
             if self.self_mtp.get("speculation_router") is not None:
                 raise ValueError("adaptive per-lane MTP depth is not batchable")
-            if max_kv_size is not None or kv_bits is not None:
-                raise ValueError("bounded or quantized KV caches are not MTP batchable")
+            if max_kv_size is not None:
+                raise ValueError("bounded (windowed) KV caches are not MTP batchable")
+            if kv_bits is not None and not self.self_mtp.get("allow_quantized_kv"):
+                # Quantized KV is opt-in for self-MTP (allow_quantized_kv). The
+                # batched transaction is bit-exact on a quantized target cache;
+                # this refusal is the policy gate, not a capability limit.
+                raise ValueError(
+                    "quantized KV caches are not MTP batchable unless "
+                    "allow_quantized_kv is set in the self-MTP config"
+                )
         self.max_tokens = max_tokens
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.logits_processors = logits_processors or []
@@ -4376,6 +4384,8 @@ class ParallelSampleGenerator:
                 Mapping[int, Union[int, str]],
             ]
         ] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
     ):
         if n < 1:
             raise ValueError(f"n must be at least 1, got {n}")
@@ -4438,6 +4448,15 @@ class ParallelSampleGenerator:
                 raise ValueError("parallel self-MTP requires a generation-thread LaneRNG")
             config = dict(self_mtp)
             BatchGenerator._validate_mtp_config(config)
+            if kv_bits is not None:
+                if not config.get("allow_quantized_kv"):
+                    raise ValueError(
+                        "quantized KV caches are not MTP batchable unless "
+                        "allow_quantized_kv is set in the self-MTP config"
+                    )
+                maybe_quantize_kv_cache(
+                    prompt_cache, 0, kv_group_size, kv_bits
+                )
             lane_rngs = lane_rng.fork(n)
             mx.eval([rng.key for rng in lane_rngs])
             matchers = stop_matchers or [StopSequenceMatcher() for _ in range(n)]
@@ -4493,6 +4512,8 @@ class ParallelSampleGenerator:
                 stream=stream,
                 self_mtp=config,
                 mtp_admission=mtp_admission,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
             )
             # The admission callback re-budgets at every cycle boundary, so the
             # lanes can drop k, migrate to plain, or pause under pressure.

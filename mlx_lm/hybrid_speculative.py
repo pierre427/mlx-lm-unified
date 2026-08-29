@@ -1570,15 +1570,20 @@ def _self_mtp_group_offset(caches: Sequence[Any]) -> int:
 
 
 def _reject_unsupported_self_mtp_caches(caches: Sequence[Any]) -> None:
+    # Windowed (sink/rotating) caches cannot do the per-row ragged speculative
+    # rollback the transaction needs, so they stay unsupported. Quantized caches
+    # CAN (the batched transaction is bit-exact on a BatchQuantizedKVCache); they
+    # are gated by policy (allow_quantized_kv) at the server/constructor, not
+    # refused here as a capability limit.
     unsupported = [
         type(cache).__name__
         for cache in caches
         if "SinkWindow" in type(cache).__name__
-        or "Quantized" in type(cache).__name__
+        or "Rotating" in type(cache).__name__
     ]
     if unsupported:
         raise ValueError(
-            "batched self-MTP excludes windowed and quantized caches; got "
+            "batched self-MTP excludes windowed caches; got "
             + ", ".join(unsupported)
         )
 
