@@ -88,6 +88,12 @@ _MOE_FUSED_GATE_UP = _env_flag("MLX_QWEN4_MOE_FUSED_GATE_UP", default=True)
 # output composition is unchanged, but the shared row moves to the gather
 # kernel family, which accumulates differently on M5 (<= 1.5e-3 of output
 # scale; <= 2e-7 with MLX_ENABLE_TF32=0) => tolerance-level lever.
+# Stays default-off, permanently: a 2026-08-29 throughput A/B (production-dim
+# block, identical weights) measured fold/baseline == 1.0 within noise at every
+# width, so there is no speedup to trade for -- and under MTP the fold lands on
+# the less-accurate kernel at the 2-3-wide verify band. The earlier "+2.4% MTP"
+# was a spurious extra-draft-accept from that divergence, not a speedup. See
+# wiki experiments/qwen38-moe-shared-in-gather-resolved-2026-08-28.md.
 _MOE_SHARED_IN_GATHER = _env_flag("MLX_QWEN4_MOE_SHARED_IN_GATHER")
 
 # MLX_QWEN4_FUSED_EXPERT_KERNEL: experimental production-shape kernel for the
