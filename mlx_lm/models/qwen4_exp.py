@@ -2254,6 +2254,10 @@ class Attention(nn.Module):
         # keeps the dense masked-SDPA path and its mask, bit-identical.
         use_nax = (
             _QSA_NAX_KERNEL
+            # The kernel is an MLX CustomKernel with no VJP, so a backward pass
+            # raises "Primitive::vjp Not implemented". Never route training
+            # through it (mirrors the _QSA_FUSED_PROJ guard); inference only.
+            and not self.training
             and selection.kind == "explicit"
             and length >= _QSA_NAX_MIN_QUERY
             and self._nax_layout_ok
