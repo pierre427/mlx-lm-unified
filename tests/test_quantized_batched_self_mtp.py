@@ -11,12 +11,18 @@ set; windowed stays unbatchable regardless).
 """
 
 import hashlib
+import os
 import types
 import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import BatchGenerator, maybe_quantize_kv_cache
+from mlx_lm.apc import AutomaticPrefixCache, MTPAPCSidecar
+from mlx_lm.generate import (
+    BatchGenerator,
+    maybe_quantize_kv_cache,
+    prefill_prompt_cache,
+)
 from mlx_lm.hybrid_speculative import (
     attach_self_mtp_lanes,
     commit_batched_self_mtp,
@@ -131,6 +137,59 @@ class TestQuantizedBatchedSelfMTP(unittest.TestCase):
                 batch, _ = detach_self_mtp_lanes(self.model, batch, leaving)
         return traces, merged_types
 
+    def _run_generator(
+        self,
+        prompt,
+        *,
+        prompt_cache=None,
+        mtp_state=None,
+        history=None,
+        maximum=6,
+    ):
+        config = {
+            "persistent": True,
+            "num_draft": 2,
+            "sampling_temp": 0.0,
+            "accept_rule": "residual",
+            "allow_quantized_kv": True,
+        }
+        generator = BatchGenerator(
+            self.model,
+            completion_batch_size=1,
+            prefill_batch_size=1,
+            prefill_step_size=4,
+            self_mtp=config,
+            kv_bits=BITS,
+            kv_group_size=GROUP,
+        )
+        try:
+            generator.insert(
+                [list(prompt)],
+                max_tokens=[maximum],
+                caches=[prompt_cache],
+                all_tokens=[list(history or [])],
+                mtp_states=[mtp_state],
+                lane_rngs=[LaneRNG(901)],
+                self_mtp_configs=[config],
+            )
+            output = []
+            terminal = None
+            for _ in range(64):
+                _, responses = generator.next()
+                output.extend(int(response.token) for response in responses)
+                finished = [
+                    response
+                    for response in responses
+                    if response.finish_reason is not None
+                ]
+                if finished:
+                    terminal = finished[-1]
+                    break
+            self.assertIsNotNone(terminal)
+            return output, terminal
+        finally:
+            generator.close()
+
     def test_quantized_target_cache_is_built(self):
         types_ = [type(c).__name__ for c in self._qcache()]
         self.assertIn("QuantizedKVCache", types_)
@@ -156,6 +215,108 @@ class TestQuantizedBatchedSelfMTP(unittest.TestCase):
         for uid in self.prompts:
             with self.subTest(uid=uid):
                 self.assertEqual(_digest(traces[uid]), _digest(refs[uid]))
+
+    def test_quantized_batched_lane_apc_restore_is_token_exact(self):
+        _, stored = self._run_generator(self.prompts[1], maximum=5)
+        self.assertTrue(
+            any(
+                type(cache).__name__ == "QuantizedKVCache"
+                for cache in stored.prompt_cache
+            )
+        )
+
+        apc = AutomaticPrefixCache()
+        sidecar = MTPAPCSidecar(
+            stored.mtp_state,
+            covered_tokens=len(stored.all_tokens),
+        )
+        apc.insert_cache(
+            "quantized", stored.all_tokens, stored.prompt_cache, sidecar=sidecar
+        )
+        continued_prompt = list(stored.all_tokens) + [19, 27]
+        lookup = apc.lookup("quantized", continued_prompt)
+        self.assertEqual(lookup.hit_kind, "mtp_sidecar")
+        self.assertIsNot(lookup.sidecar, sidecar)
+        self.assertTrue(
+            any(type(cache).__name__ == "QuantizedKVCache" for cache in lookup.cache)
+        )
+        stored_quantized = [
+            cache
+            for cache in stored.prompt_cache
+            if type(cache).__name__ == "QuantizedKVCache"
+        ]
+        restored_quantized = [
+            cache
+            for cache in lookup.cache
+            if type(cache).__name__ == "QuantizedKVCache"
+        ]
+        self.assertEqual(len(restored_quantized), len(stored_quantized))
+        for source, restored in zip(stored_quantized, restored_quantized):
+            self.assertEqual(restored.meta_state, source.meta_state)
+            for side in ("keys", "values"):
+                for source_array, restored_array in zip(
+                    getattr(source, side), getattr(restored, side)
+                ):
+                    self.assertEqual(restored_array.shape, source_array.shape)
+                    self.assertEqual(restored_array.dtype, source_array.dtype)
+
+        cold, _ = self._run_generator(continued_prompt)
+        warm, _ = self._run_generator(
+            lookup.remaining_tokens,
+            prompt_cache=lookup.cache,
+            mtp_state=lookup.sidecar.state,
+            history=continued_prompt[: lookup.cached_tokens],
+        )
+        self.assertEqual(warm, cold)
+
+    def test_quantized_hybrid_apc_trim_is_exact_or_fails_closed(self):
+        stored_tokens = list(range(1, 13))
+        branch = stored_tokens[:9] + [41, 42, 43]
+        stored_cache = self._qcache()
+        prefill_prompt_cache(
+            self.model, stored_tokens[:8], stored_cache, prefill_step_size=4
+        )
+        prefill_prompt_cache(
+            self.model, stored_tokens[8:], stored_cache, prefill_step_size=4
+        )
+        apc = AutomaticPrefixCache()
+        apc.insert_cache("quantized-hybrid", stored_tokens, stored_cache)
+
+        lookup = apc.lookup("quantized-hybrid", branch)
+        self.assertTrue(lookup.hit)
+        self.assertEqual(lookup.cached_tokens, 8)
+        self.assertEqual(lookup.remaining_tokens, branch[8:])
+        reused_logits = self.model(
+            mx.array(lookup.remaining_tokens)[None], cache=lookup.cache
+        )
+        fresh_cache = self._qcache()
+        prefill_prompt_cache(
+            self.model, branch[:8], fresh_cache, prefill_step_size=4
+        )
+        fresh_logits = self.model(mx.array(branch[8:])[None], cache=fresh_cache)
+        mx.eval(reused_logits, fresh_logits)
+        self.assertTrue(mx.array_equal(reused_logits, fresh_logits).item())
+
+        previous = os.environ.get("MLX_LM_STATE_CHECKPOINT_MAX")
+        os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = "0"
+        try:
+            uncheckpointed = self._qcache()
+            prefill_prompt_cache(
+                self.model,
+                stored_tokens,
+                uncheckpointed,
+                prefill_step_size=4,
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("MLX_LM_STATE_CHECKPOINT_MAX", None)
+            else:
+                os.environ["MLX_LM_STATE_CHECKPOINT_MAX"] = previous
+        unsafe = AutomaticPrefixCache()
+        unsafe.insert_cache("quantized-hybrid", stored_tokens, uncheckpointed)
+        miss = unsafe.lookup("quantized-hybrid", branch)
+        self.assertFalse(miss.hit)
+        self.assertEqual(miss.miss_reason, "untrimmable_branch")
 
 
 class TestQuantizedMTPPolicyGate(unittest.TestCase):

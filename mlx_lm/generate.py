@@ -4384,6 +4384,8 @@ class ParallelSampleGenerator:
                 Mapping[int, Union[int, str]],
             ]
         ] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
     ):
         if n < 1:
             raise ValueError(f"n must be at least 1, got {n}")
@@ -4446,6 +4448,15 @@ class ParallelSampleGenerator:
                 raise ValueError("parallel self-MTP requires a generation-thread LaneRNG")
             config = dict(self_mtp)
             BatchGenerator._validate_mtp_config(config)
+            if kv_bits is not None:
+                if not config.get("allow_quantized_kv"):
+                    raise ValueError(
+                        "quantized KV caches are not MTP batchable unless "
+                        "allow_quantized_kv is set in the self-MTP config"
+                    )
+                maybe_quantize_kv_cache(
+                    prompt_cache, 0, kv_group_size, kv_bits
+                )
             lane_rngs = lane_rng.fork(n)
             mx.eval([rng.key for rng in lane_rngs])
             matchers = stop_matchers or [StopSequenceMatcher() for _ in range(n)]
@@ -4501,6 +4512,8 @@ class ParallelSampleGenerator:
                 stream=stream,
                 self_mtp=config,
                 mtp_admission=mtp_admission,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
             )
             # The admission callback re-budgets at every cycle boundary, so the
             # lanes can drop k, migrate to plain, or pause under pressure.

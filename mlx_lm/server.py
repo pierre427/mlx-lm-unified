@@ -49,6 +49,7 @@ from .generate import (
     StopSequenceMatcher,
     TextStateMachine,
     validate_kv_quantization_args,
+    maybe_quantize_kv_cache,
     make_stop_matcher,
     make_text_state_machine,
     prefill_prompt_cache,
@@ -1583,6 +1584,44 @@ def _batch_kind_key(model_identity, self_mtp=None):
     )
 
 
+def _batched_kv_quantization(cli_args, self_mtp):
+    """Return immediate KV quantization settings for an opted-in MTP batch."""
+    if self_mtp is None or not self_mtp.get("allow_quantized_kv"):
+        return {}
+    kv_bits = getattr(cli_args, "kv_bits", None)
+    if kv_bits is None:
+        return {}
+    return {
+        "kv_bits": kv_bits,
+        "kv_group_size": getattr(cli_args, "kv_group_size", 64),
+    }
+
+
+def _batched_prompt_cache_model_key(model_identity, cli_args, self_mtp):
+    """Separate opted-in quantized APC entries from full-precision entries."""
+    quantization = _batched_kv_quantization(cli_args, self_mtp)
+    if not quantization:
+        return model_identity
+    return (
+        model_identity,
+        "batched_quantized_kv",
+        quantization["kv_bits"],
+        quantization["kv_group_size"],
+    )
+
+
+def _quantize_batched_self_mtp_cache(prompt_cache, cli_args, self_mtp):
+    quantization = _batched_kv_quantization(cli_args, self_mtp)
+    if quantization:
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            0,
+            quantization["kv_group_size"],
+            quantization["kv_bits"],
+        )
+    return prompt_cache
+
+
 PARALLEL_SAMPLING_MTP_MODES = ("mtp", "plain", "refuse")
 
 
@@ -2254,13 +2293,24 @@ class ResponseGenerator:
                     )
 
                     self._log_cache_stats()
+                    lookup_self_mtp = _batched_self_mtp_config(
+                        args,
+                        self.cli_args,
+                        self.model_provider.model,
+                        prompt_tokens=len(prompt),
+                    )
+                    lookup_model_key = _batched_prompt_cache_model_key(
+                        self.model_provider.model_key,
+                        self.cli_args,
+                        lookup_self_mtp,
+                    )
                     if hasattr(self.prompt_cache, "lookup"):
-                        lookup = self.prompt_cache.lookup(current_model_key, prompt)
+                        lookup = self.prompt_cache.lookup(lookup_model_key, prompt)
                         cache, rest = lookup.cache, lookup.remaining_tokens
                         mtp_sidecar = lookup.sidecar
                     else:
                         cache, rest = self.prompt_cache.fetch_nearest_cache(
-                            current_model_key, prompt
+                            lookup_model_key, prompt
                         )
                         mtp_sidecar = None
                     prompt_cache_count = len(prompt) - len(rest)
@@ -2282,7 +2332,7 @@ class ResponseGenerator:
                         # the next transaction boundary.
                         self_mtp = dict(self_mtp)
                         self_mtp["num_draft"] = current_self_mtp["num_draft"]
-                    candidate_kind = _batch_kind_key(current_model_key, self_mtp)
+                    candidate_kind = _batch_kind_key(lookup_model_key, self_mtp)
                     # A seeded request which became plain after APC/exclusion
                     # cannot enter the global-RNG plain batch.
                     if self_mtp is None and args.seed is not None:
@@ -2373,9 +2423,20 @@ class ResponseGenerator:
                     # performs a fresh owned lookup when inserted.
                     try:
                         prompt, _, _, _ = self._tokenize(tokenizer, request, args)
+                        lookup_self_mtp = _batched_self_mtp_config(
+                            args,
+                            self.cli_args,
+                            model,
+                            prompt_tokens=len(prompt),
+                        )
+                        lookup_model_key = _batched_prompt_cache_model_key(
+                            self.model_provider.model_key,
+                            self.cli_args,
+                            lookup_self_mtp,
+                        )
                         if hasattr(self.prompt_cache, "lookup"):
                             lookup = self.prompt_cache.lookup(
-                                self.model_provider.model_key, prompt
+                                lookup_model_key, prompt
                             )
                             probe_cache = lookup.cache
                             probe_rest = lookup.remaining_tokens
@@ -2383,7 +2444,7 @@ class ResponseGenerator:
                         else:
                             probe_cache, probe_rest = (
                                 self.prompt_cache.fetch_nearest_cache(
-                                    self.model_provider.model_key, prompt
+                                    lookup_model_key, prompt
                                 )
                             )
                             probe_sidecar = None
@@ -2433,7 +2494,7 @@ class ResponseGenerator:
 
                     current_model = args.model
                     current_tokenizer = tokenizer
-                    current_model_key = self.model_provider.model_key
+                    current_model_key = lookup_model_key
                     current_batch_kind = _batch_kind_key(
                         current_model_key, current_self_mtp
                     )
@@ -2469,6 +2530,9 @@ class ResponseGenerator:
                                 self._self_mtp_admission
                                 if current_self_mtp is not None
                                 else None
+                            ),
+                            **_batched_kv_quantization(
+                                self.cli_args, current_self_mtp
                             ),
                         )
                     except Exception as e:
@@ -2711,15 +2775,30 @@ class ResponseGenerator:
 
             # The prefix is shared, so the prefix-cache lookup happens once.
             self._log_cache_stats()
+            lookup_self_mtp = _batched_self_mtp_config(
+                args,
+                self.cli_args,
+                model,
+                prompt_tokens=len(prompt),
+            )
+            if any(logits_processors) or getattr(
+                self.cli_args, "parallel_sampling_mtp", "mtp"
+            ) != "mtp":
+                lookup_self_mtp = None
+            prompt_cache_model_key = _batched_prompt_cache_model_key(
+                self.model_provider.model_key,
+                self.cli_args,
+                lookup_self_mtp,
+            )
             if hasattr(self.prompt_cache, "lookup"):
                 lookup = self.prompt_cache.lookup(
-                    self.model_provider.model_key, prompt
+                    prompt_cache_model_key, prompt
                 )
                 cache, rest = lookup.cache, lookup.remaining_tokens
                 mtp_sidecar = lookup.sidecar
             else:
                 cache, rest = self.prompt_cache.fetch_nearest_cache(
-                    self.model_provider.model_key, prompt
+                    prompt_cache_model_key, prompt
                 )
                 mtp_sidecar = None
             ctx.prompt_cache_count = len(prompt) - len(rest)
@@ -2760,6 +2839,9 @@ class ResponseGenerator:
                     prompt_tokens=len(prompt),
                     cached_prompt_tokens=ctx.prompt_cache_count,
                     mtp_state=mtp_state,
+                )
+                _quantize_batched_self_mtp_cache(
+                    cache, self.cli_args, self_mtp
                 )
                 free_gib = _current_self_mtp_free_memory_gib()
                 usable = (
@@ -2888,6 +2970,7 @@ class ResponseGenerator:
                 mtp_admission=(
                     parallel_admission if self_mtp is not None else None
                 ),
+                **_batched_kv_quantization(self.cli_args, self_mtp),
             )
             logging.info(
                 "Parallel sampling: kind=%s n=%d prompt=%d cached=%d",
@@ -2946,7 +3029,7 @@ class ResponseGenerator:
             # (self-MTP retains the fully prefilled prompt; plain retains
             # exactly prompt[:-1]).
             self.prompt_cache.insert_cache(
-                self.model_provider.model_key,
+                prompt_cache_model_key,
                 _parallel_prompt_cache_key(prompt, cache, self_mtp),
                 cache,
             )
