@@ -320,6 +320,103 @@ def capture_cache_list(caches: Sequence[Any], prefix: str = "cache") -> Capture:
     return capture
 
 
+def capture_batched_state(
+    batch: BatchedSelfMTPState, prefix: str = "batch"
+) -> Capture:
+    """Capture every persistent cache, lane, RNG, and transaction surface."""
+
+    capture: Capture = {}
+    _put(capture, f"{prefix}.membership_epoch", batch.membership_epoch)
+    _put(capture, f"{prefix}.proposal_open", batch.proposal_open)
+    proposal = batch._open_proposal
+    _put(capture, f"{prefix}._open_proposal.present", proposal is not None)
+    if proposal is not None:
+        for name in (
+            "membership_epoch",
+            "lane_uids",
+            "draft_depths",
+            "accepted_lengths",
+            "target_drops",
+            "head_drops",
+        ):
+            value = getattr(proposal, name)
+            if isinstance(value, (list, tuple)):
+                _capture_sequence(capture, f"{prefix}._open_proposal.{name}", value)
+            else:
+                _put(capture, f"{prefix}._open_proposal.{name}", value)
+        _put(capture, f"{prefix}._open_proposal.outputs.count", len(proposal.outputs))
+        for row, outputs in enumerate(proposal.outputs):
+            _put(
+                capture,
+                f"{prefix}._open_proposal.outputs[{row}].count",
+                len(outputs),
+            )
+            for index, token in enumerate(outputs):
+                token_path = f"{prefix}._open_proposal.outputs[{row}][{index}]"
+                _put(capture, f"{token_path}.token", token.token)
+                _put(capture, f"{token_path}.logprobs", token.logprobs)
+                _put(capture, f"{token_path}.from_draft", token.from_draft)
+        for name in (
+            "_old_curs",
+            "_old_seed_hs",
+            "_drafts",
+            "_vhidden",
+            "_logprobs",
+            "_bonuses",
+        ):
+            _capture_sequence(
+                capture,
+                f"{prefix}._open_proposal.{name}",
+                getattr(proposal, name),
+            )
+
+    _put(capture, f"{prefix}.lane_count", len(batch.lanes))
+    _capture_sequence(
+        capture, f"{prefix}.lane_uids", [lane.uid for lane in batch.lanes]
+    )
+    rng_aliases: Dict[int, int] = {}
+    for row, lane in enumerate(batch.lanes):
+        path = f"{prefix}.lane[{row}]"
+        for name in (
+            "uid",
+            "cur",
+            "ntoks",
+            "max_tokens",
+            "num_draft",
+            "sampling_temp",
+            "accept_rule",
+            "share_qsa_indices",
+        ):
+            _put(capture, f"{path}.{name}", getattr(lane, name))
+        for name in ("seed_h", "pending_hs", "token_prefix"):
+            _put(capture, f"{path}.{name}", getattr(lane, name))
+        _capture_sequence(capture, f"{path}.pending_ts", lane.pending_ts)
+        for name, value in vars(lane.stats).items():
+            _put(capture, f"{path}.stats.{name}", value)
+
+        rng = lane.rng
+        _put(capture, f"{path}.rng.present", rng is not None)
+        if rng is not None:
+            # Object addresses differ across deep clones.  Record the alias class
+            # instead: 0 means the first distinct RNG, a repeated value proves two
+            # lanes accidentally share one mutable stream object.
+            rng_alias = rng_aliases.setdefault(id(rng), len(rng_aliases))
+            _put(capture, f"{path}.rng.alias", rng_alias)
+            _put(capture, f"{path}.rng.type", type(rng).__name__)
+            _put(capture, f"{path}.rng.key", rng.key)
+            _put(capture, f"{path}.rng.draws", rng.draws)
+
+    _merge_capture(
+        capture,
+        capture_cache_list(batch.caches.target, f"{prefix}.target"),
+    )
+    _merge_capture(
+        capture,
+        capture_cache_list(batch.caches.draft, f"{prefix}.draft"),
+    )
+    return capture
+
+
 def _prefixed(capture: Mapping[str, OracleAtom], prefix: str) -> Capture:
     return {f"{prefix}.{path}": atom for path, atom in capture.items()}
 
@@ -419,6 +516,8 @@ def _clone_batch(batch: BatchedSelfMTPState) -> BatchedSelfMTPState:
             draft=clone_cache_list(batch.caches.draft),
         ),
         membership_epoch=batch.membership_epoch,
+        proposal_open=batch.proposal_open,
+        _open_proposal=copy.deepcopy(batch._open_proposal),
     )
 
 
@@ -540,11 +639,11 @@ def oracle_fixture() -> Iterable[OracleFixture]:
         )
 
         base = attach_self_mtp_lanes(model, None, detached)
-        original = capture_cache_list(base.caches.target, "base.target")
+        original = capture_batched_state(base, "base")
         left = _clone_batch(base)
         right = _clone_batch(base)
-        left_capture = capture_cache_list(left.caches.target, "base.target")
-        right_capture = capture_cache_list(right.caches.target, "base.target")
+        left_capture = capture_batched_state(left, "base")
+        right_capture = capture_batched_state(right, "base")
         yield OracleFixture(
             model=model,
             base=base,
@@ -643,15 +742,17 @@ def _run_scenario(
         _put(result, "verify.target_drops[0]", proposal.target_drops[0])
         _put(result, "verify.target_drops[1]", proposal.target_drops[1])
         _put(result, "verify.logits", logits[-1])
-        _merge_capture(result, _capture_target(batch.caches.target, "post_trim"))
+        _merge_capture(
+            result,
+            _prefixed(capture_batched_state(batch), "post_proposal"),
+        )
         if detailed:
-            live = capture_cache_list(batch.caches.target, "post_trim_clone")
-            cloned = capture_cache_list(
-                clone_cache_list(batch.caches.target),
-                "post_trim_clone",
+            live = capture_batched_state(batch, "post_proposal_clone")
+            cloned = capture_batched_state(
+                _clone_batch(batch), "post_proposal_clone"
             )
             assert_oracle_equal(live, cloned)
-            _put(result, "post_trim.deep_clone_with_rollbacks", True)
+            _put(result, "post_proposal.deep_clone_with_rollbacks", True)
 
         commit_batched_self_mtp(
             batch,
@@ -659,7 +760,10 @@ def _run_scenario(
             emitted_counts=[len(row) for row in proposal.outputs],
             terminal=[False, False],
         )
-        _put(result, "commit.proposal_open", batch.proposal_open)
+        _merge_capture(
+            result,
+            _prefixed(capture_batched_state(batch), "post_commit"),
+        )
 
         continuation_ids = mx.array(
             [[lane.cur] for lane in batch.lanes], dtype=mx.uint32
@@ -679,7 +783,7 @@ def _run_scenario(
         _put(result, "continuation.logits", logits[-1])
         _merge_capture(
             result,
-            _capture_target(batch.caches.target, "post_continuation"),
+            _prefixed(capture_batched_state(batch), "post_continuation"),
         )
         _put(result, "route.mtp_step_calls", mtp_calls)
         _put(result, "route.backbone_calls", backbone_calls)
@@ -820,6 +924,25 @@ REQUIRED_SURFACE_FRAGMENTS = (
     "._rollbacks[0].ragged[0,5].result[0]",
     ".verify.logits",
     ".continuation.logits",
+    ".batch.membership_epoch",
+    ".batch.proposal_open",
+    ".batch._open_proposal.present",
+    ".batch._open_proposal.outputs[0][0].logprobs",
+    ".batch._open_proposal._old_seed_hs[0]",
+    ".batch.lane[0].uid",
+    ".batch.lane_uids[0]",
+    ".batch.lane[0].cur",
+    ".batch.lane[0].seed_h",
+    ".batch.lane[0].pending_hs",
+    ".batch.lane[0].pending_ts.count",
+    ".batch.lane[0].token_prefix",
+    ".batch.lane[0].rng.alias",
+    ".batch.lane[0].rng.key",
+    ".batch.lane[0].rng.draws",
+    ".batch.lane[0].ntoks",
+    ".batch.lane[0].stats.draft_cycles",
+    ".batch.target.layer[0].cache[0]",
+    ".batch.draft.layer[0].keys",
 )
 
 
@@ -942,3 +1065,96 @@ def test_real_cache_mutation_propagates_to_capture(
         assert str(error.value).startswith(expected_path), (
             f"perturbed {expected_path} but oracle reported {error.value!r}"
         )
+
+
+def test_real_batched_state_mutation_propagates_to_capture(
+    oracle_fixture: OracleFixture,
+) -> None:
+    """Prove the expanded walker reads live draft, lane, RNG, and batch state."""
+
+    baseline_batch = _clone_batch(oracle_fixture.base)
+    baseline = capture_batched_state(baseline_batch)
+
+    def check(path: str, mutate) -> None:
+        batch = _clone_batch(baseline_batch)
+        mutate(batch)
+        actual = capture_batched_state(batch)
+        assert baseline[path] != actual[path], f"mutation did not reach {path}"
+        with pytest.raises(AssertionError):
+            assert_oracle_equal(baseline, actual)
+
+    check(
+        "batch.membership_epoch",
+        lambda batch: setattr(batch, "membership_epoch", batch.membership_epoch + 1),
+    )
+    check(
+        "batch.proposal_open",
+        lambda batch: setattr(batch, "proposal_open", True),
+    )
+    check("batch.lane[0].uid", lambda batch: setattr(batch.lanes[0], "uid", 99))
+    check(
+        "batch.lane_uids[0]",
+        lambda batch: batch.lanes.reverse(),
+    )
+    check(
+        "batch.lane[0].cur",
+        lambda batch: setattr(batch.lanes[0], "cur", batch.lanes[0].cur + 1),
+    )
+    check(
+        "batch.lane[0].seed_h",
+        lambda batch: setattr(
+            batch.lanes[0], "seed_h", _distinct_like(batch.lanes[0].seed_h)
+        ),
+    )
+    check(
+        "batch.lane[0].pending_hs",
+        lambda batch: setattr(
+            batch.lanes[0], "pending_hs", mx.ones_like(batch.lanes[0].seed_h)
+        ),
+    )
+    check(
+        "batch.lane[0].pending_ts.count",
+        lambda batch: batch.lanes[0].pending_ts.append(17),
+    )
+    check(
+        "batch.lane[0].token_prefix",
+        lambda batch: setattr(
+            batch.lanes[0],
+            "token_prefix",
+            _distinct_like(batch.lanes[0].token_prefix),
+        ),
+    )
+    check(
+        "batch.lane[0].rng.key",
+        lambda batch: setattr(
+            batch.lanes[0].rng, "_key", _distinct_like(batch.lanes[0].rng.key)
+        ),
+    )
+    check(
+        "batch.lane[0].rng.draws",
+        lambda batch: setattr(batch.lanes[0].rng, "_draws", batch.lanes[0].rng.draws + 1),
+    )
+    check(
+        "batch.lane[1].rng.alias",
+        lambda batch: setattr(batch.lanes[1], "rng", batch.lanes[0].rng),
+    )
+    check(
+        "batch.lane[0].ntoks",
+        lambda batch: setattr(batch.lanes[0], "ntoks", batch.lanes[0].ntoks + 1),
+    )
+    check(
+        "batch.lane[0].stats.draft_cycles",
+        lambda batch: setattr(
+            batch.lanes[0].stats,
+            "draft_cycles",
+            batch.lanes[0].stats.draft_cycles + 1,
+        ),
+    )
+    check(
+        "batch.draft.layer[0].keys",
+        lambda batch: setattr(
+            batch.caches.draft[0],
+            "keys",
+            _distinct_like(batch.caches.draft[0].keys),
+        ),
+    )
