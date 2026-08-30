@@ -594,6 +594,14 @@ def _reload_float(low, high):
     return check
 
 
+def _reload_auto_flag(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "auto"}:
+        return None
+    return _reload_flag(value)
+
+
 @dataclass(frozen=True)
 class MutableKey:
     """One permitted soft-reload target.
@@ -702,7 +710,7 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
         "module", "_QSA_FUSED_PROJ", _reload_flag, "mlx_lm.models.qwen4_exp"
     ),
     "qwen4_qsa_nax_kernel": MutableKey(
-        "module", "_QSA_NAX_KERNEL", _reload_flag, "mlx_lm.models.qwen4_exp"
+        "module", "_QSA_NAX_KERNEL", _reload_auto_flag, "mlx_lm.models.qwen4_exp"
     ),
     "qwen4_ple_vector_shift": MutableKey(
         "module", "_PLE_VECTOR_SHIFT", _reload_flag, "mlx_lm.models.qwen4_exp"
@@ -4363,10 +4371,22 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_health_check()
         elif self.path == EFFECTIVE_CONFIG_PATH:
             self.handle_effective_config()
+        elif self.path == "/v1/status/qwen4-qsa-nax":
+            self.handle_qwen4_qsa_nax_status()
         else:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def handle_qwen4_qsa_nax_status(self):
+        """Expose bounded NAX admission/engagement evidence."""
+
+        from mlx_lm.models.qwen4_exp import qsa_nax_admission_status
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(qsa_nax_admission_status()).encode())
+        self.wfile.flush()
 
     def handle_health_check(self):
         """

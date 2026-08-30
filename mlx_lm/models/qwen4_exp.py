@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Union
 
@@ -159,27 +161,36 @@ _QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
 
 # MLX_QWEN4_QSA_NAX_KERNEL (2026-08-28): route the sparse QSA attention through
 # the hand-written NAX (MPP matmul2d) block-sparse kernel instead of building
-# the dense [B, 1, L, T] selection mask and calling bf16 masked SDPA.  Off by
-# default; live-toggleable as ``qwen4_qsa_nax_kernel``.  It engages ONLY on an
-# ``explicit`` selection (the sparse path, total > ~2051 cached tokens), a
-# multi-token query (prefill/verify, NOT M=1 decode), a supported layout, and a
-# device where the kernel compiles.  Every other path -- decode, implicit_all,
-# mask_only, unsupported shape, NAX unavailable -- keeps the dense SDPA path
-# bit-identical.  Gate class: TOLERANCE, not bitwise: the kernel keeps fp32
+# the dense [B, 1, L, T] selection mask and calling bf16 masked SDPA. Automatic
+# admission is limited to the measured M5/B1/unpadded/16K+ prefill envelope and
+# remains live-toggleable as ``qwen4_qsa_nax_kernel``. Every other path --
+# decode, speculative verify, implicit_all, mask_only, unsupported shape or
+# device, training -- keeps the dense SDPA path. Gate class: TOLERANCE, not
+# bitwise: the kernel keeps fp32
 # accumulation and rounds only P, so it is ~7x MORE accurate than bf16 SDPA
 # (~1.4e-3 rel vs fp32 vs bf16 SDPA's ~1.1e-2).  Near-tie greedy flips vs the
 # OFF path are expected and are the kernel being more accurate, not less.
-# Kept OFF by default 2026-08-28, cause NOT root-caused. A default-on restart
-# served one 200 then the service went down WITHOUT a Python traceback (a kill,
-# not a crash) -- likely a transient over-budget while the kernel's first-use
-# Metal-library compile ran on top of the 108 GB model + the fused-gate-up
-# load-time rebuild. An initial "stream-affinity" diagnosis was WRONG: the
-# cited "no Stream(gpu,0)" errors were stale from an unrelated morning incident;
-# a Codex review showed metal_kernel() captures no stream and the served ladder
-# did cross the HTTP->worker boundary and passed. So this is memory/lifecycle,
-# not threading. Re-test on an isolated server watching memory before default-on.
-# Flag still works for isolated benches.
-_QSA_NAX_KERNEL = _env_flag("MLX_QWEN4_QSA_NAX_KERNEL")
+# The original threaded-server failure was cleared by MLX
+# 0.32.2.dev20260829+334084ce9. B=4 padding, fully masked rows, greedy parity,
+# training fallback and variable-chunk pipeline cardinality subsequently passed;
+# see qsa-nax-kernel-integration-2026-08-28.md.
+# Product admission prototype (2026-08-30): explicit ``auto`` is conservative
+# for the measured M5/B1/16K+ prefill envelope. The current-build viability cell
+# regressed at 32K, so unset remains a hard off. Explicit 1 arms the wider,
+# separately-qualified batch/padding cases but still fails closed on training,
+# unsupported layout/device, or short query width.
+def _env_auto_flag(name: str):
+    raw = os.environ.get(name, "0").strip().lower()
+    if raw in {"", "auto"}:
+        return None
+    if raw in {"1", "true", "on", "yes"}:
+        return True
+    if raw in {"0", "false", "off", "no"}:
+        return False
+    raise ValueError(f"{name} must be auto, 0/off, or 1/on; got {raw!r}")
+
+
+_QSA_NAX_KERNEL = _env_auto_flag("MLX_QWEN4_QSA_NAX_KERNEL")
 
 # Minimum query length for the kernel to engage. It tiles M by query heads, so
 # it needs many tokens to amortize its launch: it wins on the 512-wide prefill
@@ -188,6 +199,115 @@ _QSA_NAX_KERNEL = _env_flag("MLX_QWEN4_QSA_NAX_KERNEL")
 # verify halved decode (54->16 t/s at 1K). Above this, prefill only; below it,
 # every decode-time shape falls back to dense SDPA, bit-identical to OFF.
 _QSA_NAX_MIN_QUERY = int(os.environ.get("MLX_QWEN4_QSA_NAX_MIN_QUERY", "64"))
+_QSA_NAX_AUTO_MIN_PHYSICAL_KV = int(
+    os.environ.get("MLX_QWEN4_QSA_NAX_AUTO_MIN_PHYSICAL_KV", "16384")
+)
+
+_QSA_NAX_STATS_LOCK = threading.Lock()
+_QSA_NAX_STATS = Counter()
+_QSA_NAX_LAST_DECISION = None
+_QSA_NAX_DEVICE_SUPPORTED = None
+
+
+@dataclass(frozen=True)
+class QSANAXAdmission:
+    engage: bool
+    reason: str
+
+
+def _qsa_nax_mode() -> str:
+    if _QSA_NAX_KERNEL is None:
+        return "auto"
+    return "on" if _QSA_NAX_KERNEL else "off"
+
+
+def _qsa_nax_device_supported() -> bool:
+    """Restrict automatic admission to the measured Apple M5 envelope."""
+
+    global _QSA_NAX_DEVICE_SUPPORTED
+    if _QSA_NAX_DEVICE_SUPPORTED is not None:
+        return _QSA_NAX_DEVICE_SUPPORTED
+    try:
+        supported = "M5" in str(mx.device_info().get("device_name", ""))
+    except (AttributeError, RuntimeError, TypeError):
+        supported = False
+    _QSA_NAX_DEVICE_SUPPORTED = supported
+    return supported
+
+
+def decide_qsa_nax_admission(
+    selection,
+    *,
+    training: bool,
+    layout_ok: bool,
+    device_supported: bool | None = None,
+    kernel_available: bool | None = None,
+) -> QSANAXAdmission:
+    """Resolve the NAX route without mutating QSA state or building a mask."""
+
+    mode = _qsa_nax_mode()
+    if mode == "off":
+        return QSANAXAdmission(False, "explicit_off")
+    if training:
+        return QSANAXAdmission(False, "training")
+    if selection.kind != "explicit":
+        return QSANAXAdmission(False, f"selection_{selection.kind}")
+    if selection.length < _QSA_NAX_MIN_QUERY:
+        return QSANAXAdmission(False, "query_below_min")
+    if not layout_ok:
+        return QSANAXAdmission(False, "unsupported_layout")
+    if mode == "auto":
+        if selection.batch != 1:
+            return QSANAXAdmission(False, "auto_batch_gt_one")
+        if selection.physical_width < _QSA_NAX_AUTO_MIN_PHYSICAL_KV:
+            return QSANAXAdmission(False, "auto_context_below_crossover")
+    supported = (
+        _qsa_nax_device_supported()
+        if device_supported is None
+        else bool(device_supported)
+    )
+    if not supported:
+        return QSANAXAdmission(False, "unsupported_device")
+    available = (
+        nax_kernel_available()
+        if kernel_available is None
+        else bool(kernel_available)
+    )
+    if not available:
+        return QSANAXAdmission(False, "kernel_unavailable")
+    return QSANAXAdmission(True, f"engaged_{mode}")
+
+
+def _record_qsa_nax_admission(selection, decision: QSANAXAdmission) -> None:
+    global _QSA_NAX_LAST_DECISION
+    receipt = {
+        "engaged": decision.engage,
+        "reason": decision.reason,
+        "batch": int(selection.batch),
+        "query_width": int(selection.length),
+        "physical_kv": int(selection.physical_width),
+    }
+    with _QSA_NAX_STATS_LOCK:
+        _QSA_NAX_STATS[decision.reason] += 1
+        _QSA_NAX_LAST_DECISION = receipt
+
+
+def qsa_nax_admission_status(*, reset: bool = False) -> dict[str, Any]:
+    """Return a bounded process receipt for server status and experiments."""
+
+    global _QSA_NAX_LAST_DECISION
+    with _QSA_NAX_STATS_LOCK:
+        report = {
+            "mode": _qsa_nax_mode(),
+            "auto_min_physical_kv": _QSA_NAX_AUTO_MIN_PHYSICAL_KV,
+            "min_query_width": _QSA_NAX_MIN_QUERY,
+            "counts": dict(_QSA_NAX_STATS),
+            "last_decision": _QSA_NAX_LAST_DECISION,
+        }
+        if reset:
+            _QSA_NAX_STATS.clear()
+            _QSA_NAX_LAST_DECISION = None
+    return report
 
 
 def _table_matmul(table, x: mx.array) -> mx.array:
@@ -2289,17 +2409,16 @@ class Attention(nn.Module):
         # Only an ``explicit`` (sparse) selection on a multi-token query with a
         # supported layout on a NAX-capable device qualifies; everything else
         # keeps the dense masked-SDPA path and its mask, bit-identical.
-        use_nax = (
-            _QSA_NAX_KERNEL
-            # The kernel is an MLX CustomKernel with no VJP, so a backward pass
-            # raises "Primitive::vjp Not implemented". Never route training
-            # through it (mirrors the _QSA_FUSED_PROJ guard); inference only.
-            and not self.training
-            and selection.kind == "explicit"
-            and length >= _QSA_NAX_MIN_QUERY
-            and self._nax_layout_ok
-            and nax_kernel_available()
+        nax_admission = decide_qsa_nax_admission(
+            selection,
+            training=self.training,
+            layout_ok=self._nax_layout_ok,
         )
+        # Never add a Python lock/counter to M=1 decode or M=3 verification.
+        # The receipt is for the prefill admission boundary.
+        if length >= _QSA_NAX_MIN_QUERY:
+            _record_qsa_nax_admission(selection, nax_admission)
+        use_nax = nax_admission.engage
         # Do NOT build the dense mask when the kernel is engaged: not
         # materializing that [B, 1, L, T] array is the point.
         sparse_mask = None if use_nax else selection.dense_mask()
