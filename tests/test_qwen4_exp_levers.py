@@ -29,6 +29,7 @@ from mlx_lm.models.qwen3_5 import (
 )
 from mlx_lm.models.qwen4_exp import (
     GatedDeltaNet,
+    GatedResidual,
     GroupRMSNorm,
     Model,
     ModelArgs,
@@ -117,6 +118,23 @@ class TestGDNShapeStableProjections(unittest.TestCase):
 
         with lever(qwen4_exp, "_GDN_SHAPE_STABLE_PROJECTIONS", True):
             actual = layer._input_projections(x)
+
+        for reference, candidate in zip(expected, actual):
+            _bytes_equal(self, reference, candidate)
+
+    def test_opt_in_hyper_connection_matches_independent_m1_calls(self):
+        layer = GatedResidual(tiny_args())
+        x = mx.random.normal((1, 3, 64), key=mx.random.key(92)).astype(mx.bfloat16)
+
+        with lever(qwen4_exp, "_GDN_SHAPE_STABLE_PROJECTIONS", False):
+            singles = [layer(x[:, index : index + 1]) for index in range(3)]
+        expected = tuple(
+            mx.concatenate([token[field] for token in singles], axis=1)
+            for field in range(3)
+        )
+
+        with lever(qwen4_exp, "_GDN_SHAPE_STABLE_PROJECTIONS", True):
+            actual = layer(x)
 
         for reference, candidate in zip(expected, actual):
             _bytes_equal(self, reference, candidate)

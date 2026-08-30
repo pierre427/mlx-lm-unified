@@ -77,13 +77,12 @@ _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
 _QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN", default=True)
 _PLE_VECTOR_SHIFT = _env_flag("MLX_QWEN4_PLE_VECTOR_SHIFT")
 _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
-# Diagnostic only: make each token's four GDN input projections use the same
-# M=1 kernel family as ordinary decode.  A short speculative slab normally
-# projects B*S rows together, and MLX may choose a different quantized-matmul
-# kernel whose bf16 rounding changes the cached convolution input.  Keeping
-# this opt-in lets the transactional-state oracle test whether that projection
-# family is the first source of width-dependent state without changing the
-# production default.
+# Diagnostic only: make the Qwen4 hyper-connection mixer and each token's four
+# GDN input projections use the same M=1 kernel family as ordinary decode. A
+# short speculative slab normally projects B*S rows together, and MLX may
+# choose a different quantized-matmul kernel whose bf16 rounding changes the
+# cached convolution input. Keeping this opt-in lets the transactional-state
+# oracle walk that width dependence upstream without changing production.
 _GDN_SHAPE_STABLE_PROJECTIONS = _env_flag(
     "MLX_QWEN4_GDN_SHAPE_STABLE_PROJECTIONS"
 )
@@ -591,6 +590,18 @@ class GatedResidual(nn.Module):
             self.block_inject_weight = nn.Linear(hc_hidden, self.hc_count, bias=False)
 
     def __call__(self, hyper_input: mx.array):
+        if _GDN_SHAPE_STABLE_PROJECTIONS and hyper_input.shape[1] > 1:
+            tokens = [
+                self(hyper_input[:, index : index + 1])
+                for index in range(hyper_input.shape[1])
+            ]
+            if isinstance(tokens[0], tuple):
+                return tuple(
+                    mx.concatenate([token[field] for token in tokens], axis=1)
+                    for field in range(len(tokens[0]))
+                )
+            return mx.concatenate(tokens, axis=1)
+
         normed = self.hc_norm(hyper_input)
         weights = nn.silu(self.input_mix_weight_down(normed) / self.hc_count)
         weights = mx.sigmoid(self.input_mix_weight_up(weights))
