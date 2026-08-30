@@ -77,6 +77,16 @@ _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
 _QSA_SCATTER_CHOSEN = _env_flag("MLX_QWEN4_QSA_SCATTER_CHOSEN", default=True)
 _PLE_VECTOR_SHIFT = _env_flag("MLX_QWEN4_PLE_VECTOR_SHIFT")
 _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
+# Diagnostic only: make each token's four GDN input projections use the same
+# M=1 kernel family as ordinary decode.  A short speculative slab normally
+# projects B*S rows together, and MLX may choose a different quantized-matmul
+# kernel whose bf16 rounding changes the cached convolution input.  Keeping
+# this opt-in lets the transactional-state oracle test whether that projection
+# family is the first source of width-dependent state without changing the
+# production default.
+_GDN_SHAPE_STABLE_PROJECTIONS = _env_flag(
+    "MLX_QWEN4_GDN_SHAPE_STABLE_PROJECTIONS"
+)
 
 # MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT (2026-08-27): skip the whole indexer
 # selection while the QSA mask is dense BY CONSTRUCTION, i.e. while
@@ -439,6 +449,19 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             args.linear_value_head_dim,
             args.rms_norm_eps,
             args.output_gate_type or args.hidden_act,
+        )
+
+    def _input_projections(self, inputs: mx.array):
+        if not _GDN_SHAPE_STABLE_PROJECTIONS or inputs.shape[1] <= 1:
+            return super()._input_projections(inputs)
+
+        per_token = [
+            super(GatedDeltaNet, self)._input_projections(inputs[:, i : i + 1])
+            for i in range(inputs.shape[1])
+        ]
+        return tuple(
+            mx.concatenate([token[projection] for token in per_token], axis=1)
+            for projection in range(4)
         )
 
 

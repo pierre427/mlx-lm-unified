@@ -28,6 +28,7 @@ from mlx_lm.models.qwen3_5 import (
     fuse_gated_delta_net_projections,
 )
 from mlx_lm.models.qwen4_exp import (
+    GatedDeltaNet,
     GroupRMSNorm,
     Model,
     ModelArgs,
@@ -97,6 +98,28 @@ def _bytes_equal(test, left, right):
     test.assertEqual(left.dtype, right.dtype)
     test.assertEqual(left.shape, right.shape)
     test.assertEqual(_array_bytes(left), _array_bytes(right))
+
+
+class TestGDNShapeStableProjections(unittest.TestCase):
+    def test_opt_in_matches_independent_m1_projection_family(self):
+        layer = GatedDeltaNet(tiny_args())
+        x = mx.random.normal((1, 3, 16), key=mx.random.key(91)).astype(mx.bfloat16)
+
+        with lever(qwen4_exp, "_GDN_SHAPE_STABLE_PROJECTIONS", False):
+            singles = [
+                layer._input_projections(x[:, index : index + 1])
+                for index in range(x.shape[1])
+            ]
+        expected = tuple(
+            mx.concatenate([row[projection] for row in singles], axis=1)
+            for projection in range(4)
+        )
+
+        with lever(qwen4_exp, "_GDN_SHAPE_STABLE_PROJECTIONS", True):
+            actual = layer._input_projections(x)
+
+        for reference, candidate in zip(expected, actual):
+            _bytes_equal(self, reference, candidate)
 
 
 class TestRMSNormFast(unittest.TestCase):
