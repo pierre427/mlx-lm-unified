@@ -665,9 +665,13 @@ def _capture_target(caches: Sequence[Any], path: str) -> Capture:
 def _run_scenario(
     model: Model,
     starting: BatchedSelfMTPState,
-    accepted: Tuple[int, int],
+    accepted: Tuple[int, ...],
 ) -> Capture:
     batch = _clone_batch(starting)
+    if len(accepted) != len(batch.lanes):
+        raise ValueError("accepted vector must have one entry per lane")
+    configured_depths = tuple(lane.num_draft for lane in batch.lanes)
+    max_depth = max(configured_depths)
     result: Capture = {}
     detailed = accepted == DETAIL_ACCEPTS
     backbone_calls = 0
@@ -733,14 +737,15 @@ def _run_scenario(
         ):
             proposal = propose_batched_self_mtp(model, batch)
 
-        assert proposal.draft_depths == (M, M)
+        assert proposal.draft_depths == configured_depths
         assert proposal.accepted_lengths == accepted
-        assert proposal.target_drops == tuple(M - value for value in accepted)
-        assert len(logits) == M + 1
-        _put(result, "verify.accepted[0]", accepted[0])
-        _put(result, "verify.accepted[1]", accepted[1])
-        _put(result, "verify.target_drops[0]", proposal.target_drops[0])
-        _put(result, "verify.target_drops[1]", proposal.target_drops[1])
+        assert proposal.target_drops == tuple(
+            depth - value for depth, value in zip(configured_depths, accepted)
+        )
+        assert len(logits) == max_depth + 1
+        for row, value in enumerate(accepted):
+            _put(result, f"verify.accepted[{row}]", value)
+            _put(result, f"verify.target_drops[{row}]", proposal.target_drops[row])
         _put(result, "verify.logits", logits[-1])
         _merge_capture(
             result,
@@ -758,7 +763,7 @@ def _run_scenario(
             batch,
             proposal,
             emitted_counts=[len(row) for row in proposal.outputs],
-            terminal=[False, False],
+            terminal=[False] * len(batch.lanes),
         )
         _merge_capture(
             result,
@@ -769,7 +774,9 @@ def _run_scenario(
             [[lane.cur] for lane in batch.lanes], dtype=mx.uint32
         )
         _prepare_self_mtp_cache_group(
-            batch.caches.target, lengths=[1, 1], right_padding=[0, 0]
+            batch.caches.target,
+            lengths=[1] * len(batch.lanes),
+            right_padding=[0] * len(batch.lanes),
         )
         try:
             continuation_hidden, _ = model.mtp_backbone(
@@ -779,7 +786,7 @@ def _run_scenario(
             mx.eval(continuation_logits)
         finally:
             _finalize_self_mtp_cache_group(batch.caches.target)
-        assert len(logits) == M + 2
+        assert len(logits) == max_depth + 2
         _put(result, "continuation.logits", logits[-1])
         _merge_capture(
             result,
