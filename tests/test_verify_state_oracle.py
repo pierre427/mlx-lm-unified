@@ -292,9 +292,19 @@ def capture_cache_list(caches: Sequence[Any], prefix: str = "cache") -> Capture:
                 _capture_staged_ple(capture, f"{path}._ple_rollback", cache)
 
         if isinstance(cache, (QSAKVCache, BatchQSAKVCache)):
+            # KVCache.trim() moves the logical cursor and deliberately leaves
+            # rejected columns in the allocation tail; update_and_fetch()
+            # overwrites those columns before they can become live again.
+            # Comparing the full backing allocation therefore turns harmless
+            # capacity residue into a false transactional-state mismatch.
+            # Keep the cursor exact and compare only its readable prefix.
+            live_width = cache._idx if isinstance(cache, BatchQSAKVCache) else cache.offset
+            for name in ("keys", "values"):
+                value = getattr(cache, name)
+                if value is not None:
+                    value = value[..., :live_width, :]
+                _put(capture, f"{path}.{name}", value)
             for name in (
-                "keys",
-                "values",
                 "offset",
                 "index_keys",
                 "_qsa_pooled_keys",
@@ -1165,3 +1175,21 @@ def test_real_batched_state_mutation_propagates_to_capture(
             _distinct_like(batch.caches.draft[0].keys),
         ),
     )
+
+
+def test_qsa_capture_ignores_inactive_allocation_tail_but_not_live_keys():
+    left = QSAKVCache()
+    right = QSAKVCache()
+    base = mx.arange(24, dtype=mx.float32).reshape(1, 1, 6, 4)
+    left.keys = mx.array(base)
+    left.values = mx.array(base + 100)
+    right.keys = mx.array(base)
+    right.values = mx.array(base + 100)
+    left.offset = right.offset = 4
+
+    right.keys[..., 5, :] = right.keys[..., 5, :] + 1
+    assert_oracle_equal(capture_cache_list([left]), capture_cache_list([right]))
+
+    right.keys[..., 3, :] = right.keys[..., 3, :] + 1
+    with pytest.raises(AssertionError, match=r"cache.layer\[0\].keys"):
+        assert_oracle_equal(capture_cache_list([left]), capture_cache_list([right]))
