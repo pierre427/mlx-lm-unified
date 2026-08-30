@@ -748,8 +748,14 @@ def _attestation_subject(
         raise RuntimeError("loaded model is not the qwen4_exp runtime")
     layers = tuple(model.language_model.model.layers)
     mtp_layers = tuple(model.mtp.layers)
-    layer_types = tuple(str(layer.layer_type) for layer in layers)
-    mtp_layer_types = tuple(str(layer.layer_type) for layer in mtp_layers)
+    layer_types = tuple(
+        "linear_attention" if layer.is_linear else "full_attention"
+        for layer in layers
+    )
+    mtp_layer_types = tuple(
+        "linear_attention" if layer.is_linear else "full_attention"
+        for layer in mtp_layers
+    )
     ple_layer_ids = tuple(
         index + 1 for index, layer in enumerate(layers) if layer.ple is not None
     )
