@@ -174,13 +174,12 @@ _QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
 # 0.32.2.dev20260829+334084ce9. B=4 padding, fully masked rows, greedy parity,
 # training fallback and variable-chunk pipeline cardinality subsequently passed;
 # see qsa-nax-kernel-integration-2026-08-28.md.
-# Product admission prototype (2026-08-30): explicit ``auto`` is conservative
-# for the measured M5/B1/16K+ prefill envelope. The current-build viability cell
-# regressed at 32K, so unset remains a hard off. Explicit 1 arms the wider,
-# separately-qualified batch/padding cases but still fails closed on training,
-# unsupported layout/device, or short query width.
+# Product admission (2026-08-30): unset/``auto`` is conservative for the
+# measured M5/B1/16K+ prefill envelope. Explicit 0 is the hard-off escape hatch.
+# Explicit 1 arms the wider, separately-qualified batch/padding cases but still
+# fails closed on training, unsupported layout/device, or short query width.
 def _env_auto_flag(name: str):
-    raw = os.environ.get(name, "0").strip().lower()
+    raw = os.environ.get(name, "auto").strip().lower()
     if raw in {"", "auto"}:
         return None
     if raw in {"1", "true", "on", "yes"}:

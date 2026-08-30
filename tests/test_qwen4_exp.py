@@ -2069,6 +2069,15 @@ class TestQSANAXAdmission(unittest.TestCase):
             selection or self.selection(), **values
         )
 
+    def test_unset_environment_defaults_to_guarded_auto(self):
+        name = "MLX_QWEN4_QSA_NAX_KERNEL_TEST_UNSET"
+        previous = environ.pop(name, None)
+        try:
+            self.assertIsNone(qwen4_exp_module._env_auto_flag(name))
+        finally:
+            if previous is not None:
+                environ[name] = previous
+
     def test_auto_admits_only_measured_single_user_envelope(self):
         decision = self.decide()
         self.assertTrue(decision.engage)
