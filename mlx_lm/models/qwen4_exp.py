@@ -86,6 +86,9 @@ _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 _GDN_SHAPE_STABLE_PROJECTIONS = _env_flag(
     "MLX_QWEN4_GDN_SHAPE_STABLE_PROJECTIONS"
 )
+_SHAPE_STABLE_SHORT_FORWARD = _env_flag(
+    "MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD"
+)
 
 # MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT (2026-08-27): skip the whole indexer
 # selection while the QSA mask is dense BY CONSTRUCTION, i.e. while
@@ -2371,6 +2374,29 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
         self.fa_idx = next((i for i, layer in enumerate(self.layers) if not layer.is_linear), None)
 
     def __call__(self, inputs, cache=None, input_embeddings=None, return_hyper=False):
+        if (
+            _SHAPE_STABLE_SHORT_FORWARD
+            and cache is not None
+            and inputs.shape[1] > 1
+        ):
+            outputs = [
+                self(
+                    inputs[:, index : index + 1],
+                    cache,
+                    None
+                    if input_embeddings is None
+                    else input_embeddings[:, index : index + 1],
+                    return_hyper,
+                )
+                for index in range(inputs.shape[1])
+            ]
+            if return_hyper:
+                return tuple(
+                    mx.concatenate([output[field] for output in outputs], axis=1)
+                    for field in range(2)
+                )
+            return mx.concatenate(outputs, axis=1)
+
         hidden = self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
         hidden = mx.tile(hidden, (1, 1, self.args.hc_count))
         cache = [None] * len(self.layers) if cache is None else cache

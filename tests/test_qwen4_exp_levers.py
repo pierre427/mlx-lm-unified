@@ -139,6 +139,37 @@ class TestGDNShapeStableProjections(unittest.TestCase):
         for reference, candidate in zip(expected, actual):
             _bytes_equal(self, reference, candidate)
 
+    def test_short_forward_matches_explicit_tokenwise_backbone(self):
+        args = tiny_args()
+        model = Model(
+            ModelArgs(model_type="qwen4_exp", text_config=args.__dict__)
+        )
+        tokens = mx.array([[1, 2, 3]], dtype=mx.uint32)
+        expected_cache = model.make_cache()
+        actual_cache = model.make_cache()
+
+        with lever(qwen4_exp, "_SHAPE_STABLE_SHORT_FORWARD", False):
+            expected = mx.concatenate(
+                [
+                    model.language_model.model(
+                        tokens[:, index : index + 1], expected_cache
+                    )
+                    for index in range(tokens.shape[1])
+                ],
+                axis=1,
+            )
+        with lever(qwen4_exp, "_SHAPE_STABLE_SHORT_FORWARD", True):
+            actual = model.language_model.model(tokens, actual_cache)
+
+        _bytes_equal(self, expected, actual)
+        for expected_layer, actual_layer in zip(expected_cache, actual_cache):
+            if hasattr(expected_layer, "cache"):
+                for expected_state, actual_state in zip(
+                    expected_layer.cache, actual_layer.cache
+                ):
+                    if expected_state is not None:
+                        _bytes_equal(self, expected_state, actual_state)
+
 
 class TestRMSNormFast(unittest.TestCase):
     def _reference(self, norm, x):
