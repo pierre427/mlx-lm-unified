@@ -3150,51 +3150,57 @@ class MTPGenerationBatch:
             return []
 
         from .hybrid_speculative import (
+            abort_batched_self_mtp,
             commit_batched_self_mtp,
             propose_batched_self_mtp,
         )
 
         proposal = propose_batched_self_mtp(self.model, self.state)
-        emitted_counts = []
-        terminal = []
-        responses = []
-        last = {}
-        for i, outputs in enumerate(proposal.outputs):
-            emitted = 0
-            is_terminal = False
-            for output in outputs:
-                emitted += 1
-                self._num_tokens[i] += 1
-                self._matcher_states[i], reason = self._finish_reason(
-                    output.token,
-                    self._num_tokens[i],
-                    self.max_tokens[i],
-                    self._matcher_states[i],
-                    self.stop_matchers[i],
-                )
-                response = self.Response(
-                    uid=self.uids[i],
-                    token=output.token,
-                    logprobs=output.logprobs,
-                    finish_reason=reason,
-                    prompt_cache=None,
-                    all_tokens=None,
-                    from_draft=output.from_draft,
-                )
-                responses.append(response)
-                last[i] = response
-                if reason is not None:
-                    is_terminal = True
-                    break
-            emitted_counts.append(emitted)
-            terminal.append(is_terminal)
+        try:
+            emitted_counts = []
+            terminal = []
+            responses = []
+            last = {}
+            for i, outputs in enumerate(proposal.outputs):
+                emitted = 0
+                is_terminal = False
+                for output in outputs:
+                    emitted += 1
+                    self._num_tokens[i] += 1
+                    self._matcher_states[i], reason = self._finish_reason(
+                        output.token,
+                        self._num_tokens[i],
+                        self.max_tokens[i],
+                        self._matcher_states[i],
+                        self.stop_matchers[i],
+                    )
+                    response = self.Response(
+                        uid=self.uids[i],
+                        token=output.token,
+                        logprobs=output.logprobs,
+                        finish_reason=reason,
+                        prompt_cache=None,
+                        all_tokens=None,
+                        from_draft=output.from_draft,
+                    )
+                    responses.append(response)
+                    last[i] = response
+                    if reason is not None:
+                        is_terminal = True
+                        break
+                emitted_counts.append(emitted)
+                terminal.append(is_terminal)
 
-        commit_batched_self_mtp(
-            self.state,
-            proposal,
-            emitted_counts=emitted_counts,
-            terminal=terminal,
-        )
+            commit_batched_self_mtp(
+                self.state,
+                proposal,
+                emitted_counts=emitted_counts,
+                terminal=terminal,
+            )
+        except BaseException as error:
+            if self.state.proposal_open:
+                abort_batched_self_mtp(self.state, proposal, cause=error)
+            raise
         terminal_indices = [i for i, value in enumerate(terminal) if value]
         if terminal_indices:
             self._complete_responses(terminal_indices, last)

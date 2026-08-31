@@ -29,6 +29,7 @@ identical semantics (and cache trim bookkeeping) to
 suffix automaton.
 """
 
+import copy
 import math
 import time
 from collections import deque
@@ -344,6 +345,8 @@ class BatchedSelfMTPState:
     caches: SelfMTPCachePair          # both groups are merged
     membership_epoch: int
     proposal_open: bool = False
+    poisoned: bool = False
+    poison_reason: Optional[str] = None
     _open_proposal: Optional["SelfMTPCycleResult"] = field(
         default=None, repr=False, compare=False
     )
@@ -1622,11 +1625,94 @@ def _merge_self_mtp_cache_groups(groups: Sequence[Sequence[Any]]) -> List[Any]:
     return merged
 
 
-def _extend_self_mtp_cache_group(target: Sequence[Any], other: Sequence[Any]) -> None:
-    if len(target) != len(other):
-        raise ValueError("cannot extend self-MTP cache groups of different widths")
-    for cache, incoming in zip(target, other):
-        cache.extend(incoming)
+def _extract_self_mtp_cache_pair(
+    caches: SelfMTPCachePair,
+    indices: Sequence[int],
+    *,
+    batched: bool = False,
+) -> SelfMTPCachePair:
+    """Copy-build a cache pair for ``indices`` without mutating the live pair."""
+    indices = [int(index) for index in indices]
+    if not indices:
+        return SelfMTPCachePair(target=[], draft=[])
+    if len(indices) == 1 and not batched:
+        index = indices[0]
+        return SelfMTPCachePair(
+            target=[cache.extract(index) for cache in caches.target],
+            draft=[cache.extract(index) for cache in caches.draft],
+        )
+    rows = [
+        SelfMTPCachePair(
+            target=[cache.extract(index) for cache in caches.target],
+            draft=[cache.extract(index) for cache in caches.draft],
+        )
+        for index in indices
+    ]
+    return SelfMTPCachePair(
+        target=_merge_self_mtp_cache_groups([row.target for row in rows]),
+        draft=_merge_self_mtp_cache_groups([row.draft for row in rows]),
+    )
+
+
+def _copy_build_self_mtp_cache_pair(
+    current: Optional[SelfMTPCachePair],
+    current_rows: int,
+    joining: Sequence[SelfMTPCachePair],
+) -> SelfMTPCachePair:
+    """Build a complete replacement pair before publishing membership.
+
+    ``extend`` and ``filter`` mutate layer objects one at a time. A late layer
+    failure can therefore leave target and draft groups with different row
+    membership. Extracting canonical rows and merging replacements keeps the
+    old pair untouched until every layer has succeeded.
+    """
+    rows = []
+    if current is not None:
+        rows.extend(
+            SelfMTPCachePair(
+                target=[cache.extract(index) for cache in current.target],
+                draft=[cache.extract(index) for cache in current.draft],
+            )
+            for index in range(current_rows)
+        )
+    rows.extend(joining)
+    if not rows:
+        return SelfMTPCachePair(target=[], draft=[])
+    return SelfMTPCachePair(
+        target=_merge_self_mtp_cache_groups([row.target for row in rows]),
+        draft=_merge_self_mtp_cache_groups([row.draft for row in rows]),
+    )
+
+
+def _poison_self_mtp_batch(batch: BatchedSelfMTPState, reason: str) -> None:
+    batch.poisoned = True
+    batch.poison_reason = str(reason)
+
+
+def _require_healthy_self_mtp_batch(batch: BatchedSelfMTPState) -> None:
+    if batch.poisoned:
+        reason = batch.poison_reason or "unproved transaction rollback"
+        raise RuntimeError(f"self-MTP batch is poisoned: {reason}")
+
+
+def _restart_live_self_mtp_or_poison(
+    batch: BatchedSelfMTPState,
+    cause: BaseException,
+) -> None:
+    """Restore rollback recording after a failed copy-build operation."""
+    try:
+        _start_speculation_or_cleanup(
+            batch.caches.target,
+            batch.caches.target,
+            "batched self-MTP requires ragged-trimmable target caches",
+        )
+    except BaseException as restart_error:
+        _poison_self_mtp_batch(
+            batch,
+            f"membership rebuild failed ({cause}); rollback restart failed: "
+            f"{restart_error}",
+        )
+        raise RuntimeError(batch.poison_reason) from restart_error
 
 
 def _prepare_self_mtp_cache_group(caches, lengths, right_padding) -> None:
@@ -1782,8 +1868,10 @@ def attach_self_mtp_lanes(
 ) -> BatchedSelfMTPState:
     """Attach canonical rows at a transaction boundary and restart rollback."""
     joining = list(joining)
-    if batch is not None and batch.proposal_open:
-        raise RuntimeError("cannot attach self-MTP lanes while a proposal is open")
+    if batch is not None:
+        _require_healthy_self_mtp_batch(batch)
+        if batch.proposal_open:
+            raise RuntimeError("cannot attach self-MTP lanes while a proposal is open")
     if not joining:
         if batch is None:
             raise ValueError("cannot create an empty self-MTP batch")
@@ -1804,11 +1892,12 @@ def attach_self_mtp_lanes(
     if len(share_modes) != 1:
         raise ValueError("mixed shared-QSA modes cannot enter one self-MTP batch")
 
-    incoming = SelfMTPCachePair(
-        target=_merge_self_mtp_cache_groups([item.caches.target for item in joining]),
-        draft=_merge_self_mtp_cache_groups([item.caches.draft for item in joining]),
-    )
     if batch is None or not batch.lanes:
+        incoming = _copy_build_self_mtp_cache_pair(
+            None,
+            0,
+            [item.caches for item in joining],
+        )
         epoch = 1 if batch is None else batch.membership_epoch + 1
         result = BatchedSelfMTPState(
             lanes=[item.lane for item in joining],
@@ -1816,26 +1905,39 @@ def attach_self_mtp_lanes(
             membership_epoch=epoch,
         )
     else:
-        _stop_all_speculation(batch.caches.target)
         try:
-            _extend_self_mtp_cache_group(batch.caches.target, incoming.target)
-            _extend_self_mtp_cache_group(batch.caches.draft, incoming.draft)
-            batch.lanes.extend(item.lane for item in joining)
-            batch.membership_epoch += 1
-            result = batch
-        except Exception:
-            # The cache extend primitives fail closed and membership rollback
-            # cannot safely reconstruct a partially extended heterogeneous set.
+            _stop_all_speculation(batch.caches.target)
+        except BaseException as error:
+            _poison_self_mtp_batch(batch, f"rollback stop failed: {error}")
             raise
-    _start_speculation_or_cleanup(
-        result.caches.target,
-        result.caches.target,
-        "batched self-MTP requires ragged-trimmable target caches",
-    )
+        try:
+            replacement = _copy_build_self_mtp_cache_pair(
+                batch.caches,
+                len(batch.lanes),
+                [item.caches for item in joining],
+            )
+            _start_speculation_or_cleanup(
+                replacement.target,
+                replacement.target,
+                "batched self-MTP requires ragged-trimmable target caches",
+            )
+        except BaseException as error:
+            _restart_live_self_mtp_or_poison(batch, error)
+            raise
+        batch.caches = replacement
+        batch.lanes = [*batch.lanes, *(item.lane for item in joining)]
+        batch.membership_epoch += 1
+        result = batch
+    if batch is None or not old_lanes:
+        _start_speculation_or_cleanup(
+            result.caches.target,
+            result.caches.target,
+            "batched self-MTP requires ragged-trimmable target caches",
+        )
     return result
 
 
-def propose_batched_self_mtp(
+def _propose_batched_self_mtp_impl(
     model: nn.Module,
     batch: BatchedSelfMTPState,
 ) -> SelfMTPCycleResult:
@@ -2108,6 +2210,25 @@ def propose_batched_self_mtp(
     return proposal
 
 
+def propose_batched_self_mtp(
+    model: nn.Module,
+    batch: BatchedSelfMTPState,
+) -> SelfMTPCycleResult:
+    """Open a proposal, poisoning state when rollback cannot be proved."""
+    _require_healthy_self_mtp_batch(batch)
+    if batch.proposal_open:
+        raise RuntimeError("a self-MTP proposal is already open")
+    if not batch.lanes:
+        raise ValueError("cannot propose on an empty self-MTP batch")
+    try:
+        return _propose_batched_self_mtp_impl(model, batch)
+    except BaseException as error:
+        batch.proposal_open = False
+        batch._open_proposal = None
+        _poison_self_mtp_batch(batch, f"proposal rollback unproved: {error}")
+        raise
+
+
 def commit_batched_self_mtp(
     batch: BatchedSelfMTPState,
     proposal: SelfMTPCycleResult,
@@ -2116,6 +2237,7 @@ def commit_batched_self_mtp(
     terminal: Sequence[bool],
 ) -> None:
     """Commit exactly the delivered prefix of one open proposal."""
+    _require_healthy_self_mtp_batch(batch)
     if not batch.proposal_open or batch._open_proposal is not proposal:
         raise RuntimeError("commit requires the currently open self-MTP proposal")
     if proposal.membership_epoch != batch.membership_epoch:
@@ -2144,70 +2266,101 @@ def commit_batched_self_mtp(
             accepted - count + 1 if is_terminal and count <= accepted else 0
         )
 
-    if any(delivery_drops):
-        trim_ragged_prompt_cache(
-            batch.caches.target, delivery_drops, validate=False
-        )
+    try:
+        if any(delivery_drops):
+            trim_ragged_prompt_cache(
+                batch.caches.target, delivery_drops, validate=False
+            )
 
-    for row, lane in enumerate(batch.lanes):
-        accepted = proposal.accepted_lengths[row]
-        count = emitted[row]
-        old_cur = proposal._old_curs[row]
-        old_seed_h = proposal._old_seed_hs[row]
-        drafts = list(proposal._drafts[row])
-        hidden = proposal._vhidden[row]
-        consumed_accepted = min(count, accepted)
+        for row, lane in enumerate(batch.lanes):
+            accepted = proposal.accepted_lengths[row]
+            count = emitted[row]
+            old_cur = proposal._old_curs[row]
+            old_seed_h = proposal._old_seed_hs[row]
+            drafts = list(proposal._drafts[row])
+            hidden = proposal._vhidden[row]
+            consumed_accepted = min(count, accepted)
 
-        if terminal[row] and count <= accepted:
-            # The cycle ends at the last emitted token: it becomes ``cur``
-            # (outside the target cache), ``seed_h`` is the hidden that
-            # predicts it, and pending pairs stop one token before it.
-            if count > 0:
-                lane.pending_hs = mx.concatenate(
-                    [old_seed_h, hidden[:, : count - 1, :]], axis=1
+            if terminal[row] and count <= accepted:
+                # The cycle ends at the last emitted token: it becomes ``cur``
+                # (outside the target cache), ``seed_h`` is the hidden that
+                # predicts it, and pending pairs stop one token before it.
+                if count > 0:
+                    lane.pending_hs = mx.concatenate(
+                        [old_seed_h, hidden[:, : count - 1, :]], axis=1
+                    )
+                    lane.pending_ts = [old_cur] + drafts[: count - 1]
+                    lane.seed_h = hidden[:, count - 1 : count, :]
+                    lane.cur = proposal.outputs[row][count - 1].token
+                    lane.token_prefix = mx.concatenate(
+                        [
+                            lane.token_prefix,
+                            mx.array(lane.pending_ts, mx.uint32),
+                        ]
+                    )
+                # count == 0 keeps the pre-cycle state: the delivery trim
+                # already rolled the target cache back to before ``cur``.
+            else:
+                new_hs = mx.concatenate(
+                    [old_seed_h, hidden[:, :accepted, :]], axis=1
                 )
-                lane.pending_ts = [old_cur] + drafts[: count - 1]
-                lane.seed_h = hidden[:, count - 1 : count, :]
-                lane.cur = proposal.outputs[row][count - 1].token
+                new_ts = [old_cur] + drafts[:accepted]
+                if lane.pending_ts:
+                    # A k == 0 lane skips the draft flush, so pairs retained
+                    # from the prior cycle are still owed to the draft cache.
+                    new_hs = mx.concatenate([lane.pending_hs, new_hs], axis=1)
+                    new_ts = lane.pending_ts + new_ts
+                lane.pending_hs = new_hs
+                lane.pending_ts = new_ts
+                lane.seed_h = hidden[:, accepted : accepted + 1, :]
+                lane.cur = proposal._bonuses[row]
                 lane.token_prefix = mx.concatenate(
                     [
                         lane.token_prefix,
-                        mx.array(lane.pending_ts, mx.uint32),
+                        mx.array([old_cur] + drafts[:accepted], mx.uint32),
                     ]
                 )
-            # count == 0 keeps the pre-cycle state: the delivery trim
-            # already rolled the target cache back to before ``cur``.
-        else:
-            new_hs = mx.concatenate(
-                [old_seed_h, hidden[:, :accepted, :]], axis=1
-            )
-            new_ts = [old_cur] + drafts[:accepted]
-            if lane.pending_ts:
-                # A k == 0 lane skips the draft flush, so pairs retained
-                # from the prior cycle are still owed to the draft cache.
-                new_hs = mx.concatenate([lane.pending_hs, new_hs], axis=1)
-                new_ts = lane.pending_ts + new_ts
-            lane.pending_hs = new_hs
-            lane.pending_ts = new_ts
-            lane.seed_h = hidden[:, accepted : accepted + 1, :]
-            lane.cur = proposal._bonuses[row]
-            lane.token_prefix = mx.concatenate(
-                [
-                    lane.token_prefix,
-                    mx.array([old_cur] + drafts[:accepted], mx.uint32),
-                ]
-            )
 
-        lane.ntoks += count
-        lane.stats.cycles += 1
-        lane.stats.draft_cycles += 1
-        lane.stats.draft_proposed += proposal.draft_depths[row]
-        lane.stats.draft_accepted += consumed_accepted
-        if count > accepted:
-            lane.stats.bonus_tokens += 1
+            lane.ntoks += count
+            lane.stats.cycles += 1
+            lane.stats.draft_cycles += 1
+            lane.stats.draft_proposed += proposal.draft_depths[row]
+            lane.stats.draft_accepted += consumed_accepted
+            if count > accepted:
+                lane.stats.bonus_tokens += 1
+    except BaseException as error:
+        batch.proposal_open = False
+        batch._open_proposal = None
+        _poison_self_mtp_batch(batch, f"commit rollback unproved: {error}")
+        raise
 
     batch.proposal_open = False
     batch._open_proposal = None
+
+
+def abort_batched_self_mtp(
+    batch: BatchedSelfMTPState,
+    proposal: SelfMTPCycleResult,
+    *,
+    cause: Optional[BaseException] = None,
+) -> None:
+    """Close an interrupted proposal and permanently isolate its state.
+
+    The integrated MLX backend does not yet expose a model-neutral exact-abort
+    ABI. Once proposal compute has advanced recurrent/KV state or consumed a
+    per-lane RNG key, replay safety cannot be proved. Match Rapid-MLX's abort
+    contract by failing closed: close the transaction, poison the cohort, and
+    require the scheduler to discard it rather than detach, retry, or reuse it.
+    """
+    _require_healthy_self_mtp_batch(batch)
+    if not batch.proposal_open or batch._open_proposal is not proposal:
+        raise RuntimeError("abort requires the currently open self-MTP proposal")
+    batch.proposal_open = False
+    batch._open_proposal = None
+    detail = "explicit proposal abort"
+    if cause is not None:
+        detail = f"proposal delivery aborted: {cause}"
+    _poison_self_mtp_batch(batch, detail)
 
 
 def detach_self_mtp_lanes(
@@ -2216,6 +2369,7 @@ def detach_self_mtp_lanes(
     indices: Sequence[int],
 ) -> Tuple[BatchedSelfMTPState, List[DetachedSelfMTPLane]]:
     """Extract canonical rows before filtering the old batch membership."""
+    _require_healthy_self_mtp_batch(batch)
     if batch.proposal_open:
         raise RuntimeError("cannot detach self-MTP lanes while a proposal is open")
     requested = [int(index) for index in indices]
@@ -2226,45 +2380,49 @@ def detach_self_mtp_lanes(
     if not requested:
         return batch, []
 
-    _stop_all_speculation(batch.caches.target)
-    detached: List[DetachedSelfMTPLane] = []
-    for index in requested:
-        lane = batch.lanes[index]
-        caches = SelfMTPCachePair(
-            target=[cache.extract(index) for cache in batch.caches.target],
-            draft=[cache.extract(index) for cache in batch.caches.draft],
-        )
-        if lane.pending_hs is not None and lane.pending_ts:
-            model.mtp_step(
-                lane.pending_hs,
-                mx.array([lane.pending_ts], mx.uint32),
-                caches.draft,
-            )
-        lane.pending_hs = None
-        lane.pending_ts = []
-        item = DetachedSelfMTPLane(lane=lane, caches=caches)
-        _eval_self_mtp_lane_state(item)
-        _validate_detached_self_mtp(item)
-        detached.append(item)
-
     leaving = set(requested)
     keep = [index for index in range(len(batch.lanes)) if index not in leaving]
-    if keep:
-        for cache in batch.caches.target:
-            cache.filter(keep)
-        for cache in batch.caches.draft:
-            cache.filter(keep)
-        batch.lanes = [batch.lanes[index] for index in keep]
-        batch.membership_epoch += 1
-        _start_speculation_or_cleanup(
-            batch.caches.target,
-            batch.caches.target,
-            "batched self-MTP requires ragged-trimmable target caches",
+    try:
+        _stop_all_speculation(batch.caches.target)
+    except BaseException as error:
+        _poison_self_mtp_batch(batch, f"rollback stop failed: {error}")
+        raise
+    try:
+        detached: List[DetachedSelfMTPLane] = []
+        for index in requested:
+            lane = copy.copy(batch.lanes[index])
+            caches = _extract_self_mtp_cache_pair(batch.caches, [index])
+            if lane.pending_hs is not None and lane.pending_ts:
+                model.mtp_step(
+                    lane.pending_hs,
+                    mx.array([lane.pending_ts], mx.uint32),
+                    caches.draft,
+                )
+            lane.pending_hs = None
+            lane.pending_ts = []
+            item = DetachedSelfMTPLane(lane=lane, caches=caches)
+            _eval_self_mtp_lane_state(item)
+            _validate_detached_self_mtp(item)
+            detached.append(item)
+
+        replacement = _extract_self_mtp_cache_pair(
+            batch.caches,
+            keep,
+            batched=True,
         )
-    else:
-        batch.lanes = []
-        batch.caches = SelfMTPCachePair(target=[], draft=[])
-        batch.membership_epoch += 1
+        if keep:
+            _start_speculation_or_cleanup(
+                replacement.target,
+                replacement.target,
+                "batched self-MTP requires ragged-trimmable target caches",
+            )
+    except BaseException as error:
+        _restart_live_self_mtp_or_poison(batch, error)
+        raise
+
+    batch.lanes = [batch.lanes[index] for index in keep]
+    batch.caches = replacement
+    batch.membership_epoch += 1
     return batch, detached
 
 
