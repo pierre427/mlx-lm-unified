@@ -1911,6 +1911,54 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     )
 
 
+def _fetch_single_request_prompt_cache(
+    prompt_cache, model_key, prompt, *, external_draft: bool
+):
+    """Fetch reusable state for one request, unless it is a model-draft pair.
+
+    ``speculative_generate_step`` intentionally ends with the target cache one
+    token behind the emitted stream and may leave the draft cache one token
+    further behind. The current prompt-cache format stores only one token key
+    and has no way to persist that pair-specific coverage/debt. Reusing such an
+    entry can therefore omit committed context from both models. Fail closed
+    until paired cache entries carry an explicit shared-coverage contract.
+    """
+    if external_draft:
+        logging.info(
+            "External-draft speculative decoding bypasses prompt-cache lookup "
+            "because paired target/draft coverage is not persisted"
+        )
+        return None, prompt, None
+    if hasattr(prompt_cache, "lookup"):
+        lookup = prompt_cache.lookup(model_key, prompt)
+        return lookup.cache, lookup.remaining_tokens, lookup.sidecar
+    cache, rest = prompt_cache.fetch_nearest_cache(model_key, prompt)
+    return cache, rest, None
+
+
+def _store_single_request_prompt_cache(
+    prompt_cache,
+    model_key,
+    tokens,
+    cache,
+    *,
+    sidecar=None,
+    external_draft: bool,
+):
+    """Store one request's cache when its token key fully describes the state."""
+    if external_draft:
+        logging.info(
+            "External-draft speculative decoding bypasses prompt-cache storage "
+            "because paired target/draft coverage is not persisted"
+        )
+        return False
+    if isinstance(prompt_cache, AutomaticPrefixCache):
+        prompt_cache.insert_cache(model_key, tokens, cache, sidecar=sidecar)
+    else:
+        prompt_cache.insert_cache(model_key, tokens, cache)
+    return True
+
+
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
@@ -3083,17 +3131,13 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
-            if hasattr(self.prompt_cache, "lookup"):
-                lookup = self.prompt_cache.lookup(
-                    self.model_provider.model_key, prompt
-                )
-                cache, rest = lookup.cache, lookup.remaining_tokens
-                mtp_sidecar = lookup.sidecar
-            else:
-                cache, rest = self.prompt_cache.fetch_nearest_cache(
-                    self.model_provider.model_key, prompt
-                )
-                mtp_sidecar = None
+            external_draft = draft_model is not None
+            cache, rest, mtp_sidecar = _fetch_single_request_prompt_cache(
+                self.prompt_cache,
+                self.model_provider.model_key,
+                prompt,
+                external_draft=external_draft,
+            )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             if _discard_small_sidecarless_apc_hit_for_mtp(
                 self.cli_args,
@@ -3298,17 +3342,14 @@ class ResponseGenerator:
                         cache_offset,
                         len(cache_key),
                     )
-            if isinstance(self.prompt_cache, AutomaticPrefixCache):
-                self.prompt_cache.insert_cache(
-                    self.model_provider.model_key,
-                    cache_key,
-                    cache,
-                    sidecar=sidecar,
-                )
-            else:
-                self.prompt_cache.insert_cache(
-                    self.model_provider.model_key, cache_key, cache
-                )
+            _store_single_request_prompt_cache(
+                self.prompt_cache,
+                self.model_provider.model_key,
+                cache_key,
+                cache,
+                sidecar=sidecar,
+                external_draft=external_draft,
+            )
 
         except Exception as e:
             rqueue.put(e)

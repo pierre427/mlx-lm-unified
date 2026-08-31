@@ -22,12 +22,14 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     _discard_small_sidecarless_apc_hit_for_mtp,
+    _fetch_single_request_prompt_cache,
     _make_sampler,
     _measure_kv_cost,
     _configure_process_wired_limit,
     _request_output_ceiling,
     _request_sampling_profile,
     _self_mtp_config,
+    _store_single_request_prompt_cache,
     process_message_content,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
@@ -292,7 +294,10 @@ class DummyModelProvider:
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
-        self.is_batchable = True
+        # Production ModelProvider disables continuous batching when an
+        # external draft model is loaded; mirror that routing contract so the
+        # draft-server tests actually exercise speculative_generate_step.
+        self.is_batchable = not with_draft
 
         # Add draft model support
         self.draft_model = None
@@ -360,6 +365,69 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestExternalDraftPromptCachePolicy(unittest.TestCase):
+    class SpyPromptCache:
+        def __init__(self):
+            self.lookup_calls = 0
+            self.insert_calls = 0
+            self.cached = [object()]
+
+        def lookup(self, model_key, prompt):
+            self.lookup_calls += 1
+            return types.SimpleNamespace(
+                cache=self.cached,
+                remaining_tokens=[prompt[-1]],
+                sidecar=object(),
+            )
+
+        def insert_cache(self, *args, **kwargs):
+            self.insert_calls += 1
+
+    def test_external_draft_bypasses_lookup_and_store(self):
+        prompt_cache = self.SpyPromptCache()
+        prompt = [1, 2, 3]
+
+        cache, rest, sidecar = _fetch_single_request_prompt_cache(
+            prompt_cache, "model", prompt, external_draft=True
+        )
+        stored = _store_single_request_prompt_cache(
+            prompt_cache,
+            "model",
+            prompt,
+            [object(), object()],
+            external_draft=True,
+        )
+
+        self.assertIsNone(cache)
+        self.assertIs(rest, prompt)
+        self.assertIsNone(sidecar)
+        self.assertFalse(stored)
+        self.assertEqual(prompt_cache.lookup_calls, 0)
+        self.assertEqual(prompt_cache.insert_calls, 0)
+
+    def test_plain_request_keeps_lookup_and_store_behavior(self):
+        prompt_cache = self.SpyPromptCache()
+        prompt = [1, 2, 3]
+
+        cache, rest, sidecar = _fetch_single_request_prompt_cache(
+            prompt_cache, "model", prompt, external_draft=False
+        )
+        stored = _store_single_request_prompt_cache(
+            prompt_cache,
+            "model",
+            prompt,
+            cache,
+            external_draft=False,
+        )
+
+        self.assertIs(cache, prompt_cache.cached)
+        self.assertEqual(rest, [3])
+        self.assertIsNotNone(sidecar)
+        self.assertTrue(stored)
+        self.assertEqual(prompt_cache.lookup_calls, 1)
+        self.assertEqual(prompt_cache.insert_calls, 1)
 
 
 class TestTextStateMachine(unittest.TestCase):
@@ -954,10 +1022,13 @@ class TestServerWithDraftModel(unittest.TestCase):
         # Make sure we got some streaming chunks
         self.assertGreater(chunk_count, 0)
 
-    def test_prompt_cache_with_draft_model(self):
+    def test_prompt_cache_is_bypassed_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
+        self.assertEqual(len(self.response_generator.prompt_cache), 0)
 
-        # First request to initialize cache
+        # External-draft cache pairs do not share one persisted token boundary,
+        # so neither this request nor the related-prefix request below may load
+        # or store a server prompt-cache entry.
         chat_post_data = {
             "model": "chat_model",
             "max_tokens": 5,
@@ -970,8 +1041,9 @@ class TestServerWithDraftModel(unittest.TestCase):
 
         first_response = requests.post(url, json=chat_post_data)
         self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(len(self.response_generator.prompt_cache), 0)
 
-        # Second request with same prefix should use cache
+        # A related prefix must still start from fresh target and draft caches.
         chat_post_data = {
             "model": "chat_model",
             "max_tokens": 5,
@@ -984,6 +1056,7 @@ class TestServerWithDraftModel(unittest.TestCase):
 
         second_response = requests.post(url, json=chat_post_data)
         self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(len(self.response_generator.prompt_cache), 0)
 
         # Both responses should have content
         first_response_body = json.loads(first_response.text)
