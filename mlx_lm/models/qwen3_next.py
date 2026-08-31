@@ -96,13 +96,36 @@ _MOE_FUSED_GATE_UP = _env_flag("MLX_QWEN4_MOE_FUSED_GATE_UP", default=True)
 # wiki experiments/qwen38-moe-shared-in-gather-resolved-2026-08-28.md.
 _MOE_SHARED_IN_GATHER = _env_flag("MLX_QWEN4_MOE_SHARED_IN_GATHER")
 
-# MLX_QWEN4_FUSED_EXPERT_KERNEL: experimental production-shape kernel for the
-# remaining routed-MoE boundary. Gate/up stay on MLX's gather path; the q4
-# down projection, router weighting, and top-k reduction become one dispatch.
-# It is exact-geometry, default-off, and falls back structurally before a
-# kernel is emitted. See qwen4_fused_moe.py.
-_MOE_FUSED_EXPERT_KERNEL = _env_flag("MLX_QWEN4_FUSED_EXPERT_KERNEL")
-_MOE_FUSED_EXPERT_MODES = ("stock", "scalar", "tile4")
+# MLX_QWEN4_FUSED_EXPERT_KERNEL: production-shape kernel for the remaining
+# routed-MoE boundary. Gate/up stay on MLX's gather path; the q4 down
+# projection, router weighting, and top-k reduction become one dispatch.
+#
+# The promoted default is ``auto``: tile4 for M=1 decode, scalar for M=3 MTP
+# verify, and structural stock fallback for every unsupported shape/layout.
+# Operators retain an immediate hard-off with ``=0``/``=off``/``=stock`` and
+# may pin either qualified variant with ``=scalar`` or ``=tile4``.
+_MOE_FUSED_EXPERT_MODES = ("stock", "auto", "scalar", "tile4")
+
+
+def _fused_expert_mode_from_env() -> str:
+    raw = os.environ.get("MLX_QWEN4_FUSED_EXPERT_KERNEL")
+    if raw is None or not raw.strip():
+        return "auto"
+    value = raw.strip().lower()
+    if value in {"0", "false", "off", "no", "stock"}:
+        return "stock"
+    if value in {"1", "true", "on", "yes", "auto"}:
+        return "auto"
+    if value in {"scalar", "tile4"}:
+        return value
+    logger.warning(
+        "Ignoring invalid MLX_QWEN4_FUSED_EXPERT_KERNEL=%r; using auto",
+        raw,
+    )
+    return "auto"
+
+
+_MOE_FUSED_EXPERT_MODE = _fused_expert_mode_from_env()
 
 # Both MoE levers are LOAD-TIME weight transforms, not runtime tables. A
 # runtime re-fusion was OOM-killed on the 104 GB serving artifact: the
@@ -416,6 +439,10 @@ def _try_qwen4_fused_down(
     )
     if not admission.accepted:
         return None
+    if variant == "auto":
+        # The real-weight qualification selected tile4 at M=1 and scalar at
+        # M=3. Admission guarantees that no other token width reaches here.
+        variant = "tile4" if admission.tokens == 1 else "scalar"
     return qwen4_fused_down(
         compact_hidden,
         indices,
@@ -917,9 +944,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             shared_expert_intermediate_size == intermediate_size
         )
         self.fused_expert_kernel_mode = (
-            "scalar"
-            if _MOE_FUSED_EXPERT_KERNEL and not self.shared_folded
-            else "stock"
+            _MOE_FUSED_EXPERT_MODE if not self.shared_folded else "stock"
         )
         if self.fused_gate_up:
             switch_cls = FusedGateUpSwitchGLU
