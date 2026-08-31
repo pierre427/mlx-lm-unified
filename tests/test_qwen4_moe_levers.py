@@ -105,6 +105,12 @@ def _block(quantized, **overrides):
     return block
 
 
+def _stock_block(quantized, **overrides):
+    """Build the historical split-gate, separate-shared reference layout."""
+    with levers(False, False):
+        return _block(quantized, **overrides)
+
+
 def _weights(block) -> dict:
     return {f"mlp.{k}": v for k, v in tree_flatten(block.parameters())}
 
@@ -143,17 +149,18 @@ _COMBOS = ((True, False), (False, True), (True, True))
 
 
 class TestLoadTimeTransforms(unittest.TestCase):
-    def test_flags_default_off_and_layout_is_stock(self):
-        self.assertFalse(qwen3_next._MOE_FUSED_GATE_UP)
+    def test_promoted_defaults_keep_shared_separate_and_fuse_gate_up(self):
+        self.assertTrue(qwen3_next._MOE_FUSED_GATE_UP)
         self.assertFalse(qwen3_next._MOE_SHARED_IN_GATHER)
         block = _block(False)
-        self.assertFalse(block.fused_gate_up)
+        self.assertTrue(block.fused_gate_up)
         self.assertFalse(block.shared_folded)
-        self.assertTrue(hasattr(block.switch_mlp, "gate_proj"))
+        self.assertTrue(hasattr(block.switch_mlp, "gate_up_proj"))
+        self.assertEqual(block.fused_expert_kernel_mode, "auto")
         self.assertTrue(hasattr(block, "shared_expert"))
 
     def test_transformed_layout_and_expert_counts(self):
-        stock = _block(True)
+        stock = _stock_block(True)
         for fuse_gate_up, fold_shared in _COMBOS:
             block, changed = _lever_block_from(
                 stock, fuse_gate_up, fold_shared, True
@@ -177,7 +184,7 @@ class TestLoadTimeTransforms(unittest.TestCase):
     def test_transform_adds_no_second_copy(self):
         """The OOM regression guard: a load-time transform must not grow
         resident parameters beyond the folded shared expert's own rows."""
-        stock = _block(True)
+        stock = _stock_block(True)
         base = _param_bytes(stock)
         for fuse_gate_up, fold_shared in _COMBOS:
             block, _ = _lever_block_from(stock, fuse_gate_up, fold_shared, True)
@@ -193,7 +200,7 @@ class TestLoadTimeTransforms(unittest.TestCase):
 
     def test_outputs_match_within_tolerance(self):
         for quantized in (False, True):
-            stock = _block(quantized)
+            stock = _stock_block(quantized)
             for fuse_gate_up, fold_shared in _COMBOS:
                 block, _ = _lever_block_from(
                     stock, fuse_gate_up, fold_shared, quantized
@@ -215,7 +222,7 @@ class TestLoadTimeTransforms(unittest.TestCase):
 
     def test_fused_gate_up_halves_routed_dispatches(self):
         """Structural check that the lever does what it claims."""
-        stock = _block(True)
+        stock = _stock_block(True)
         block, _ = _lever_block_from(stock, True, False, True)
         stock_projs = [
             name
@@ -245,7 +252,7 @@ class TestLoadTimeTransforms(unittest.TestCase):
         )
 
     def test_transform_is_a_noop_without_flags(self):
-        stock = _block(True)
+        stock = _stock_block(True)
         weights = _weights(stock)
         before = dict(weights)
         self.assertEqual(
@@ -308,7 +315,8 @@ class TestSanitizeSeamEndToEnd(unittest.TestCase):
         return tokens
 
     def test_sanitize_transforms_and_keeps_trajectory_and_size(self):
-        stock = self._model()
+        with levers(False, False):
+            stock = self._model()
         weights = self._checkpoint_keys(stock)
         expected = self._greedy(stock)
         stock_bytes = _param_bytes(stock)

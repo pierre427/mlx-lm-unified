@@ -357,6 +357,14 @@ class FusedGateUpSwitchGLU(nn.Module):
         fused = _try_qwen4_fused_down(
             hidden, idx, scores, self.down_proj, do_sort, variant
         )
+        outcome = None
+        if fused is not None:
+            outcome = (
+                "tile4"
+                if variant == "auto" and idx.size // idx.shape[-1] == 1
+                else ("scalar" if variant == "auto" else variant)
+            )
+        object.__setattr__(self, "_last_fused_variant", outcome)
         if fused is not None:
             return fused
         x = self.down_proj(hidden, idx, sorted_indices=do_sort)
@@ -393,6 +401,14 @@ class FusedDownSwitchGLU(SwitchGLU):
         fused = _try_qwen4_fused_down(
             hidden, idx, scores, self.down_proj, do_sort, variant
         )
+        outcome = None
+        if fused is not None:
+            outcome = (
+                "tile4"
+                if variant == "auto" and idx.size // idx.shape[-1] == 1
+                else ("scalar" if variant == "auto" else variant)
+            )
+        object.__setattr__(self, "_last_fused_variant", outcome)
         if fused is not None:
             return fused
         x = self.down_proj(hidden, idx, sorted_indices=do_sort)
@@ -963,6 +979,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 dim, shared_expert_intermediate_size
             )
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
+        self.fused_expert_dispatches = {"scalar": 0, "tile4": 0}
+        self.fused_expert_fallbacks = 0
 
         self.sharding_group = None
 
@@ -1024,6 +1042,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                     scores=scores,
                     variant=self.fused_expert_kernel_mode,
                 )
+                outcome = getattr(self.switch_mlp, "_last_fused_variant", None)
+                if outcome in self.fused_expert_dispatches:
+                    self.fused_expert_dispatches[outcome] += 1
+                else:
+                    self.fused_expert_fallbacks += 1
             else:
                 y = self.switch_mlp(x, inds)
                 y = (y * scores[..., None]).sum(axis=-2)
