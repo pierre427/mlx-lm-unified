@@ -38,6 +38,7 @@ from mlx_lm.models.cache import (
 from mlx_lm.models import qwen4_exp as qwen4_exp_module
 from mlx_lm.models.qwen4_exp import (
     BatchQSAKVCache,
+    BatchQSAQuantizedKVCache,
     GatedResidual,
     Model,
     ModelArgs,
@@ -45,6 +46,7 @@ from mlx_lm.models.qwen4_exp import (
     PLELayer,
     QSAIndexer,
     QSAKVCache,
+    QSAQuantizedKVCache,
     QSASelection,
     Qwen4ArraysCache,
     TextModel,
@@ -2032,188 +2034,157 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestQSAKVQuantizationRefused(unittest.TestCase):
-    """``--kv-bits`` over a QSA cache: both classes refuse, neither goes quiet.
+class TestQSAKVQuantization(unittest.TestCase):
+    """Packed QSA K/V must retain every native auxiliary-state contract."""
 
-    The two classes used to fail in OPPOSITE directions.  ``QSAKVCache``
-    inherited ``KVCache.to_quantized`` and converted into a plain
-    ``QuantizedKVCache``, dropping ``index_keys`` and every ``_QSA_CYCLE_STATE``
-    field, so the indexer's ``cache.update_index_keys(raw)`` hit an object
-    without the method.  ``BatchQSAKVCache`` had no ``to_quantized`` at all, so
-    the ``hasattr`` gate in ``maybe_quantize_kv_cache`` skipped it and the
-    batched path ignored the user's ``--kv-bits`` in silence -- the mode this
-    class exists to keep closed, because silence is the one failure a serving
-    run does not report.
-
-    Refusal, not support: carrying the QSA side state through quantization
-    needs quantized twins of the whole batch ledger protocol and its own
-    equivalence battery.  These tests pin the refusal, and they are what a
-    future implementation has to come back and rewrite deliberately.
-    """
-
-    GROUP = 64
-    BITS = 8
-
-    # A head dim the quantizer actually accepts (divisible by GROUP).  With a
-    # narrower one the old inherited KVCache.to_quantized died on the group
-    # size instead of converting, which would have made these tests pass
-    # against the very bug they exist to pin.
-    DIM = GROUP
+    GROUP = 32
+    DIM = 64
 
     def _single(self, width=8):
+        mx.random.seed(7)
         cache = QSAKVCache()
-        values = mx.zeros((1, 1, width, self.DIM))
-        cache.update_and_fetch(values, values)
-        cache.update_index_keys(
-            mx.zeros((1, width, self.DIM), dtype=mx.float32)
-        )
-        return cache
+        keys = mx.random.normal((1, 2, width, self.DIM)).astype(mx.bfloat16)
+        values = mx.random.normal((1, 2, width, self.DIM)).astype(mx.bfloat16)
+        ledger = mx.random.normal((1, width, self.DIM)).astype(mx.bfloat16)
+        cache.update_and_fetch(keys, values)
+        cache.update_index_keys(ledger)
+        return cache, ledger
 
-    def _batch(self, rows=2, width=8):
+    def _batch(self, rows=3, width=8):
+        mx.random.seed(11)
         cache = BatchQSAKVCache([0] * rows)
-        values = mx.zeros((rows, 1, width, self.DIM))
-        cache.update_and_fetch(values, values)
-        cache.update_index_keys(mx.zeros((rows, width, self.DIM)))
-        return cache
+        keys = mx.random.normal((rows, 2, width, self.DIM)).astype(mx.bfloat16)
+        values = mx.random.normal((rows, 2, width, self.DIM)).astype(mx.bfloat16)
+        ledger = mx.random.normal((rows, width, self.DIM)).astype(mx.bfloat16)
+        cache.update_and_fetch(keys, values)
+        cache.update_index_keys(ledger)
+        return cache, ledger
 
-    def _caches(self):
-        return (self._single(), self._batch())
+    def test_single_int4_and_int8_keep_packed_kv_and_raw_ledger(self):
+        for bits in (4, 8):
+            source, ledger = self._single()
+            cache = source.to_quantized(self.GROUP, bits)
+            with self.subTest(bits=bits):
+                self.assertIsInstance(cache, QSAQuantizedKVCache)
+                self.assertEqual(len(cache.keys), 3)
+                self.assertEqual(cache.keys[0].dtype, mx.uint32)
+                self.assertTrue(mx.array_equal(cache.index_keys, ledger))
+                self.assertEqual(cache.offset, source.offset)
 
-    def test_the_two_classes_refuse_through_one_object(self):
-        # Identity, not just equal behaviour: bound to one function, the two
-        # classes cannot drift apart into opposite failure modes again.
-        for cls in (QSAKVCache, BatchQSAKVCache):
-            self.assertIn("to_quantized", cls.__dict__, cls.__name__)
-            self.assertTrue(cls.kv_quantization_unsupported, cls.__name__)
-        self.assertIs(
-            QSAKVCache.__dict__["to_quantized"],
-            BatchQSAKVCache.__dict__["to_quantized"],
+                extra = mx.ones((1, 2, 1, self.DIM), dtype=mx.bfloat16)
+                raw = mx.ones((1, 1, self.DIM), dtype=mx.bfloat16)
+                cache.update_and_fetch(extra, extra)
+                cache.update_index_keys(raw)
+                self.assertEqual(cache.offset, 9)
+                self.assertEqual(cache.index_keys.shape[1], 9)
+
+    def test_batch_int4_and_int8_keep_packed_kv_and_raw_ledger(self):
+        for bits in (4, 8):
+            source, ledger = self._batch()
+            cache = source.to_quantized(self.GROUP, bits)
+            with self.subTest(bits=bits):
+                self.assertIsInstance(cache, BatchQSAQuantizedKVCache)
+                self.assertEqual(len(cache.keys), 3)
+                self.assertEqual(cache.keys[0].dtype, mx.uint32)
+                self.assertTrue(mx.array_equal(cache.index_keys, ledger))
+                self.assertEqual(cache.offset.tolist(), [8, 8, 8])
+
+    def test_merge_ragged_trim_and_extract_preserve_ledger_geometry(self):
+        rows = []
+        ledgers = []
+        for width in (5, 8, 6):
+            source, ledger = self._single(width)
+            rows.append(source.to_quantized(self.GROUP, 8))
+            ledgers.append(ledger)
+        batch = BatchQSAQuantizedKVCache.merge(rows)
+        self.assertEqual(batch.offset.tolist(), [5, 8, 6])
+        self.assertEqual(batch.left_padding.tolist(), [3, 0, 2])
+        batch.trim_ragged([1, 2, 0])
+        self.assertEqual(batch.offset.tolist(), [4, 6, 6])
+        self.assertEqual(batch.index_keys.shape[1], batch._idx)
+        extracted = batch.extract(1)
+        self.assertIsInstance(extracted, QSAQuantizedKVCache)
+        self.assertEqual(extracted.offset, 6)
+        self.assertEqual(extracted.index_keys.shape[1], 6)
+
+    def test_single_and_batch_state_round_trip_keep_class_and_ledger(self):
+        single, _ = self._single()
+        single = single.to_quantized(self.GROUP, 4)
+        restored = QSAQuantizedKVCache.from_state(
+            single.state, single.meta_state
         )
-        self.assertEqual(
-            QSAKVCache.kv_quantization_unsupported,
-            BatchQSAKVCache.kv_quantization_unsupported,
+        self.assertEqual(restored.offset, single.offset)
+        self.assertTrue(mx.array_equal(restored.index_keys, single.index_keys))
+
+        batch = BatchQSAQuantizedKVCache.merge([single, restored])
+        restored_batch = BatchQSAQuantizedKVCache.from_state(
+            batch.state, batch.meta_state
         )
-        # And it is NOT the inherited converter that dropped the ledger.
-        self.assertIsNot(
-            QSAKVCache.__dict__["to_quantized"], KVCache.__dict__["to_quantized"]
+        self.assertEqual(restored_batch.offset.tolist(), [8, 8])
+        self.assertTrue(
+            mx.array_equal(restored_batch.index_keys, batch.index_keys)
         )
 
-    def test_to_quantized_refuses_on_every_call_shape(self):
-        # maybe_quantize_kv_cache calls the symmetric shape positionally-ish
-        # and the asymmetric/rotated shape with three more kwargs; a refusal
-        # that only covered one would be a crash on the other.
-        shapes = (
-            {"group_size": 64, "bits": 8},
-            {
-                "group_size": 64,
-                "bits": 8,
-                "key_bits": 8,
-                "value_bits": 4,
-                "rotate": True,
-            },
-        )
-        for cache in self._caches():
-            for kwargs in shapes:
-                with self.subTest(cache=type(cache).__name__, shape=len(kwargs)):
-                    with self.assertRaises(NotImplementedError):
-                        cache.to_quantized(**kwargs)
+    def test_cachelist_recursion_converts_the_real_qsa_leaf(self):
+        leaf, ledger = self._single()
+        wrapper = CacheList(leaf)
+        maybe_quantize_kv_cache([wrapper], 0, self.GROUP, 8)
+        converted = wrapper.caches[0]
+        self.assertIsInstance(converted, QSAQuantizedKVCache)
+        self.assertTrue(mx.array_equal(converted.index_keys, ledger))
 
-    def _assert_refused(self, cache, **kwargs):
+    def test_batch_conversion_has_no_array_truthiness_failure(self):
+        leaf, ledger = self._batch()
+        prompt_cache = [leaf]
+        maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, 8)
+        self.assertIsInstance(prompt_cache[0], BatchQSAQuantizedKVCache)
+        self.assertTrue(mx.array_equal(prompt_cache[0].index_keys, ledger))
+
+    def test_conversion_refuses_an_armed_mtp_cycle(self):
+        cache, _ = self._single()
+        cache._mtp_share_topk = True
+        with self.assertRaisesRegex(RuntimeError, "armed MTP cycle"):
+            cache.to_quantized(self.GROUP, 8)
+
+    def test_unquantized_serving_is_unchanged(self):
+        cache, ledger = self._single()
         prompt_cache = [cache]
-        with self.assertRaises(ValueError) as raised:
-            maybe_quantize_kv_cache(
-                prompt_cache, 0, self.GROUP, self.BITS, **kwargs
-            )
-        message = str(raised.exception)
-        self.assertIn(type(cache).__name__, message)
-        # The reason travels, not just the refusal.
-        self.assertIn("index_keys", message)
-        # Refused whole: not replaced, not half-converted, ledger intact.
+        maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, None)
         self.assertIs(prompt_cache[0], cache)
-        self.assertIsNotNone(cache.index_keys)
-        self.assertFalse(hasattr(cache, "bits"))
+        self.assertTrue(mx.array_equal(cache.index_keys, ledger))
 
-    def test_single_sequence_refuses_instead_of_dropping_the_ledger(self):
-        cache = self._single()
-        self._assert_refused(cache)
-        # The method the indexer calls every forward is still there -- the old
-        # QuantizedKVCache conversion is exactly what took it away.
-        self.assertTrue(hasattr(cache, "update_index_keys"))
-
-    def test_batched_path_is_not_silently_skipped(self):
-        # THE regression.  Before ``to_quantized`` existed on this class the
-        # hasattr gate skipped it and this call returned cleanly, leaving an
-        # unquantized cache and a user who believed --kv-bits took effect.
-        cache = self._batch()
-        self.assertTrue(hasattr(cache, "to_quantized"))
-        self._assert_refused(cache)
-
-    def test_batched_refusal_is_not_a_stray_array_truthiness_error(self):
-        # A B>1 batch cache reports ``offset`` as an mx.array, so reaching the
-        # ``offset >= quantized_kv_start`` gate at all would raise a confusing
-        # "[convert] Only length-1 arrays" ValueError instead of the reason.
-        cache = self._batch(rows=3)
-        self.assertIsInstance(cache.offset, mx.array)
-        with self.assertRaises(ValueError) as raised:
-            maybe_quantize_kv_cache([cache], 0, self.GROUP, self.BITS)
-        self.assertNotIn("length-1", str(raised.exception))
-
-    def test_asymmetric_and_rotated_requests_are_refused_too(self):
-        for cache in self._caches():
-            with self.subTest(cache=type(cache).__name__, mode="asymmetric"):
-                self._assert_refused(cache, kv_key_bits=8, kv_value_bits=4)
-        for cache in self._caches():
-            with self.subTest(cache=type(cache).__name__, mode="rotated"):
-                self._assert_refused(cache, kv_rotate=True)
-
-    def test_refusal_survives_the_cachelist_recursion(self):
-        # Hybrid models nest their KV leaves one level down, and
-        # maybe_quantize_kv_cache recurses on purpose so nested leaves honor
-        # kv_bits -- which is the recursion that reaches QSA leaves at all.
-        for leaf in self._caches():
-            with self.subTest(cache=type(leaf).__name__):
-                wrapper = CacheList(leaf)
-                with self.assertRaisesRegex(ValueError, "index_keys"):
-                    maybe_quantize_kv_cache(
-                        [wrapper], 0, self.GROUP, self.BITS
-                    )
-                self.assertIs(wrapper.caches[0], leaf)
-
-    def test_refusal_does_not_wait_for_quantized_kv_start(self):
-        # A cache that can NEVER be quantized fails at setup, not at the step
-        # where its offset first crosses the threshold: a server that starts
-        # and then dies mid-stream is strictly worse than one that will not
-        # start.
-        for cache in self._caches():
-            with self.subTest(cache=type(cache).__name__):
-                with self.assertRaisesRegex(ValueError, "index_keys"):
-                    maybe_quantize_kv_cache(
-                        [cache], 1 << 30, self.GROUP, self.BITS
-                    )
-
-    def test_unquantized_serving_is_left_alone(self):
-        # The live bf16 profile: kv_bits=None returns early and must stay a
-        # no-op, refusal or not.
-        for cache in self._caches():
-            with self.subTest(cache=type(cache).__name__):
-                prompt_cache = [cache]
-                maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, None)
-                self.assertIs(prompt_cache[0], cache)
-                self.assertIsNotNone(cache.index_keys)
-
-    def test_the_cache_the_model_actually_builds_is_refused(self):
-        # Against ``make_cache``'s own leaves, so a future make_cache that
-        # hands back some other QSA cache class still has to refuse.
+    def test_model_factory_qsa_leaf_converts_in_place(self):
         model = Model(
             ModelArgs(model_type="qwen4_exp", text_config=tiny_args().__dict__)
         )
         prompt_cache = make_prompt_cache(model)
+        self.assertTrue(any(isinstance(c, QSAKVCache) for c in prompt_cache))
+        maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, 8)
         self.assertTrue(
-            any(isinstance(c, QSAKVCache) for c in prompt_cache),
-            "the tiny config has no QSA layer, so this asserts nothing",
+            any(isinstance(c, QSAQuantizedKVCache) for c in prompt_cache)
         )
-        with self.assertRaisesRegex(ValueError, "index_keys"):
-            maybe_quantize_kv_cache(prompt_cache, 0, self.GROUP, self.BITS)
+
+    def test_real_qsa_indexer_continues_over_packed_attention_kv(self):
+        mx.random.seed(19)
+        model = TextModel(
+            tiny_args(
+                hidden_size=128,
+                head_dim=64,
+                indexer_head_dim=32,
+                ple_embed_dim=128,
+            )
+        )
+        mx.eval(model.parameters())
+        cache = make_prompt_cache(model)
+        maybe_quantize_kv_cache(cache, 0, self.GROUP, 8)
+        mx.eval(model(mx.array([[1, 2, 3, 4]], dtype=mx.int32), cache=cache))
+        logits = model(mx.array([[5]], dtype=mx.int32), cache=cache)
+        mx.eval(logits)
+        qsa = [c for c in cache if isinstance(c, QSAQuantizedKVCache)]
+        self.assertEqual(logits.shape, (1, 1, 64))
+        self.assertTrue(qsa)
+        self.assertEqual(qsa[0].offset, 5)
+        self.assertEqual(qsa[0].index_keys.shape[1], 5)
 
 
 def _oracle_dense_mask(

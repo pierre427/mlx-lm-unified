@@ -404,7 +404,14 @@ def maybe_quantize_kv_cache(
                     "KV cache quantization is not available for "
                     f"{type(c).__name__}. {reason}"
                 )
-            if not (c.offset >= quantized_kv_start):
+            reached_start = c.offset >= quantized_kv_start
+            if isinstance(reached_start, mx.array):
+                # Batch caches carry one logical offset per row. Format
+                # conversion is group-wide, so wait until every row has
+                # reached the requested boundary. This is a setup/membership
+                # boundary where the one host read is acceptable.
+                reached_start = bool(mx.all(reached_start).item())
+            if not reached_start:
                 continue
             symmetric = key_bits == value_bits and not kv_rotate
             if (

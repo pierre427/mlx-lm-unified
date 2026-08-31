@@ -16,7 +16,15 @@ import mlx.nn as nn
 import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
-from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynamic_roll
+from .cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchQuantizedKVCache,
+    KVCache,
+    QuantizedKVCache,
+    SinkWindowKVCache,
+    dynamic_roll,
+)
 from .pipeline import PipelineMixin
 from .qwen4_qsa_nax import (
     block_sparse_layout_supported,
@@ -1183,56 +1191,46 @@ _QSA_CYCLE_STATE = (
 )
 
 
-# QSA caches are NOT quantizable, and both classes have to say so the same way.
-#
-# The attention KV is only half of a QSA cache. Beside it sits ``index_keys``,
-# the raw pre-pooling indexer-key ledger that ``QSAIndexer.__call__`` appends to
-# every forward and pools its block grid from, plus the cross-call state in
-# ``_QSA_CYCLE_STATE``. No quantized cache class carries either, and the two
-# classes used to fail in OPPOSITE directions because of it:
-#
-#   * ``QSAKVCache`` inherited ``KVCache.to_quantized`` and converted into a
-#     plain ``QuantizedKVCache``, DROPPING the ledger and every cycle field --
-#     so the indexer's ``cache.update_index_keys(raw)`` had nothing to call.
-#   * ``BatchQSAKVCache`` had no ``to_quantized`` at all, so the ``hasattr``
-#     gate in ``maybe_quantize_kv_cache`` skipped it and the batched path
-#     ignored the user's ``--kv-bits`` in SILENCE.
-#
-# Both are closed the same way: refuse, out loud, on both classes. Carrying the
-# QSA side state through quantization is a feature, not a bug fix -- it needs
-# quantized twins of the whole batch ledger protocol (merge / filter / extend /
-# extract / ragged trim, all written against unquantized ``keys``) and its own
-# equivalence battery, and nothing serves QSA with quantized KV today.
-_QSA_KV_QUANT_UNSUPPORTED = (
-    "QSA attention caches keep a raw indexer-key ledger (index_keys) and "
-    "cross-call cycle state beside the attention KV, and no quantized cache "
-    "class carries them, so quantizing would leave the indexer without the "
-    "ledger it reads every forward. Serve QSA models with unquantized KV "
-    "(drop --kv-bits)."
-)
+def _qsa_to_quantized(
+    self,
+    group_size: int = 64,
+    bits: int = 4,
+    *,
+    key_bits: Optional[int] = None,
+    value_bits: Optional[int] = None,
+    rotate: bool = False,
+    normalize: bool = False,
+):
+    """Convert QSA attention K/V without dropping the raw index-key ledger.
 
-
-def _qsa_to_quantized(self, group_size: int = 64, bits: int = 4, **kwargs):
-    """The refusal itself, for anyone who calls ``to_quantized`` directly.
-
-    Both QSA cache classes bind THIS function object rather than each defining
-    their own, so they cannot drift apart again; the regression test asserts
-    that identity. ``**kwargs`` swallows the asymmetric/rotated extension
-    (``key_bits``/``value_bits``/``rotate``) so the refusal is the same on
-    every call shape ``maybe_quantize_kv_cache`` uses.
+    The quantized twins are defined below the float classes. Name lookup is
+    intentionally delayed until this method is called, after module import is
+    complete. QSA's auxiliary state remains native: only attention K/V is
+    packed.
     """
-    raise NotImplementedError(_QSA_KV_QUANT_UNSUPPORTED)
+    kwargs = dict(
+        group_size=group_size,
+        bits=bits,
+        key_bits=key_bits,
+        value_bits=value_bits,
+        rotate=rotate,
+    )
+    if isinstance(self, BatchQSAKVCache):
+        if normalize:
+            raise NotImplementedError(
+                "Batched QSA KVarN caches need a per-row scale contract."
+            )
+        return BatchQSAQuantizedKVCache.from_unquantized(self, **kwargs)
+    return QSAQuantizedKVCache.from_unquantized(
+        self, normalize=normalize, **kwargs
+    )
 
 
 class BatchQSAKVCache(BatchKVCache):
     """Batched QSA cache retaining raw indexer keys beside attention KV."""
 
-    # Refused identically on both QSA classes -- see _QSA_KV_QUANT_UNSUPPORTED.
-    # The attribute is what ``maybe_quantize_kv_cache`` reads so it can refuse
-    # at setup instead of when ``offset`` first crosses ``quantized_kv_start``;
-    # the method is what a direct caller gets. Defining ``to_quantized`` at all
-    # is also what stops the ``hasattr`` gate from skipping this class quietly.
-    kv_quantization_unsupported = _QSA_KV_QUANT_UNSUPPORTED
+    # Bind the same converter on the single and batch classes so neither path
+    # can silently ignore --kv-bits or drop QSA's auxiliary ledger.
     to_quantized = _qsa_to_quantized
 
     # ``index_keys`` is a per-row ledger parallel to the KV columns, so a
@@ -1561,9 +1559,7 @@ class QSAKVCache(KVCache):
 
     _QSA_CYCLE_FIELDS = _QSA_CYCLE_STATE
 
-    # The single-sequence twin of the refusal on BatchQSAKVCache: the same
-    # attribute and the same function object, so the two classes agree.
-    kv_quantization_unsupported = _QSA_KV_QUANT_UNSUPPORTED
+    # The single-sequence twin of the converter on BatchQSAKVCache.
     to_quantized = _qsa_to_quantized
 
     def __new__(cls, *args, **kwargs):
@@ -1642,6 +1638,453 @@ class QSAKVCache(KVCache):
     @property
     def nbytes(self):
         return super().nbytes + (0 if self.index_keys is None else self.index_keys.nbytes)
+
+
+def _copy_qsa_auxiliary_state(source, destination):
+    """Copy QSA-only state without conflating it with packed attention KV."""
+    destination.index_keys = source.index_keys
+    for name, blank in _QSA_CYCLE_STATE:
+        setattr(destination, name, getattr(source, name, blank))
+    if hasattr(destination, "_max_left_pad"):
+        destination._max_left_pad = None
+
+
+def _check_qsa_quantization_boundary(cache, cursor: int):
+    """Quantization is a cache-format boundary, never a live draft boundary."""
+    if cache._mtp_share_topk or cache._mtp_shared_topk is not None:
+        raise RuntimeError(
+            "QSA KV cannot change representation during an armed MTP cycle."
+        )
+    if cache.index_keys is not None and cache.index_keys.shape[1] < cursor:
+        raise RuntimeError(
+            "QSA raw-key ledger is shorter than the KV cursor at quantization."
+        )
+
+
+class QSAQuantizedKVCache(QSAKVCache):
+    """Quantized attention K/V plus QSA's native raw index-key ledger."""
+
+    _validate_config = QuantizedKVCache._validate_config
+    _validate_state_geometry = QuantizedKVCache._validate_state_geometry
+    _channel_scale = staticmethod(QuantizedKVCache._channel_scale)
+
+    def __init__(
+        self,
+        group_size: int = 64,
+        bits: int = 8,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+        normalize: bool = False,
+    ):
+        QuantizedKVCache.__init__(
+            self,
+            group_size=group_size,
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotate=rotate,
+            normalize=normalize,
+        )
+
+    @classmethod
+    def from_unquantized(
+        cls,
+        source,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+        normalize: bool = False,
+    ):
+        _check_qsa_quantization_boundary(source, source.offset)
+        cache = cls(
+            group_size=group_size,
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotate=rotate,
+            normalize=normalize,
+        )
+        if source.keys is not None:
+            # Convert only the live prefix, not KVCache's step-allocation tail.
+            plain = KVCache()
+            plain.keys = mx.contiguous(source.keys[..., : source.offset, :])
+            plain.values = mx.contiguous(source.values[..., : source.offset, :])
+            plain.offset = source.offset
+            packed = KVCache.to_quantized(
+                plain,
+                group_size=group_size,
+                bits=bits,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                rotate=rotate,
+                normalize=normalize,
+            )
+            cache.keys = packed.keys
+            cache.values = packed.values
+            cache.key_scale = packed.key_scale
+            cache.value_scale = packed.value_scale
+        cache.offset = source.offset
+        _copy_qsa_auxiliary_state(source, cache)
+        if cache.index_keys is not None:
+            cache.index_keys = mx.contiguous(cache.index_keys[:, : cache.offset])
+        return cache
+
+    def update_and_fetch(self, keys, values):
+        return QuantizedKVCache.update_and_fetch(self, keys, values)
+
+    def keys_and_values(self):
+        return QuantizedKVCache.keys_and_values(self)
+
+    def trim(self, n):
+        n = QuantizedKVCache.trim(self, n)
+        self.release_qsa_cycle("QSAQuantizedKVCache.trim")
+        return n
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchQSAQuantizedKVCache.merge(caches)
+
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+        normalize: bool = False,
+    ):
+        key_bits = bits if key_bits is None else key_bits
+        value_bits = bits if value_bits is None else value_bits
+        current = (
+            self.group_size,
+            self.key_bits,
+            self.value_bits,
+            self.rotate,
+            self.normalize,
+        )
+        requested = (group_size, key_bits, value_bits, rotate, normalize)
+        if current != requested:
+            raise NotImplementedError(
+                "Re-quantizing an already packed QSA cache is not supported."
+            )
+        return self
+
+    @property
+    def state(self):
+        return QuantizedKVCache.state.fget(self), self.index_keys
+
+    @state.setter
+    def state(self, value):
+        QuantizedKVCache.state.fset(self, value[0])
+        self.index_keys = value[1]
+        self.offset = 0
+        for name, blank in _QSA_CYCLE_STATE:
+            setattr(self, name, blank)
+
+    @property
+    def meta_state(self):
+        return QuantizedKVCache.meta_state.fget(self)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        QuantizedKVCache.meta_state.fset(self, value)
+        self.release_qsa_cycle(
+            "QSAQuantizedKVCache.meta_state", keep_pooled=False
+        )
+
+    @property
+    def nbytes(self):
+        packed = 0
+        if self.keys is not None:
+            packed = sum(x.nbytes for x in (*self.keys, *self.values))
+        return packed + (0 if self.index_keys is None else self.index_keys.nbytes)
+
+
+class BatchQSAQuantizedKVCache(BatchQSAKVCache):
+    """Ragged batch QSA cache with packed attention K/V and native ledger."""
+
+    _quantize = BatchQuantizedKVCache._quantize
+
+    def __init__(
+        self,
+        left_padding: List[int],
+        group_size: int = 64,
+        bits: int = 8,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+    ):
+        BatchQuantizedKVCache.__init__(
+            self,
+            left_padding,
+            group_size=group_size,
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotate=rotate,
+        )
+        # This subclass inherits BatchKVCache.bucketed_attention. Quantized
+        # attention uses the dense packed path, so keep that optional backend
+        # explicitly disabled while still satisfying its attribute contract.
+        BatchKVCache._configure_attention_backend(self, "sdpa")
+
+    @classmethod
+    def from_unquantized(
+        cls,
+        source,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+    ):
+        _check_qsa_quantization_boundary(source, source._idx)
+        rows = int(source.offset.shape[0])
+        cache = cls(
+            [0] * rows,
+            group_size=group_size,
+            bits=bits,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            rotate=rotate,
+        )
+        cache.left_padding = source.left_padding
+        cache.offset = source.offset
+        cache._idx = source._idx
+        cache._right_padding = source._right_padding
+        if source.keys is not None:
+            keys = mx.contiguous(source.keys[..., : source._idx, :])
+            values = mx.contiguous(source.values[..., : source._idx, :])
+            cache.keys = cache._quantize(keys, cache.key_bits)
+            cache.values = cache._quantize(values, cache.value_bits)
+        _copy_qsa_auxiliary_state(source, cache)
+        if cache.index_keys is not None:
+            cache.index_keys = mx.contiguous(cache.index_keys[:, : cache._idx])
+        return cache
+
+    def update_and_fetch(self, keys, values):
+        return BatchQuantizedKVCache.update_and_fetch(self, keys, values)
+
+    def keys_and_values(self):
+        if self.keys is None:
+            return None, None
+        if self._idx == self.keys[0].shape[2]:
+            return self.keys, self.values
+        return (
+            tuple(x[..., : self._idx, :] for x in self.keys),
+            tuple(x[..., : self._idx, :] for x in self.values),
+        )
+
+    def trim(self, n):
+        n = BatchQuantizedKVCache.trim(self, n)
+        self.release_qsa_cycle("BatchQSAQuantizedKVCache.trim")
+        return n
+
+    def trim_ragged(self, n, *, validate: bool = True):
+        drops = BatchQuantizedKVCache.trim_ragged(self, n, validate=validate)
+        self.release_qsa_cycle("BatchQSAQuantizedKVCache.trim_ragged")
+        return drops
+
+    def preflight_ragged_trim(self, n, *, validate: bool = True):
+        return BatchQuantizedKVCache.preflight_ragged_trim(
+            self, n, validate=validate
+        )
+
+    def prepare(self, *args, **kwargs):
+        BatchQuantizedKVCache.prepare(self, *args, **kwargs)
+        self.release_qsa_cycle("BatchQSAQuantizedKVCache.prepare")
+
+    def prepare_self_mtp_step(self, *args, **kwargs):
+        if not self._mtp_share_topk:
+            return self.prepare(*args, **kwargs)
+        BatchQuantizedKVCache.prepare(self, *args, **kwargs)
+        self.release_qsa_cycle(
+            "BatchQSAQuantizedKVCache.prepare_self_mtp_step",
+            cursor_final=False,
+            keep_shared=True,
+        )
+
+    def _finalize(self, *, keep_shared=False):
+        padding = self._right_padding
+        if padding is not None and self.index_keys is not None:
+            self.index_keys = dynamic_roll(self.index_keys, padding, axis=1)
+        BatchQuantizedKVCache.finalize(self)
+        self.release_qsa_cycle(
+            "BatchQSAQuantizedKVCache.finalize",
+            cursor_final=not keep_shared,
+            keep_shared=keep_shared,
+        )
+
+    def finalize(self):
+        self._finalize()
+
+    def finalize_self_mtp_step(self):
+        if not self._mtp_share_topk:
+            return self.finalize()
+        self._finalize(keep_shared=True)
+
+    def filter(self, batch_indices):
+        min_left_pad = self.left_padding[batch_indices].min().item()
+        if self.index_keys is not None:
+            self.index_keys = self.index_keys[batch_indices]
+            if min_left_pad > 0:
+                self.index_keys = self.index_keys[:, min_left_pad:]
+        BatchQuantizedKVCache.filter(self, batch_indices)
+        self.release_qsa_cycle(
+            "BatchQSAQuantizedKVCache.filter", rows=batch_indices
+        )
+
+    def extend(self, other):
+        index_a, index_b = self.index_keys, other.index_keys
+        idx_a, idx_b = self._idx, other._idx
+        if index_a is None and index_b is None:
+            merged_index = None
+        else:
+            populated = index_a if index_a is not None else index_b
+            dims, dtype = populated.shape[-1], populated.dtype
+            max_idx = max(idx_a, idx_b)
+
+            def pad(index, idx, batch):
+                if index is None:
+                    index = mx.zeros((batch, 0, dims), dtype=dtype)
+                else:
+                    index = index[:, :idx]
+                return mx.pad(index, [(0, 0), (max_idx - idx, 0), (0, 0)])
+
+            merged_index = mx.concatenate(
+                [
+                    pad(index_a, idx_a, self.offset.shape[0]),
+                    pad(index_b, idx_b, other.offset.shape[0]),
+                ]
+            )
+        BatchQuantizedKVCache.extend(self, other)
+        self.index_keys = merged_index
+        self._max_left_pad = None
+        self.release_qsa_cycle("BatchQSAQuantizedKVCache.extend")
+
+    def extract(self, idx):
+        self._reconcile_index_ledger("BatchQSAQuantizedKVCache.extract")
+        cache = QSAQuantizedKVCache(
+            group_size=self.group_size,
+            bits=self.key_bits,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+            rotate=self.rotate,
+        )
+        if self.keys is None:
+            return cache
+        padding = int(self.left_padding[idx].item())
+        end = self._idx
+        if self._right_padding is not None:
+            end -= int(self._right_padding[idx].item())
+        cache.keys = tuple(
+            mx.contiguous(x[idx : idx + 1, :, padding:end]) for x in self.keys
+        )
+        cache.values = tuple(
+            mx.contiguous(x[idx : idx + 1, :, padding:end]) for x in self.values
+        )
+        cache.offset = cache.keys[0].shape[2]
+        if self.index_keys is not None:
+            cache.index_keys = mx.contiguous(
+                self.index_keys[idx : idx + 1, padding:end]
+            )
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        base = BatchQuantizedKVCache.merge(caches)
+        batch = cls(
+            [int(x) for x in base.left_padding.tolist()],
+            group_size=base.group_size,
+            bits=base.key_bits,
+            key_bits=base.key_bits,
+            value_bits=base.value_bits,
+            rotate=base.rotate,
+        )
+        batch.keys = base.keys
+        batch.values = base.values
+        batch.offset = base.offset
+        batch.left_padding = base.left_padding
+        batch._idx = base._idx
+
+        lengths = [cache.size() for cache in caches]
+        width = max(lengths)
+        populated = next(
+            (cache.index_keys for cache in caches if cache.index_keys is not None),
+            None,
+        )
+        if populated is not None:
+            dims, dtype = populated.shape[-1], populated.dtype
+            rows = []
+            for cache, length in zip(caches, lengths):
+                values = cache.index_keys
+                if values is None:
+                    values = mx.zeros((1, 0, dims), dtype=dtype)
+                else:
+                    values = values[:, :length]
+                rows.append(
+                    mx.pad(values, [(0, 0), (width - length, 0), (0, 0)])
+                )
+            batch.index_keys = mx.concatenate(rows)
+        return batch
+
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
+        rotate: bool = False,
+        normalize: bool = False,
+    ):
+        key_bits = bits if key_bits is None else key_bits
+        value_bits = bits if value_bits is None else value_bits
+        current = (self.group_size, self.key_bits, self.value_bits, self.rotate)
+        requested = (group_size, key_bits, value_bits, rotate)
+        if normalize or current != requested:
+            raise NotImplementedError(
+                "Re-quantizing an already packed batched QSA cache is not supported."
+            )
+        return self
+
+    @property
+    def state(self):
+        return BatchQuantizedKVCache.state.fget(self), self.index_keys
+
+    @state.setter
+    def state(self, value):
+        BatchQuantizedKVCache.state.fset(self, value[0])
+        self.index_keys = value[1]
+        self._max_left_pad = None
+        for name, blank in _QSA_CYCLE_STATE:
+            setattr(self, name, blank)
+        BatchKVCache._configure_attention_backend(self, "sdpa")
+
+    @property
+    def meta_state(self):
+        return BatchQuantizedKVCache.meta_state.fget(self)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        BatchQuantizedKVCache.meta_state.fset(self, value)
+        BatchKVCache._configure_attention_backend(self, "sdpa")
+        self._reconcile_index_ledger("BatchQSAQuantizedKVCache.meta_state")
+
+    @property
+    def nbytes(self):
+        packed = 0
+        if self.keys is not None:
+            packed = sum(x.nbytes for x in (*self.keys, *self.values))
+        return packed + (0 if self.index_keys is None else self.index_keys.nbytes)
 
 
 @dataclass(frozen=True)
@@ -1987,7 +2430,14 @@ class QSAIndexer(nn.Module):
             )
 
         if not (
-            _QSA_POOLED_KEY_CACHE and type(cache) in (QSAKVCache, BatchQSAKVCache)
+            _QSA_POOLED_KEY_CACHE
+            and type(cache)
+            in (
+                QSAKVCache,
+                BatchQSAKVCache,
+                QSAQuantizedKVCache,
+                BatchQSAQuantizedKVCache,
+            )
         ):
             return pool(0, n_blocks)
         if left_pad is None and all_raw.shape[1] != cache.offset + length:
