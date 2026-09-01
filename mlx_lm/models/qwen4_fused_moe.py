@@ -8,8 +8,9 @@ This module provides an isolated Metal kernel that consumes the resident
 affine-q4 down table and the stock ``[M, 10, 640]`` SwiGLU activations. Each
 SIMD group computes one output channel across all ten selected experts, applies
 the router scores in registers, and writes only ``[M, 2560]``. No weight table
-is copied or transformed. Qwen3-Next-family MoE blocks call it only behind the
-default-off ``MLX_QWEN4_FUSED_EXPERT_KERNEL`` flag and retain the stock path.
+is copied or transformed. Qwen3-Next-family MoE blocks use it through the
+default-``auto`` ``MLX_QWEN4_FUSED_EXPERT_KERNEL`` policy and retain the stock
+path for every geometry or layout outside the narrow admission contract.
 The ``scalar`` variant is the conservative baseline. ``tile4`` reuses each
 hidden word across four output rows and splits the ten experts over five SIMD
 groups, then reduces router-weighted values in the original slot order.

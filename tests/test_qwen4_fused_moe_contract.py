@@ -124,24 +124,24 @@ class TestFusedMoeAdmission(unittest.TestCase):
 
 
 class TestFusedMoeIntegration(unittest.TestCase):
-    def test_flag_selects_split_gate_up_fused_down_class(self):
-        with patch.object(qwen3_next, "_MOE_FUSED_EXPERT_KERNEL", True), patch.object(
+    def test_auto_selects_split_gate_up_fused_down_class(self):
+        with patch.object(qwen3_next, "_MOE_FUSED_EXPERT_MODE", "auto"), patch.object(
             qwen3_next, "_MOE_FUSED_GATE_UP", False
         ), patch.object(qwen3_next, "_MOE_SHARED_IN_GATHER", False):
             block = qwen3_next.Qwen3NextSparseMoeBlock(tiny_args())
         self.assertTrue(block.fused_expert_kernel_enabled)
-        self.assertEqual(block.fused_expert_kernel_mode, "scalar")
+        self.assertEqual(block.fused_expert_kernel_mode, "auto")
         self.assertIsInstance(block.switch_mlp, qwen3_next.FusedDownSwitchGLU)
 
     def test_shared_fold_disables_incompatible_kernel(self):
-        with patch.object(qwen3_next, "_MOE_FUSED_EXPERT_KERNEL", True), patch.object(
+        with patch.object(qwen3_next, "_MOE_FUSED_EXPERT_MODE", "auto"), patch.object(
             qwen3_next, "_MOE_FUSED_GATE_UP", False
         ), patch.object(qwen3_next, "_MOE_SHARED_IN_GATHER", True):
             block = qwen3_next.Qwen3NextSparseMoeBlock(tiny_args())
         self.assertFalse(block.fused_expert_kernel_enabled)
 
     def test_resident_model_switches_modes_without_replacing_weights(self):
-        with patch.object(qwen3_next, "_MOE_FUSED_EXPERT_KERNEL", False), patch.object(
+        with patch.object(qwen3_next, "_MOE_FUSED_EXPERT_MODE", "stock"), patch.object(
             qwen3_next, "_MOE_FUSED_GATE_UP", False
         ), patch.object(qwen3_next, "_MOE_SHARED_IN_GATHER", False):
             block = qwen3_next.Qwen3NextSparseMoeBlock(tiny_args())
@@ -149,7 +149,7 @@ class TestFusedMoeIntegration(unittest.TestCase):
 
         self.assertEqual(
             qwen3_next.qwen4_fused_expert_mode_counts(block),
-            {"stock": 1, "scalar": 0, "tile4": 0},
+            {"stock": 1, "auto": 0, "scalar": 0, "tile4": 0},
         )
         self.assertEqual(qwen3_next.set_qwen4_fused_expert_mode(block, "tile4"), 1)
         self.assertIs(block.switch_mlp.down_proj.weight, weight)
@@ -159,6 +159,59 @@ class TestFusedMoeIntegration(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown fused expert mode"):
             qwen3_next.set_qwen4_fused_expert_mode(block, "bogus")
         self.assertEqual(block.fused_expert_kernel_mode, "stock")
+
+    def test_environment_policy_defaults_auto_and_preserves_hard_off(self):
+        with patch.dict(qwen3_next.os.environ, {}, clear=True):
+            self.assertEqual(qwen3_next._fused_expert_mode_from_env(), "auto")
+        for value in ("0", "off", "false", "stock"):
+            with self.subTest(value=value), patch.dict(
+                qwen3_next.os.environ,
+                {"MLX_QWEN4_FUSED_EXPERT_KERNEL": value},
+                clear=True,
+            ):
+                self.assertEqual(
+                    qwen3_next._fused_expert_mode_from_env(), "stock"
+                )
+        for value, expected in (
+            ("1", "auto"),
+            ("scalar", "scalar"),
+            ("tile4", "tile4"),
+        ):
+            with self.subTest(value=value), patch.dict(
+                qwen3_next.os.environ,
+                {"MLX_QWEN4_FUSED_EXPERT_KERNEL": value},
+                clear=True,
+            ):
+                self.assertEqual(
+                    qwen3_next._fused_expert_mode_from_env(), expected
+                )
+
+    def test_auto_selects_qualified_variant_by_token_width(self):
+        down = FakeQuantizedDown()
+        sentinel = object()
+        for tokens, expected in ((1, "tile4"), (3, "scalar")):
+            hidden = FakeArray((1, tokens, 10, 1, 640), mx.bfloat16)
+            indices = FakeArray((1, tokens, 10), mx.uint32)
+            scores = FakeArray((1, tokens, 10), mx.bfloat16)
+            accepted = qwen4_fused_moe.FusedMoeAdmission(
+                True, "eligible", tokens
+            )
+            with self.subTest(tokens=tokens), patch.object(
+                qwen3_next, "QuantizedSwitchLinear", FakeQuantizedDown
+            ), patch.object(
+                qwen4_fused_moe,
+                "admit_qwen4_fused_down",
+                return_value=accepted,
+            ), patch.object(
+                qwen4_fused_moe,
+                "qwen4_fused_down",
+                return_value=sentinel,
+            ) as execute:
+                result = qwen3_next._try_qwen4_fused_down(
+                    hidden, indices, scores, down, False, "auto"
+                )
+            self.assertIs(result, sentinel)
+            self.assertEqual(execute.call_args.kwargs["variant"], expected)
 
     def test_switch_singleton_is_removed_before_kernel(self):
         hidden = FakeArray((1, 1, 10, 1, 640), mx.bfloat16)
