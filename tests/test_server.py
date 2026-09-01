@@ -226,12 +226,16 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertEqual(long["window_size"], 2048)
         self.assertEqual(long["sink_size"], 4)
 
-    def test_enabled_self_mtp_forces_single_stream_server_path(self):
+    def test_enabled_self_mtp_reaches_the_post_apc_batch_gate(self):
         generator = ResponseGenerator.__new__(ResponseGenerator)
         generator.model_provider = types.SimpleNamespace(
             is_batchable=True, cli_args=self.cli
         )
-        request_args = types.SimpleNamespace(seed=None, prompt_lookup_ngram=0)
+        # A seeded self-MTP request reaches the post-APC batch gate. Without
+        # self-MTP, seeded requests stay on the single-stream path. 92576ce.
+        request_args = types.SimpleNamespace(seed=7, prompt_lookup_ngram=0)
+        self.assertTrue(generator._is_batchable(request_args))
+        self.cli.self_mtp = False
         self.assertFalse(generator._is_batchable(request_args))
 
     def test_enabled_self_mtp_preserves_existing_process_wired_limit(self):
@@ -1466,17 +1470,14 @@ class TestSingleModelMode(unittest.TestCase):
 
 
 class TestKVBudgetProbeFailure(unittest.TestCase):
-    def test_probe_failure_reaches_requester_and_thread_survives(self):
-        """A probe error must be delivered to the requesting queue, and the
+    def test_budget_refusal_reaches_requester_and_thread_survives(self):
+        """A budget error must be delivered to the requesting queue, and the
         generation thread must remain usable afterwards."""
         from queue import Queue
         from types import SimpleNamespace
-        from unittest.mock import patch
-
-        import mlx_lm.server as server_mod
 
         provider = DummyModelProvider()
-        provider.cli_args.state_budget_gb = 1.0  # budget mode on → probe runs
+        provider.cli_args.state_budget_gb = 1.0
         provider.cli_args.decode_concurrency = 32
         provider.cli_args.prompt_concurrency = 8
         provider.cli_args.prefill_step_size = 2048
@@ -1492,21 +1493,19 @@ class TestKVBudgetProbeFailure(unittest.TestCase):
                     ),
                     seed=None,
                 )
-                gen.requests.put((rqueue, {"prompt": "hello"}, args))
+                request = CompletionRequest("text", "hello", [], None, None)
+                gen.requests.put((rqueue, request, args))
                 return rqueue
 
-            with patch.object(
-                server_mod,
-                "_measure_kv_cost",
-                side_effect=ValueError("probe refused"),
-            ):
-                result = request().get(timeout=30)
-                self.assertIsInstance(result, ValueError)
+            result = request().get(timeout=30)
+            self.assertIsInstance(result, ValueError)
+            self.assertIn("state-budget-gb is disabled", str(result))
 
-                # Thread must still be alive and serving further requests
-                self.assertTrue(gen._generation_thread.is_alive())
-                second = request().get(timeout=30)
-                self.assertIsInstance(second, ValueError)
+            # Thread must still be alive and serving further requests
+            self.assertTrue(gen._generation_thread.is_alive())
+            second = request().get(timeout=30)
+            self.assertIsInstance(second, ValueError)
+            self.assertIn("state-budget-gb is disabled", str(second))
         finally:
             gen.stop_and_join()
 

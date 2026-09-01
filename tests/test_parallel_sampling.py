@@ -10,8 +10,8 @@ Covers the things the feature has to get right:
     decision uses the prefix-cache result the n=1 path uses, and the count cap
     is backed by a projected state budget, refused before the request is
     accepted;
-  * the composition with self-MTP -- there is no batched MTP path, so an n>1
-    request that would use MTP is refused (or explicitly demoted to plain);
+  * the composition with self-MTP -- eligible requests use batched MTP, while
+    explicit compatibility policies still refuse or demote them to plain;
   * per-sample independence -- one shared prefill, but separate sampling draws,
     separate token histories and separate logits processors;
   * the wire format -- one choice per sample with its own index, usage summing
@@ -42,6 +42,7 @@ from mlx_lm.sample_utils import LaneRNG, make_sampler
 from mlx_lm.server import (
     APIHandler,
     CompletionRequest,
+    GenerationContext,
     RequestCompositionError,
     ResponseGenerator,
     _parallel_sampling_route,
@@ -278,7 +279,7 @@ class TestParallelSamplingRoute(unittest.TestCase):
             self_mtp=True,
             self_mtp_num_draft=1,
             self_mtp_persistent=True,
-            self_mtp_rate_gate=True,
+            self_mtp_rate_gate=False,
             self_mtp_share_qsa_indices=False,
             self_mtp_share_qsa_indices_min_prompt_tokens=16384,
             self_mtp_window_size=0,
@@ -303,7 +304,7 @@ class TestParallelSamplingRoute(unittest.TestCase):
             ),
         )
 
-    def test_mtp_admissible_request_is_refused_by_default(self):
+    def test_refuse_policy_rejects_an_mtp_admissible_request(self):
         with self.assertRaises(ValueError) as cm:
             _parallel_sampling_route(self.args(), self.cli, self.model)
         self.assertIn("self-MTP", str(cm.exception))
@@ -313,6 +314,15 @@ class TestParallelSamplingRoute(unittest.TestCase):
         route, note = _parallel_sampling_route(self.args(), self.cli, self.model)
         self.assertEqual(route, "plain")
         self.assertIn("self-MTP disabled", note)
+
+    def test_default_rate_gate_demotes_refuse_policy_to_plain(self):
+        # The default rate gate is a frozen exclusion from the batched MTP
+        # path, so the request becomes plain before the refuse policy. 92576ce.
+        self.cli.self_mtp_rate_gate = True
+        self.assertEqual(
+            _parallel_sampling_route(self.args(), self.cli, self.model),
+            ("plain", None),
+        )
 
     def test_server_without_mtp_needs_no_note(self):
         self.cli.self_mtp = False
@@ -466,7 +476,7 @@ class TestServeParallelSamples(unittest.TestCase):
                 self_mtp=self_mtp,
                 self_mtp_num_draft=1,
                 self_mtp_persistent=True,
-                self_mtp_rate_gate=True,
+                self_mtp_rate_gate=False,
                 self_mtp_share_qsa_indices=False,
                 self_mtp_share_qsa_indices_min_prompt_tokens=16384,
                 self_mtp_window_size=0,
@@ -531,10 +541,9 @@ class TestServeParallelSamples(unittest.TestCase):
         rqueue = Queue()
         request = CompletionRequest("text", "hello", [], None, None)
         generator._serve_parallel_samples((rqueue, request, args))
-        ctx = rqueue.get()
-        if isinstance(ctx, Exception):
-            raise ctx
-        return ctx, self._drain(rqueue)
+        queued = self._drain(rqueue)
+        ctx = next(item for item in queued if isinstance(item, GenerationContext))
+        return ctx, [item for item in queued if item is not ctx]
 
     def test_two_samples_stream_with_their_own_indices(self):
         mx.random.seed(1)
@@ -574,7 +583,7 @@ class TestServeParallelSamples(unittest.TestCase):
         # The last report marks the prompt complete, seed token included.
         self.assertEqual(progress[-1], (6, 6))
 
-    def test_mtp_server_refuses_by_default(self):
+    def test_mtp_server_honors_the_refuse_policy(self):
         generator = self._generator(self_mtp=True)
         with self.assertRaises(ValueError):
             self._serve(generator, self._args(n=2, max_tokens=2))
