@@ -44,6 +44,7 @@ from mlx_lm.models.qwen4_exp import (
     NGramEmbedding,
     PLELayer,
     QSAIndexer,
+    QSACompactBlocks,
     QSAKVCache,
     QSASelection,
     Qwen4ArraysCache,
@@ -2675,6 +2676,148 @@ class TestQSASelectionObject(unittest.TestCase):
             self.assertIs(compact.left_padding, selection.left_padding)
             self.assertEqual(compact.block_size, self.RATIO)
             self.assertEqual(compact.physical_width, 10)
+
+    def test_gather_attention_matches_dense_mask_for_ragged_rows_and_tiles(self):
+        """Each batch/query row may select a different window; tile edges
+        must change memory shape only, never the attended token set."""
+        batch, length, total, block = 2, 3, 13, 4
+        left = mx.array([0, 3], dtype=mx.int32)
+        q_pos = mx.array([[8, 9, 10], [5, 6, 7]], dtype=mx.int32)
+        token_logical = mx.arange(total)[None, :] - left[:, None]
+        valid_blocks = (
+            (mx.arange(total // block) * block + block - 1)[None, None, :]
+            <= q_pos[..., None]
+        )
+        # Deliberately unsorted with invalid choices interleaved.  Compaction
+        # gives rows counts from one to two and exercises an empty tail at q=7.
+        selected = mx.array(
+            [
+                [[2, 0], [1, 0], [2, 1]],
+                [[2, 0], [1, 2], [1, 0]],
+            ],
+            dtype=mx.uint32,
+        )
+        causal = (
+            (token_logical[:, None, :] >= 0)
+            & (token_logical[:, None, :] <= q_pos[..., None])
+        )[:, None]
+        selection = QSASelection(
+            kind="explicit",
+            batch=batch,
+            length=length,
+            block_size=block,
+            raw_block_ids=selected,
+            valid_blocks=valid_blocks,
+            q_positions=q_pos,
+            token_positions=token_logical,
+            causal_mask=causal,
+            left_padding=left,
+            physical_width=total,
+            n_blocks=total // block,
+            scatter_chosen=True,
+        )
+        key = mx.random.key(71)
+        q = mx.random.normal((batch, 2, length, 8), key=key)
+        k = mx.random.normal((batch, 1, total, 8), key=mx.random.key(72))
+        v = mx.random.normal((batch, 1, total, 8), key=mx.random.key(73))
+        expected = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=8**-0.5, mask=selection.dense_mask()
+        )
+        for tile_rows in (1, 2, 4, 8):
+            with self.subTest(tile_rows=tile_rows):
+                actual = qwen4_exp_module._gather_qsa_attention(
+                    q,
+                    k,
+                    v,
+                    selection.compact_blocks(),
+                    scale=8**-0.5,
+                    tile_rows=tile_rows,
+                )
+                mx.eval(expected, actual)
+                np.testing.assert_allclose(
+                    np.asarray(actual), np.asarray(expected), rtol=2e-5, atol=2e-5
+                )
+
+    def test_gather_attention_rejects_invalid_tile_size(self):
+        compact = QSACompactBlocks(
+            block_ids=mx.zeros((1, 1, 1), dtype=mx.uint32),
+            block_counts=mx.ones((1, 1), dtype=mx.int32),
+            tail_start=mx.ones((1, 1), dtype=mx.int32),
+            tail_stop=mx.ones((1, 1), dtype=mx.int32),
+            left_padding=None,
+            block_size=1,
+            physical_width=1,
+            causal_mask=None,
+        )
+        q = k = v = mx.ones((1, 1, 1, 1))
+        with self.assertRaises(ValueError):
+            qwen4_exp_module._gather_qsa_attention(
+                q, k, v, compact, scale=1.0, tile_rows=0
+            )
+
+    def test_gather_flag_routes_decode_but_not_wide_prefill(self):
+        model = self._model()
+        model.eval()
+        cache = model.make_cache()
+        calls = []
+        original = qwen4_exp_module._gather_qsa_attention
+
+        def spy(*args, **kwargs):
+            calls.append((args[0].shape, kwargs["tile_rows"]))
+            return original(*args, **kwargs)
+
+        with (
+            lever_flag("_QSA_GATHER_KV"),
+            lever_flag("_QSA_GATHER_TILE_ROWS", 2),
+            lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
+            lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
+            lever_flag("_QSA_GATHER_MIN_QUERY", 1),
+        ):
+            qwen4_exp_module._gather_qsa_attention = spy
+            try:
+                # M=12 exceeds the default gather max-query latch; the next
+                # M=1 call is explicit QSA and must route all four FA layers.
+                mx.eval(
+                    model(
+                        mx.array([list(range(1, 13))], dtype=mx.int32),
+                        cache=cache,
+                    )
+                )
+                self.assertEqual(calls, [])
+                mx.eval(model(mx.array([[13]], dtype=mx.int32), cache=cache))
+            finally:
+                qwen4_exp_module._gather_qsa_attention = original
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(shape[2] == 1 for shape, _tile in calls))
+        self.assertTrue(all(tile == 2 for _shape, tile in calls))
+
+    def test_gather_min_query_keeps_width_one_decode_on_stock_path(self):
+        model = self._model()
+        model.eval()
+        cache = model.make_cache()
+        original = qwen4_exp_module._gather_qsa_attention
+
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("M=1 reached gathered KV with min-query 3")
+
+        with (
+            lever_flag("_QSA_GATHER_KV"),
+            lever_flag("_QSA_GATHER_MIN_QUERY", 3),
+            lever_flag("_QSA_GATHER_MAX_QUERY", 8),
+            lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
+            lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
+        ):
+            qwen4_exp_module._gather_qsa_attention = refuse
+            try:
+                mx.eval(
+                    model(
+                        mx.array([list(range(1, 13))], dtype=mx.int32),
+                        cache=cache,
+                    )
+                )
+                mx.eval(model(mx.array([[13]], dtype=mx.int32), cache=cache))
+            finally:
+                qwen4_exp_module._gather_qsa_attention = original
 
     def test_implicit_all_compacts_to_every_causally_valid_block(self):
         args = tiny_args()

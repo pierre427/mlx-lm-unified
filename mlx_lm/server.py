@@ -704,6 +704,29 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
     "qwen4_qsa_nax_kernel": MutableKey(
         "module", "_QSA_NAX_KERNEL", _reload_flag, "mlx_lm.models.qwen4_exp"
     ),
+    "qwen4_qsa_gather_kv": MutableKey(
+        "module", "_QSA_GATHER_KV", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_gather_tile_rows": MutableKey(
+        "module", "_QSA_GATHER_TILE_ROWS", _reload_int(1, 1 << 10),
+        "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_gather_min_context": MutableKey(
+        "module", "_QSA_GATHER_MIN_CONTEXT", _reload_int(0, 1 << 22),
+        "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_gather_max_context": MutableKey(
+        "module", "_QSA_GATHER_MAX_CONTEXT", _reload_int(0, 1 << 22),
+        "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_gather_min_query": MutableKey(
+        "module", "_QSA_GATHER_MIN_QUERY", _reload_int(1, 1 << 10),
+        "mlx_lm.models.qwen4_exp"
+    ),
+    "qwen4_qsa_gather_max_query": MutableKey(
+        "module", "_QSA_GATHER_MAX_QUERY", _reload_int(1, 1 << 10),
+        "mlx_lm.models.qwen4_exp"
+    ),
     "qwen4_ple_vector_shift": MutableKey(
         "module", "_PLE_VECTOR_SHIFT", _reload_flag, "mlx_lm.models.qwen4_exp"
     ),

@@ -189,6 +189,38 @@ _QSA_NAX_KERNEL = _env_flag("MLX_QWEN4_QSA_NAX_KERNEL")
 # every decode-time shape falls back to dense SDPA, bit-identical to OFF.
 _QSA_NAX_MIN_QUERY = int(os.environ.get("MLX_QWEN4_QSA_NAX_MIN_QUERY", "64"))
 
+# MLX_QWEN4_QSA_GATHER_KV (2026-09-01): for small-query inference, gather the
+# exact token rows named by QSA's compact block selection and feed that bounded
+# K/V slab to dense SDPA.  This is the small-M companion to the NAX prefill
+# kernel: NAX amortizes its custom launch at large M, while gather-then-dense
+# targets decode and short speculative verification.  Off until the in-situ
+# context/batch ladder establishes a sustained crossover.
+#
+# Flattened (batch, query) rows are processed in bounded tiles.  Each row keeps
+# its own block set and valid count, so unequal batch histories and a ragged
+# final tile do not force selection sharing.  The tile width is static (the QSA
+# budget plus one tail block) and invalid suffixes are masked; this avoids a
+# device-to-host count sync in every layer and bounds the largest gathered K/V
+# transient to tile_rows * ~2K tokens instead of batch * query * ~2K.
+_QSA_GATHER_KV = _env_flag("MLX_QWEN4_QSA_GATHER_KV")
+_QSA_GATHER_TILE_ROWS = max(
+    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_TILE_ROWS", "1"))
+)
+_QSA_GATHER_MIN_CONTEXT = max(
+    0, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MIN_CONTEXT", "0"))
+)
+# Zero means no high-context latch-off.  It remains independently tunable so
+# the raw ladder can test whether allocator/dispatch effects create one.
+_QSA_GATHER_MAX_CONTEXT = max(
+    0, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_CONTEXT", "0"))
+)
+_QSA_GATHER_MIN_QUERY = max(
+    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MIN_QUERY", "3"))
+)
+_QSA_GATHER_MAX_QUERY = max(
+    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_QUERY", "8"))
+)
+
 
 def _table_matmul(table, x: mx.array) -> mx.array:
     weight, scales, biases, group_size, bits, mode = table
@@ -1893,6 +1925,115 @@ class QSASelection:
         )
 
 
+def _gather_qsa_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    compact: QSACompactBlocks,
+    *,
+    scale: float,
+    tile_rows: int,
+) -> mx.array:
+    """Exact selected-row gather followed by bounded dense SDPA.
+
+    ``q`` is ``[B,H,L,D]`` and ``k/v`` are ``[B,HKV,T,D]``.  QSA selection
+    varies by both batch row and query row, so those axes are flattened and
+    tiled.  The last tile may be short.  Within a tile every row retains its
+    own token indices and validity mask; padding is computational only and can
+    never become an attended key.
+
+    The helper deliberately consumes the same compact contract as NAX.  It
+    does not inspect a dynamic count on the host: doing so in twelve QSA layers
+    on every decode step would serialize the command stream.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("QSA gather wants rank-4 q/k/v tensors")
+    if k.shape != v.shape:
+        raise ValueError("QSA gather K/V shapes must match")
+    batch, heads, length, dim = q.shape
+    if k.shape[0] != batch or k.shape[2] != compact.physical_width:
+        raise ValueError("QSA gather tensors do not match compact selection")
+    if compact.block_ids.shape[:2] != (batch, length):
+        raise ValueError("QSA gather selection must match [batch, query]")
+    if tile_rows < 1:
+        raise ValueError("QSA gather tile_rows must be positive")
+
+    ids, counts, n_selected, u_width, q_pos, left_pad, total = (
+        compact_blocks_to_kernel_inputs(compact)
+    )
+    block_size = compact.block_size
+    # [B,L,U,BS] logical positions.  The padded U suffix is harmless because
+    # ``block_slot < counts`` rejects it before attention.
+    logical = (
+        ids.astype(mx.int32)[..., None] * block_size
+        + mx.arange(block_size, dtype=mx.int32)
+    )
+    block_slot = mx.arange(u_width, dtype=mx.int32)[None, None, :, None]
+    selected_slot = block_slot < n_selected.astype(mx.int32)[..., None, None]
+    present_slot = block_slot < counts.astype(mx.int32)[..., None, None]
+    tail_member = (logical >= compact.tail_start[..., None, None]) & (
+        logical < compact.tail_stop[..., None, None]
+    )
+    valid = present_slot & (selected_slot | tail_member)
+
+    physical = logical + left_pad[:, None, None, None]
+    valid = valid & (physical >= 0) & (physical < total)
+    # This upper bound is redundant for selected closed blocks, but makes the
+    # causal contract explicit and protects a malformed compact input.
+    valid = valid & (logical <= q_pos[..., None, None])
+    physical = mx.clip(physical, 0, total - 1).reshape(batch, length, -1)
+    valid = valid.reshape(batch, length, -1)
+
+    # Preserve every extra cache mask term (left/right padding and ragged
+    # continuation geometry) by gathering it at the same selected columns.
+    if compact.causal_mask is not None:
+        causal = mx.broadcast_to(
+            compact.causal_mask, (batch, 1, length, total)
+        )[:, 0]
+        valid = valid & mx.take_along_axis(causal, physical, axis=-1)
+
+    rows = batch * length
+    width = physical.shape[-1]
+    row_batch = mx.broadcast_to(
+        mx.arange(batch, dtype=mx.int32)[:, None], (batch, length)
+    ).reshape(-1)
+    q_rows = q.transpose(0, 2, 1, 3).reshape(rows, heads, dim)
+    physical = physical.reshape(rows, width)
+    valid = valid.reshape(rows, width)
+    # Put the gather axis next to batch so one take_along_axis covers all KV
+    # heads and channels for a row.
+    k_by_token = k.transpose(0, 2, 1, 3)
+    v_by_token = v.transpose(0, 2, 1, 3)
+    outputs = []
+    for start in range(0, rows, tile_rows):
+        stop = min(rows, start + tile_rows)
+        source_rows = row_batch[start:stop]
+        token_rows = physical[start:stop]
+        gather_index = token_rows[..., None, None]
+        gathered_k = mx.take_along_axis(
+            k_by_token[source_rows], gather_index, axis=1
+        ).transpose(0, 2, 1, 3)
+        gathered_v = mx.take_along_axis(
+            v_by_token[source_rows], gather_index, axis=1
+        ).transpose(0, 2, 1, 3)
+        tile_q = q_rows[start:stop, :, None, :]
+        tile_mask = valid[start:stop, None, None, :]
+        outputs.append(
+            mx.fast.scaled_dot_product_attention(
+                tile_q,
+                gathered_k,
+                gathered_v,
+                scale=scale,
+                mask=tile_mask,
+            )[:, :, 0]
+        )
+    return (
+        mx.concatenate(outputs, axis=0)
+        .reshape(batch, length, heads, dim)
+        .transpose(0, 2, 1, 3)
+    )
+
+
 class QSAIndexer(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -2300,9 +2441,26 @@ class Attention(nn.Module):
             and self._nax_layout_ok
             and nax_kernel_available()
         )
-        # Do NOT build the dense mask when the kernel is engaged: not
-        # materializing that [B, 1, L, T] array is the point.
-        sparse_mask = None if use_nax else selection.dense_mask()
+        gather_context_ok = (
+            selection.physical_width >= _QSA_GATHER_MIN_CONTEXT
+            and (
+                _QSA_GATHER_MAX_CONTEXT == 0
+                or selection.physical_width <= _QSA_GATHER_MAX_CONTEXT
+            )
+        )
+        use_gather = (
+            _QSA_GATHER_KV
+            and not use_nax
+            and not self.training
+            and selection.kind == "explicit"
+            and length >= _QSA_GATHER_MIN_QUERY
+            and length <= _QSA_GATHER_MAX_QUERY
+            and gather_context_ok
+        )
+        # Do NOT build the dense mask when either sparse representation is
+        # engaged: avoiding that [B, 1, L, T] materialization is part of the
+        # win, especially for ragged batches.
+        sparse_mask = None if (use_nax or use_gather) else selection.dense_mask()
         if fused_index_qk is None:
             qg = self.q_proj(x)
             k_flat = self.k_proj(x)
@@ -2329,6 +2487,15 @@ class Attention(nn.Module):
                 scale=self.scale, u_width=u_width, total=total,
                 n_kv_heads=self.num_kv_heads,
             ).astype(q.dtype)
+        elif use_gather:
+            out = _gather_qsa_attention(
+                q,
+                k,
+                v,
+                selection.compact_blocks(),
+                scale=self.scale,
+                tile_rows=_QSA_GATHER_TILE_ROWS,
+            )
         else:
             out = scaled_dot_product_attention(
                 q, k, v, cache=cache, scale=self.scale, mask=sparse_mask
