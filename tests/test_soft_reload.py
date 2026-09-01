@@ -273,6 +273,41 @@ class TestWhitelist(unittest.TestCase):
         finally:
             qwen4_exp._QSA_NAX_KERNEL = original
 
+    def test_qwen4_stage1_lever_is_independent(self):
+        from mlx_lm.models import qwen4_exp
+
+        cli_args = make_cli_args()
+        original = qwen4_exp._QSA_STAGE1_KERNEL
+        try:
+            qwen4_exp._QSA_STAGE1_KERNEL = False
+            plan = plan_soft_reload(cli_args, {"qwen4_qsa_stage1_kernel": True})
+            changes = apply_soft_reload(cli_args, plan)
+            self.assertEqual(
+                changes,
+                {"qwen4_qsa_stage1_kernel": {"old": False, "new": True}},
+            )
+            self.assertTrue(qwen4_exp._QSA_STAGE1_KERNEL)
+
+            plan = plan_soft_reload(
+                cli_args, {"qwen4_qsa_stage1_kernel": "auto"}
+            )
+            changes = apply_soft_reload(cli_args, plan)
+            self.assertEqual(
+                changes,
+                {"qwen4_qsa_stage1_kernel": {"old": True, "new": None}},
+            )
+            self.assertIsNone(qwen4_exp._QSA_STAGE1_KERNEL)
+
+            plan = plan_soft_reload(cli_args, {"qwen4_qsa_stage1_kernel": False})
+            changes = apply_soft_reload(cli_args, plan)
+            self.assertEqual(
+                changes,
+                {"qwen4_qsa_stage1_kernel": {"old": None, "new": False}},
+            )
+            self.assertFalse(qwen4_exp._QSA_STAGE1_KERNEL)
+        finally:
+            qwen4_exp._QSA_STAGE1_KERNEL = original
+
 
 class TestHardTierRefusal(unittest.TestCase):
     def test_model_path_is_refused_with_a_restart_message(self):
