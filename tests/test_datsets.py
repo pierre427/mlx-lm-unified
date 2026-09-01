@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 
+import pytest
 from transformers import AutoTokenizer
 
 from mlx_lm.tuner import datasets
@@ -112,6 +113,8 @@ class TestDatasets(unittest.TestCase):
         self.assertTrue(isinstance(train, datasets.ChatDataset))
 
     def test_hf(self):
+        pytest.importorskip("datasets")
+
         hf_args = {
             "path": "FiscalNote/billsum",
             "prompt_feature": "text",

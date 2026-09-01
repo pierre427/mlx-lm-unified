@@ -4,6 +4,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import pytest
+
+pytest.importorskip("lm_eval")
 
 from mlx_lm.evaluate import MLXLM
 
