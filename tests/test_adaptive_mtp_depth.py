@@ -442,7 +442,7 @@ class TestRollbackExactness(_TinyMTPBase):
         tokens, stats, records, cache = self._spied_run(router, num_draft=3)
         self._check_invariants(tokens, stats, records, cache, 3, 24)
         # The schedule really varied the per-cycle depth.
-        self.assertGreater(len({k for _n, k in router.observed}), 1)
+        self.assertGreater(len({k for k, _n in router.observed}), 1)
 
 
 class TestLiveFeatureComposition(_TinyMTPBase):
