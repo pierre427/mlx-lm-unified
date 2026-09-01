@@ -21,6 +21,11 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update, normalize_gdn_qk
+from .qwen4_moe_router import (
+    admit_qwen4_moe_router,
+    probe_qwen4_moe_router,
+    qwen4_moe_router,
+)
 from .rope_utils import initialize_rope
 from . import switch_layers as _switch_layers
 from .switch_layers import (
@@ -57,6 +62,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Compiles the expert-selection chain of EVERY user of
 # Qwen3NextSparseMoeBlock: qwen3_next itself, qwen3_5, and qwen4_exp.
 _MOE_GATE_COMPILE = _env_flag("MLX_QWEN4_MOE_GATE_COMPILE")
+_MOE_ROUTER_KERNEL = _env_flag("MLX_QWEN4_MOE_ROUTER_KERNEL")
+_MOE_ROUTER_MODES = ("stock", "fused")
 
 # Shaped compile traces are keyed by exact width, and production widths are
 # not a small stable set: the final prefill chunk has arbitrary width per
@@ -921,6 +928,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if _MOE_FUSED_EXPERT_KERNEL and not self.shared_folded
             else "stock"
         )
+        self.moe_router_mode = "fused" if _MOE_ROUTER_KERNEL else "stock"
+        self.moe_router_calls = 0
+        self.moe_router_fallbacks = 0
+        self.moe_router_last_fallback = None
         if self.fused_gate_up:
             switch_cls = FusedGateUpSwitchGLU
         else:
@@ -956,6 +967,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             raise ValueError("fused expert kernels do not support a folded shared row")
         self.fused_expert_kernel_mode = mode
 
+    def set_moe_router_mode(self, mode: str):
+        if mode not in _MOE_ROUTER_MODES:
+            raise ValueError(
+                f"unknown MoE router mode {mode!r}; expected {_MOE_ROUTER_MODES}"
+            )
+        self.moe_router_mode = mode
+
     def __call__(
         self,
         x: mx.array,
@@ -964,14 +982,29 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x)
-        if (
+        router_fused = False
+        if self.moe_router_mode == "fused":
+            admission = admit_qwen4_moe_router(
+                gates,
+                top_k=self.top_k,
+                norm_topk_prob=bool(self.norm_topk_prob),
+            )
+            if admission.accepted and probe_qwen4_moe_router(gates.dtype):
+                inds, scores = qwen4_moe_router(gates)
+                self.moe_router_calls += 1
+                self.moe_router_last_fallback = None
+                router_fused = True
+            else:
+                self.moe_router_fallbacks += 1
+                self.moe_router_last_fallback = admission.reason
+        if not router_fused and (
             _MOE_GATE_COMPILE
             and gates.size // gates.shape[-1] <= _MOE_GATE_COMPILE_MAX_TOKENS
         ):
             inds, scores = _select_experts(
                 gates, self.top_k, bool(self.norm_topk_prob)
             )
-        else:
+        elif not router_fused:
             gates = mx.softmax(gates, axis=-1, precise=True)
 
             k = self.top_k
@@ -1051,6 +1084,37 @@ def qwen4_fused_expert_mode_counts(model: nn.Module) -> dict[str, int]:
         if isinstance(module, Qwen3NextSparseMoeBlock):
             counts[module.fused_expert_kernel_mode] += 1
     return counts
+
+
+def set_qwen4_moe_router_mode(model: nn.Module, mode: str) -> int:
+    """Switch all resident Qwen4-family sparse blocks between stock/fused."""
+    if mode not in _MOE_ROUTER_MODES:
+        raise ValueError(
+            f"unknown MoE router mode {mode!r}; expected {_MOE_ROUTER_MODES}"
+        )
+    blocks = [
+        module
+        for _, module in model.named_modules()
+        if isinstance(module, Qwen3NextSparseMoeBlock)
+    ]
+    for block in blocks:
+        block.set_moe_router_mode(mode)
+    return len(blocks)
+
+
+def qwen4_moe_router_stats(model: nn.Module) -> dict[str, Any]:
+    stats = {"fused_calls": 0, "fallbacks": 0, "last_fallbacks": {}}
+    for _, module in model.named_modules():
+        if not isinstance(module, Qwen3NextSparseMoeBlock):
+            continue
+        stats["fused_calls"] += module.moe_router_calls
+        stats["fallbacks"] += module.moe_router_fallbacks
+        reason = module.moe_router_last_fallback
+        if reason is not None:
+            stats["last_fallbacks"][reason] = (
+                stats["last_fallbacks"].get(reason, 0) + 1
+            )
+    return stats
 
 
 class Qwen3NextDecoderLayer(nn.Module):

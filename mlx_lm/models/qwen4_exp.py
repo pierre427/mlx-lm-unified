@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import os
+import threading
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Union
 
@@ -18,6 +20,14 @@ import numpy as np
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
 from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynamic_roll
 from .pipeline import PipelineMixin
+from .qwen4_fused_gdn import (
+    admit_qwen4_fused_gdn_decode,
+    fused_gdn_runtime_supported,
+    probe_qwen4_fused_gdn_decode,
+    qwen4_fused_gdn_decode,
+    qwen4_fused_gdn_decode_outproj,
+)
+from .qwen4_gdn_outproj import admit_qwen4_gdn_outproj
 from .qwen4_qsa_nax import (
     block_sparse_layout_supported,
     compact_blocks_to_kernel_inputs,
@@ -86,6 +96,8 @@ _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 _GDN_SHAPE_STABLE_PROJECTIONS = _env_flag(
     "MLX_QWEN4_GDN_SHAPE_STABLE_PROJECTIONS"
 )
+_FUSED_GDN_DECODE = _env_flag("MLX_QWEN4_FUSED_GDN_DECODE")
+_FUSED_GDN_DECODE_MODES = ("stock", "fused", "fused_outproj")
 _SHAPE_STABLE_SHORT_FORWARD = _env_flag(
     "MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD"
 )
@@ -180,6 +192,10 @@ _QSA_FUSED_PROJ = _env_flag("MLX_QWEN4_QSA_FUSED_PROJ")
 # not threading. Re-test on an isolated server watching memory before default-on.
 # Flag still works for isolated benches.
 _QSA_NAX_KERNEL = _env_flag("MLX_QWEN4_QSA_NAX_KERNEL")
+_QSA_NAX_DECODE = _env_flag("MLX_QWEN4_QSA_NAX_DECODE")
+_QSA_NAX_DECODE_STATS_LOCK = threading.Lock()
+_QSA_NAX_DECODE_STATS = Counter()
+_QSA_NAX_DECODE_LAST_DECISION = None
 
 # Minimum query length for the kernel to engage. It tiles M by query heads, so
 # it needs many tokens to amortize its launch: it wins on the 512-wide prefill
@@ -220,6 +236,40 @@ _QSA_GATHER_MIN_QUERY = max(
 _QSA_GATHER_MAX_QUERY = max(
     1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_QUERY", "8"))
 )
+
+
+def _record_qsa_nax_decode(*, engaged: bool, reason: str, context: int) -> None:
+    global _QSA_NAX_DECODE_LAST_DECISION
+    receipt = {
+        "engaged": engaged,
+        "reason": reason,
+        "context": int(context),
+    }
+    with _QSA_NAX_DECODE_STATS_LOCK:
+        _QSA_NAX_DECODE_STATS[reason] += 1
+        _QSA_NAX_DECODE_LAST_DECISION = receipt
+
+
+def qsa_nax_decode_status(*, reset: bool = False) -> dict[str, Any]:
+    """Return direct-M1 NAX engagement evidence."""
+    global _QSA_NAX_DECODE_LAST_DECISION
+    with _QSA_NAX_DECODE_STATS_LOCK:
+        report = {
+            "enabled": bool(_QSA_NAX_DECODE),
+            "counts": dict(_QSA_NAX_DECODE_STATS),
+            "last_decision": _QSA_NAX_DECODE_LAST_DECISION,
+        }
+        if reset:
+            _QSA_NAX_DECODE_STATS.clear()
+            _QSA_NAX_DECODE_LAST_DECISION = None
+    return report
+
+
+def set_qwen4_qsa_nax_decode(enabled: bool) -> bool:
+    """Live-toggle direct M=1 selected-block NAX without rebuilding weights."""
+    global _QSA_NAX_DECODE
+    _QSA_NAX_DECODE = bool(enabled)
+    return _QSA_NAX_DECODE
 
 
 def _table_matmul(table, x: mx.array) -> mx.array:
@@ -484,6 +534,121 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             args.rms_norm_eps,
             args.output_gate_type or args.hidden_act,
         )
+        self.fused_gdn_decode_mode = "fused" if _FUSED_GDN_DECODE else "stock"
+        self.fused_gdn_decode_calls = 0
+        self.fused_gdn_outproj_calls = 0
+        self.fused_gdn_decode_fallbacks = 0
+        self.fused_gdn_decode_last_fallback = None
+        # Per-layer device rendezvous for the 12-block one-dispatch output
+        # epilogue.  Length 64 keeps it a device buffer, not a Metal constant.
+        object.__setattr__(
+            self, "_fused_gdn_outproj_control", mx.zeros((64,), mx.uint32)
+        )
+        self._fused_gdn_outproj_epoch = 0
+
+    def set_fused_gdn_decode_mode(self, mode: str):
+        """Select the decode implementation without touching resident arrays."""
+        if mode not in _FUSED_GDN_DECODE_MODES:
+            raise ValueError(
+                f"unknown fused GDN decode mode {mode!r}; "
+                f"expected one of {_FUSED_GDN_DECODE_MODES}"
+            )
+        self.fused_gdn_decode_mode = mode
+
+    def _fused_gdn_fallback(self, reason: str):
+        self.fused_gdn_decode_fallbacks += 1
+        self.fused_gdn_decode_last_fallback = reason
+        return None
+
+    def _try_fused_decode(self, qkv, z, b, a, mask, cache):
+        if self.fused_gdn_decode_mode == "stock":
+            return None
+        if cache is None or cache[0] is None or cache[1] is None:
+            return self._fused_gdn_fallback("uninitialized cache")
+
+        admission = admit_qwen4_fused_gdn_decode(
+            qkv=qkv,
+            z=z,
+            b=b,
+            a=a,
+            conv_state=cache[0],
+            recurrent_state=cache[1],
+            conv_weight=self.conv1d.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            norm_weight=self.norm.weight,
+            mask=mask,
+            cache_lengths=getattr(cache, "lengths", None),
+            speculating=bool(getattr(cache, "speculating", False)),
+            training=bool(self.training),
+            sharded=self.sharding_group is not None,
+            num_key_heads=self.num_k_heads,
+            num_value_heads=self.num_v_heads,
+            key_head_dim=self.head_k_dim,
+            value_head_dim=self.head_v_dim,
+            conv_kernel=self.conv_kernel_size,
+            gate_activation=self.norm.activation,
+        )
+        if not admission.accepted:
+            return self._fused_gdn_fallback(admission.reason)
+        if not fused_gdn_runtime_supported():
+            return self._fused_gdn_fallback("Metal runtime unavailable")
+
+        threadgroup_y = probe_qwen4_fused_gdn_decode(qkv.dtype)
+        if threadgroup_y is None:
+            return self._fused_gdn_fallback("Metal kernel probe declined")
+        if self.fused_gdn_decode_mode == "fused_outproj":
+            # z has the same production B1/M1/6144 geometry and dtype as the
+            # normalized GDN vector consumed inside the fused epilogue.
+            outproj_admission = admit_qwen4_gdn_outproj(self.out_proj, z)
+            if not outproj_admission.accepted:
+                return self._fused_gdn_fallback(outproj_admission.reason)
+            self._fused_gdn_outproj_epoch += 1
+            out, conv_state, recurrent_state = qwen4_fused_gdn_decode_outproj(
+                qkv,
+                z,
+                b,
+                a,
+                cache[0],
+                self.conv1d.weight,
+                self.A_log,
+                self.dt_bias,
+                cache[1],
+                self.norm.weight,
+                self.norm.eps,
+                self.out_proj.weight,
+                self.out_proj.scales,
+                self.out_proj.biases,
+                self._fused_gdn_outproj_control,
+                self._fused_gdn_outproj_epoch,
+                output_dim=self.hidden_size,
+                output_group_size=self.out_proj.group_size,
+            )
+        else:
+            out, conv_state, recurrent_state = qwen4_fused_gdn_decode(
+                qkv,
+                z,
+                b,
+                a,
+                cache[0],
+                self.conv1d.weight,
+                self.A_log,
+                self.dt_bias,
+                cache[1],
+                self.norm.weight,
+                self.norm.eps,
+                threadgroup_y=threadgroup_y,
+            )
+        cache[0] = conv_state
+        cache[1] = recurrent_state
+        cache.advance(1)
+        self.fused_gdn_decode_calls += 1
+        if self.fused_gdn_decode_mode == "fused_outproj":
+            self.fused_gdn_outproj_calls += 1
+        self.fused_gdn_decode_last_fallback = None
+        if self.fused_gdn_decode_mode == "fused_outproj":
+            return out
+        return self.out_proj(out)
 
     def _input_projections(self, inputs: mx.array):
         if not _GDN_SHAPE_STABLE_PROJECTIONS or inputs.shape[1] <= 1:
@@ -497,6 +662,54 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             mx.concatenate([token[projection] for token in per_token], axis=1)
             for projection in range(4)
         )
+
+
+def set_qwen4_fused_gdn_mode(model: nn.Module, mode: str) -> int:
+    """Atomically switch all resident Qwen4 GDN layers between stock/fused."""
+    if mode not in _FUSED_GDN_DECODE_MODES:
+        raise ValueError(
+            f"unknown fused GDN decode mode {mode!r}; "
+            f"expected one of {_FUSED_GDN_DECODE_MODES}"
+        )
+    layers = [
+        module
+        for _, module in model.named_modules()
+        if isinstance(module, GatedDeltaNet)
+    ]
+    for layer in layers:
+        layer.set_fused_gdn_decode_mode(mode)
+    return len(layers)
+
+
+def qwen4_fused_gdn_mode_counts(model: nn.Module) -> dict[str, int]:
+    """Return resident GDN mode counts without evaluating model arrays."""
+    counts = {mode: 0 for mode in _FUSED_GDN_DECODE_MODES}
+    for _, module in model.named_modules():
+        if isinstance(module, GatedDeltaNet):
+            counts[module.fused_gdn_decode_mode] += 1
+    return counts
+
+
+def qwen4_fused_gdn_stats(model: nn.Module) -> dict[str, Any]:
+    """Return graph-selection and fallback counters without host synchronization."""
+    stats = {
+        "fused_calls": 0,
+        "fused_outproj_calls": 0,
+        "fallbacks": 0,
+        "last_fallbacks": {},
+    }
+    for _, module in model.named_modules():
+        if not isinstance(module, GatedDeltaNet):
+            continue
+        stats["fused_calls"] += module.fused_gdn_decode_calls
+        stats["fused_outproj_calls"] += module.fused_gdn_outproj_calls
+        stats["fallbacks"] += module.fused_gdn_decode_fallbacks
+        reason = module.fused_gdn_decode_last_fallback
+        if reason is not None:
+            stats["last_fallbacks"][reason] = (
+                stats["last_fallbacks"].get(reason, 0) + 1
+            )
+    return stats
 
 
 class Qwen4ArraysCache(ArraysCache):
@@ -2430,6 +2643,13 @@ class Attention(nn.Module):
         # Only an ``explicit`` (sparse) selection on a multi-token query with a
         # supported layout on a NAX-capable device qualifies; everything else
         # keeps the dense masked-SDPA path and its mask, bit-identical.
+        direct_nax = (
+            _QSA_NAX_DECODE
+            and length == 1
+            # Do not replace the dense-by-construction operating point.  The
+            # direct kernel is for genuinely sparse selection only.
+            and selection.n_blocks > self.indexer.block_topk
+        )
         use_nax = (
             _QSA_NAX_KERNEL
             # The kernel is an MLX CustomKernel with no VJP, so a backward pass
@@ -2437,10 +2657,28 @@ class Attention(nn.Module):
             # through it (mirrors the _QSA_FUSED_PROJ guard); inference only.
             and not self.training
             and selection.kind == "explicit"
-            and length >= _QSA_NAX_MIN_QUERY
+            and (length >= _QSA_NAX_MIN_QUERY or direct_nax)
             and self._nax_layout_ok
             and nax_kernel_available()
         )
+        if length == 1 and _QSA_NAX_DECODE:
+            if use_nax:
+                reason = "engaged"
+            elif selection.n_blocks <= self.indexer.block_topk:
+                reason = "dense_by_construction"
+            elif selection.kind != "explicit":
+                reason = "selection_not_explicit"
+            elif not self._nax_layout_ok:
+                reason = "unsupported_layout"
+            elif self.training:
+                reason = "training"
+            else:
+                reason = "kernel_unavailable"
+            _record_qsa_nax_decode(
+                engaged=use_nax,
+                reason=reason,
+                context=selection.physical_width,
+            )
         gather_context_ok = (
             selection.physical_width >= _QSA_GATHER_MIN_CONTEXT
             and (

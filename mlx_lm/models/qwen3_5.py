@@ -369,6 +369,10 @@ class GatedDeltaNet(nn.Module):
             lower = upper
         return outputs
 
+    def _try_fused_decode(self, qkv, z, b, a, mask, cache):
+        """Architecture-specific decode shortcut; stock models opt out."""
+        return None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -381,6 +385,11 @@ class GatedDeltaNet(nn.Module):
             inputs = sum_gradients(self.sharding_group)(inputs)
 
         qkv, z, b, a = self._input_projections(inputs)
+
+        fused = self._try_fused_decode(qkv, z, b, a, mask, cache)
+        if fused is not None:
+            return fused
+
         z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         if cache is not None and cache[0] is not None:
