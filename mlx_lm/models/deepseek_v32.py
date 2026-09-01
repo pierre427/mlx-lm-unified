@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ._safe_reduce import sum_head_axis
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
@@ -106,7 +107,12 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
-        scores = scores.sum(axis=1, keepdims=True)
+        # Avoid MLX #4437's oversized strided reduction during prefill.
+        scores = (
+            sum_head_axis(scores, keepdims=True)
+            if s > 1
+            else scores.sum(axis=1, keepdims=True)
+        )
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
