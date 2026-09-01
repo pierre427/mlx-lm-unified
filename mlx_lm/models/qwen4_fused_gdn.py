@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
+from threading import Lock
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -192,11 +193,6 @@ inline U mlx_softplus_fast(U x) {
       : (hi + mlx_log1p_fast(static_cast<U>(metal::exp(lo - hi))));
 }
 
-#pragma clang fp contract(off)
-inline float sq_acc(float acc, float v) {
-  return v * v + acc;
-}
-#pragma clang fp contract(on)
 """
 
 
@@ -216,6 +212,8 @@ _SOURCE = r"""
 
   threadgroup float sq[DK];
   threadgroup float sk[DK];
+  threadgroup T sq_squared[DK];
+  threadgroup T sk_squared[DK];
   threadgroup float sv[DV];
   threadgroup float sy[DV];
   threadgroup float shr[4];
@@ -260,31 +258,42 @@ _SOURCE = r"""
     T sp = mlx_softplus_fast(av);
     shr[2] = metal::precise::exp(
         -metal::precise::exp(float(A_log[hv])) * float(sp));
-    shr[3] = mlx_sigmoid_precise<float>(float(b[hv]));
+    shr[3] = float(mlx_sigmoid_fast(b[hv]));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint d = tid; d < (uint)DK; d += NT) {
+    T qv = static_cast<T>(sq[d]);
+    T kv = static_cast<T>(sk[d]);
+    sq_squared[d] = static_cast<T>(qv * qv);
+    sk_squared[d] = static_cast<T>(kv * kv);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (simdgroup_index_in_threadgroup == 0u) {
-    float pq = 0.0f, pk = 0.0f;
+    T pq = static_cast<T>(0), pk = static_cast<T>(0);
     uint base = 4u * lane;
     for (int i = 0; i < 4; ++i) {
-      pq += sq[base + i] * sq[base + i];
-      pk += sk[base + i] * sk[base + i];
+      pq = static_cast<T>(sq_squared[base + i] + pq);
+      pk = static_cast<T>(sk_squared[base + i] + pk);
     }
-    pq = simd_sum(pq);
-    pk = simd_sum(pk);
+    pq = static_cast<T>(simd_sum(float(pq)));
+    pk = static_cast<T>(simd_sum(float(pk)));
     if (lane == 0u) {
-      shr[0] = metal::precise::rsqrt(pq / (float)DK + qk_eps);
-      shr[1] = metal::precise::rsqrt(pk / (float)DK + qk_eps);
+      T eps = static_cast<T>(1.0e-6f);
+      T qdenom = pq + eps;
+      T kdenom = pk + eps;
+      shr[0] = float(static_cast<T>(metal::precise::rsqrt(qdenom)));
+      shr[1] = float(static_cast<T>(metal::precise::rsqrt(kdenom)));
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  T scale = static_cast<T>(qscale);
+  T qscale = static_cast<T>(0.08838834764831845f);
   for (uint d = tid; d < (uint)DK; d += NT) {
-    T q_rms = static_cast<T>(sq[d] * shr[0]);
-    T k_rms = static_cast<T>(sk[d] * shr[1]);
-    sq[d] = float(static_cast<T>(q_rms * static_cast<T>(scale * scale)));
-    sk[d] = float(static_cast<T>(k_rms * scale));
+    T q_normalized = static_cast<T>(static_cast<T>(sq[d]) * static_cast<T>(shr[0]));
+    T k_normalized = static_cast<T>(static_cast<T>(sk[d]) * static_cast<T>(shr[1]));
+    sq[d] = float(static_cast<T>(q_normalized * qscale));
+    sk[d] = float(k_normalized);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -315,16 +324,16 @@ _SOURCE = r"""
   if (simdgroup_index_in_threadgroup == 0u) {
     float po = 0.0f;
     uint base = 4u * lane;
-    for (int i = 0; i < 4; ++i) po = sq_acc(po, sy[base + i]);
+    for (int i = 0; i < 4; ++i) po += sy[base + i] * sy[base + i];
     po = simd_sum(po);
     if (lane == 0u)
       shr[0] = metal::precise::rsqrt(po / (float)DV + norm_eps);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint d = tid; d < (uint)DV; d += NT) {
-    float x = sy[d] * shr[0];
-    x = float(norm_weight[d]) * x;
-    x = x * mlx_sigmoid_precise<float>(float(z[hv * DV + d]));
+    T normalized = static_cast<T>(sy[d] * shr[0]);
+    normalized = norm_weight[d] * normalized;
+    float x = float(normalized) * mlx_sigmoid_fast<float>(float(z[hv * DV + d]));
     output[hv * DV + d] = static_cast<T>(x);
   }
 """
@@ -350,6 +359,8 @@ _SOURCE_OUTPROJ = r"""
 
   threadgroup float sq[DK];
   threadgroup float sk[DK];
+  threadgroup T sq_squared[DK];
+  threadgroup T sk_squared[DK];
   threadgroup float sv[DV];
   threadgroup float sy[DV];
   threadgroup float shr[4];
@@ -417,31 +428,42 @@ _SOURCE_OUTPROJ = r"""
       T sp = mlx_softplus_fast(av);
       shr[2] = metal::precise::exp(
           -metal::precise::exp(float(A_log[hv])) * float(sp));
-      shr[3] = mlx_sigmoid_precise<float>(float(b[hv]));
+      shr[3] = float(mlx_sigmoid_fast(b[hv]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = tid; d < (uint)DK; d += NT) {
+      T qv = static_cast<T>(sq[d]);
+      T kv = static_cast<T>(sk[d]);
+      sq_squared[d] = static_cast<T>(qv * qv);
+      sk_squared[d] = static_cast<T>(kv * kv);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (sg == 0u) {
-      float pq = 0.0f, pk = 0.0f;
+      T pq = static_cast<T>(0), pk = static_cast<T>(0);
       uint base = 4u * lane;
       for (int i = 0; i < 4; ++i) {
-        pq += sq[base + i] * sq[base + i];
-        pk += sk[base + i] * sk[base + i];
+        pq = static_cast<T>(sq_squared[base + i] + pq);
+        pk = static_cast<T>(sk_squared[base + i] + pk);
       }
-      pq = simd_sum(pq);
-      pk = simd_sum(pk);
+      pq = static_cast<T>(simd_sum(float(pq)));
+      pk = static_cast<T>(simd_sum(float(pk)));
       if (lane == 0u) {
-        shr[0] = metal::precise::rsqrt(pq / (float)DK + qk_eps);
-        shr[1] = metal::precise::rsqrt(pk / (float)DK + qk_eps);
+        T eps = static_cast<T>(1.0e-6f);
+        T qdenom = pq + eps;
+        T kdenom = pk + eps;
+        shr[0] = float(static_cast<T>(metal::precise::rsqrt(qdenom)));
+        shr[1] = float(static_cast<T>(metal::precise::rsqrt(kdenom)));
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    T scale = static_cast<T>(qscale);
+    T qscale = static_cast<T>(0.08838834764831845f);
     for (uint d = tid; d < (uint)DK; d += NT) {
-      T q_rms = static_cast<T>(sq[d] * shr[0]);
-      T k_rms = static_cast<T>(sk[d] * shr[1]);
-      sq[d] = float(static_cast<T>(q_rms * static_cast<T>(scale * scale)));
-      sk[d] = float(static_cast<T>(k_rms * scale));
+      T q_normalized = static_cast<T>(static_cast<T>(sq[d]) * static_cast<T>(shr[0]));
+      T k_normalized = static_cast<T>(static_cast<T>(sk[d]) * static_cast<T>(shr[1]));
+      sq[d] = float(static_cast<T>(q_normalized * qscale));
+      sk[d] = float(k_normalized);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -472,16 +494,16 @@ _SOURCE_OUTPROJ = r"""
     if (sg == 0u) {
       float po = 0.0f;
       uint base = 4u * lane;
-      for (int i = 0; i < 4; ++i) po = sq_acc(po, sy[base + i]);
+      for (int i = 0; i < 4; ++i) po += sy[base + i] * sy[base + i];
       po = simd_sum(po);
       if (lane == 0u)
         shr[0] = metal::precise::rsqrt(po / (float)DV + norm_eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint d = tid; d < (uint)DV; d += NT) {
-      float x = sy[d] * shr[0];
-      x = float(norm_weight[d]) * x;
-      x = x * mlx_sigmoid_precise<float>(float(z[hv * DV + d]));
+      T normalized = static_cast<T>(sy[d] * shr[0]);
+      normalized = norm_weight[d] * normalized;
+      float x = float(normalized) * mlx_sigmoid_fast<float>(float(z[hv * DV + d]));
       all_y[local_hv * DV + d] = static_cast<T>(x);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -576,8 +598,6 @@ def _kernel():
             "dt_bias",
             "recurrent_state",
             "norm_weight",
-            "qscale",
-            "qk_eps",
             "norm_eps",
         ],
         output_names=["output", "conv_state_out", "recurrent_state_out"],
@@ -607,8 +627,6 @@ def _kernel_outproj():
             "out_biases",
             "control",
             "epoch",
-            "qscale",
-            "qk_eps",
             "norm_eps",
         ],
         output_names=[
@@ -656,8 +674,6 @@ def qwen4_fused_gdn_decode(
             dt_bias,
             recurrent_state,
             norm_weight,
-            float(KEY_HEAD_DIM**-0.5),
-            float(1.0e-6 / KEY_HEAD_DIM),
             float(norm_eps),
         ],
         template=[
@@ -723,8 +739,6 @@ def qwen4_fused_gdn_decode_outproj(
             out_biases,
             control,
             mx.array([epoch], dtype=mx.uint32),
-            float(KEY_HEAD_DIM**-0.5),
-            float(1.0e-6 / KEY_HEAD_DIM),
             float(norm_eps),
         ],
         template=[
@@ -765,56 +779,65 @@ def fused_gdn_runtime_supported() -> bool:
 
 _PROBED_THREADGROUP_Y: Optional[int] = None
 _PROBE_COMPLETE = False
+_PROBE_LOCK = Lock()
 
 
 def probe_qwen4_fused_gdn_decode(dtype) -> Optional[int]:
-    """Compile/launch candidates once.  This function intentionally uses Metal."""
+    """Compile candidates once and publish the supported geometry atomically."""
     global _PROBE_COMPLETE, _PROBED_THREADGROUP_Y
     if _PROBE_COMPLETE:
         return _PROBED_THREADGROUP_Y
-    _PROBE_COMPLETE = True
-    if not fused_gdn_runtime_supported():
-        return None
+    with _PROBE_LOCK:
+        if _PROBE_COMPLETE:
+            return _PROBED_THREADGROUP_Y
+        if not fused_gdn_runtime_supported():
+            _PROBE_COMPLETE = True
+            return None
 
-    qkv = mx.zeros((1, 1, CONV_DIM), dtype=dtype)
-    z = mx.zeros((1, 1, VALUE_DIM), dtype=dtype)
-    gates = mx.zeros((1, 1, NUM_VALUE_HEADS), dtype=dtype)
-    conv_state = mx.zeros((1, CONV_KERNEL - 1, CONV_DIM), dtype=dtype)
-    conv_weight = mx.zeros((CONV_DIM, CONV_KERNEL, 1), dtype=dtype)
-    recurrent_state = mx.zeros(
-        (1, NUM_VALUE_HEADS, VALUE_HEAD_DIM, KEY_HEAD_DIM), dtype=mx.float32
-    )
-    vector = mx.zeros((NUM_VALUE_HEADS,), dtype=dtype)
-    A_log = mx.zeros((NUM_VALUE_HEADS,), dtype=mx.float32)
-    norm_weight = mx.ones((VALUE_HEAD_DIM,), dtype=dtype)
-    for threadgroup_y in _THREADGROUP_Y_CANDIDATES:
-        try:
-            outputs = qwen4_fused_gdn_decode(
-                qkv,
-                z,
-                gates,
-                gates,
-                conv_state,
-                conv_weight,
-                A_log,
-                vector,
-                recurrent_state,
-                norm_weight,
-                1.0e-6,
-                threadgroup_y=threadgroup_y,
-            )
-            mx.eval(*outputs)
-            _PROBED_THREADGROUP_Y = threadgroup_y
-            return threadgroup_y
-        except ValueError as exc:
-            if "threads per threadgroup" in str(exc):
+        qkv = mx.zeros((1, 1, CONV_DIM), dtype=dtype)
+        z = mx.zeros((1, 1, VALUE_DIM), dtype=dtype)
+        gates = mx.zeros((1, 1, NUM_VALUE_HEADS), dtype=dtype)
+        conv_state = mx.zeros((1, CONV_KERNEL - 1, CONV_DIM), dtype=dtype)
+        conv_weight = mx.zeros((CONV_DIM, CONV_KERNEL, 1), dtype=dtype)
+        recurrent_state = mx.zeros(
+            (1, NUM_VALUE_HEADS, VALUE_HEAD_DIM, KEY_HEAD_DIM), dtype=mx.float32
+        )
+        vector = mx.zeros((NUM_VALUE_HEADS,), dtype=dtype)
+        A_log = mx.zeros((NUM_VALUE_HEADS,), dtype=mx.float32)
+        norm_weight = mx.ones((VALUE_HEAD_DIM,), dtype=dtype)
+        for threadgroup_y in _THREADGROUP_Y_CANDIDATES:
+            try:
+                outputs = qwen4_fused_gdn_decode(
+                    qkv,
+                    z,
+                    gates,
+                    gates,
+                    conv_state,
+                    conv_weight,
+                    A_log,
+                    vector,
+                    recurrent_state,
+                    norm_weight,
+                    1.0e-6,
+                    threadgroup_y=threadgroup_y,
+                )
+                mx.eval(*outputs)
+                _PROBED_THREADGROUP_Y = threadgroup_y
+                break
+            except ValueError as exc:
+                if "threads per threadgroup" in str(exc):
+                    continue
+                logger.info("Qwen4 fused GDN probe failed: %s", exc)
+                break
+            except RuntimeError as exc:
+                logger.info(
+                    "Qwen4 fused GDN threadgroup_y=%d is unavailable: %s",
+                    threadgroup_y,
+                    exc,
+                )
                 continue
-            logger.info("Qwen4 fused GDN probe failed: %s", exc)
-            break
-        except RuntimeError as exc:
-            logger.info("Qwen4 fused GDN kernel is unavailable: %s", exc)
-            break
-    return None
+        _PROBE_COMPLETE = True
+        return _PROBED_THREADGROUP_Y
 
 
 __all__ = [

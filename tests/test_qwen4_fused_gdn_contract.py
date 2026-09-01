@@ -1,4 +1,6 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -84,6 +86,69 @@ class Identity:
 
 
 class TestFusedGdnAdmission(unittest.TestCase):
+    def test_concurrent_probe_publishes_only_after_initialization(self):
+        entered = Event()
+        release = Event()
+        calls = 0
+
+        def blocking_kernel(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return (object(), object(), object())
+
+        with patch.object(
+            qwen4_fused_gdn, "_PROBE_COMPLETE", False
+        ), patch.object(
+            qwen4_fused_gdn, "_PROBED_THREADGROUP_Y", None
+        ), patch.object(
+            qwen4_fused_gdn, "_PROBE_LOCK", Lock()
+        ), patch.object(
+            qwen4_fused_gdn, "fused_gdn_runtime_supported", return_value=True
+        ), patch.object(
+            qwen4_fused_gdn,
+            "qwen4_fused_gdn_decode",
+            side_effect=blocking_kernel,
+        ), patch.object(qwen4_fused_gdn.mx, "eval"), ThreadPoolExecutor(
+            max_workers=2
+        ) as pool:
+            first = pool.submit(
+                qwen4_fused_gdn.probe_qwen4_fused_gdn_decode, mx.bfloat16
+            )
+            self.assertTrue(entered.wait(timeout=5))
+            second = pool.submit(
+                qwen4_fused_gdn.probe_qwen4_fused_gdn_decode, mx.bfloat16
+            )
+            release.set()
+            self.assertEqual(first.result(timeout=5), 32)
+            self.assertEqual(second.result(timeout=5), 32)
+
+        self.assertEqual(calls, 1)
+
+    def test_probe_tries_smaller_threadgroup_after_runtime_error(self):
+        successful_outputs = (object(), object(), object())
+        with patch.object(
+            qwen4_fused_gdn, "_PROBE_COMPLETE", False
+        ), patch.object(
+            qwen4_fused_gdn, "_PROBED_THREADGROUP_Y", None
+        ), patch.object(
+            qwen4_fused_gdn, "_PROBE_LOCK", Lock()
+        ), patch.object(
+            qwen4_fused_gdn, "fused_gdn_runtime_supported", return_value=True
+        ), patch.object(
+            qwen4_fused_gdn,
+            "qwen4_fused_gdn_decode",
+            side_effect=[RuntimeError("threadgroup resources"), successful_outputs],
+        ) as execute, patch.object(qwen4_fused_gdn.mx, "eval"):
+            selected = qwen4_fused_gdn.probe_qwen4_fused_gdn_decode(mx.bfloat16)
+
+        self.assertEqual(selected, 16)
+        self.assertEqual(
+            [call.kwargs["threadgroup_y"] for call in execute.call_args_list],
+            [32, 16],
+        )
+
     def test_production_single_token_decode_is_admitted(self):
         result = admission()
         self.assertTrue(result.accepted, result.reason)
@@ -282,6 +347,36 @@ class TestFusedGdnIntegration(unittest.TestCase):
         self.assertEqual(cache.advanced, 1)
         self.assertEqual(layer.fused_gdn_decode_calls, 1)
         self.assertEqual(execute.call_args.kwargs["threadgroup_y"], 8)
+
+    def test_synchronous_dispatch_failure_preserves_cache(self):
+        layer = qwen4_exp.GatedDeltaNet(tiny_args())
+        layer.set_fused_gdn_decode_mode("fused")
+        values = production_values()
+        cache = FakeCache(values["conv_state"], values["recurrent_state"])
+        accepted = qwen4_fused_gdn.FusedGdnAdmission(True, "eligible")
+        with patch.object(
+            qwen4_exp, "admit_qwen4_fused_gdn_decode", return_value=accepted
+        ), patch.object(
+            qwen4_exp, "fused_gdn_runtime_supported", return_value=True
+        ), patch.object(
+            qwen4_exp, "probe_qwen4_fused_gdn_decode", return_value=8
+        ), patch.object(
+            qwen4_exp,
+            "qwen4_fused_gdn_decode",
+            side_effect=RuntimeError("dispatch rejected"),
+        ):
+            result = layer._try_fused_decode(
+                values["qkv"], values["z"], values["b"], values["a"], None, cache
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(cache[0], values["conv_state"])
+        self.assertIs(cache[1], values["recurrent_state"])
+        self.assertEqual(cache.advanced, 0)
+        self.assertEqual(
+            layer.fused_gdn_decode_last_fallback,
+            "Metal kernel dispatch failed: RuntimeError",
+        )
 
 
 if __name__ == "__main__":

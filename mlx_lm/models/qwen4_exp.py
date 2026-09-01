@@ -19,6 +19,7 @@ import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
 from .cache import ArraysCache, BatchKVCache, KVCache, SinkWindowKVCache, dynamic_roll
+from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
 from .qwen4_fused_gdn import (
     admit_qwen4_fused_gdn_decode,
@@ -518,9 +519,10 @@ class RMSNormGated(nn.Module):
 
     def __call__(self, hidden_states: mx.array, gate: mx.array) -> mx.array:
         dtype = hidden_states.dtype
-        x = hidden_states.astype(mx.float32)
-        x = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        x = x * self.weight.astype(mx.float32)
+        # Qwen4-Exp materializes fused RMSNorm in the activation dtype before
+        # applying the fp32 output gate. This boundary is required for exact
+        # agreement with the released architecture and the fused Metal path.
+        x = mx.fast.rms_norm(hidden_states, self.weight, self.eps).astype(mx.float32)
         g = gate.astype(mx.float32)
         g = mx.sigmoid(g) if self.activation == "sigmoid" else nn.silu(g)
         return (x * g).astype(dtype)
@@ -545,6 +547,27 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             self, "_fused_gdn_outproj_control", mx.zeros((64,), mx.uint32)
         )
         self._fused_gdn_outproj_epoch = 0
+
+    def _normalize_qk(self, q, k):
+        """Preserve Qwen4-Exp's direct L2 materialization boundaries."""
+        q = q * mx.rsqrt(mx.sum(mx.square(q), axis=-1, keepdims=True) + 1.0e-6)
+        k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1.0e-6)
+        return q * (k.shape[-1] ** -0.5), k
+
+    def _gated_delta_update(self, q, k, v, a, b, state, mask, use_kernel):
+        return gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            mask,
+            use_kernel=use_kernel,
+            beta_input_dtype=True,
+        )
 
     def set_fused_gdn_decode_mode(self, mode: str):
         """Select the decode implementation without touching resident arrays."""
@@ -594,50 +617,55 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         if not fused_gdn_runtime_supported():
             return self._fused_gdn_fallback("Metal runtime unavailable")
 
-        threadgroup_y = probe_qwen4_fused_gdn_decode(qkv.dtype)
-        if threadgroup_y is None:
-            return self._fused_gdn_fallback("Metal kernel probe declined")
-        if self.fused_gdn_decode_mode == "fused_outproj":
-            # z has the same production B1/M1/6144 geometry and dtype as the
-            # normalized GDN vector consumed inside the fused epilogue.
-            outproj_admission = admit_qwen4_gdn_outproj(self.out_proj, z)
-            if not outproj_admission.accepted:
-                return self._fused_gdn_fallback(outproj_admission.reason)
-            self._fused_gdn_outproj_epoch += 1
-            out, conv_state, recurrent_state = qwen4_fused_gdn_decode_outproj(
-                qkv,
-                z,
-                b,
-                a,
-                cache[0],
-                self.conv1d.weight,
-                self.A_log,
-                self.dt_bias,
-                cache[1],
-                self.norm.weight,
-                self.norm.eps,
-                self.out_proj.weight,
-                self.out_proj.scales,
-                self.out_proj.biases,
-                self._fused_gdn_outproj_control,
-                self._fused_gdn_outproj_epoch,
-                output_dim=self.hidden_size,
-                output_group_size=self.out_proj.group_size,
-            )
-        else:
-            out, conv_state, recurrent_state = qwen4_fused_gdn_decode(
-                qkv,
-                z,
-                b,
-                a,
-                cache[0],
-                self.conv1d.weight,
-                self.A_log,
-                self.dt_bias,
-                cache[1],
-                self.norm.weight,
-                self.norm.eps,
-                threadgroup_y=threadgroup_y,
+        try:
+            threadgroup_y = probe_qwen4_fused_gdn_decode(qkv.dtype)
+            if threadgroup_y is None:
+                return self._fused_gdn_fallback("Metal kernel probe declined")
+            if self.fused_gdn_decode_mode == "fused_outproj":
+                # z has the same production B1/M1/6144 geometry and dtype as the
+                # normalized GDN vector consumed inside the fused epilogue.
+                outproj_admission = admit_qwen4_gdn_outproj(self.out_proj, z)
+                if not outproj_admission.accepted:
+                    return self._fused_gdn_fallback(outproj_admission.reason)
+                self._fused_gdn_outproj_epoch += 1
+                out, conv_state, recurrent_state = qwen4_fused_gdn_decode_outproj(
+                    qkv,
+                    z,
+                    b,
+                    a,
+                    cache[0],
+                    self.conv1d.weight,
+                    self.A_log,
+                    self.dt_bias,
+                    cache[1],
+                    self.norm.weight,
+                    self.norm.eps,
+                    self.out_proj.weight,
+                    self.out_proj.scales,
+                    self.out_proj.biases,
+                    self._fused_gdn_outproj_control,
+                    self._fused_gdn_outproj_epoch,
+                    output_dim=self.hidden_size,
+                    output_group_size=self.out_proj.group_size,
+                )
+            else:
+                out, conv_state, recurrent_state = qwen4_fused_gdn_decode(
+                    qkv,
+                    z,
+                    b,
+                    a,
+                    cache[0],
+                    self.conv1d.weight,
+                    self.A_log,
+                    self.dt_bias,
+                    cache[1],
+                    self.norm.weight,
+                    self.norm.eps,
+                    threadgroup_y=threadgroup_y,
+                )
+        except Exception as exc:  # noqa: BLE001 - optional fast path fails closed
+            return self._fused_gdn_fallback(
+                f"Metal kernel dispatch failed: {type(exc).__name__}"
             )
         cache[0] = conv_state
         cache[1] = recurrent_state

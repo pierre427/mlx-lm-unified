@@ -335,6 +335,23 @@ class GatedDeltaNet(nn.Module):
 
         self.sharding_group = None
 
+    def _normalize_qk(self, q, k):
+        return normalize_gdn_qk(q, k)
+
+    def _gated_delta_update(self, q, k, v, a, b, state, mask, use_kernel):
+        return gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            mask,
+            use_kernel=use_kernel,
+        )
+
     def _input_projections(self, inputs: mx.array):
         if not hasattr(self, "in_proj_fused"):
             return (
@@ -423,7 +440,7 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
-        q, k = normalize_gdn_qk(q, k)
+        q, k = self._normalize_qk(q, k)
 
         # Gate on the geometry being describable per row, not on it being
         # unpadded: a right-padded speculative slab is exactly the case that
@@ -454,14 +471,12 @@ class GatedDeltaNet(nn.Module):
             def _rollback(
                 m, q=q, k=k, v=v, a=a, b=b, S0=state, ci=conv_input, nk=n_keep
             ):
-                _, s_m = gated_delta_update(
+                _, s_m = self._gated_delta_update(
                     q[:, :m],
                     k[:, :m],
                     v[:, :m],
                     a[:, :m],
                     b[:, :m],
-                    self.A_log,
-                    self.dt_bias,
                     S0,
                     None,
                     use_kernel,
@@ -470,17 +485,15 @@ class GatedDeltaNet(nn.Module):
 
             cache.record_rollback(S, _rollback, [conv_state, state])
 
-        out, state = gated_delta_update(
+        out, state = self._gated_delta_update(
             q,
             k,
             v,
             a,
             b,
-            self.A_log,
-            self.dt_bias,
             state,
             mask,
-            use_kernel=not self.training,
+            not self.training,
         )
 
         if cache is not None:

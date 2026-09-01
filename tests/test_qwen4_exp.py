@@ -6,6 +6,7 @@ from dataclasses import replace
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 # mlx >= 0.32 runs fp32 GEMMs at TF32 precision on M5 unless this is 0, while
 # M=1 gemv shapes stay exact -- so a batched row (GEMM) and the same sequence
@@ -2027,6 +2028,51 @@ class TestRaggedBatchRecurrentState(unittest.TestCase):
                 int(want[0, -1].argmax()),
                 f"row {row}: argmax differs",
             )
+
+
+class TestQwen4GdnRoundingBoundaries(unittest.TestCase):
+    def setUp(self):
+        self.previous_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.set_default_device(self.previous_device)
+
+    def test_qk_uses_direct_l2_materialization(self):
+        layer = qwen4_exp_module.GatedDeltaNet(tiny_args())
+        q = (mx.arange(64).reshape(1, 1, 1, 64) / 127 - 0.25).astype(mx.bfloat16)
+        k = (mx.arange(64).reshape(1, 1, 1, 64) / 91 - 0.5).astype(mx.bfloat16)
+        actual_q, actual_k = layer._normalize_qk(q, k)
+        expected_q = q * mx.rsqrt(mx.sum(mx.square(q), axis=-1, keepdims=True) + 1e-6)
+        expected_k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1e-6)
+        expected_q = expected_q * (64**-0.5)
+        mx.eval(actual_q, actual_k, expected_q, expected_k)
+        self.assertTrue(mx.array_equal(actual_q, expected_q).item())
+        self.assertTrue(mx.array_equal(actual_k, expected_k).item())
+
+    def test_beta_requests_activation_dtype_sigmoid(self):
+        layer = qwen4_exp_module.GatedDeltaNet(tiny_args())
+        values = [mx.zeros((1,), dtype=mx.bfloat16) for _ in range(5)]
+        state = mx.zeros((1,), dtype=mx.float32)
+        with mock.patch.object(
+            qwen4_exp_module,
+            "gated_delta_update",
+            return_value=(object(), object()),
+        ) as update:
+            layer._gated_delta_update(*values, state, None, False)
+        self.assertTrue(update.call_args.kwargs["beta_input_dtype"])
+
+    def test_gated_rmsnorm_materializes_before_fp32_gate(self):
+        norm = qwen4_exp_module.RMSNormGated(8, 1e-6, "sigmoid")
+        hidden = (mx.arange(16).reshape(1, 2, 8) / 13 - 0.4).astype(mx.bfloat16)
+        gate = (mx.arange(16).reshape(1, 2, 8) / 17 - 0.3).astype(mx.bfloat16)
+        actual = norm(hidden, gate)
+        expected = (
+            mx.fast.rms_norm(hidden, norm.weight, norm.eps).astype(mx.float32)
+            * mx.sigmoid(gate.astype(mx.float32))
+        ).astype(mx.bfloat16)
+        mx.eval(actual, expected)
+        self.assertTrue(mx.array_equal(actual, expected).item())
 
 
 if __name__ == "__main__":
