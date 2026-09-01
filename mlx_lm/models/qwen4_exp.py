@@ -43,6 +43,12 @@ from .qwen4_qsa_nax import (
     nax_kernel_available,
     nax_qsa_attention,
 )
+from .qwen4_qsa_stage1 import (
+    qsa_stage1_kernel_cache_info,
+    qsa_stage1_score_producer,
+    qsa_stage1_select,
+    qsa_stage1_supported,
+)
 from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 from . import qwen3_next
@@ -215,6 +221,20 @@ _QSA_NAX_DECODE = _env_flag("MLX_QWEN4_QSA_NAX_DECODE")
 _QSA_NAX_DECODE_STATS_LOCK = threading.Lock()
 _QSA_NAX_DECODE_STATS = Counter()
 _QSA_NAX_DECODE_LAST_DECISION = None
+
+# This fuses FP32 scoring, causal block admission, and exact K=512 selection.
+# Unset/``auto`` admits only the measured long-context envelope. Explicit 0 is
+# the hard-off escape hatch. It stays independent from the stage-two NAX switch.
+_QSA_STAGE1_KERNEL = _env_auto_flag("MLX_QWEN4_QSA_STAGE1_KERNEL")
+_QSA_STAGE1_MIN_QUERY = int(
+    os.environ.get("MLX_QWEN4_QSA_STAGE1_MIN_QUERY", "64")
+)
+_QSA_STAGE1_MIN_PHYSICAL_KV = int(
+    os.environ.get("MLX_QWEN4_QSA_STAGE1_MIN_PHYSICAL_KV", "65536")
+)
+_QSA_STAGE1_STATS_LOCK = threading.Lock()
+_QSA_STAGE1_STATS = Counter()
+_QSA_STAGE1_LAST_DECISION = None
 
 # Minimum query length for the kernel to engage. It tiles M by query heads, so
 # it needs many tokens to amortize its launch: it wins on the 512-wide prefill
@@ -398,6 +418,57 @@ def set_qwen4_qsa_nax_decode(enabled: bool) -> bool:
     global _QSA_NAX_DECODE
     _QSA_NAX_DECODE = bool(enabled)
     return _QSA_NAX_DECODE
+
+
+def _record_qsa_stage1(
+    *,
+    engaged: bool,
+    reason: str,
+    batch: int,
+    query_width: int,
+    blocks: int,
+) -> None:
+    global _QSA_STAGE1_LAST_DECISION
+    receipt = {
+        "engaged": engaged,
+        "reason": reason,
+        "batch": int(batch),
+        "query_width": int(query_width),
+        "blocks": int(blocks),
+    }
+    with _QSA_STAGE1_STATS_LOCK:
+        _QSA_STAGE1_STATS[reason] += 1
+        _QSA_STAGE1_LAST_DECISION = receipt
+
+
+def qsa_stage1_status(*, reset: bool = False) -> dict[str, Any]:
+    """Return bounded stage-one engagement and template-cache evidence."""
+
+    global _QSA_STAGE1_LAST_DECISION
+    with _QSA_STAGE1_STATS_LOCK:
+        cache = qsa_stage1_kernel_cache_info()
+        report = {
+            "enabled": _QSA_STAGE1_KERNEL is not False,
+            "mode": (
+                "auto"
+                if _QSA_STAGE1_KERNEL is None
+                else "on"
+                if _QSA_STAGE1_KERNEL
+                else "off"
+            ),
+            "min_query_width": _QSA_STAGE1_MIN_QUERY,
+            "min_physical_kv": _QSA_STAGE1_MIN_PHYSICAL_KV,
+            "counts": dict(_QSA_STAGE1_STATS),
+            "last_decision": _QSA_STAGE1_LAST_DECISION,
+            "kernel_templates": {
+                "current": cache.currsize,
+                "maximum": cache.maxsize,
+            },
+        }
+        if reset:
+            _QSA_STAGE1_STATS.clear()
+            _QSA_STAGE1_LAST_DECISION = None
+    return report
 
 
 def _table_matmul(table, x: mx.array) -> mx.array:
@@ -3121,13 +3192,53 @@ class QSAIndexer(nn.Module):
             pooled = self._pooled_keys(
                 all_raw, n_blocks, starts, cache, length, left_pad
             )
-            scores = mx.einsum(
-                "blhd,bnd->blnh", q.astype(mx.float32), pooled.astype(mx.float32)
-            )
-            scores = mx.sum(mx.maximum(scores, 0), axis=-1) / math.sqrt(self.head_dim)
-            scores = mx.where(valid_blocks, scores, -mx.inf)
             k = min(self.block_topk, n_blocks)
-            selected = mx.argpartition(scores, kth=n_blocks - k, axis=-1)[..., -k:]
+            stage1_reason = "disabled"
+            stage1_engaged = False
+            if _QSA_STAGE1_KERNEL is not False:
+                if length < _QSA_STAGE1_MIN_QUERY:
+                    stage1_reason = "query_below_min"
+                elif n_blocks * self.compress_ratio < _QSA_STAGE1_MIN_PHYSICAL_KV:
+                    stage1_reason = "context_below_min"
+                elif qsa_stage1_supported(
+                    q,
+                    pooled,
+                    q_pos,
+                    block_topk=self.block_topk,
+                    compress_ratio=self.compress_ratio,
+                ):
+                    selected = qsa_stage1_select(
+                        q,
+                        pooled,
+                        q_pos,
+                        block_topk=self.block_topk,
+                        compress_ratio=self.compress_ratio,
+                    )
+                    stage1_reason = f"engaged_{qsa_stage1_score_producer(q, pooled)}"
+                    stage1_engaged = True
+                else:
+                    stage1_reason = "unsupported_geometry"
+            if not stage1_engaged:
+                scores = mx.einsum(
+                    "blhd,bnd->blnh",
+                    q.astype(mx.float32),
+                    pooled.astype(mx.float32),
+                )
+                scores = mx.sum(mx.maximum(scores, 0), axis=-1) / math.sqrt(
+                    self.head_dim
+                )
+                scores = mx.where(valid_blocks, scores, -mx.inf)
+                selected = mx.argpartition(
+                    scores, kth=n_blocks - k, axis=-1
+                )[..., -k:]
+            if length >= _QSA_STAGE1_MIN_QUERY:
+                _record_qsa_stage1(
+                    engaged=stage1_engaged,
+                    reason=stage1_reason,
+                    batch=batch,
+                    query_width=length,
+                    blocks=n_blocks,
+                )
             if cache is not None and getattr(cache, "_mtp_share_topk", False):
                 shared = (
                     cache.last_valid_query(selected)

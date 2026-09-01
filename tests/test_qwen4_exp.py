@@ -2407,6 +2407,40 @@ class TestQSASelectionObject(unittest.TestCase):
             tiny_args(ple_layer_ids=[], layer_types=["full_attention"] * 4)
         )
 
+    def test_native_stage1_reaches_model_path_without_changing_logits(self):
+        model = self._model()
+        tokens = mx.array([list(range(1, 33))], dtype=mx.int32)
+        previous_min = qwen4_exp_module._QSA_STAGE1_MIN_QUERY
+        previous_context = qwen4_exp_module._QSA_STAGE1_MIN_PHYSICAL_KV
+        qwen4_exp_module.qsa_stage1_status(reset=True)
+        try:
+            qwen4_exp_module._QSA_STAGE1_MIN_QUERY = 1
+            qwen4_exp_module._QSA_STAGE1_MIN_PHYSICAL_KV = 1
+            with lever_flag("_QSA_STAGE1_KERNEL", False):
+                eager = model(tokens, cache=model.make_cache())
+                mx.eval(eager)
+            with lever_flag("_QSA_STAGE1_KERNEL", None):
+                native = model(tokens, cache=model.make_cache())
+                mx.eval(native)
+            np.testing.assert_array_equal(np.asarray(native), np.asarray(eager))
+            status = qwen4_exp_module.qsa_stage1_status()
+            self.assertEqual(status["mode"], "auto")
+            self.assertTrue(status["enabled"])
+            engaged = sum(
+                count
+                for reason, count in status["counts"].items()
+                if reason.startswith("engaged_")
+            )
+            self.assertGreater(engaged, 0)
+            self.assertLessEqual(
+                status["kernel_templates"]["current"],
+                status["kernel_templates"]["maximum"],
+            )
+        finally:
+            qwen4_exp_module._QSA_STAGE1_MIN_QUERY = previous_min
+            qwen4_exp_module._QSA_STAGE1_MIN_PHYSICAL_KV = previous_context
+            qwen4_exp_module.qsa_stage1_status(reset=True)
+
     @contextmanager
     def _selections(self):
         """Collect every ``QSASelection`` the indexer returns, in call order."""
