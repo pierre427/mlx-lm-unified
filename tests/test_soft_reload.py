@@ -250,6 +250,29 @@ class TestWhitelist(unittest.TestCase):
         self.assertTrue(fake._LEVER)
         self.assertFalse(hasattr(cli_args, "_LEVER"))
 
+    def test_qwen4_nax_lever_accepts_auto_and_boolean_modes(self):
+        from mlx_lm.models import qwen4_exp
+
+        cli_args = make_cli_args()
+        original = qwen4_exp._QSA_NAX_KERNEL
+        try:
+            qwen4_exp._QSA_NAX_KERNEL = False
+            plan = plan_soft_reload(cli_args, {"qwen4_qsa_nax_kernel": "auto"})
+            changes = apply_soft_reload(cli_args, plan)
+            self.assertEqual(
+                changes,
+                {"qwen4_qsa_nax_kernel": {"old": False, "new": None}},
+            )
+            self.assertIsNone(qwen4_exp._QSA_NAX_KERNEL)
+
+            plan = plan_soft_reload(cli_args, {"qwen4_qsa_nax_kernel": True})
+            apply_soft_reload(cli_args, plan)
+            self.assertTrue(qwen4_exp._QSA_NAX_KERNEL)
+            with self.assertRaisesRegex(SoftReloadError, "expected a boolean"):
+                plan_soft_reload(cli_args, {"qwen4_qsa_nax_kernel": "sometimes"})
+        finally:
+            qwen4_exp._QSA_NAX_KERNEL = original
+
 
 class TestHardTierRefusal(unittest.TestCase):
     def test_model_path_is_refused_with_a_restart_message(self):
@@ -619,6 +642,12 @@ class TestAdminRoutesOverHTTP(unittest.TestCase):
         self.assertTrue(readback.json()["effective_config"]["self_mtp"])
         # The completion routes must be unaffected by the new admin paths.
         self.assertEqual(requests.get(self.base + "/health").status_code, 200)
+        nax_status = requests.get(
+            self.base + "/v1/status/qwen4-qsa-nax"
+        )
+        self.assertEqual(nax_status.status_code, 200)
+        self.assertIn(nax_status.json()["mode"], {"auto", "on", "off"})
+        self.assertEqual(nax_status.json()["auto_min_physical_kv"], 16_384)
         self.assertEqual(requests.get(self.base + "/v1/nope").status_code, 404)
 
 

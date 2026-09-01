@@ -6,6 +6,7 @@ from dataclasses import replace
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 # mlx >= 0.32 runs fp32 GEMMs at TF32 precision on M5 unless this is 0, while
 # M=1 gemv shapes stay exact -- so a batched row (GEMM) and the same sequence
@@ -2027,6 +2028,124 @@ class TestRaggedBatchRecurrentState(unittest.TestCase):
                 int(want[0, -1].argmax()),
                 f"row {row}: argmax differs",
             )
+
+
+class TestQSANAXAdmission(unittest.TestCase):
+    def setUp(self):
+        self.mode = qwen4_exp_module._QSA_NAX_KERNEL
+        self.min_query = qwen4_exp_module._QSA_NAX_MIN_QUERY
+        self.min_context = qwen4_exp_module._QSA_NAX_AUTO_MIN_PHYSICAL_KV
+        qwen4_exp_module._QSA_NAX_KERNEL = None
+        qwen4_exp_module._QSA_NAX_MIN_QUERY = 64
+        qwen4_exp_module._QSA_NAX_AUTO_MIN_PHYSICAL_KV = 16_384
+        qwen4_exp_module.qsa_nax_admission_status(reset=True)
+
+    def tearDown(self):
+        qwen4_exp_module._QSA_NAX_KERNEL = self.mode
+        qwen4_exp_module._QSA_NAX_MIN_QUERY = self.min_query
+        qwen4_exp_module._QSA_NAX_AUTO_MIN_PHYSICAL_KV = self.min_context
+        qwen4_exp_module.qsa_nax_admission_status(reset=True)
+
+    @staticmethod
+    def selection(**overrides):
+        values = {
+            "kind": "explicit",
+            "batch": 1,
+            "length": 512,
+            "physical_width": 16_384,
+            "left_padding": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def decide(self, selection=None, **overrides):
+        values = {
+            "training": False,
+            "layout_ok": True,
+            "device_supported": True,
+            "kernel_available": True,
+        }
+        values.update(overrides)
+        return qwen4_exp_module.decide_qsa_nax_admission(
+            selection or self.selection(), **values
+        )
+
+    def test_unset_environment_defaults_to_guarded_auto(self):
+        name = "MLX_QWEN4_QSA_NAX_KERNEL_TEST_UNSET"
+        previous = environ.pop(name, None)
+        try:
+            self.assertIsNone(qwen4_exp_module._env_auto_flag(name))
+        finally:
+            if previous is not None:
+                environ[name] = previous
+
+    def test_auto_admits_only_measured_single_user_envelope(self):
+        decision = self.decide()
+        self.assertTrue(decision.engage)
+        self.assertEqual(decision.reason, "engaged_auto")
+
+        refusals = (
+            (self.selection(batch=2), {}, "auto_batch_gt_one"),
+            (
+                self.selection(physical_width=16_383),
+                {},
+                "auto_context_below_crossover",
+            ),
+            (self.selection(length=63), {}, "query_below_min"),
+            (self.selection(kind="mask_only"), {}, "selection_mask_only"),
+            (self.selection(), {"training": True}, "training"),
+            (self.selection(), {"layout_ok": False}, "unsupported_layout"),
+            (
+                self.selection(),
+                {"device_supported": False},
+                "unsupported_device",
+            ),
+            (
+                self.selection(),
+                {"kernel_available": False},
+                "kernel_unavailable",
+            ),
+        )
+        for selection, kwargs, reason in refusals:
+            with self.subTest(reason=reason):
+                decision = self.decide(selection, **kwargs)
+                self.assertFalse(decision.engage)
+                self.assertEqual(decision.reason, reason)
+
+        # The serving B1 cache publishes a zero-valued left-padding array even
+        # when no row is padded. Presence is therefore not a padding oracle;
+        # B1 is the auto gate, and padded math has an independent correctness
+        # receipt.
+        self.assertTrue(self.decide(self.selection(left_padding=object())).engage)
+
+    def test_explicit_modes_preserve_hard_off_and_checked_on(self):
+        qwen4_exp_module._QSA_NAX_KERNEL = False
+        self.assertEqual(self.decide().reason, "explicit_off")
+
+        qwen4_exp_module._QSA_NAX_KERNEL = True
+        wide_batch = self.selection(
+            batch=4, left_padding=object(), physical_width=1024
+        )
+        decision = self.decide(wide_batch)
+        self.assertTrue(decision.engage)
+        self.assertEqual(decision.reason, "engaged_on")
+        self.assertEqual(
+            self.decide(wide_batch, device_supported=False).reason,
+            "unsupported_device",
+        )
+
+    def test_status_receipt_is_bounded_and_resettable(self):
+        selection = self.selection()
+        decision = self.decide(selection)
+        qwen4_exp_module._record_qsa_nax_admission(selection, decision)
+        status = qwen4_exp_module.qsa_nax_admission_status()
+        self.assertEqual(status["mode"], "auto")
+        self.assertEqual(status["counts"], {"engaged_auto": 1})
+        self.assertEqual(status["last_decision"]["physical_kv"], 16_384)
+        qwen4_exp_module.qsa_nax_admission_status(reset=True)
+        self.assertEqual(
+            qwen4_exp_module.qsa_nax_admission_status()["counts"], {}
+        )
 
 
 if __name__ == "__main__":
