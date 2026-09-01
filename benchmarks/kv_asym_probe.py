@@ -82,8 +82,10 @@ def cache_nbytes(cache):
 
 def make_eval_cache(model, prefix, key_bits, value_bits, group_size=64):
     cache = make_prompt_cache(model)
-    model(mx.array(prefix)[None], cache=cache)
-    mx.eval([c.state for c in cache])
+    # chunked prefill: one-shot long forwards corrupt quantized-MoE KV (mlx#3856)
+    for s in range(0, len(prefix), 2048):
+        model(mx.array(prefix[s : s + 2048])[None], cache=cache)
+        mx.eval([c.state for c in cache])
     source_dtype = str(cache[0].keys.dtype)
     if key_bits is not None:
         if not all(isinstance(c, KVCache) for c in cache):
