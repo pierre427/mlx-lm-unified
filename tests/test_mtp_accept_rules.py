@@ -273,17 +273,21 @@ class TestAcceptRuleEndToEnd(unittest.TestCase):
                 )
             ]
 
+        prompt = mx.array(
+            [token for token in self.prompt.tolist() if token != close],
+            dtype=mx.uint32,
+        )
         n = 18
         plain = [
             int(t)
             for t, _ in generate_step(
-                self.prompt, self.model, max_tokens=n, logits_processors=procs()
+                prompt, self.model, max_tokens=n, logits_processors=procs()
             )
         ]
         spec = [
             int(t)
             for t, _lp, _fd in self_mtp_generate_step(
-                self.prompt,
+                prompt,
                 self.model,
                 num_draft=2,
                 max_tokens=n,
