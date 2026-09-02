@@ -54,6 +54,13 @@ def sha256(path):
 
 
 def write_report(report, output):
+    import mlx.core as mx
+
+    version = str(getattr(mx, "__version__", "unknown"))
+    report["manifest"]["mlx_version"] = version
+    report["manifest"]["mlx_build_hash"] = (
+        version.rsplit("+", 1)[1] if "+" in version else None
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"

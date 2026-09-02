@@ -744,7 +744,7 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
     "qwen4_qsa_indexed": MutableKey(
         "module",
         "_QSA_INDEXED_ENABLED",
-        _reload_flag,
+        _reload_auto_flag,
         "mlx_lm.models.qwen4_qsa_indexed",
     ),
     "qwen4_ple_vector_shift": MutableKey(

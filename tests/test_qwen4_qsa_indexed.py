@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import hashlib
 import io
 import json
 import os
@@ -106,6 +107,26 @@ def _real_bf16_fixture():
         block_size=4,
         physical_width=width,
         causal_mask=None,
+    )
+    return arrays["q"], arrays["k"], arrays["v"], compact
+
+
+def _real_bf16_m3_fixture():
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "qwen4_qsa_indexed_real_bf16_m3.safetensors"
+    )
+    arrays = mx.load(str(path))
+    compact = QSACompactBlocks(
+        block_ids=arrays["ids"],
+        block_counts=arrays["n_sel"].astype(mx.int32),
+        tail_start=arrays["tail_start"],
+        tail_stop=arrays["tail_stop"],
+        left_padding=arrays["left_pad"],
+        block_size=4,
+        physical_width=int(arrays["total"].item()),
+        causal_mask=arrays["causal_mask"],
     )
     return arrays["q"], arrays["k"], arrays["v"], compact
 
@@ -247,6 +268,38 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertEqual(reference.shape, gather.shape)
         self.assertTrue(bool(mx.all(mx.isfinite(reference)).item()))
 
+    def test_real_m3_fixture_mirror_matches_gather_on_cpu(self):
+        q, k, v, compact = _real_bf16_m3_fixture()
+        self.assertEqual(q.shape, (1, 12, 3, 256))
+        self.assertEqual(k.shape, (1, 1, 1031, 256))
+        mirror = indexed.qwen4_qsa_indexed_reference(
+            q, k, v, compact, scale=256**-0.5, splits=8
+        )
+        gather = _gather_qsa_attention(
+            q, k, v, compact, scale=256**-0.5, tile_rows=1
+        )
+        mx.eval(mirror, gather)
+        np.testing.assert_allclose(
+            np.asarray(mirror.astype(mx.float32)),
+            np.asarray(gather.astype(mx.float32)),
+            rtol=0.0,
+            atol=1.0 / 128.0,
+        )
+
+    def test_reviewed_sdpa_header_hash_matches_installed_mlx(self):
+        header = (
+            Path(mx.__file__).resolve().parent
+            / "include"
+            / "mlx"
+            / "backend"
+            / "metal"
+            / "kernels"
+            / "sdpa_vector.h"
+        )
+        self.assertTrue(header.is_file(), f"MLX wheel does not ship {header}")
+        digest = hashlib.sha256(header.read_bytes()).hexdigest()
+        self.assertEqual(digest, indexed._SDPA_VECTOR_HEADER_SHA256)
+
     @unittest.skipUnless(
         os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
         "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
@@ -271,6 +324,30 @@ class TestQSAIndexedReference(unittest.TestCase):
                     bool(mx.array_equal(output, gather).item()),
                     f"real fixture differs from gather at S={splits}",
                 )
+        finally:
+            mx.set_default_device(device)
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
+    )
+    def test_real_m3_fixture_kernel_mirror_and_gather_are_bit_exact(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            q, k, v, compact = _real_bf16_m3_fixture()
+            kernel = indexed.qwen4_qsa_indexed_attention(
+                q, k, v, compact, scale=256**-0.5, splits=8
+            )
+            mirror = indexed.qwen4_qsa_indexed_reference(
+                q, k, v, compact, scale=256**-0.5, splits=8
+            )
+            gather = _gather_qsa_attention(
+                q, k, v, compact, scale=256**-0.5, tile_rows=1
+            )
+            mx.eval(kernel, mirror, gather)
+            self.assertTrue(bool(mx.array_equal(kernel, mirror).item()))
+            self.assertTrue(bool(mx.array_equal(mirror, gather).item()))
         finally:
             mx.set_default_device(device)
 
@@ -487,6 +564,59 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         ):
             self.assertEqual(self.decide(), (False, "kernel_unavailable"))
 
+    def test_auto_admission_mode_matrix(self):
+        with (
+            mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", None),
+            mock.patch.object(indexed, "indexed_kernel_available", return_value=True),
+        ):
+            cases = [
+                (1, 65_535, False, "auto_context_out_of_range"),
+                (1, 65_536, True, "engaged"),
+                (2, 16_383, False, "auto_context_out_of_range"),
+                (2, 16_384, True, "engaged"),
+                (3, 16_384, True, "engaged"),
+                (9, 65_536, False, "width_out_of_range"),
+            ]
+            for length, context, engage, reason in cases:
+                with self.subTest(length=length, context=context):
+                    self.assertEqual(
+                        self.decide(
+                            selection=self.selection(physical_width=context),
+                            length=length,
+                        ),
+                        (engage, reason),
+                    )
+
+    def test_unverified_mlx_build_falls_back_with_specific_receipt(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        expected = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=1
+        )
+        indexed.qsa_indexed_status(reset=True)
+        with (
+            mock.patch.object(indexed, "_EXACT_MLX_BUILDS", frozenset({"wrong"})),
+            mock.patch.dict(
+                os.environ,
+                {"MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX": ""},
+            ),
+        ):
+            actual = qwen4_exp._indexed_qsa_attention_or_gather(
+                q,
+                k,
+                v,
+                compact,
+                scale=8**-0.5,
+                splits=4,
+                tile_rows=1,
+            )
+        mx.eval(actual, expected)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        self.assertEqual(
+            indexed.qsa_indexed_status()["counts"]["mlx_build_unverified"], 1
+        )
+        self.assertEqual(indexed.qsa_indexed_status()["fallbacks"], 1)
+
     def test_runtime_refusal_reasons_and_width_buckets_are_receipted(self):
         indexed.qsa_indexed_status(reset=True)
         for reason, width in (
@@ -571,9 +701,32 @@ class TestQSAIndexedServer(unittest.TestCase):
             body = json.loads(handler.wfile.getvalue())
             self.assertEqual(handler.status, 200)
             self.assertTrue(body["enabled"])
+            self.assertEqual(body["mode"], "on")
+            self.assertEqual(body["mlx_version"], mx.__version__)
+            self.assertEqual(body["mlx_build_hash"], "334084ce9")
+            self.assertEqual(body["auto_min_context_m3"], 16_384)
+            self.assertEqual(body["auto_min_context_m1"], 65_536)
             self.assertIn("query_width_counts", body)
         finally:
             indexed.set_qwen4_qsa_indexed(original)
+
+
+class TestQSAIndexedGate(unittest.TestCase):
+    def test_phase3_raises_when_any_gather_comparison_is_not_exact(self):
+        from benchmarks import qwen4_qsa_indexed_gate as gate
+
+        def zeros(q, *_args, **_kwargs):
+            return mx.zeros(q.shape, dtype=q.dtype)
+
+        def ones(q, *_args, **_kwargs):
+            return mx.ones(q.shape, dtype=q.dtype)
+
+        with (
+            mock.patch.object(indexed, "qwen4_qsa_indexed_attention", zeros),
+            mock.patch.object(qwen4_exp, "_gather_qsa_attention", ones),
+        ):
+            with self.assertRaisesRegex(gate.GateFailure, '"asserted": true'):
+                gate.phase3_gather(mx)
 
 
 if __name__ == "__main__":

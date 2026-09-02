@@ -2944,8 +2944,8 @@ def _indexed_qsa_attention_or_gather(
         return qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=scale, splits=splits
         )
-    except QSAIndexedProbeDeclined:
-        reason = "probe_declined"
+    except QSAIndexedProbeDeclined as error:
+        reason = error.reason
     except Exception:
         reason = "dispatch_raised"
     record_qsa_indexed_receipt(
@@ -3014,9 +3014,9 @@ def _capture_qsa_indexed_comparison(
         indexed_out = qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=scale, splits=splits
         )
-    except QSAIndexedProbeDeclined:
+    except QSAIndexedProbeDeclined as error:
         indexed_out = None
-        fallback_reason = "probe_declined"
+        fallback_reason = error.reason
     except Exception:
         indexed_out = None
         fallback_reason = "dispatch_raised"

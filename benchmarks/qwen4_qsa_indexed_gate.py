@@ -481,7 +481,16 @@ def phase3_gather(mx):
         )
         del q, k, v, kernel, gather
         mx.clear_cache()
-    return {"phase": 3, "status": "PASS", "asserted": False, "rows": rows}
+    passed = all(row["max_abs"] == 0.0 for row in rows)
+    result = {
+        "phase": 3,
+        "status": "PASS" if passed else "FAIL",
+        "asserted": True,
+        "rows": rows,
+    }
+    if not passed:
+        raise GateFailure(3, json.dumps(result, sort_keys=True))
+    return result
 
 
 def corpus_tokens(tokenizer, context):
@@ -1124,6 +1133,13 @@ def phase5_timing(
 
 
 def write_artifacts(report, output):
+    import mlx.core as mx
+
+    version = str(getattr(mx, "__version__", "unknown"))
+    report["manifest"]["mlx_version"] = version
+    report["manifest"]["mlx_build_hash"] = (
+        version.rsplit("+", 1)[1] if "+" in version else None
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"

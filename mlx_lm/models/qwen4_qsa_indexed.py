@@ -19,6 +19,10 @@ _BLOCK_SIZE = 4
 _CHUNK_SLOTS = 64
 _CHUNK_TOKENS = _CHUNK_SLOTS * _BLOCK_SIZE
 _SDPA_BLOCKS = 128
+_EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
+_SDPA_VECTOR_HEADER_SHA256 = (
+    "2100a4d1eaa8a524c5147c82c771cad75197495c72daffa03e7ea4c259aebf10"
+)
 
 
 def _env_flag(name: str) -> bool:
@@ -40,12 +44,46 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return value
 
 
-_QSA_INDEXED_ENABLED = _env_flag("MLX_QWEN4_QSA_INDEXED")
+def _env_mode(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value == "auto":
+        return None
+    if value in {"1", "true", "on", "yes"}:
+        return True
+    if value in {"0", "false", "off", "no", ""}:
+        return False
+    raise ValueError(f"{name} must be 0/off, 1/on, or auto; got {raw!r}")
+
+
+_QSA_INDEXED_ENABLED = _env_mode("MLX_QWEN4_QSA_INDEXED")
 _MIN_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_QUERY", 2, minimum=1)
 _MAX_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_QUERY", 8, minimum=1)
 _MIN_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_CONTEXT", 16384)
 _MAX_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_CONTEXT", 0)
+_AUTO_MIN_CONTEXT_M3 = _env_int(
+    "MLX_QWEN4_QSA_INDEXED_AUTO_MIN_CONTEXT_M3", 16384
+)
+_AUTO_MIN_CONTEXT_M1 = _env_int(
+    "MLX_QWEN4_QSA_INDEXED_AUTO_MIN_CONTEXT_M1", 65536
+)
 _SPLITS_OVERRIDE = _env_int("MLX_QWEN4_QSA_INDEXED_SPLITS", 0)
+
+
+def _qsa_indexed_mode() -> str:
+    if _QSA_INDEXED_ENABLED is None:
+        return "auto"
+    return "on" if _QSA_INDEXED_ENABLED else "off"
+
+
+def _mlx_build_hash() -> str | None:
+    version = str(getattr(mx, "__version__", "unknown"))
+    marker = version.rsplit("+", 1)
+    if len(marker) == 2 and marker[1]:
+        return marker[1]
+    return None
 
 
 def indexed_splits_for(u_width: int) -> int:
@@ -117,7 +155,8 @@ def decide_qsa_indexed_admission(
 ) -> tuple[bool, str]:
     """Resolve the indexed route without evaluating arrays or changing state."""
 
-    if not _QSA_INDEXED_ENABLED:
+    mode = _qsa_indexed_mode()
+    if mode == "off":
         return False, "disabled"
     if training:
         return False, "training"
@@ -126,11 +165,23 @@ def decide_qsa_indexed_admission(
     topk = _selection_topk_width(selection)
     if topk and int(selection.n_blocks) <= topk:
         return False, "dense_by_construction"
-    if int(length) < _MIN_QUERY or int(length) > _MAX_QUERY:
-        return False, "width_out_of_range"
+    length = int(length)
     context = int(selection.physical_width)
-    if context < _MIN_CONTEXT or (_MAX_CONTEXT and context > _MAX_CONTEXT):
-        return False, "context_out_of_range"
+    if mode == "auto":
+        if length < 1 or length > _MAX_QUERY:
+            return False, "width_out_of_range"
+        threshold = (
+            _AUTO_MIN_CONTEXT_M1 if length == 1 else _AUTO_MIN_CONTEXT_M3
+        )
+        if context < threshold:
+            return False, "auto_context_out_of_range"
+        if _MAX_CONTEXT and context > _MAX_CONTEXT:
+            return False, "context_out_of_range"
+    else:
+        if length < _MIN_QUERY or length > _MAX_QUERY:
+            return False, "width_out_of_range"
+        if context < _MIN_CONTEXT or (_MAX_CONTEXT and context > _MAX_CONTEXT):
+            return False, "context_out_of_range"
     if not layout_ok:
         return False, "unsupported_layout"
     if not indexed_kernel_available():
@@ -183,7 +234,11 @@ def record_qsa_indexed_receipt(
     with _STATUS_LOCK:
         _STATUS_COUNTS[reason] += 1
         _STATUS_WIDTHS[_width_bucket(int(length))][outcome] += 1
-        if reason in {"probe_declined", "dispatch_raised"}:
+        if reason in {
+            "mlx_build_unverified",
+            "probe_declined",
+            "dispatch_raised",
+        }:
             _STATUS_FALLBACKS += 1
         if candidate is not None:
             _STATUS_CANDIDATE = tuple(candidate)
@@ -196,12 +251,27 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
     global _STATUS_CANDIDATE, _STATUS_FALLBACKS, _STATUS_LAST
     with _STATUS_LOCK:
         report = {
-            "enabled": bool(_QSA_INDEXED_ENABLED),
+            "enabled": _qsa_indexed_mode() != "off",
+            "mode": _qsa_indexed_mode(),
             "min_query_width": _MIN_QUERY,
             "max_query_width": _MAX_QUERY,
             "min_context": _MIN_CONTEXT,
             "max_context": _MAX_CONTEXT,
+            "auto_min_context_m3": _AUTO_MIN_CONTEXT_M3,
+            "auto_min_context_m1": _AUTO_MIN_CONTEXT_M1,
             "splits_override": _SPLITS_OVERRIDE,
+            "mlx_version": str(getattr(mx, "__version__", "unknown")),
+            "mlx_build_hash": _mlx_build_hash(),
+            "mlx_build_verified": (
+                str(getattr(mx, "__version__", "unknown"))
+                in _EXACT_MLX_BUILDS
+            ),
+            "mlx_build_allow_unverified": (
+                os.environ.get(
+                    "MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX"
+                )
+                == "1"
+            ),
             "counts": dict(_STATUS_COUNTS),
             "query_width_counts": {
                 key: dict(value) for key, value in _STATUS_WIDTHS.items()
@@ -223,18 +293,18 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
     return report
 
 
-def set_qwen4_qsa_indexed(enabled: bool) -> bool:
+def set_qwen4_qsa_indexed(enabled: bool | None) -> bool | None:
     """Live-toggle indexed QSA without changing resident arrays."""
 
     global _QSA_INDEXED_ENABLED
-    _QSA_INDEXED_ENABLED = bool(enabled)
+    _QSA_INDEXED_ENABLED = None if enabled is None else bool(enabled)
     return _QSA_INDEXED_ENABLED
 
 
 def qsa_indexed_enabled() -> bool:
     """Return the live indexed-QSA switch."""
 
-    return bool(_QSA_INDEXED_ENABLED)
+    return _qsa_indexed_mode() != "off"
 
 
 def _compact_token_inputs(compact):
@@ -593,6 +663,10 @@ def _combine_kernel():
 class QSAIndexedProbeDeclined(RuntimeError):
     """No candidate in the indexed Metal ladder could dispatch."""
 
+    def __init__(self, message: str, *, reason: str = "probe_declined"):
+        super().__init__(message)
+        self.reason = reason
+
 
 _PROBE_LOCK = threading.Lock()
 _PROBE_RESULTS = {}
@@ -693,6 +767,15 @@ def qwen4_qsa_indexed_attention(
 ):
     """Dispatch indexed attention with MLX SDPA's two-pass reduction tree."""
 
+    mlx_version = str(getattr(mx, "__version__", "unknown"))
+    allow_unverified = (
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX") == "1"
+    )
+    if mlx_version not in _EXACT_MLX_BUILDS and not allow_unverified:
+        raise QSAIndexedProbeDeclined(
+            f"indexed QSA exactness is unproven on mlx {mlx_version}",
+            reason="mlx_build_unverified",
+        )
     if not indexed_kernel_available():
         raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
     if q.ndim != 4 or k.ndim != 4 or k.shape != v.shape:
@@ -732,6 +815,7 @@ def qwen4_qsa_indexed_attention(
     if requested < 1 or requested > min(8, u_width):
         raise ValueError("splits must be in [1, min(8, u_width)]")
     key = (
+        mlx_version,
         str(q.dtype),
         int(q.shape[-1]),
         int(q.shape[1]),
