@@ -3137,10 +3137,10 @@ class TestQSASelectionObject(unittest.TestCase):
         self.assertTrue(all(shape[2] == 1 for shape, _tile in calls))
         self.assertTrue(all(tile == 2 for _shape, tile in calls))
 
-    def test_shipped_gather_window_admits_every_pld_verify_width(self):
-        """The default window mirrors the indexed one so PLD spans reach it."""
-        self.assertEqual(qwen4_exp_module._QSA_GATHER_MAX_QUERY, 17)
-        for width, expected in ((12, 4), (16, 4), (17, 4), (18, 0)):
+    def test_shipped_gather_window_mirrors_the_indexed_default(self):
+        """Both windows ship at 8; PLD's width-17 blocks stay off both."""
+        self.assertEqual(qwen4_exp_module._QSA_GATHER_MAX_QUERY, 8)
+        for width, expected in ((12, 0), (17, 0)):
             with self.subTest(width=width):
                 model = self._model()
                 model.eval()

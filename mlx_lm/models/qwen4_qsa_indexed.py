@@ -84,7 +84,17 @@ _MIN_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_QUERY", 2, minimum=1)
 # in ``hybrid_speculative``). At the serving profile's ``max_span=16`` the
 # measured distribution is 17 x 14, 15 x 1, 1 x 3 per 256-token generation, so
 # a bound of 16 admits one speculative forward in fifteen.
-_MAX_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_QUERY", 17, minimum=1)
+#
+# The kernel is PROVEN EXACT at every width up to 17 (kernel == gather to
+# max_abs 0.0 at B1/B2 x L in {9, 12, 16, 17} on Metal, split-invariant,
+# 48/48 device-attested), and end to end the widened path is token-identical.
+# The DEFAULT nonetheless stays 8: the composed gate of 2026-09-02 measured no
+# decode gain from widening (0.971x on the one clean 32K PLD cell, inside that
+# arm's own 6.7% spread) against +4.3 GiB peak, and it moved this window and
+# the fused GDN verify bound together, so it cannot say which lever spent the
+# memory. Widen with the env var to opt in; see
+# wiki/docs/experiments/qwen4-pld-width-levers-2026-09-02.md.
+_MAX_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_QUERY", 8, minimum=1)
 _MIN_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_CONTEXT", 16384)
 _MAX_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_CONTEXT", 0)
 _AUTO_MIN_CONTEXT_M3 = _env_int(

@@ -197,7 +197,7 @@ def _assert_verify_kernel_matches_stock(steps, threadgroup_y, blocks=6):
 
 
 @pytest.mark.parametrize(
-    "steps", [2, 3, 5, 8, 9, 16, fused_verify.MAX_VERIFY_STEPS]
+    "steps", [2, 3, 5, 8, 9, 16, fused_verify.MAX_VERIFY_WIDTH_PROVEN]
 )
 def test_real_metal_verify_matches_stock_for_every_supported_threadgroup(steps):
     supported = []

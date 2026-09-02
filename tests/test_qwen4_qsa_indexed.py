@@ -969,6 +969,9 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         with (
             mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", None),
             mock.patch.object(indexed, "indexed_kernel_available", return_value=True),
+            # The shipped default is 8; this matrix is about the window's
+            # behaviour at the widths the kernel is proven exact for.
+            mock.patch.object(indexed, "_MAX_QUERY", 17),
         ):
             cases = [
                 (1, 65_535, False, "auto_context_out_of_range"),
@@ -1097,6 +1100,20 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
         self.assertEqual(geometry["candidate"], [384, 32])
         self.assertEqual(geometry["candidate_timings_ms"]["32"], 0.4)
+
+    def test_shipped_indexed_window_is_the_gated_default(self):
+        """The gate measured no gain from widening, so the default stays 8."""
+        self.assertEqual(indexed._MAX_QUERY, 8)
+        with mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", None), \
+                mock.patch.object(
+                    indexed, "indexed_kernel_available", return_value=True
+                ):
+            self.assertEqual(
+                self.decide(
+                    selection=self.selection(physical_width=16_384), length=17
+                ),
+                (False, "width_out_of_range"),
+            )
 
     def test_env_unset_selects_guarded_auto(self):
         with mock.patch.dict(os.environ, {}, clear=True):
