@@ -294,6 +294,7 @@ class TestQSAIndexedReference(unittest.TestCase):
 
     def test_metal_kernel_object_construction_does_not_dispatch(self):
         self.assertIsNotNone(indexed._partition_kernel())
+        self.assertIsNotNone(indexed._quantized_partition_kernel())
         self.assertIsNotNone(indexed._combine_kernel())
 
     def test_real_capture_fixture_has_production_two_pass_geometry(self):
