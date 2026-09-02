@@ -383,7 +383,6 @@ def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
         for start, stop in chunks:
             token_index = physical[:, :, start:stop].reshape(batch, length, -1)
             token_valid = valid[:, :, start:stop].reshape(batch, length, -1)
-            width = int(token_index.shape[-1])
             gather_index = token_index[..., None, None]
             gathered_k = mx.take_along_axis(
                 k_by_token[:, None], gather_index, axis=2
@@ -402,19 +401,15 @@ def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
             part_m = mx.max(scores, axis=-1)
             live = mx.isfinite(part_m)
             safe_m = mx.where(live, part_m, mx.zeros_like(part_m))
-            part_l = mx.zeros_like(part_m)
-            part_o = mx.zeros((batch, length, nqh, dim), dtype=mx.float32)
-            for token in range(width):
-                probability = mx.where(
-                    head_valid[..., token],
-                    mx.exp(scores[..., token] - safe_m),
-                    mx.zeros_like(part_m),
-                )
-                part_l = part_l + probability
-                part_o = (
-                    part_o
-                    + probability[..., None] * gathered_v[..., token, :]
-                )
+            probabilities = mx.where(
+                head_valid,
+                mx.exp(scores - safe_m[..., None]),
+                mx.zeros_like(scores),
+            )
+            part_l = mx.sum(probabilities, axis=-1)
+            part_o = mx.sum(
+                probabilities[..., None] * gathered_v, axis=-2
+            )
             chunk_ms.append(part_m.transpose(0, 2, 1))
             chunk_ls.append(part_l.transpose(0, 2, 1))
             chunk_os.append(part_o.transpose(0, 2, 1, 3))

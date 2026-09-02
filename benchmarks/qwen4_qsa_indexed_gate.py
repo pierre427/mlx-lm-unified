@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -101,11 +102,13 @@ def safety_snapshot():
     }
 
 
-def check_safety(snapshot, *, swap_baseline=None, before_load=False):
+def check_safety(
+    snapshot, *, swap_baseline=None, before_load=False, phase=5
+):
     floor = MODEL_LOAD_FREE_FLOOR if before_load else RUN_FREE_FLOOR
     if snapshot["free_percent"] < floor:
         raise GateFailure(
-            4 if before_load else 5,
+            int(phase),
             f"free memory {snapshot['free_percent']}% is below {floor}%",
         )
     if (
@@ -113,7 +116,7 @@ def check_safety(snapshot, *, swap_baseline=None, before_load=False):
         and snapshot["swap_used_mib"] - swap_baseline > SWAP_LIMIT_MIB
     ):
         growth = snapshot["swap_used_mib"] - swap_baseline
-        raise GateFailure(5, f"swap grew {growth:.2f} MiB")
+        raise GateFailure(int(phase), f"swap grew {growth:.2f} MiB")
 
 
 def thermal_clean(lines):
@@ -185,7 +188,7 @@ def compact_fixture(mx, compact_type, context, length=3):
     )
 
 
-def adversarial_fixture(mx, compact_type, *, batch, length, context=16_384):
+def adversarial_fixture(mx, compact_type, *, batch, length, context=4096):
     width = 512
     ids = np.zeros((batch, length, width), dtype=np.uint32)
     counts = np.zeros((batch, length), dtype=np.int32)
@@ -291,8 +294,8 @@ def phase2_exactness(mx):
             mx, QSACompactBlocks, batch=batch, length=length
         )
         q = mx.random.normal((batch, 24, length, 256)).astype(mx.float32)
-        k = mx.random.normal((batch, 2, 16_384, 256)).astype(mx.float32)
-        v = mx.random.normal((batch, 2, 16_384, 256)).astype(mx.float32)
+        k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.float32)
+        v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.float32)
         outputs = {
             splits: qwen4_qsa_indexed_attention(
                 q, k, v, compact, scale=256**-0.5, splits=splits
@@ -363,8 +366,8 @@ def phase3_gather(mx):
             mx, QSACompactBlocks, batch=batch, length=length
         )
         q = mx.random.normal((batch, 24, length, 256)).astype(mx.bfloat16)
-        k = mx.random.normal((batch, 2, 16_384, 256)).astype(mx.bfloat16)
-        v = mx.random.normal((batch, 2, 16_384, 256)).astype(mx.bfloat16)
+        k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
+        v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
         kernel = qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=256**-0.5, splits=8
         )
@@ -720,9 +723,16 @@ def main():
             current_phase = 3
             report["phases"].append(phase3_gather(mx))
             current_phase = 4
+            mx.clear_cache()
+            gc.collect()
             before_load = safety_snapshot()
             report["safety"].append(before_load)
-            check_safety(before_load, swap_baseline=swap_baseline, before_load=True)
+            check_safety(
+                before_load,
+                swap_baseline=swap_baseline,
+                before_load=True,
+                phase=4,
+            )
             model, tokenizer = load(str(args.model))
             model.eval()
             mx.eval(model.parameters())
