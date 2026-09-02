@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from collections import Counter
 from functools import lru_cache
 from typing import Any
@@ -12,13 +13,17 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from .qwen4_qsa_nax import compact_blocks_to_kernel_inputs
+from .qwen4_qsa_nax import (
+    compact_blocks_to_kernel_inputs,
+    compact_token_validity,
+)
 
 
 _BLOCK_SIZE = 4
 _CHUNK_SLOTS = 64
 _CHUNK_TOKENS = _CHUNK_SLOTS * _BLOCK_SIZE
 _SDPA_BLOCKS = 128
+_SPLIT_CANDIDATES = (128, 64, 32, 16, 8)
 _EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
 _SDPA_VECTOR_HEADER_SHA256 = (
     "2100a4d1eaa8a524c5147c82c771cad75197495c72daffa03e7ea4c259aebf10"
@@ -87,17 +92,18 @@ def _mlx_build_hash() -> str | None:
 
 
 def indexed_splits_for(u_width: int) -> int:
-    """Return the static split count for a compact block-slot width."""
+    """Return the requested split ceiling for a compact block-slot width."""
 
     width = int(u_width)
     if width < 1:
         raise ValueError("u_width must be positive")
     requested = _SPLITS_OVERRIDE
     if requested == 0:
-        requested = min(8, max(1, math.ceil(width * _BLOCK_SIZE / 256)))
-    if width * _BLOCK_SIZE >= 512:
-        requested = max(4, requested)
-    return min(width, 8, requested)
+        requested = _SPLIT_CANDIDATES[0]
+    if requested not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    return requested
 
 
 def indexed_chunk_ranges(u_width: int) -> tuple[tuple[int, int], ...]:
@@ -119,8 +125,8 @@ def indexed_split_chunk_ranges(
 
     chunks = indexed_chunk_ranges(u_width)
     count = int(splits)
-    if count < 1 or count > min(8, int(u_width)):
-        raise ValueError("splits must be in [1, min(8, u_width)]")
+    if count < 1 or count > min(_SDPA_BLOCKS, int(u_width)):
+        raise ValueError("splits must be in [1, min(128, u_width)]")
     base, remainder = divmod(len(chunks), count)
     groups = []
     start = 0
@@ -198,7 +204,15 @@ _STATUS_WIDTHS = {
 }
 _STATUS_LAST = None
 _STATUS_CANDIDATE = None
+_STATUS_GEOMETRIES = {}
 _STATUS_FALLBACKS = 0
+_STATUS_DEVICE_PENDING = None
+_STATUS_DEVICE_PENDING_EXPECTED = 0
+_STATUS_DEVICE_PENDING_WIDTHS = Counter()
+_STATUS_DEVICE_PENDING_LAST = None
+_STATUS_DEVICE_EXPECTED = 0
+_STATUS_DEVICE_OBSERVED = 0
+_STATUS_DEVICE_MISMATCHES = 0
 
 
 def _width_bucket(width: int) -> str:
@@ -217,6 +231,9 @@ def record_qsa_indexed_receipt(
     context: int,
     splits: int | None = None,
     candidate: tuple[int, int] | None = None,
+    exception_class: str | None = None,
+    geometry_key: str | None = None,
+    candidate_timings_ms: dict[int, float] | None = None,
 ) -> None:
     """Record bounded process evidence without evaluating device arrays."""
 
@@ -229,6 +246,16 @@ def record_qsa_indexed_receipt(
         "physical_kv": int(context),
         "splits": None if splits is None else int(splits),
         "candidate": None if candidate is None else list(candidate),
+        "exception_class": exception_class,
+        "geometry_key": geometry_key,
+        "candidate_timings_ms": (
+            None
+            if candidate_timings_ms is None
+            else {
+                str(split): float(elapsed)
+                for split, elapsed in candidate_timings_ms.items()
+            }
+        ),
         "fully_masked_output": "zero",
     }
     with _STATUS_LOCK:
@@ -242,14 +269,102 @@ def record_qsa_indexed_receipt(
             _STATUS_FALLBACKS += 1
         if candidate is not None:
             _STATUS_CANDIDATE = tuple(candidate)
+            if geometry_key is not None:
+                _STATUS_GEOMETRIES[geometry_key] = {
+                    "candidate": list(candidate),
+                    "candidate_timings_ms": receipt["candidate_timings_ms"],
+                }
         _STATUS_LAST = receipt
+
+
+def _device_attest_output(
+    output,
+    counter,
+    *,
+    length: int,
+    context: int,
+    splits: int,
+    candidate: tuple[int, int],
+    geometry_key: str,
+    candidate_timings_ms: dict[int, float],
+):
+    """Attach one device counter and defer host credit until status readback."""
+
+    global _STATUS_CANDIDATE, _STATUS_DEVICE_PENDING
+    global _STATUS_DEVICE_PENDING_EXPECTED, _STATUS_DEVICE_PENDING_LAST
+    timings = {
+        str(split): float(elapsed)
+        for split, elapsed in candidate_timings_ms.items()
+    }
+    receipt = {
+        "engaged": True,
+        "reason": "engaged",
+        "query_width": int(length),
+        "physical_kv": int(context),
+        "splits": int(splits),
+        "candidate": list(candidate),
+        "exception_class": None,
+        "geometry_key": geometry_key,
+        "candidate_timings_ms": timings,
+        "device_attested": False,
+        "fully_masked_output": "zero",
+    }
+    with _STATUS_LOCK:
+        _STATUS_DEVICE_PENDING = (
+            counter
+            if _STATUS_DEVICE_PENDING is None
+            else _STATUS_DEVICE_PENDING + counter
+        )
+        _STATUS_DEVICE_PENDING_EXPECTED += 1
+        _STATUS_DEVICE_PENDING_WIDTHS[_width_bucket(int(length))] += 1
+        _STATUS_DEVICE_PENDING_LAST = receipt
+        _STATUS_CANDIDATE = tuple(candidate)
+        _STATUS_GEOMETRIES[geometry_key] = {
+            "candidate": list(candidate),
+            "candidate_timings_ms": timings,
+        }
+        dependency = _STATUS_DEVICE_PENDING
+    return mx.depends(output, dependency)
+
+
+def _reconcile_device_receipts_locked() -> None:
+    global _STATUS_DEVICE_PENDING, _STATUS_DEVICE_PENDING_EXPECTED
+    global _STATUS_DEVICE_PENDING_LAST, _STATUS_DEVICE_EXPECTED
+    global _STATUS_DEVICE_OBSERVED, _STATUS_DEVICE_MISMATCHES, _STATUS_LAST
+    if _STATUS_DEVICE_PENDING is None:
+        return
+    observed = int(_STATUS_DEVICE_PENDING.item())
+    expected = int(_STATUS_DEVICE_PENDING_EXPECTED)
+    _STATUS_DEVICE_EXPECTED += expected
+    _STATUS_DEVICE_OBSERVED += observed
+    receipt = dict(_STATUS_DEVICE_PENDING_LAST)
+    receipt["device_attested"] = observed == expected
+    receipt["device_counter_observed"] = observed
+    receipt["device_counter_expected"] = expected
+    if observed == expected:
+        _STATUS_COUNTS["engaged"] += observed
+        for bucket, count in _STATUS_DEVICE_PENDING_WIDTHS.items():
+            _STATUS_WIDTHS[bucket]["engaged"] += count
+    else:
+        _STATUS_COUNTS["device_attestation_mismatch"] += 1
+        _STATUS_DEVICE_MISMATCHES += 1
+        receipt["engaged"] = False
+        receipt["reason"] = "device_attestation_mismatch"
+    _STATUS_LAST = receipt
+    _STATUS_DEVICE_PENDING = None
+    _STATUS_DEVICE_PENDING_EXPECTED = 0
+    _STATUS_DEVICE_PENDING_WIDTHS.clear()
+    _STATUS_DEVICE_PENDING_LAST = None
 
 
 def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
     """Return indexed-QSA admission, candidate, and fallback evidence."""
 
     global _STATUS_CANDIDATE, _STATUS_FALLBACKS, _STATUS_LAST
+    global _STATUS_DEVICE_EXPECTED, _STATUS_DEVICE_OBSERVED
+    global _STATUS_DEVICE_MISMATCHES
     with _STATUS_LOCK:
+        _reconcile_device_receipts_locked()
         report = {
             "enabled": _qsa_indexed_mode() != "off",
             "mode": _qsa_indexed_mode(),
@@ -260,6 +375,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             "auto_min_context_m3": _AUTO_MIN_CONTEXT_M3,
             "auto_min_context_m1": _AUTO_MIN_CONTEXT_M1,
             "splits_override": _SPLITS_OVERRIDE,
+            "split_candidates": list(_SPLIT_CANDIDATES),
             "mlx_version": str(getattr(mx, "__version__", "unknown")),
             "mlx_build_hash": _mlx_build_hash(),
             "mlx_build_verified": (
@@ -279,7 +395,14 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             "candidate": (
                 None if _STATUS_CANDIDATE is None else list(_STATUS_CANDIDATE)
             ),
+            "geometry_candidates": dict(_STATUS_GEOMETRIES),
             "fallbacks": _STATUS_FALLBACKS,
+            "device_attestation": {
+                "expected": _STATUS_DEVICE_EXPECTED,
+                "observed": _STATUS_DEVICE_OBSERVED,
+                "mismatches": _STATUS_DEVICE_MISMATCHES,
+                "pending": _STATUS_DEVICE_PENDING_EXPECTED,
+            },
             "fully_masked_output": "zero",
             "last_decision": _STATUS_LAST,
         }
@@ -288,8 +411,12 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             for value in _STATUS_WIDTHS.values():
                 value.clear()
             _STATUS_CANDIDATE = None
+            _STATUS_GEOMETRIES.clear()
             _STATUS_FALLBACKS = 0
             _STATUS_LAST = None
+            _STATUS_DEVICE_EXPECTED = 0
+            _STATUS_DEVICE_OBSERVED = 0
+            _STATUS_DEVICE_MISMATCHES = 0
     return report
 
 
@@ -305,50 +432,6 @@ def qsa_indexed_enabled() -> bool:
     """Return the live indexed-QSA switch."""
 
     return _qsa_indexed_mode() != "off"
-
-
-def _compact_token_inputs(compact):
-    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
-        compact_blocks_to_kernel_inputs(compact)
-    )
-    block_size = int(compact.block_size)
-    logical = (
-        ids.astype(mx.int32)[..., None] * block_size
-        + mx.arange(block_size, dtype=mx.int32)
-    )
-    slots = mx.arange(u_width, dtype=mx.int32)[None, None, :, None]
-    present = slots < counts.astype(mx.int32)[..., None, None]
-    selected = slots < n_sel.astype(mx.int32)[..., None, None]
-    tail = (logical >= compact.tail_start[..., None, None]) & (
-        logical < compact.tail_stop[..., None, None]
-    )
-    valid = present & (selected | tail)
-    physical = logical + left_pad[:, None, None, None]
-    valid = valid & (physical >= 0) & (physical < total)
-    valid = valid & (logical <= q_pos[..., None, None])
-    physical = mx.clip(physical, 0, total - 1)
-    if compact.causal_mask is not None:
-        batch, length = ids.shape[:2]
-        causal = mx.broadcast_to(
-            compact.causal_mask, (batch, 1, length, total)
-        )[:, 0]
-        gathered = mx.take_along_axis(
-            causal,
-            physical.reshape(batch, length, -1),
-            axis=-1,
-        ).reshape(physical.shape)
-        valid = valid & gathered
-    return (
-        ids,
-        counts,
-        n_sel,
-        u_width,
-        q_pos,
-        left_pad,
-        total,
-        physical,
-        valid,
-    )
 
 
 def _validate_no_duplicate_blocks(ids, counts) -> None:
@@ -373,7 +456,7 @@ def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
     if nkh < 1 or nqh % nkh:
         raise ValueError("indexed QSA requires integral GQA")
 
-    ids, counts, _, u_width, _, _, _, physical, valid = _compact_token_inputs(
+    ids, counts, _, u_width, _, _, _, physical, valid = compact_token_validity(
         compact
     )
     _validate_no_duplicate_blocks(ids, counts)
@@ -509,14 +592,19 @@ _SOURCE = r"""
     float q_values[D / 32];
     for (uint part = 0; part < elements; ++part) {
         const uint d = lane * elements + part;
-        q_values[part] = float(scale[0]) * float(
-            q[((size_t)(b * NQH + qh) * L + row) * D + d]
-        );
+        const size_t q_index =
+            (size_t)b * q_strides[0] +
+            (size_t)qh * q_strides[1] +
+            (size_t)row * q_strides[2] +
+            (size_t)d * q_strides[3];
+        q_values[part] = float(scale[0]) * float(q[q_index]);
     }
 
     const uint slot_base = (b * L + row) * uint(U);
-    const device T* kb = k + (size_t)(b * NKVH + hkv) * TOT * D;
-    const device T* vb = v + (size_t)(b * NKVH + hkv) * TOT * D;
+    const size_t k_head =
+        (size_t)b * k_strides[0] + (size_t)hkv * k_strides[1];
+    const size_t v_head =
+        (size_t)b * v_strides[0] + (size_t)hkv * v_strides[1];
     for (uint local_block = 0; local_block < block_count; ++local_block) {
         const uint block_idx = block_begin + local_block;
         float out_values[D / 32] = {0};
@@ -535,15 +623,24 @@ _SOURCE = r"""
                 physical = lpad + logical;
                 live = physical >= 0 && physical < TOT && logical <= qp;
                 live = live && (slot < selected || logical >= complete);
-                if (HAS_MASK && live)
-                    live = mask[(size_t)(b * L + row) * TOT + physical];
+                if (HAS_MASK && live) {
+                    const uint mask_batch = mask_shape[0] == 1 ? 0 : b;
+                    const size_t mask_index =
+                        (size_t)mask_batch * mask_strides[0] +
+                        (size_t)row * mask_strides[2] +
+                        (size_t)physical * mask_strides[3];
+                    live = mask[mask_index];
+                }
             }
             if (!live) continue;
 
             float score = 0.0f;
             for (uint part = 0; part < elements; ++part) {
                 const uint d = lane * elements + part;
-                score += q_values[part] * float(kb[(size_t)physical * D + d]);
+                const size_t k_index =
+                    k_head + (size_t)physical * k_strides[2] +
+                    (size_t)d * k_strides[3];
+                score += q_values[part] * float(k[k_index]);
             }
             score = simd_sum(score);
             const float new_max = metal::max(maximum, score);
@@ -554,7 +651,10 @@ _SOURCE = r"""
             for (uint part = 0; part < elements; ++part) {
                 const uint d = lane * elements + part;
                 out_values[part] = out_values[part] * factor
-                    + probability * float(vb[(size_t)physical * D + d]);
+                    + probability * float(
+                        v[v_head + (size_t)physical * v_strides[2] +
+                          (size_t)d * v_strides[3]]
+                    );
             }
         }
 
@@ -570,6 +670,8 @@ _SOURCE = r"""
             part_o[state * D + d] = T(out_values[part]);
         }
     }
+    if (unit == 0 && row == 0 && head == 0 && lane == 0)
+        engaged[0] = 1;
 """
 
 
@@ -641,10 +743,10 @@ def _partition_kernel():
             "scale",
             "dims",
         ],
-        output_names=["part_m", "part_l", "part_o"],
+        output_names=["part_m", "part_l", "part_o", "engaged"],
         header=_HEADER,
         source=_SOURCE,
-        ensure_row_contiguous=True,
+        ensure_row_contiguous=False,
     )
 
 
@@ -670,14 +772,49 @@ class QSAIndexedProbeDeclined(RuntimeError):
 
 _PROBE_LOCK = threading.Lock()
 _PROBE_RESULTS = {}
+_PROBE_TIMINGS = {}
 _MISSING = object()
 
 
-def _candidate_ladder(splits: int, threads: int):
-    split_candidates = [int(splits)]
-    if splits > 4:
-        split_candidates.append(max(4, splits // 2))
+def _candidate_ladder(splits: int | None, threads: int):
+    split_candidates = (
+        _SPLIT_CANDIDATES if splits is None else (int(splits),)
+    )
     return tuple((int(threads), value) for value in split_candidates)
+
+
+def _measure_candidates(candidates, dispatch):
+    """Compile viable candidates, then time one real dispatch for each."""
+
+    viable = []
+    for candidate in candidates:
+        try:
+            output, _ = dispatch(candidate)
+            mx.eval(output)
+            viable.append(candidate)
+        except RuntimeError:
+            continue
+
+    timings = {}
+    outputs = {}
+    for candidate in viable:
+        try:
+            started = time.perf_counter_ns()
+            output, counter = dispatch(candidate)
+            mx.eval(output)
+            elapsed = time.perf_counter_ns() - started
+        except RuntimeError:
+            continue
+        timings[candidate[1]] = elapsed / 1.0e6
+        outputs[candidate] = (output, counter)
+    if not timings:
+        return None, None, None, {}
+    selected = min(
+        outputs,
+        key=lambda candidate: (timings[candidate[1]], -candidate[1]),
+    )
+    output, counter = outputs[selected]
+    return selected, output, counter, timings
 
 
 def _partition_dispatch(
@@ -700,24 +837,40 @@ def _partition_dispatch(
     if threads != required_threads:
         raise ValueError("indexed QSA pass 1 requires one SIMD group per GQA head")
     if compact.causal_mask is None:
-        mask = mx.ones((1,), dtype=mx.bool_)
+        mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
         has_mask = False
     else:
-        mask = mx.broadcast_to(
-            compact.causal_mask, (batch, 1, length, total)
-        )[:, 0]
+        mask = compact.causal_mask
+        if (
+            mask.ndim != 4
+            or int(mask.shape[1]) != 1
+            or int(mask.shape[2]) != length
+            or int(mask.shape[3]) != total
+            or mask.dtype != mx.bool_
+        ):
+            raise QSAIndexedProbeDeclined(
+                "indexed QSA requires a rank-4 [B|1, 1, L, T] bool cache mask",
+                reason="unsupported_mask_layout",
+            )
+        if int(mask.shape[0]) not in (1, batch):
+            raise QSAIndexedProbeDeclined(
+                "indexed QSA cache mask batch must be 1 or B",
+                reason="unsupported_mask_layout",
+            )
+        if int(mask.shape[0]) == 1 and batch > 1:
+            mask = mx.broadcast_to(mask, (batch, 1, length, total))
         has_mask = True
     return _partition_kernel()(
         inputs=[
-            mx.contiguous(q),
-            mx.contiguous(k),
-            mx.contiguous(v),
+            q,
+            k,
+            v,
             mx.contiguous(ids.astype(mx.uint32)),
             mx.contiguous(counts.astype(mx.uint32)),
             mx.contiguous(n_sel.astype(mx.uint32)),
             mx.contiguous(q_pos.astype(mx.int32)),
             mx.contiguous(left_pad.astype(mx.int32)),
-            mx.contiguous(mask),
+            mask,
             mx.array([scale], dtype=mx.float32),
             mx.array([length, total, u_width], dtype=mx.int32),
         ],
@@ -738,17 +891,18 @@ def _partition_dispatch(
             (batch, nqh, length, _SDPA_BLOCKS),
             (batch, nqh, length, _SDPA_BLOCKS),
             (batch, nqh, length, _SDPA_BLOCKS, dim),
+            (1,),
         ],
-        output_dtypes=[mx.float32, mx.float32, q.dtype],
+        output_dtypes=[mx.float32, mx.float32, q.dtype, mx.uint32],
     )
 
 
-def _combine_sdpa_partials(m, l, o, *, output_dtype):
+def _combine_sdpa_partials(m, l, o, engaged, *, output_dtype):
     batch, nqh, length, blocks = map(int, m.shape)
     dim = int(o.shape[-1])
     if blocks != _SDPA_BLOCKS or dim % 32:
         raise ValueError("indexed QSA pass 2 has unsupported partial geometry")
-    return _combine_kernel()(
+    output = _combine_kernel()(
         inputs=[m, l, o, mx.array([length], dtype=mx.int32)],
         template=[
             ("T", output_dtype),
@@ -760,6 +914,7 @@ def _combine_sdpa_partials(m, l, o, *, output_dtype):
         output_shapes=[(batch, nqh, length, dim)],
         output_dtypes=[output_dtype],
     )[0]
+    return output, engaged
 
 
 def qwen4_qsa_indexed_attention(
@@ -811,9 +966,19 @@ def qwen4_qsa_indexed_attention(
         raise QSAIndexedProbeDeclined(
             "indexed QSA exact mode requires a 128-block MLX SDPA device"
         )
-    requested = indexed_splits_for(u_width) if splits is None else int(splits)
-    if requested < 1 or requested > min(8, u_width):
-        raise ValueError("splits must be in [1, min(8, u_width)]")
+    requested = (
+        None
+        if splits is None and _SPLITS_OVERRIDE == 0
+        else indexed_splits_for(u_width) if splits is None else int(splits)
+    )
+    if requested is not None and requested not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    geometry_key = (
+        f"B{int(q.shape[0])}-L{int(q.shape[2])}"
+        f"-U{int(u_width)}-dtype{q.dtype}"
+        f"-mask{int(compact.causal_mask is not None)}"
+    )
     key = (
         mlx_version,
         str(q.dtype),
@@ -822,6 +987,9 @@ def qwen4_qsa_indexed_attention(
         int(k.shape[1]),
         int(compact.block_size),
         int(u_width),
+        int(q.shape[0]),
+        int(q.shape[2]),
+        int(compact.causal_mask is not None),
         requested,
     )
 
@@ -836,43 +1004,42 @@ def qwen4_qsa_indexed_attention(
                     "indexed QSA candidate ladder was declined"
                 )
             if candidate is _MISSING:
-                candidate = None
-                for attempted in _candidate_ladder(requested, threads):
-                    try:
-                        partials = _partition_dispatch(
-                            q,
-                            k,
-                            v,
-                            compact,
-                            scale=scale,
-                            threads=attempted[0],
-                            splits=attempted[1],
-                        )
-                        combined = _combine_sdpa_partials(
-                            *partials, output_dtype=q.dtype
-                        )
-                        mx.eval(combined)
-                        candidate = attempted
-                        _PROBE_RESULTS[key] = attempted
-                        break
-                    except (RuntimeError, ValueError):
-                        continue
+                def dispatch(attempted):
+                    partials = _partition_dispatch(
+                        q,
+                        k,
+                        v,
+                        compact,
+                        scale=scale,
+                        threads=attempted[0],
+                        splits=attempted[1],
+                    )
+                    return _combine_sdpa_partials(
+                        *partials, output_dtype=q.dtype
+                    )
+
+                candidate, combined, counter, timings = _measure_candidates(
+                    _candidate_ladder(requested, threads), dispatch
+                )
                 if candidate is None:
                     _PROBE_RESULTS[key] = False
                     raise QSAIndexedProbeDeclined(
                         "indexed QSA candidate ladder was declined"
                     )
-                record_qsa_indexed_receipt(
-                    engaged=True,
-                    reason="engaged",
+                _PROBE_RESULTS[key] = candidate
+                _PROBE_TIMINGS[key] = timings
+                return _device_attest_output(
+                    combined,
+                    counter,
                     length=int(q.shape[2]),
                     context=int(compact.physical_width),
                     splits=candidate[1],
                     candidate=candidate,
+                    geometry_key=geometry_key,
+                    candidate_timings_ms=timings,
                 )
-                return combined
 
-    m, l, o = _partition_dispatch(
+    m, l, o, counter = _partition_dispatch(
         q,
         k,
         v,
@@ -881,15 +1048,19 @@ def qwen4_qsa_indexed_attention(
         threads=candidate[0],
         splits=candidate[1],
     )
-    record_qsa_indexed_receipt(
-        engaged=True,
-        reason="engaged",
+    output, counter = _combine_sdpa_partials(
+        m, l, o, counter, output_dtype=q.dtype
+    )
+    return _device_attest_output(
+        output,
+        counter,
         length=int(q.shape[2]),
         context=int(compact.physical_width),
         splits=candidate[1],
         candidate=candidate,
+        geometry_key=geometry_key,
+        candidate_timings_ms=_PROBE_TIMINGS[key],
     )
-    return _combine_sdpa_partials(m, l, o, output_dtype=q.dtype)
 
 
 __all__ = [

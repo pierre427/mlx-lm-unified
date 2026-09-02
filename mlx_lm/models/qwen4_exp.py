@@ -47,6 +47,7 @@ from .qwen4_gdn_outproj import admit_qwen4_gdn_outproj
 from .qwen4_qsa_nax import (
     block_sparse_layout_supported,
     compact_blocks_to_kernel_inputs,
+    compact_token_validity,
     nax_kernel_available,
     nax_qsa_attention,
 )
@@ -3012,39 +3013,9 @@ def _gather_qsa_attention(
     if tile_rows < 1:
         raise ValueError("QSA gather tile_rows must be positive")
 
-    ids, counts, n_selected, u_width, q_pos, left_pad, total = (
-        compact_blocks_to_kernel_inputs(compact)
-    )
-    block_size = compact.block_size
-    # [B,L,U,BS] logical positions.  The padded U suffix is harmless because
-    # ``block_slot < counts`` rejects it before attention.
-    logical = (
-        ids.astype(mx.int32)[..., None] * block_size
-        + mx.arange(block_size, dtype=mx.int32)
-    )
-    block_slot = mx.arange(u_width, dtype=mx.int32)[None, None, :, None]
-    selected_slot = block_slot < n_selected.astype(mx.int32)[..., None, None]
-    present_slot = block_slot < counts.astype(mx.int32)[..., None, None]
-    tail_member = (logical >= compact.tail_start[..., None, None]) & (
-        logical < compact.tail_stop[..., None, None]
-    )
-    valid = present_slot & (selected_slot | tail_member)
-
-    physical = logical + left_pad[:, None, None, None]
-    valid = valid & (physical >= 0) & (physical < total)
-    # This upper bound is redundant for selected closed blocks, but makes the
-    # causal contract explicit and protects a malformed compact input.
-    valid = valid & (logical <= q_pos[..., None, None])
-    physical = mx.clip(physical, 0, total - 1).reshape(batch, length, -1)
+    _, _, _, _, _, _, _, physical, valid = compact_token_validity(compact)
+    physical = physical.reshape(batch, length, -1)
     valid = valid.reshape(batch, length, -1)
-
-    # Preserve every extra cache mask term (left/right padding and ragged
-    # continuation geometry) by gathering it at the same selected columns.
-    if compact.causal_mask is not None:
-        causal = mx.broadcast_to(
-            compact.causal_mask, (batch, 1, length, total)
-        )[:, 0]
-        valid = valid & mx.take_along_axis(causal, physical, axis=-1)
 
     rows = batch * length
     width = physical.shape[-1]
@@ -3101,10 +3072,15 @@ def _indexed_qsa_attention_or_gather(
     compact,
     *,
     scale: float,
-    splits: int,
+    splits: int | None,
     tile_rows: int,
 ):
-    """Run indexed QSA or fall back with the same fetched cache tensors."""
+    """Run indexed QSA or fall back with the same fetched cache tensors.
+
+    Only synchronous Metal failures can fall back. A lazy failure after this
+    function returns is outside this try block, so the first probe evaluates
+    its result before caching a candidate.
+    """
 
     length = int(q.shape[2])
     context = int(compact.physical_width)
@@ -3112,16 +3088,20 @@ def _indexed_qsa_attention_or_gather(
         return qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=scale, splits=splits
         )
-    except QSAIndexedProbeDeclined as error:
-        reason = error.reason
-    except Exception:
-        reason = "dispatch_raised"
+    except (QSAIndexedProbeDeclined, RuntimeError) as error:
+        reason = (
+            error.reason
+            if isinstance(error, QSAIndexedProbeDeclined)
+            else "dispatch_raised"
+        )
+        exception_class = type(error).__name__
     record_qsa_indexed_receipt(
         engaged=False,
         reason=reason,
         length=length,
         context=context,
         splits=splits,
+        exception_class=exception_class,
     )
     return _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
@@ -3155,7 +3135,7 @@ def _capture_qsa_indexed_comparison(
     compact,
     *,
     scale: float,
-    splits: int,
+    splits: int | None,
     tile_rows: int,
     layer_index: int,
     call_counter: int,
@@ -3165,15 +3145,8 @@ def _capture_qsa_indexed_comparison(
 
     capture_dir = Path(os.environ["MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"])
     capture_dir.mkdir(parents=True, exist_ok=True)
-    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
-        compact_blocks_to_kernel_inputs(compact)
-    )
-    logical = (
-        ids.astype(mx.int32)[..., None] * int(compact.block_size)
-        + mx.arange(int(compact.block_size), dtype=mx.int32)
-    )
-    physical = mx.clip(
-        logical + left_pad[:, None, None, None], 0, int(total) - 1
+    ids, counts, n_sel, u_width, q_pos, left_pad, total, physical, _ = (
+        compact_token_validity(compact)
     )
     causal_slots = _capture_qsa_causal_slots(compact, physical)
 
@@ -3182,17 +3155,24 @@ def _capture_qsa_indexed_comparison(
         indexed_out = qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=scale, splits=splits
         )
-    except QSAIndexedProbeDeclined as error:
+    except (QSAIndexedProbeDeclined, RuntimeError) as error:
         indexed_out = None
-        fallback_reason = error.reason
-    except Exception:
-        indexed_out = None
-        fallback_reason = "dispatch_raised"
+        fallback_reason = (
+            error.reason
+            if isinstance(error, QSAIndexedProbeDeclined)
+            else "dispatch_raised"
+        )
+        fallback_exception_class = type(error).__name__
     gather_out = _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
     )
+    mirror_splits = (
+        int(splits)
+        if splits is not None
+        else min(indexed_splits_for(u_width), u_width)
+    )
     mirror_out = qwen4_qsa_indexed_reference(
-        q, k, v, compact, scale=scale, splits=splits
+        q, k, v, compact, scale=scale, splits=mirror_splits
     )
 
     values = [
@@ -3242,11 +3222,12 @@ def _capture_qsa_indexed_comparison(
             length=int(q.shape[2]),
             context=int(compact.physical_width),
             splits=splits,
+            exception_class=fallback_exception_class,
         )
 
     status = qsa_indexed_status()
     candidate = status.get("candidate")
-    used_splits = splits if candidate is None else int(candidate[1])
+    used_splits = mirror_splits if candidate is None else int(candidate[1])
     row_axes = tuple(range(2, mirror_delta.ndim))
     ledger = {
         "layer_index": int(layer_index),
@@ -3265,7 +3246,7 @@ def _capture_qsa_indexed_comparison(
         "tail_stop": np.asarray(compact.tail_stop).astype(np.int64).tolist(),
         "causal_mask_present": compact.causal_mask is not None,
         "candidate": candidate,
-        "requested_splits": int(splits),
+        "requested_splits": None if splits is None else int(splits),
         "used_splits": int(used_splits),
         "u_width": int(u_width),
         "gather_would_admit": bool(gather_would_admit),
@@ -3329,7 +3310,7 @@ def _dispatch_qsa_indexed_with_optional_capture(
     compact,
     *,
     scale: float,
-    splits: int,
+    splits: int | None,
     tile_rows: int,
     layer_index: int,
     call_counter: int,
@@ -3921,8 +3902,7 @@ class Attention(nn.Module):
             compact = selection.compact_blocks()
             if int(k.shape[2]) != int(compact.physical_width):
                 raise ValueError("indexed QSA tensors do not match compact selection")
-            _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
-            splits = indexed_splits_for(u_width)
+            splits = None
             if os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"):
                 self._qsa_indexed_capture_calls += 1
             out = _dispatch_qsa_indexed_with_optional_capture(

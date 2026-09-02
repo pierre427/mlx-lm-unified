@@ -26,7 +26,7 @@ DEFAULT_OUTPUT = Path(
 )
 CONTEXTS = (16_384, 32_768, 65_536, 131_072)
 MODEL_CONTEXTS = CONTEXTS[:3]
-SPLITS = (1, 2, 4, 8)
+SPLITS = (8, 16, 32, 64, 128)
 DEFAULT_SWAP_LIMIT_MIB = 512.0
 DEFAULT_MODEL_LOAD_FREE_FLOOR = 45
 DEFAULT_RUN_FREE_FLOOR = 25
@@ -286,11 +286,18 @@ def phase1_candidate(mx):
     v = mx.random.normal((1, 2, CONTEXTS[0], 256)).astype(mx.bfloat16)
     qsa_indexed_status(reset=True)
     output = qwen4_qsa_indexed_attention(
-        q, k, v, compact, scale=256**-0.5, splits=8
+        q, k, v, compact, scale=256**-0.5
     )
     mx.eval(output)
     status = qsa_indexed_status()
-    if status["candidate"] is None or status["fallbacks"]:
+    device = status["device_attestation"]
+    if (
+        status["candidate"] is None
+        or status["fallbacks"]
+        or device["expected"] != 1
+        or device["observed"] != 1
+        or device["mismatches"]
+    ):
         raise GateFailure(1, f"candidate probe did not engage cleanly: {status}")
     return {"phase": 1, "status": "PASS", "receipt": status}
 
@@ -317,59 +324,64 @@ def phase2_exactness(mx):
     worst_relative = 0.0
     all_s_equal = True
     non_ties = 0
-    for length in range(1, 9):
-        batch = 1 + length % 2
-        mx.random.seed(20260901 + length)
-        compact = adversarial_fixture(
-            mx, QSACompactBlocks, batch=batch, length=length
-        )
-        q = mx.random.normal((batch, 24, length, 256)).astype(mx.float32)
-        k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.float32)
-        v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.float32)
-        outputs = {
-            splits: qwen4_qsa_indexed_attention(
-                q, k, v, compact, scale=256**-0.5, splits=splits
+    for batch in (1, 2):
+        for length in range(1, 9):
+            mx.random.seed(20260901 + batch * 100 + length)
+            compact = adversarial_fixture(
+                mx, QSACompactBlocks, batch=batch, length=length
             )
-            for splits in SPLITS
-        }
-        mirror = qwen4_qsa_indexed_reference(
-            q, k, v, compact, scale=256**-0.5, splits=8
-        )
-        mx.eval(*outputs.values(), mirror)
-        first = np.asarray(outputs[1])
-        split_checks = {}
-        for splits in SPLITS:
-            current = np.asarray(outputs[splits])
-            equal = np.array_equal(first, current)
-            all_s_equal = all_s_equal and equal
-            split_checks[str(splits)] = {
-                "bit_equal_to_s1": equal,
-                "max_abs": float(np.max(np.abs(first - current))),
+            q = mx.random.normal((batch, 24, length, 256)).astype(mx.float32)
+            k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.float32)
+            v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.float32)
+            outputs = {
+                splits: qwen4_qsa_indexed_attention(
+                    q, k, v, compact, scale=256**-0.5, splits=splits
+                )
+                for splits in SPLITS
             }
-        kernel = np.asarray(outputs[8])
-        mirror_np = np.asarray(mirror)
-        delta = float(np.max(np.abs(kernel - mirror_np)))
-        scale = max(float(np.max(np.abs(mirror_np))), 1.0)
-        relative = delta / scale
-        worst_relative = max(worst_relative, relative)
-        kernel_cast = np.asarray(outputs[8].astype(mx.bfloat16).astype(mx.float32))
-        mirror_cast = np.asarray(mirror.astype(mx.bfloat16).astype(mx.float32))
-        tie_counts = cast_tie_counts(
-            kernel, mirror_np, kernel_cast, mirror_cast, 1.0e-4 * scale
-        )
-        non_ties += tie_counts["non_tie_count"]
-        rows.append(
-            {
-                "batch": batch,
-                "length": length,
-                "kernel_mirror_max_abs": delta,
-                "kernel_mirror_max_relative": relative,
-                "splits": split_checks,
-                **tie_counts,
-            }
-        )
-        del q, k, v, outputs, mirror
-        mx.clear_cache()
+            mirror = qwen4_qsa_indexed_reference(
+                q, k, v, compact, scale=256**-0.5, splits=128
+            )
+            mx.eval(*outputs.values(), mirror)
+            first = np.asarray(outputs[SPLITS[0]])
+            split_checks = {}
+            for splits in SPLITS:
+                current = np.asarray(outputs[splits])
+                equal = np.array_equal(first, current)
+                all_s_equal = all_s_equal and equal
+                split_checks[str(splits)] = {
+                    "bit_equal_to_s8": equal,
+                    "max_abs": float(np.max(np.abs(first - current))),
+                }
+            kernel = np.asarray(outputs[128])
+            mirror_np = np.asarray(mirror)
+            delta = float(np.max(np.abs(kernel - mirror_np)))
+            scale = max(float(np.max(np.abs(mirror_np))), 1.0)
+            relative = delta / scale
+            worst_relative = max(worst_relative, relative)
+            kernel_cast = np.asarray(
+                outputs[128].astype(mx.bfloat16).astype(mx.float32)
+            )
+            mirror_cast = np.asarray(
+                mirror.astype(mx.bfloat16).astype(mx.float32)
+            )
+            tie_counts = cast_tie_counts(
+                kernel, mirror_np, kernel_cast, mirror_cast, 1.0e-4 * scale
+            )
+            non_ties += tie_counts["non_tie_count"]
+            rows.append(
+                {
+                    "batch": batch,
+                    "length": length,
+                    "u_width": 520,
+                    "kernel_mirror_max_abs": delta,
+                    "kernel_mirror_max_relative": relative,
+                    "splits": split_checks,
+                    **tie_counts,
+                }
+            )
+            del q, k, v, outputs, mirror
+            mx.clear_cache()
     fixture_path = (
         Path(__file__).resolve().parents[1]
         / "tests"
@@ -406,7 +418,7 @@ def phase2_exactness(mx):
             scale=256**-0.5,
             splits=splits,
         )
-        for splits in (1, 4, 8)
+        for splits in SPLITS
     }
     mx.eval(fixture_gather, *fixture_outputs.values())
     fixture_checks = {}
@@ -425,11 +437,65 @@ def phase2_exactness(mx):
                 ).item()
             ),
         }
+    fixture_m3_path = (
+        Path(__file__).resolve().parents[1]
+        / "tests"
+        / "fixtures"
+        / "qwen4_qsa_indexed_real_bf16_m3.safetensors"
+    )
+    fixture_m3 = mx.load(str(fixture_m3_path))
+    fixture_m3_compact = QSACompactBlocks(
+        block_ids=fixture_m3["ids"],
+        block_counts=fixture_m3["n_sel"].astype(mx.int32),
+        tail_start=fixture_m3["tail_start"],
+        tail_stop=fixture_m3["tail_stop"],
+        left_padding=fixture_m3["left_pad"],
+        block_size=4,
+        physical_width=int(fixture_m3["total"].item()),
+        causal_mask=fixture_m3["causal_mask"],
+    )
+    fixture_m3_gather = _gather_qsa_attention(
+        fixture_m3["q"],
+        fixture_m3["k"],
+        fixture_m3["v"],
+        fixture_m3_compact,
+        scale=256**-0.5,
+        tile_rows=1,
+    )
+    fixture_m3_outputs = {
+        splits: qwen4_qsa_indexed_attention(
+            fixture_m3["q"],
+            fixture_m3["k"],
+            fixture_m3["v"],
+            fixture_m3_compact,
+            scale=256**-0.5,
+            splits=splits,
+        )
+        for splits in SPLITS
+    }
+    mx.eval(fixture_m3_gather, *fixture_m3_outputs.values())
+    fixture_m3_checks = {}
+    fixture_m3_exact = True
+    for splits, output in fixture_m3_outputs.items():
+        exact = bool(mx.array_equal(output, fixture_m3_gather).item())
+        fixture_m3_exact = fixture_m3_exact and exact
+        fixture_m3_checks[str(splits)] = {
+            "bit_equal_to_gather": exact,
+            "max_abs": float(
+                mx.max(
+                    mx.abs(
+                        output.astype(mx.float32)
+                        - fixture_m3_gather.astype(mx.float32)
+                    )
+                ).item()
+            ),
+        }
     passed = (
         all_s_equal
         and worst_relative <= 1.0e-4
         and non_ties == 0
         and fixture_exact
+        and fixture_m3_exact
     )
     result = {
         "phase": 2,
@@ -443,6 +509,12 @@ def phase2_exactness(mx):
             "physical_width": fixture_width,
             "checks": fixture_checks,
         },
+        "real_m3_fixture": {
+            "path": str(fixture_m3_path),
+            "source_geometry": list(map(int, fixture_m3["q"].shape)),
+            "physical_width": int(fixture_m3["total"].item()),
+            "checks": fixture_m3_checks,
+        },
         "rows": rows,
     }
     if not passed:
@@ -455,32 +527,77 @@ def phase3_gather(mx):
     from mlx_lm.models.qwen4_qsa_indexed import qwen4_qsa_indexed_attention
 
     rows = []
-    for length in range(1, 9):
-        batch = 1 + length % 2
-        mx.random.seed(20261001 + length)
-        compact = adversarial_fixture(
-            mx, QSACompactBlocks, batch=batch, length=length
-        )
-        q = mx.random.normal((batch, 24, length, 256)).astype(mx.bfloat16)
-        k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
-        v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
-        kernel = qwen4_qsa_indexed_attention(
-            q, k, v, compact, scale=256**-0.5, splits=8
-        )
-        gather = _gather_qsa_attention(
-            q, k, v, compact, scale=256**-0.5, tile_rows=1
-        )
-        absolute, relative = max_scaled_error(mx, kernel, gather)
-        rows.append(
-            {
-                "batch": batch,
-                "length": length,
-                "max_abs": absolute,
-                "max_relative": relative,
-            }
-        )
-        del q, k, v, kernel, gather
-        mx.clear_cache()
+    for batch in (1, 2):
+        for length in range(1, 9):
+            mx.random.seed(20261001 + batch * 100 + length)
+            compact = adversarial_fixture(
+                mx, QSACompactBlocks, batch=batch, length=length
+            )
+            q = mx.random.normal((batch, 24, length, 256)).astype(mx.bfloat16)
+            k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
+            v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
+            kernel = qwen4_qsa_indexed_attention(
+                q, k, v, compact, scale=256**-0.5
+            )
+            gather = _gather_qsa_attention(
+                q, k, v, compact, scale=256**-0.5, tile_rows=1
+            )
+            absolute, relative = max_scaled_error(mx, kernel, gather)
+            rows.append(
+                {
+                    "fixture": "adversarial",
+                    "batch": batch,
+                    "length": length,
+                    "u_width": 520,
+                    "max_abs": absolute,
+                    "max_relative": relative,
+                }
+            )
+            del q, k, v, kernel, gather
+            mx.clear_cache()
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "tests"
+        / "fixtures"
+        / "qwen4_qsa_indexed_real_bf16_m3.safetensors"
+    )
+    fixture = mx.load(str(fixture_path))
+    fixture_compact = QSACompactBlocks(
+        block_ids=fixture["ids"],
+        block_counts=fixture["n_sel"].astype(mx.int32),
+        tail_start=fixture["tail_start"],
+        tail_stop=fixture["tail_stop"],
+        left_padding=fixture["left_pad"],
+        block_size=4,
+        physical_width=int(fixture["total"].item()),
+        causal_mask=fixture["causal_mask"],
+    )
+    fixture_kernel = qwen4_qsa_indexed_attention(
+        fixture["q"],
+        fixture["k"],
+        fixture["v"],
+        fixture_compact,
+        scale=256**-0.5,
+    )
+    fixture_gather = _gather_qsa_attention(
+        fixture["q"],
+        fixture["k"],
+        fixture["v"],
+        fixture_compact,
+        scale=256**-0.5,
+        tile_rows=1,
+    )
+    absolute, relative = max_scaled_error(mx, fixture_kernel, fixture_gather)
+    rows.append(
+        {
+            "fixture": str(fixture_path),
+            "batch": 1,
+            "length": 3,
+            "u_width": 520,
+            "max_abs": absolute,
+            "max_relative": relative,
+        }
+    )
     passed = all(row["max_abs"] == 0.0 for row in rows)
     result = {
         "phase": 3,
@@ -865,6 +982,11 @@ def phase4_model(
             "draft_cycles", indexed["stats"].get("cycles", 0)
         )
         expected_verify_calls = qsa_layers * cycles
+        device = status["device_attestation"]
+        expected_device_calls = sum(
+            bucket.get("engaged", 0)
+            for bucket in status["query_width_counts"].values()
+        )
         receipt = {
             "qsa_layers": qsa_layers,
             "self_mtp_rounds": cycles,
@@ -875,13 +997,20 @@ def phase4_model(
             ),
             "candidate": status["candidate"],
             "fallbacks": status["fallbacks"],
+            "expected_device_dispatch_calls": expected_device_calls,
+            "device_attestation": device,
         }
         passed = (
-            max_logprob_delta <= 0.002
+            gather["digest"] == indexed["digest"]
+            and max_logprob_delta == 0.0
             and not status["fallbacks"]
             and status["candidate"] is not None
             and reached == expected_verify_calls
-            and (divergence is None or divergence["classification"] == "NEAR_TIE")
+            and status["counts"].get("engaged", 0) == expected_device_calls
+            and device["expected"] == expected_device_calls
+            and device["observed"] == expected_device_calls
+            and device["mismatches"] == 0
+            and divergence is None
         )
         row = {
             "context": context,
@@ -958,7 +1087,7 @@ def isolated_timing(
             mask = dense_fixture_mask(mx, context, length)
             arms = {
                 "indexed": lambda: qwen4_qsa_indexed_attention(
-                    q, k, v, compact, scale=256**-0.5, splits=8
+                    q, k, v, compact, scale=256**-0.5
                 ),
                 "gather": lambda: _gather_qsa_attention(
                     q, k, v, compact, scale=256**-0.5, tile_rows=1

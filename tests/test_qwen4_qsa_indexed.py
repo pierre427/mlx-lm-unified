@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -16,6 +17,7 @@ import numpy as np
 from mlx_lm.models import qwen4_qsa_indexed as indexed
 from mlx_lm.models import qwen4_exp as qwen4_exp
 from mlx_lm.models.qwen4_exp import QSACompactBlocks, _gather_qsa_attention
+from mlx_lm.models.qwen4_qsa_nax import compact_token_validity
 from mlx_lm.server import (
     APIHandler,
     SOFT_RELOAD_KEYS,
@@ -212,6 +214,139 @@ class TestQSAIndexedReference(unittest.TestCase):
             np.asarray(baseline[:, :, 0]), np.asarray(changed[:, :, 0])
         )
 
+    def test_shared_validity_matches_metal_slot_arithmetic_at_m3(self):
+        compact = _compact(2, 3, total=32)
+        (
+            ids,
+            counts,
+            n_sel,
+            u_width,
+            q_pos,
+            left_pad,
+            total,
+            physical,
+            valid,
+        ) = compact_token_validity(compact)
+        mx.eval(ids, counts, n_sel, q_pos, left_pad, physical, valid)
+        ids_np = np.asarray(ids)
+        counts_np = np.asarray(counts)
+        n_sel_np = np.asarray(n_sel)
+        q_pos_np = np.asarray(q_pos)
+        left_pad_np = np.asarray(left_pad)
+        mask_np = np.asarray(compact.causal_mask)
+        expected_physical = np.zeros(physical.shape, dtype=np.int32)
+        expected_valid = np.zeros(valid.shape, dtype=bool)
+        for batch in range(2):
+            for row in range(3):
+                complete = ((int(q_pos_np[batch, row]) + 1) // 4) * 4
+                for slot in range(u_width):
+                    for tail in range(4):
+                        logical = int(ids_np[batch, row, slot]) * 4 + tail
+                        source = int(left_pad_np[batch]) + logical
+                        expected_physical[batch, row, slot, tail] = np.clip(
+                            source, 0, total - 1
+                        )
+                        live = slot < int(counts_np[batch, row])
+                        live = live and 0 <= source < total
+                        live = live and logical <= int(q_pos_np[batch, row])
+                        live = live and (
+                            slot < int(n_sel_np[batch, row])
+                            or logical >= complete
+                        )
+                        if live:
+                            live = bool(mask_np[batch, 0, row, source])
+                        expected_valid[batch, row, slot, tail] = live
+        np.testing.assert_array_equal(np.asarray(physical), expected_physical)
+        np.testing.assert_array_equal(np.asarray(valid), expected_valid)
+        self.assertGreater(int(left_pad_np.max()), 0)
+        self.assertTrue(bool(expected_valid.any()))
+
+        q, k, v = _arrays(2, 3, total=32)
+        mirror = indexed.qwen4_qsa_indexed_reference(
+            q, k, v, compact, scale=8**-0.5, splits=8
+        )
+        gather = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=2
+        )
+        mx.eval(mirror, gather)
+        np.testing.assert_allclose(
+            np.asarray(mirror), np.asarray(gather), rtol=1.0e-5, atol=1.0e-5
+        )
+
+    def test_cache_prefix_views_pass_through_and_match_contiguous_mirror(self):
+        mx.random.seed(30)
+        total = 32
+        compact = _compact(1, 3, total=total)
+        q = mx.random.normal((1, 4, 3, 8))
+        k_buffer = mx.random.normal((1, 2, 256, 8))
+        v_buffer = mx.random.normal((1, 2, 256, 8))
+        k_view = k_buffer[:, :, :total]
+        v_view = v_buffer[:, :, :total]
+        k_contiguous = mx.contiguous(k_view)
+        v_contiguous = mx.contiguous(v_view)
+
+        view_output = indexed.qwen4_qsa_indexed_reference(
+            q, k_view, v_view, compact, scale=8**-0.5, splits=4
+        )
+        contiguous_output = indexed.qwen4_qsa_indexed_reference(
+            q, k_contiguous, v_contiguous, compact, scale=8**-0.5, splits=4
+        )
+        mx.eval(view_output, contiguous_output)
+        np.testing.assert_array_equal(
+            np.asarray(view_output), np.asarray(contiguous_output)
+        )
+
+        captured = {}
+
+        def dispatch(**kwargs):
+            captured["inputs"] = kwargs["inputs"]
+            return (mx.zeros((1,), dtype=mx.float32),)
+
+        with mock.patch.object(indexed, "_partition_kernel", return_value=dispatch):
+            indexed._partition_dispatch(
+                q,
+                k_view,
+                v_view,
+                compact,
+                scale=8**-0.5,
+                threads=64,
+                splits=4,
+            )
+        self.assertIs(captured["inputs"][0], q)
+        self.assertIs(captured["inputs"][1], k_view)
+        self.assertIs(captured["inputs"][2], v_view)
+        self.assertIs(captured["inputs"][8], compact.causal_mask)
+
+    def test_partition_dispatch_declines_unsupported_mask_layouts(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        invalid_masks = (
+            mx.ones((1, 3, 32), dtype=mx.bool_),
+            mx.ones((1, 2, 3, 32), dtype=mx.bool_),
+            mx.ones((1, 1, 3, 32), dtype=mx.float32),
+            mx.ones((2, 1, 3, 32), dtype=mx.bool_),
+        )
+        for mask in invalid_masks:
+            with self.subTest(shape=mask.shape, dtype=mask.dtype):
+                with (
+                    mock.patch.object(
+                        indexed,
+                        "_partition_kernel",
+                        side_effect=AssertionError("kernel must not run"),
+                    ),
+                    self.assertRaises(indexed.QSAIndexedProbeDeclined) as raised,
+                ):
+                    indexed._partition_dispatch(
+                        q,
+                        k,
+                        v,
+                        replace(compact, causal_mask=mask),
+                        scale=8**-0.5,
+                        threads=64,
+                        splits=4,
+                    )
+                self.assertEqual(raised.exception.reason, "unsupported_mask_layout")
+
     def test_duplicate_block_ids_fail_closed(self):
         compact = QSACompactBlocks(
             block_ids=mx.array([[[1, 1]]], dtype=mx.uint32),
@@ -257,7 +392,7 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertEqual(k.shape, (1, 1, 1028, 256))
         self.assertEqual(k.shape, v.shape)
         self.assertEqual(q.dtype, mx.bfloat16)
-        self.assertEqual(indexed.indexed_splits_for(257), 5)
+        self.assertEqual(indexed.indexed_splits_for(257), 128)
         reference = indexed.qwen4_qsa_indexed_reference(
             q, k, v, compact, scale=256**-0.5, splits=5
         )
@@ -316,10 +451,10 @@ class TestQSAIndexedReference(unittest.TestCase):
                 indexed.qwen4_qsa_indexed_attention(
                     q, k, v, compact, scale=256**-0.5, splits=splits
                 )
-                for splits in (1, 4, 8)
+                for splits in (8, 16, 32, 64, 128)
             ]
             mx.eval(gather, *outputs)
-            for splits, output in zip((1, 4, 8), outputs):
+            for splits, output in zip((8, 16, 32, 64, 128), outputs):
                 self.assertTrue(
                     bool(mx.array_equal(output, gather).item()),
                     f"real fixture differs from gather at S={splits}",
@@ -388,6 +523,112 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertEqual(
             indexed.qsa_indexed_status()["counts"]["dispatch_raised"], 1
         )
+        self.assertEqual(
+            indexed.qsa_indexed_status()["last_decision"]["exception_class"],
+            "RuntimeError",
+        )
+
+    def test_contract_value_error_does_not_fall_back(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        with (
+            mock.patch.object(
+                qwen4_exp,
+                "qwen4_qsa_indexed_attention",
+                side_effect=ValueError("contract failure"),
+            ),
+            mock.patch.object(
+                qwen4_exp,
+                "_gather_qsa_attention",
+                side_effect=AssertionError("gather must not run"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "contract failure"):
+                qwen4_exp._indexed_qsa_attention_or_gather(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=8**-0.5,
+                    splits=4,
+                    tile_rows=1,
+                )
+
+    def test_probe_ladder_does_not_swallow_contract_value_error(self):
+        q, k, v, compact = _real_bf16_fixture()
+        indexed._PROBE_RESULTS.clear()
+        with (
+            mock.patch.object(indexed, "indexed_kernel_available", return_value=True),
+            mock.patch.object(
+                indexed.mx,
+                "device_info",
+                return_value={"architecture": "applegpu_g17s"},
+            ),
+            mock.patch.object(
+                indexed,
+                "_partition_dispatch",
+                side_effect=ValueError("contract failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "contract failure"):
+                indexed.qwen4_qsa_indexed_attention(
+                    q, k, v, compact, scale=256**-0.5, splits=8
+                )
+
+    def test_default_ladder_is_timed_and_fastest_candidate_wins(self):
+        candidates = indexed._candidate_ladder(None, 384)
+        self.assertEqual(
+            candidates,
+            ((384, 128), (384, 64), (384, 32), (384, 16), (384, 8)),
+        )
+        calls = []
+
+        def dispatch(candidate):
+            calls.append(candidate)
+            return (
+                mx.array(candidate[1], dtype=mx.int32),
+                mx.array(1, dtype=mx.uint32),
+            )
+
+        clock = iter(
+            (0, 500, 1_000, 1_200, 2_000, 2_100, 3_000, 3_400, 4_000, 4_300)
+        )
+        with mock.patch.object(
+            indexed.time, "perf_counter_ns", side_effect=lambda: next(clock)
+        ):
+            selected, output, counter, timings = indexed._measure_candidates(
+                candidates, dispatch
+            )
+        self.assertEqual(selected, (384, 32))
+        self.assertEqual(int(output.item()), 32)
+        self.assertEqual(int(counter.item()), 1)
+        self.assertEqual(set(timings), {8, 16, 32, 64, 128})
+        self.assertEqual(calls, list(candidates) * 2)
+
+    def test_device_engagement_is_credited_only_after_reconciliation(self):
+        indexed.qsa_indexed_status(reset=True)
+        output = mx.array([7], dtype=mx.int32)
+        for context in (16_384, 16_385):
+            output = indexed._device_attest_output(
+                output,
+                mx.array([1], dtype=mx.uint32),
+                length=3,
+                context=context,
+                splits=32,
+                candidate=(384, 32),
+                geometry_key="B1-L3-U520-dtypemlx.core.bfloat16-mask0",
+                candidate_timings_ms={32: 0.4},
+            )
+        self.assertEqual(indexed._STATUS_COUNTS.get("engaged", 0), 0)
+        mx.eval(output)
+        status = indexed.qsa_indexed_status()
+        self.assertEqual(status["counts"]["engaged"], 2)
+        self.assertEqual(
+            status["device_attestation"],
+            {"expected": 2, "observed": 2, "mismatches": 0, "pending": 0},
+        )
+        self.assertTrue(status["last_decision"]["device_attested"])
+        self.assertEqual(status["last_decision"]["device_counter_observed"], 2)
 
     def test_capture_writes_mismatch_and_returns_gather(self):
         mx.random.seed(37)
@@ -631,12 +872,32 @@ class TestQSAIndexedAdmission(unittest.TestCase):
                 context=32_768,
                 splits=4,
             )
+        indexed.record_qsa_indexed_receipt(
+            engaged=True,
+            reason="engaged",
+            length=3,
+            context=32_768,
+            splits=32,
+            candidate=(384, 32),
+            geometry_key="B1-L3-T32768-U520-mask1",
+            candidate_timings_ms={
+                128: 0.7,
+                64: 0.5,
+                32: 0.4,
+                16: 0.6,
+                8: 0.8,
+            },
+        )
         status = indexed.qsa_indexed_status()
         self.assertEqual(status["counts"]["nax_engaged"], 1)
         self.assertEqual(status["fallbacks"], 2)
         self.assertEqual(status["query_width_counts"]["1"]["declined"], 1)
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
         self.assertEqual(status["query_width_counts"][">8"]["declined"], 1)
+        self.assertEqual(status["split_candidates"], [128, 64, 32, 16, 8])
+        geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
+        self.assertEqual(geometry["candidate"], [384, 32])
+        self.assertEqual(geometry["candidate_timings_ms"]["32"], 0.4)
 
     def test_env_unset_selects_guarded_auto(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -664,23 +925,17 @@ class TestQSAIndexedAdmission(unittest.TestCase):
                     self.assertEqual(repr(old).encode(), repr(new).encode())
 
     def test_split_table_and_override(self):
-        expected = {
-            8: 1,
-            64: 1,
-            65: 2,
-            127: 2,
-            128: 4,
-            256: 4,
-            512: 8,
-            520: 8,
-        }
+        expected = {8: 128, 64: 128, 520: 128}
         with mock.patch.object(indexed, "_SPLITS_OVERRIDE", 0):
             self.assertEqual(
                 {width: indexed.indexed_splits_for(width) for width in expected},
                 expected,
             )
         with mock.patch.object(indexed, "_SPLITS_OVERRIDE", 6):
-            self.assertEqual(indexed.indexed_splits_for(520), 6)
+            with self.assertRaisesRegex(ValueError, "8, 16, 32, 64, 128"):
+                indexed.indexed_splits_for(520)
+        with mock.patch.object(indexed, "_SPLITS_OVERRIDE", 64):
+            self.assertEqual(indexed.indexed_splits_for(520), 64)
         with self.assertRaises(ValueError):
             indexed.indexed_splits_for(0)
 

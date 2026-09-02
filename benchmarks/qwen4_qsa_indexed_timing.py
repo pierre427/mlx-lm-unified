@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded indexed-QSA 32K gate and M=1 timing ladder."""
+"""Run the exact indexed-QSA performance gate and timing ladder."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ DEFAULT_MODEL = Path(
     "/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP"
 )
 DEFAULT_OUTPUT_DIR = LAB_ROOT / "results"
-PREFIX = "qwen4-qsa-indexed-timing-20260901"
+PREFIX = "qwen4-qsa-indexed-perf-gate-20260902"
 CONTEXTS = (16_384, 32_768, 65_536, 131_072)
 START_FREE_FLOOR = 15
 ABORT_FREE_FLOOR = 10
@@ -79,12 +79,17 @@ def write_report(report, output):
 
 @contextmanager
 def owned_gpu_lock():
+    inherited_owner = os.environ.get("MLXUAG_GPU_LOCK_ALREADY_HELD")
+    if inherited_owner:
+        owner = validate_inherited_lock()
+        yield owner
+        return
     os.mkdir(GPU_LOCK)
     owner_path = GPU_LOCK / "owner.json"
     owner = {
-        "owner": "codex-n-timing",
-        "agent": "codex-n-timing",
-        "label": "qwen4-qsa-indexed-32k-and-timing",
+        "owner": "codex-s-perf",
+        "agent": "codex-s-perf",
+        "label": "qwen4-qsa-indexed-perf-gate-20260902",
         "pid": os.getpid(),
         "purpose": "phase 4 at 32K and phase 5 M=1/M=3 timing",
         "started_at": utc_now(),
@@ -101,7 +106,8 @@ def owned_gpu_lock():
 
 def validate_inherited_lock():
     owner = json.loads((GPU_LOCK / "owner.json").read_text(encoding="utf-8"))
-    if owner.get("owner") != "codex-n-timing":
+    expected = os.environ.get("MLXUAG_GPU_LOCK_ALREADY_HELD", "codex-s-perf")
+    if owner.get("owner") != expected:
         raise RuntimeError(f"GPU lock belongs to {owner.get('owner')!r}")
     return owner
 
@@ -225,6 +231,49 @@ def load_model(mx, model_path):
     return model, tokenizer
 
 
+def run_phase123_cell(output):
+    validate_inherited_lock()
+    import mlx.core as mx
+
+    mx.set_default_device(mx.gpu)
+    report = {
+        "manifest": {
+            "record": "manifest",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
+            "cell": "phase123",
+            "started_at": utc_now(),
+            "outcome": "RUNNING",
+        },
+        "records": [],
+        "safety": [],
+    }
+    exit_code = 0
+    try:
+        before = gate.safety_snapshot("before_phase123")
+        report["safety"].append(before)
+        check_cell_start(before, 2)
+        report["records"].append(gate.phase1_candidate(mx))
+        report["records"].append(gate.phase2_exactness(mx))
+        report["records"].append(gate.phase3_gather(mx))
+        report["manifest"]["outcome"] = "PASS"
+    except Exception as error:
+        report["manifest"]["outcome"] = "FAIL"
+        report["failure"] = {
+            "phase": getattr(error, "phase", 1),
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+        exit_code = 1
+    finally:
+        mx.clear_cache()
+        gc.collect()
+        report["safety"].append(gate.safety_snapshot("after_phase123"))
+        report["manifest"]["finished_at"] = utc_now()
+        write_report(report, output)
+    return exit_code
+
+
 def run_phase4_cell(model_path, context, output):
     validate_inherited_lock()
     import mlx.core as mx
@@ -233,8 +282,8 @@ def run_phase4_cell(model_path, context, output):
     report = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
             "cell": "phase4",
             "context": context,
             "model": str(model_path),
@@ -323,14 +372,19 @@ def run_isolated_cell(output):
     validate_inherited_lock()
     import mlx.core as mx
     from mlx_lm.models.qwen4_exp import QSACompactBlocks, _gather_qsa_attention
-    from mlx_lm.models.qwen4_qsa_indexed import qwen4_qsa_indexed_attention
+    from mlx_lm.models.qwen4_qsa_indexed import (
+        _combine_sdpa_partials,
+        _partition_dispatch,
+        qsa_indexed_status,
+        qwen4_qsa_indexed_attention,
+    )
 
     mx.set_default_device(mx.gpu)
     report = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
             "cell": "isolated",
             "started_at": utc_now(),
             "contexts": list(CONTEXTS),
@@ -352,78 +406,152 @@ def run_isolated_cell(output):
         report["cpu_load_gate"] = wait_for_cpu_load()
         for context in CONTEXTS:
             for length in (3, 1):
-                before = gate.safety_snapshot(
-                    f"before_isolated_{context}_m{length}"
-                )
-                check_cell_start(before, 5)
                 compact = gate.compact_fixture(mx, QSACompactBlocks, context, length)
                 mx.random.seed(20262000 + context + length)
                 q = mx.random.normal((1, 24, length, 256)).astype(mx.bfloat16)
-                k = mx.random.normal((1, 2, context, 256)).astype(mx.bfloat16)
-                v = mx.random.normal((1, 2, context, 256)).astype(mx.bfloat16)
+                capacity = context + 256
+                k_buffer = mx.random.normal((1, 2, capacity, 256)).astype(
+                    mx.bfloat16
+                )
+                v_buffer = mx.random.normal((1, 2, capacity, 256)).astype(
+                    mx.bfloat16
+                )
+                k_view = k_buffer[:, :, :context]
+                v_view = v_buffer[:, :, :context]
+                k_contiguous = mx.contiguous(k_view)
+                v_contiguous = mx.contiguous(v_view)
+                mx.eval(k_buffer, v_buffer, k_contiguous, v_contiguous)
                 mask = gate.dense_fixture_mask(mx, context, length)
-                arms = {
-                    "indexed": lambda: qwen4_qsa_indexed_attention(
-                        q, k, v, compact, scale=256**-0.5, splits=8
-                    ),
-                    "dense_masked": lambda: mx.fast.scaled_dot_product_attention(
-                        q, k, v, scale=256**-0.5, mask=mask
-                    ),
-                }
-                if length == 3:
-                    arms["gather"] = lambda: _gather_qsa_attention(
-                        q, k, v, compact, scale=256**-0.5, tile_rows=1
+                layouts = (
+                    ("fresh_contiguous", k_contiguous, v_contiguous),
+                    ("cache_prefix_view", k_view, v_view),
+                )
+                for layout, k, v in layouts:
+                    before = gate.safety_snapshot(
+                        f"before_isolated_{context}_m{length}_{layout}"
                     )
-                for function in arms.values():
-                    gate.timed(mx, function)
-                cell_settlement = gate.settle_thermal(timeout=30.0)
-                names = list(arms)
-                samples = {name: [] for name in names}
-                controls = []
-                for repeat in range(8):
-                    offset = repeat % len(names)
-                    order = names[offset:] + names[:offset]
-                    for name in order:
-                        controls.append(
-                            {
-                                "repeat": repeat,
-                                "arm": name,
-                                "order": list(order),
-                            }
-                        )
-                        samples[name].append(gate.timed(mx, arms[name]) * 1000.0)
-                medians = {
-                    name: statistics.median(values)
-                    for name, values in samples.items()
-                }
-                after = gate.safety_snapshot(
-                    f"after_isolated_{context}_m{length}"
-                )
-                check_abort_floor(after, 5)
-                report["safety"].append(after)
-                report["records"].append(
-                    {
-                        "record": "isolated_timing",
-                        "context": context,
-                        "query_width": length,
-                        "query_contract": "M=3" if length == 3 else "M=1",
-                        "median_ms": medians,
-                        "samples_ms": samples,
-                        "arm_order": controls,
-                        "cell_thermal_settle": cell_settlement,
-                        "indexed_speedup_vs_dense": (
-                            medians["dense_masked"] / medians["indexed"]
+                    check_cell_start(before, 5)
+                    qsa_indexed_status(reset=True)
+                    arms = {
+                        "indexed": lambda: qwen4_qsa_indexed_attention(
+                            q, k, v, compact, scale=256**-0.5
                         ),
-                        "indexed_speedup_vs_gather": (
-                            medians["gather"] / medians["indexed"]
-                            if "gather" in medians
-                            else None
+                        "dense_masked": (
+                            lambda: mx.fast.scaled_dot_product_attention(
+                                q, k, v, scale=256**-0.5, mask=mask
+                            )
                         ),
-                        "safety_before": before,
-                        "safety_after": after,
                     }
+                    if length == 3:
+                        arms["gather"] = lambda: _gather_qsa_attention(
+                            q, k, v, compact, scale=256**-0.5, tile_rows=1
+                        )
+                    for function in arms.values():
+                        gate.timed(mx, function)
+                    cell_settlement = gate.settle_thermal(timeout=30.0)
+                    names = list(arms)
+                    samples = {name: [] for name in names}
+                    controls = []
+                    for repeat in range(8):
+                        offset = repeat % len(names)
+                        order = names[offset:] + names[:offset]
+                        for name in order:
+                            controls.append(
+                                {
+                                    "repeat": repeat,
+                                    "arm": name,
+                                    "order": list(order),
+                                }
+                            )
+                            samples[name].append(
+                                gate.timed(mx, arms[name]) * 1000.0
+                            )
+                    medians = {
+                        name: statistics.median(values)
+                        for name, values in samples.items()
+                    }
+                    indexed_status = qsa_indexed_status()
+                    chosen_s = int(indexed_status["candidate"][1])
+                    pass1_samples = []
+                    pass2_samples = []
+                    for _ in range(8):
+                        started = time.perf_counter()
+                        partials = _partition_dispatch(
+                            q,
+                            k,
+                            v,
+                            compact,
+                            scale=256**-0.5,
+                            threads=384,
+                            splits=chosen_s,
+                        )
+                        mx.eval(*partials)
+                        pass1_samples.append(
+                            (time.perf_counter() - started) * 1000.0
+                        )
+                        started = time.perf_counter()
+                        merged, _ = _combine_sdpa_partials(
+                            *partials, output_dtype=q.dtype
+                        )
+                        mx.eval(merged)
+                        pass2_samples.append(
+                            (time.perf_counter() - started) * 1000.0
+                        )
+                    after = gate.safety_snapshot(
+                        f"after_isolated_{context}_m{length}_{layout}"
+                    )
+                    check_abort_floor(after, 5)
+                    report["safety"].append(after)
+                    report["records"].append(
+                        {
+                            "record": "isolated_timing",
+                            "context": context,
+                            "query_width": length,
+                            "layout": layout,
+                            "cache_capacity": capacity,
+                            "query_contract": (
+                                "M=3" if length == 3 else "M=1"
+                            ),
+                            "median_ms": medians,
+                            "samples_ms": samples,
+                            "pass_profile_ms": {
+                                "pass1": statistics.median(pass1_samples),
+                                "pass2": statistics.median(pass2_samples),
+                            },
+                            "pass_profile_samples_ms": {
+                                "pass1": pass1_samples,
+                                "pass2": pass2_samples,
+                            },
+                            "arm_order": controls,
+                            "cell_thermal_settle": cell_settlement,
+                            "indexed_status": indexed_status,
+                            "indexed_speedup_vs_dense": (
+                                medians["dense_masked"] / medians["indexed"]
+                            ),
+                            "indexed_speedup_vs_gather": (
+                                medians["gather"] / medians["indexed"]
+                                if "gather" in medians
+                                else None
+                            ),
+                            "safety_before": before,
+                            "safety_after": after,
+                        }
+                    )
+                    del arms
+                del (
+                    layouts,
+                    k_view,
+                    v_view,
+                    k,
+                    v,
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    k_contiguous,
+                    v_contiguous,
+                    mask,
+                    compact,
                 )
-                del arms, q, k, v, mask, compact
                 mx.clear_cache()
                 gc.collect()
         report["manifest"]["outcome"] = "PASS"
@@ -453,8 +581,8 @@ def run_end_to_end_cell(model_path, context, output):
     report = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
             "cell": "end_to_end",
             "context": context,
             "model": str(model_path),
@@ -556,6 +684,23 @@ def run_end_to_end_cell(model_path, context, output):
             )
             for name, arm_samples in samples.items()
         }
+        digest_exact = all(
+            indexed_sample["digest"] == gather_sample["digest"]
+            for indexed_sample, gather_sample in zip(
+                samples["indexed"], samples["gather"]
+            )
+        )
+        device_attested = all(
+            sample["indexed_status"]["fallbacks"] == 0
+            and sample["indexed_status"]["device_attestation"]["expected"]
+            == sample["indexed_status"]["device_attestation"]["observed"]
+            and sample["indexed_status"]["device_attestation"]["mismatches"] == 0
+            for sample in samples["indexed"]
+        )
+        if not digest_exact or not device_attested:
+            raise gate.GateFailure(
+                5, "end-to-end timing lost digest or device receipt identity"
+            )
         after = gate.safety_snapshot(f"after_end_to_end_{context}")
         check_abort_floor(after, 5)
         report["safety"].append(after)
@@ -572,6 +717,8 @@ def run_end_to_end_cell(model_path, context, output):
             "indexed_delta_vs_plain_dense_percent": (
                 (medians["indexed"] / medians["plain_dense"] - 1.0) * 100.0
             ),
+            "indexed_gather_digest_exact": digest_exact,
+            "device_attested": device_attested,
             "memory_guard": {"breach": guard.breach, "error": guard.error},
             "safety_before": before_timing,
             "safety_after": after,
@@ -671,8 +818,8 @@ def run_all(args):
     combined = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
             "started_at": utc_now(),
             "model": str(args.model),
             "gpu_wall_limit_minutes": args.wall_limit_minutes,
@@ -682,47 +829,73 @@ def run_all(args):
     }
     with owned_gpu_lock() as owner:
         combined["manifest"]["lock_owner"] = owner
-        phase32 = run_child(args, "phase4", context=32_768, deadline=deadline)
-        combined["records"].append({"record": "child", **phase32})
-        passed32 = bool(
-            phase32.get("report") and phase4_passed(phase32["report"])
+        phase123 = run_child(args, "phase123", deadline=deadline)
+        combined["records"].append({"record": "child", **phase123})
+        passed123 = bool(
+            phase123.get("report")
+            and phase123["report"]["manifest"]["outcome"] == "PASS"
         )
-        free32 = (
-            phase4_after_free(phase32["report"])
-            if phase32.get("report")
+        passed16 = passed64 = False
+        if passed123:
+            phase16 = run_child(
+                args, "phase4", context=16_384, deadline=deadline
+            )
+            passed16 = bool(
+                phase16.get("report") and phase4_passed(phase16["report"])
+            )
+        else:
+            phase16 = {"status": "SKIPPED_PHASE123_NOT_PASSED"}
+        combined["records"].append({"record": "child", **phase16})
+        free16 = (
+            phase4_after_free(phase16["report"])
+            if phase16.get("report")
             else None
         )
-        passed64 = False
-        if passed32 and free32 is not None and free32 >= 25:
-            phase64 = run_child(args, "phase4", context=65_536, deadline=deadline)
+        if passed16 and free16 is not None and free16 >= START_FREE_FLOOR:
+            phase64 = run_child(
+                args, "phase4", context=65_536, deadline=deadline
+            )
             passed64 = bool(
                 phase64.get("report") and phase4_passed(phase64["report"])
             )
         else:
             phase64 = {
-                "status": "SKIPPED_32K_FREE_BELOW_25_PERCENT",
-                "post_32k_free_percent": free32,
+                "status": "SKIPPED_16K_GATE_OR_MEMORY",
+                "post_16k_free_percent": free16,
             }
         combined["records"].append({"record": "child", **phase64})
-        isolated = run_child(args, "isolated", deadline=deadline)
+        exact_gate_passed = passed123 and passed16 and passed64
+        if exact_gate_passed:
+            isolated = run_child(args, "isolated", deadline=deadline)
+        else:
+            isolated = {"status": "SKIPPED_EXACT_GATE_NOT_PASSED"}
         combined["records"].append({"record": "child", **isolated})
-        end16 = run_child(args, "end-to-end", context=16_384, deadline=deadline)
-        combined["records"].append({"record": "child", **end16})
-        if passed32:
-            end32 = run_child(
-                args, "end-to-end", context=32_768, deadline=deadline
+        timing_passed = bool(
+            isolated.get("report")
+            and isolated["report"]["manifest"]["outcome"] == "PASS"
+        )
+        for context in (16_384, 32_768, 65_536):
+            result = (
+                run_child(
+                    args,
+                    "end-to-end",
+                    context=context,
+                    deadline=deadline,
+                )
+                if timing_passed
+                else {
+                    "status": "SKIPPED_ISOLATED_GATE_NOT_PASSED",
+                    "context": context,
+                }
             )
-        else:
-            end32 = {"status": "SKIPPED_PHASE4_NOT_PASSED", "context": 32_768}
-        combined["records"].append({"record": "child", **end32})
-        if passed64:
-            end64 = run_child(
-                args, "end-to-end", context=65_536, deadline=deadline
+            combined["records"].append({"record": "child", **result})
+            timing_passed = bool(
+                result.get("report")
+                and result["report"]["manifest"]["outcome"] == "PASS"
             )
-        else:
-            end64 = {"status": "SKIPPED_PHASE4_NOT_PASSED", "context": 65_536}
-        combined["records"].append({"record": "child", **end64})
-        combined["manifest"]["outcome"] = "COMPLETE"
+        combined["manifest"]["outcome"] = (
+            "PASS" if timing_passed else "INCOMPLETE_OR_FAILED"
+        )
         combined["manifest"]["gpu_wall_seconds"] = time.monotonic() - started
         combined["manifest"]["finished_at"] = utc_now()
         write_report(combined, combined_path)
@@ -736,8 +909,8 @@ def run_remaining(args):
     combined = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
             "started_at": utc_now(),
             "model": str(args.model),
             "gpu_wall_limit_minutes": args.wall_limit_minutes,
@@ -794,8 +967,8 @@ def run_end_to_end_32k(args):
     combined = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.v1",
+            "agent": "codex-s-perf",
             "started_at": utc_now(),
             "model": str(args.model),
             "gpu_wall_limit_minutes": args.wall_limit_minutes,
@@ -882,8 +1055,8 @@ def finalize_results(output_dir):
     report = {
         "manifest": {
             "record": "manifest",
-            "schema": "mlx-uag.qwen4-qsa-indexed-timing.final.v1",
-            "agent": "codex-n-timing",
+            "schema": "mlx-uag.qwen4-qsa-indexed-perf.final.v1",
+            "agent": "codex-s-perf",
             "created_at": utc_now(),
             "git_head": subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -939,13 +1112,13 @@ def main():
     parser.add_argument("--run-e2e32", action="store_true")
     parser.add_argument("--finalize", action="store_true")
     parser.add_argument(
-        "--cell", choices=("phase4", "isolated", "end-to-end")
+        "--cell", choices=("phase123", "phase4", "isolated", "end-to-end")
     )
     parser.add_argument("--context", type=int, choices=CONTEXTS)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--wall-limit-minutes", type=float, default=60.0)
+    parser.add_argument("--wall-limit-minutes", type=float, default=120.0)
     args = parser.parse_args()
     if args.run_all:
         return run_all(args)
@@ -960,6 +1133,8 @@ def main():
         parser.error("a child run requires --cell and --output")
     if args.cell in {"phase4", "end-to-end"} and args.context is None:
         parser.error(f"{args.cell} requires --context")
+    if args.cell == "phase123":
+        return run_phase123_cell(args.output)
     if args.cell == "phase4":
         return run_phase4_cell(args.model, args.context, args.output)
     if args.cell == "isolated":

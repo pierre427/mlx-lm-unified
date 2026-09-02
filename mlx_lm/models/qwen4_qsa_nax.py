@@ -367,6 +367,52 @@ def compact_blocks_to_kernel_inputs(cb):
     )
 
 
+def compact_token_validity(cb):
+    """Return compact token coordinates and the shared validity predicate."""
+
+    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
+        compact_blocks_to_kernel_inputs(cb)
+    )
+    block_size = int(cb.block_size)
+    logical = (
+        ids.astype(mx.int32)[..., None] * block_size
+        + mx.arange(block_size, dtype=mx.int32)
+    )
+    slots = mx.arange(u_width, dtype=mx.int32)[None, None, :, None]
+    present = slots < counts.astype(mx.int32)[..., None, None]
+    selected = slots < n_sel.astype(mx.int32)[..., None, None]
+    tail = (logical >= cb.tail_start[..., None, None]) & (
+        logical < cb.tail_stop[..., None, None]
+    )
+    valid = present & (selected | tail)
+    physical = logical + left_pad[:, None, None, None]
+    valid = valid & (physical >= 0) & (physical < total)
+    valid = valid & (logical <= q_pos[..., None, None])
+    physical = mx.clip(physical, 0, total - 1)
+    if cb.causal_mask is not None:
+        batch, length = ids.shape[:2]
+        causal = mx.broadcast_to(
+            cb.causal_mask, (batch, 1, length, total)
+        )[:, 0]
+        gathered = mx.take_along_axis(
+            causal,
+            physical.reshape(batch, length, -1),
+            axis=-1,
+        ).reshape(physical.shape)
+        valid = valid & gathered
+    return (
+        ids,
+        counts,
+        n_sel,
+        u_width,
+        q_pos,
+        left_pad,
+        total,
+        physical,
+        valid,
+    )
+
+
 def nax_qsa_attention(q, k, v, ids, counts, n_sel, q_pos, left_pad, *,
                       scale, u_width, total, n_kv_heads):
     """Block-sparse QSA attention on NAX.  q [B,H,L,D], k/v [B,HKV,T,D] -> fp32.
