@@ -756,15 +756,24 @@ def phase4_model(
         gc.collect()
         after = safety_snapshot(f"after_phase4_{context}")
         safety_rows.append(after)
-        check_safety(
-            after,
-            swap_baseline=swap_baseline,
-            phase=4,
-            model_load_free_floor=model_load_free_floor,
-            run_free_floor=run_free_floor,
-            swap_growth_abort_mib=swap_growth_abort_mib,
-        )
         row["safety_after"] = after
+        try:
+            check_safety(
+                after,
+                swap_baseline=swap_baseline,
+                phase=4,
+                model_load_free_floor=model_load_free_floor,
+                run_free_floor=run_free_floor,
+                swap_growth_abort_mib=swap_growth_abort_mib,
+            )
+        except GateFailure as error:
+            return {
+                "phase": 4,
+                "status": "ABORTED_MEMORY_FLOOR",
+                "rows": rows,
+                "stopped_after_context": context,
+                "safety_failure": str(error),
+            }
         if not passed:
             raise GateFailure(4, json.dumps(row, sort_keys=True))
         if wall_deadline is not None and time.monotonic() >= wall_deadline:
@@ -1137,7 +1146,17 @@ def main():
                     else "PARTIAL_TIME_BOUND"
                 )
             else:
-                report["manifest"]["outcome"] = "PARTIAL_TIME_BOUND"
+                report["manifest"]["outcome"] = (
+                    "PARTIAL_TIME_BOUND"
+                    if phase4["status"] == "PARTIAL_TIME_BOUND"
+                    else "FAIL_PHASE_4"
+                )
+                if phase4["status"] != "PARTIAL_TIME_BOUND":
+                    report["failure"] = {
+                        "phase": 4,
+                        "message": phase4.get("safety_failure", phase4["status"]),
+                    }
+                    exit_code = 1
         except GateFailure as error:
             report["manifest"]["outcome"] = f"FAIL_PHASE_{error.phase}"
             report["failure"] = {"phase": error.phase, "message": str(error)}
