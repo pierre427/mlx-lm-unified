@@ -18,7 +18,7 @@ from .qwen4_qsa_nax import compact_blocks_to_kernel_inputs
 _BLOCK_SIZE = 4
 _CHUNK_SLOTS = 64
 _CHUNK_TOKENS = _CHUNK_SLOTS * _BLOCK_SIZE
-_THREAD_CANDIDATES = (256, 128, 64)
+_SDPA_BLOCKS = 128
 
 
 def _env_flag(name: str) -> bool:
@@ -293,51 +293,6 @@ def _validate_no_duplicate_blocks(ids, counts) -> None:
             raise ValueError("compact QSA block ids must be unique per row")
 
 
-# TODO: add an optional fused second-pass hook after an isolated A/B.
-def _combine_indexed_partials(m, l, o, *, output_dtype):
-    """Merge fixed chunks in ascending split then chunk order.
-
-    This is the hook point for a future fused second pass.
-    """
-
-    state_m = mx.full(m.shape[:3], -mx.inf, dtype=mx.float32)
-    state_l = mx.zeros_like(state_m)
-    state_o = mx.zeros(o.shape[:3] + (o.shape[-1],), dtype=mx.float32)
-    for split in range(m.shape[-2]):
-        for chunk in range(m.shape[-1]):
-            chunk_m = m[..., split, chunk]
-            chunk_l = l[..., split, chunk]
-            chunk_o = o[..., split, chunk, :]
-            chunk_live = mx.isfinite(chunk_m)
-            state_live = mx.isfinite(state_m)
-            merged_m = mx.maximum(state_m, chunk_m)
-            safe_m = mx.where(chunk_live, merged_m, mx.zeros_like(merged_m))
-            alpha = mx.where(
-                state_live,
-                mx.exp(state_m - safe_m),
-                mx.zeros_like(state_l),
-            )
-            beta = mx.where(
-                chunk_live,
-                mx.exp(chunk_m - safe_m),
-                mx.zeros_like(chunk_l),
-            )
-            merged_l = state_l * alpha + chunk_l * beta
-            merged_o = (
-                state_o * alpha[..., None] + chunk_o * beta[..., None]
-            )
-            state_m = mx.where(chunk_live, merged_m, state_m)
-            state_l = mx.where(chunk_live, merged_l, state_l)
-            state_o = mx.where(chunk_live[..., None], merged_o, state_o)
-    out = mx.where(
-        (state_l > 0)[..., None],
-        state_o
-        / mx.maximum(state_l[..., None], mx.array(1.0e-30, mx.float32)),
-        mx.zeros_like(state_o),
-    )
-    return out.astype(output_dtype)
-
-
 def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or k.shape != v.shape:
         raise ValueError("indexed QSA wants matching rank-4 q/k/v tensors")
@@ -348,83 +303,91 @@ def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
     if nkh < 1 or nqh % nkh:
         raise ValueError("indexed QSA requires integral GQA")
 
-    (
-        ids,
-        counts,
-        _,
-        u_width,
-        _,
-        _,
-        _,
-        physical,
-        valid,
-    ) = _compact_token_inputs(compact)
+    ids, counts, _, u_width, _, _, _, physical, valid = _compact_token_inputs(
+        compact
+    )
     _validate_no_duplicate_blocks(ids, counts)
     if splits < 1 or splits > u_width:
         raise ValueError("splits must be in [1, u_width]")
 
-    q_rows = q.transpose(0, 2, 1, 3).astype(mx.float32)
+    token_width = u_width * int(compact.block_size)
+    steps = math.ceil(token_width / _SDPA_BLOCKS)
+    padded_width = steps * _SDPA_BLOCKS
+    padding = padded_width - token_width
+    physical = physical.reshape(batch, length, token_width)
+    valid = valid.reshape(batch, length, token_width)
+    if padding:
+        physical = mx.pad(physical, [(0, 0), (0, 0), (0, padding)])
+        valid = mx.pad(
+            valid,
+            [(0, 0), (0, 0), (0, padding)],
+            constant_values=False,
+        )
+    physical = physical.reshape(
+        batch, length, steps, _SDPA_BLOCKS
+    ).transpose(0, 1, 3, 2)
+    valid = valid.reshape(batch, length, steps, _SDPA_BLOCKS).transpose(
+        0, 1, 3, 2
+    )
+
+    q_rows = q.transpose(0, 2, 1, 3).astype(mx.float32) * float(scale)
     k_by_token = k.transpose(0, 2, 1, 3)
     v_by_token = v.transpose(0, 2, 1, 3)
     gqa = nqh // nkh
     head_map = mx.arange(nqh, dtype=mx.int32) // gqa
-    split_chunks = indexed_split_chunk_ranges(u_width, splits)
-    chunks_per_split = max(1, max(map(len, split_chunks)))
-    split_ms = []
-    split_ls = []
-    split_os = []
-    empty_m = mx.full((batch, nqh, length), -mx.inf, dtype=mx.float32)
-    empty_l = mx.zeros_like(empty_m)
-    empty_o = mx.zeros((batch, nqh, length, dim), dtype=mx.float32)
-    for chunks in split_chunks:
-        chunk_ms = []
-        chunk_ls = []
-        chunk_os = []
-        for start, stop in chunks:
-            token_index = physical[:, :, start:stop].reshape(batch, length, -1)
-            token_valid = valid[:, :, start:stop].reshape(batch, length, -1)
-            gather_index = token_index[..., None, None]
-            gathered_k = mx.take_along_axis(
-                k_by_token[:, None], gather_index, axis=2
-            ).transpose(0, 1, 3, 2, 4)
-            gathered_v = mx.take_along_axis(
-                v_by_token[:, None], gather_index, axis=2
-            ).transpose(0, 1, 3, 2, 4)
-            gathered_k = mx.take(gathered_k, head_map, axis=2).astype(mx.float32)
-            gathered_v = mx.take(gathered_v, head_map, axis=2).astype(mx.float32)
-            scores = (
-                mx.sum(q_rows[..., None, :] * gathered_k, axis=-1)
-                * float(scale)
-            )
-            head_valid = token_valid[:, :, None, :]
-            scores = mx.where(head_valid, scores, -mx.inf)
-            part_m = mx.max(scores, axis=-1)
-            live = mx.isfinite(part_m)
-            safe_m = mx.where(live, part_m, mx.zeros_like(part_m))
-            probabilities = mx.where(
-                head_valid,
-                mx.exp(scores - safe_m[..., None]),
-                mx.zeros_like(scores),
-            )
-            part_l = mx.sum(probabilities, axis=-1)
-            part_o = mx.sum(
-                probabilities[..., None] * gathered_v, axis=-2
-            )
-            chunk_ms.append(part_m.transpose(0, 2, 1))
-            chunk_ls.append(part_l.transpose(0, 2, 1))
-            chunk_os.append(part_o.transpose(0, 2, 1, 3))
-        while len(chunk_ms) < chunks_per_split:
-            chunk_ms.append(empty_m)
-            chunk_ls.append(empty_l)
-            chunk_os.append(empty_o)
-        split_ms.append(mx.stack(chunk_ms, axis=-1))
-        split_ls.append(mx.stack(chunk_ls, axis=-1))
-        split_os.append(mx.stack(chunk_os, axis=-2))
-    return (
-        mx.stack(split_ms, axis=-2),
-        mx.stack(split_ls, axis=-2),
-        mx.stack(split_os, axis=-3),
+    gather_index = physical[..., None, None]
+    gathered_k = mx.take_along_axis(
+        k_by_token[:, None, None], gather_index, axis=3
     )
+    gathered_v = mx.take_along_axis(
+        v_by_token[:, None, None], gather_index, axis=3
+    )
+    gathered_k = mx.take(gathered_k, head_map, axis=4).transpose(
+        0, 1, 4, 2, 3, 5
+    )
+    gathered_v = mx.take(gathered_v, head_map, axis=4).transpose(
+        0, 1, 4, 2, 3, 5
+    )
+    scores = mx.sum(
+        q_rows[..., None, None, :] * gathered_k.astype(mx.float32), axis=-1
+    )
+    head_valid = valid[:, :, None]
+    scores = mx.where(head_valid, scores, -mx.inf)
+    part_m = mx.max(scores, axis=-1)
+    live = mx.isfinite(part_m)
+    safe_m = mx.where(live, part_m, mx.zeros_like(part_m))
+    probabilities = mx.where(
+        head_valid,
+        mx.exp(scores - safe_m[..., None]),
+        mx.zeros_like(scores),
+    )
+    part_l = mx.sum(probabilities, axis=-1)
+    part_o = mx.sum(
+        probabilities[..., None] * gathered_v.astype(mx.float32), axis=-2
+    ).astype(q.dtype)
+    return (
+        part_m.transpose(0, 2, 1, 3),
+        part_l.transpose(0, 2, 1, 3),
+        part_o.transpose(0, 2, 1, 3, 4),
+    )
+
+
+def _combine_reference_sdpa_partials(m, l, o, *, output_dtype):
+    live = mx.isfinite(m)
+    state_m = mx.max(m, axis=-1)
+    safe_m = mx.where(mx.isfinite(state_m), state_m, mx.zeros_like(state_m))
+    factors = mx.where(
+        live,
+        mx.exp(m - safe_m[..., None]),
+        mx.zeros_like(m),
+    )
+    denom = mx.sum(l * factors, axis=-1)
+    numer = mx.sum(o.astype(mx.float32) * factors[..., None], axis=-2)
+    return mx.where(
+        (denom > 0)[..., None],
+        numer / mx.maximum(denom[..., None], mx.array(1.0e-30, mx.float32)),
+        mx.zeros_like(numer),
+    ).astype(output_dtype)
 
 
 def qwen4_qsa_indexed_reference(
@@ -435,7 +398,7 @@ def qwen4_qsa_indexed_reference(
     m, l, o = _reference_partials(
         q, k, v, compact, scale=scale, splits=int(splits)
     )
-    return _combine_indexed_partials(m, l, o, output_dtype=q.dtype)
+    return _combine_reference_sdpa_partials(m, l, o, output_dtype=q.dtype)
 
 
 _HEADER = r"""
@@ -446,11 +409,10 @@ using namespace metal;
 
 
 _SOURCE = r"""
-    // Each group owns (batch, query row, KV head, split). Fixed chunks do
-    // not depend on S. The MLX merge scans split then chunk in slot order.
-    const uint tid = thread_index_in_threadgroup;
+    // Match MLX sdpa_vector_2pass_1 on the compact token order. Splits only
+    // distribute the fixed 128 blocks; every block keeps its global index.
     const uint lane = thread_index_in_simdgroup;
-    const uint sg = simdgroup_index_in_threadgroup;
+    const uint head = simdgroup_index_in_threadgroup;
     const uint row = threadgroup_position_in_grid.y;
     const uint unit = threadgroup_position_in_grid.z;
     const uint split = unit % S;
@@ -466,154 +428,128 @@ _SOURCE = r"""
     const int qp = qpos[b * L + row];
     const int complete = ((qp + 1) / BS) * BS;
     const int lpad = left_pad[b];
-    const uint chunks = (uint(U) + CHUNK_SLOTS - 1) / CHUNK_SLOTS;
-    const uint base = chunks / S;
-    const uint remainder = chunks % S;
-    const uint chunk_begin = split * base + metal::min(split, remainder);
-    const uint chunk_count = base + (split < remainder ? 1u : 0u);
-    const uint nsg = THREADS / 32;
+    const uint base = BLOCKS / S;
+    const uint remainder = BLOCKS % S;
+    const uint block_begin = split * base + metal::min(split, remainder);
+    const uint block_count = base + (split < remainder ? 1u : 0u);
+    const uint token_width = uint(U) * BS;
+    const uint qh = hkv * GQA + head;
+    const uint elements = D / 32;
 
-    threadgroup float dot_parts[GQA * (THREADS / 32)];
-    threadgroup float scores[GQA * CHUNK_TOKENS];
-    threadgroup float probabilities[GQA];
-    threadgroup float maxima[GQA];
-    threadgroup float sums[GQA];
-
-    float q_values[GQA][D / THREADS + 1];
-    float out[GQA][D / THREADS + 1];
-    for (uint head = 0; head < GQA; ++head) {
-        const uint qh = hkv * GQA + head;
-        for (uint d = tid; d < D; d += THREADS) {
-            const uint part = d / THREADS;
-            q_values[head][part] = float(
-                q[((size_t)(b * NQH + qh) * L + row) * D + d]
-            );
-        }
+    float q_values[D / 32];
+    for (uint part = 0; part < elements; ++part) {
+        const uint d = lane * elements + part;
+        q_values[part] = float(scale[0]) * float(
+            q[((size_t)(b * NQH + qh) * L + row) * D + d]
+        );
     }
 
     const uint slot_base = (b * L + row) * uint(U);
     const device T* kb = k + (size_t)(b * NKVH + hkv) * TOT * D;
     const device T* vb = v + (size_t)(b * NKVH + hkv) * TOT * D;
-    for (uint local_chunk = 0; local_chunk < CPS; ++local_chunk) {
-        for (uint head = 0; head < GQA; ++head)
-            for (uint part = 0; part < D / THREADS + 1; ++part)
-                out[head][part] = 0.0f;
-        if (tid < GQA) {
-            maxima[tid] = -INFINITY;
-            sums[tid] = 0.0f;
+    for (uint local_block = 0; local_block < block_count; ++local_block) {
+        const uint block_idx = block_begin + local_block;
+        float out_values[D / 32] = {0};
+        float maximum = -3.402823466e+38F;
+        float sum = 0.0f;
+
+        for (uint token = block_idx; token < token_width; token += BLOCKS) {
+            const uint slot = token / BS;
+            const uint tail = token % BS;
+            int logical = 0;
+            int physical = 0;
+            bool live = slot < count;
+            if (live) {
+                const int block = int(ids[slot_base + slot]);
+                logical = block * BS + int(tail);
+                physical = lpad + logical;
+                live = physical >= 0 && physical < TOT && logical <= qp;
+                live = live && (slot < selected || logical >= complete);
+                if (HAS_MASK && live)
+                    live = mask[(size_t)(b * L + row) * TOT + physical];
+            }
+            if (!live) continue;
+
+            float score = 0.0f;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                score += q_values[part] * float(kb[(size_t)physical * D + d]);
+            }
+            score = simd_sum(score);
+            const float new_max = metal::max(maximum, score);
+            const float factor = fast::exp(maximum - new_max);
+            const float probability = fast::exp(score - new_max);
+            maximum = new_max;
+            sum = sum * factor + probability;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                out_values[part] = out_values[part] * factor
+                    + probability * float(vb[(size_t)physical * D + d]);
+            }
         }
+
+        const size_t state = (
+            ((size_t)(b * NQH + qh) * L + row) * BLOCKS + block_idx
+        );
+        if (lane == 0) {
+            part_m[state] = maximum;
+            part_l[state] = sum;
+        }
+        for (uint part = 0; part < elements; ++part) {
+            const uint d = lane * elements + part;
+            part_o[state * D + d] = T(out_values[part]);
+        }
+    }
+"""
+
+
+_COMBINE_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint bh = threadgroup_position_in_grid.z;
+    const int L = dims[0];
+    const uint elements = D / 32;
+    const size_t state = ((size_t)bh * L + row) * BLOCKS;
+    const device float* row_m = part_m + state;
+    const device float* row_l = part_l + state;
+    const device T* row_o = part_o + state * D;
+
+    float maximum = -3.402823466e+38F;
+    for (uint group = 0; group < BLOCKS / 32; ++group)
+        maximum = metal::max(maximum, row_m[lane + 32 * group]);
+    maximum = simd_max(maximum);
+
+    float sum = 0.0f;
+    for (uint group = 0; group < BLOCKS / 32; ++group) {
+        const uint block = lane + 32 * group;
+        sum += fast::exp(row_m[block] - maximum) * row_l[block];
+    }
+    sum = simd_sum(sum);
+
+    float values[D / 32] = {0};
+    for (uint group = 0; group < BLOCKS / 32; ++group) {
+        const uint block = sg + 32 * group;
+        const float factor = fast::exp(row_m[block] - maximum);
+        for (uint part = 0; part < elements; ++part) {
+            const uint d = lane * elements + part;
+            values[part] += factor * float(row_o[(size_t)block * D + d]);
+        }
+    }
+
+    threadgroup float transposed[32 * 32];
+    for (uint part = 0; part < elements; ++part) {
+        transposed[lane * 32 + sg] = values[part];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (local_chunk < chunk_count) {
-            const uint chunk = chunk_begin + local_chunk;
-            const uint first_slot = chunk * CHUNK_SLOTS;
-            const uint last_slot = metal::min(first_slot + CHUNK_SLOTS, uint(U));
-
-            // Pass 1 stores every score and finds the chunk maximum.
-            for (uint token = 0; token < CHUNK_TOKENS; ++token) {
-                const uint slot = first_slot + token / BS;
-                const uint tail = token % BS;
-                int logical = 0;
-                int physical = 0;
-                bool live = slot < last_slot && slot < count;
-                if (live) {
-                    const int block = int(ids[slot_base + slot]);
-                    logical = block * BS + int(tail);
-                    physical = lpad + logical;
-                    live = physical >= 0 && physical < TOT && logical <= qp;
-                    live = live && (slot < selected || logical >= complete);
-                    if (HAS_MASK && live)
-                        live = mask[(size_t)(b * L + row) * TOT + physical];
-                }
-                if (!live) {
-                    if (tid < GQA)
-                        scores[tid * CHUNK_TOKENS + token] = -INFINITY;
-                    continue;
-                }
-
-                float key_values[D / THREADS + 1];
-                for (uint d = tid; d < D; d += THREADS) {
-                    const uint part = d / THREADS;
-                    key_values[part] = float(kb[(size_t)physical * D + d]);
-                }
-                for (uint head = 0; head < GQA; ++head) {
-                    float local = 0.0f;
-                    for (uint d = tid; d < D; d += THREADS) {
-                        const uint part = d / THREADS;
-                        local += q_values[head][part] * key_values[part];
-                    }
-                    local = simd_sum(local);
-                    if (lane == 0)
-                        dot_parts[head * nsg + sg] = local;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (tid < GQA) {
-                    float score = 0.0f;
-                    for (uint part = 0; part < nsg; ++part)
-                        score += dot_parts[tid * nsg + part];
-                    score *= scale[0];
-                    scores[tid * CHUNK_TOKENS + token] = score;
-                    maxima[tid] = metal::max(maxima[tid], score);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Pass 2 accumulates in fixed slot-major, token-minor order.
-            for (uint token = 0; token < CHUNK_TOKENS; ++token) {
-                const uint slot = first_slot + token / BS;
-                const uint tail = token % BS;
-                int logical = 0;
-                int physical = 0;
-                bool live = slot < last_slot && slot < count;
-                if (live) {
-                    const int block = int(ids[slot_base + slot]);
-                    logical = block * BS + int(tail);
-                    physical = lpad + logical;
-                    live = physical >= 0 && physical < TOT && logical <= qp;
-                    live = live && (slot < selected || logical >= complete);
-                    if (HAS_MASK && live)
-                        live = mask[(size_t)(b * L + row) * TOT + physical];
-                }
-                if (!live) continue;
-
-                float value_values[D / THREADS + 1];
-                for (uint d = tid; d < D; d += THREADS) {
-                    const uint part = d / THREADS;
-                    value_values[part] = float(vb[(size_t)physical * D + d]);
-                }
-                if (tid < GQA) {
-                    const float probability = metal::precise::exp(
-                        scores[tid * CHUNK_TOKENS + token] - maxima[tid]
-                    );
-                    probabilities[tid] = probability;
-                    sums[tid] += probability;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint d = tid; d < D; d += THREADS) {
-                    const uint part = d / THREADS;
-                    for (uint head = 0; head < GQA; ++head)
-                        out[head][part] += probabilities[head] * value_values[part];
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-
-        for (uint head = 0; head < GQA; ++head) {
-            const uint qh = hkv * GQA + head;
-            const size_t state = (
-                (((size_t)b * NQH + qh) * L + row) * S + split
-            ) * CPS + local_chunk;
-            if (tid == head) {
-                part_m[state] = maxima[head];
-                part_l[state] = sums[head];
-            }
-            for (uint d = tid; d < D; d += THREADS) {
-                const uint part = d / THREADS;
-                part_o[state * D + d] = out[head][part];
-            }
-        }
+        values[part] = simd_sum(transposed[sg * 32 + lane]);
+        values[part] = sum == 0.0f ? values[part] : values[part] / sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        device T* row_out = out + ((size_t)bh * L + row) * D + sg * elements;
+        for (uint part = 0; part < elements; ++part)
+            row_out[part] = T(values[part]);
     }
 """
 
@@ -621,7 +557,7 @@ _SOURCE = r"""
 @lru_cache(maxsize=None)
 def _partition_kernel():
     return mx.fast.metal_kernel(
-        name="qwen4_qsa_indexed_splitk_v2",
+        name="qwen4_qsa_indexed_sdpa_pass1_v3",
         input_names=[
             "q",
             "k",
@@ -642,6 +578,18 @@ def _partition_kernel():
     )
 
 
+@lru_cache(maxsize=None)
+def _combine_kernel():
+    return mx.fast.metal_kernel(
+        name="qwen4_qsa_indexed_sdpa_pass2_v3",
+        input_names=["part_m", "part_l", "part_o", "dims"],
+        output_names=["out"],
+        header=_HEADER,
+        source=_COMBINE_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
 class QSAIndexedProbeDeclined(RuntimeError):
     """No candidate in the indexed Metal ladder could dispatch."""
 
@@ -651,15 +599,11 @@ _PROBE_RESULTS = {}
 _MISSING = object()
 
 
-def _candidate_ladder(splits: int):
+def _candidate_ladder(splits: int, threads: int):
     split_candidates = [int(splits)]
     if splits > 4:
         split_candidates.append(max(4, splits // 2))
-    return tuple(
-        (threads, candidate_splits)
-        for candidate_splits in split_candidates
-        for threads in _THREAD_CANDIDATES
-    )
+    return tuple((int(threads), value) for value in split_candidates)
 
 
 def _partition_dispatch(
@@ -678,9 +622,9 @@ def _partition_dispatch(
     ids, counts, n_sel, u_width, q_pos, left_pad, total = (
         compact_blocks_to_kernel_inputs(compact)
     )
-    chunks_per_split = max(
-        1, max(map(len, indexed_split_chunk_ranges(u_width, splits)))
-    )
+    required_threads = gqa * 32
+    if threads != required_threads:
+        raise ValueError("indexed QSA pass 1 requires one SIMD group per GQA head")
     if compact.causal_mask is None:
         mask = mx.ones((1,), dtype=mx.bool_)
         has_mask = False
@@ -711,27 +655,43 @@ def _partition_dispatch(
             ("GQA", gqa),
             ("BS", int(compact.block_size)),
             ("S", int(splits)),
-            ("CHUNK_SLOTS", _CHUNK_SLOTS),
-            ("CHUNK_TOKENS", _CHUNK_TOKENS),
-            ("CPS", chunks_per_split),
-            ("THREADS", int(threads)),
+            ("BLOCKS", _SDPA_BLOCKS),
             ("HAS_MASK", int(has_mask)),
         ],
         grid=(threads, length, batch * nkh * splits),
         threadgroup=(threads, 1, 1),
         output_shapes=[
-            (batch, nqh, length, splits, chunks_per_split),
-            (batch, nqh, length, splits, chunks_per_split),
-            (batch, nqh, length, splits, chunks_per_split, dim),
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS, dim),
         ],
-        output_dtypes=[mx.float32, mx.float32, mx.float32],
+        output_dtypes=[mx.float32, mx.float32, q.dtype],
     )
+
+
+def _combine_sdpa_partials(m, l, o, *, output_dtype):
+    batch, nqh, length, blocks = map(int, m.shape)
+    dim = int(o.shape[-1])
+    if blocks != _SDPA_BLOCKS or dim % 32:
+        raise ValueError("indexed QSA pass 2 has unsupported partial geometry")
+    return _combine_kernel()(
+        inputs=[m, l, o, mx.array([length], dtype=mx.int32)],
+        template=[
+            ("T", output_dtype),
+            ("D", dim),
+            ("BLOCKS", _SDPA_BLOCKS),
+        ],
+        grid=(1024, length, batch * nqh),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(batch, nqh, length, dim)],
+        output_dtypes=[output_dtype],
+    )[0]
 
 
 def qwen4_qsa_indexed_attention(
     q, k, v, compact, *, scale: float, splits: int | None = None
 ):
-    """Dispatch indexed split-K Metal attention and merge partials in MLX."""
+    """Dispatch indexed attention with MLX SDPA's two-pass reduction tree."""
 
     if not indexed_kernel_available():
         raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
@@ -743,8 +703,31 @@ def qwen4_qsa_indexed_attention(
         raise ValueError("indexed QSA tensors do not match compact selection")
     if int(compact.block_size) != _BLOCK_SIZE:
         raise ValueError("indexed QSA requires block size 4")
+    if int(q.shape[-1]) != 256:
+        raise QSAIndexedProbeDeclined("indexed QSA exact mode requires D=256")
+    gqa = int(q.shape[1]) // int(k.shape[1])
+    if gqa != 12:
+        raise QSAIndexedProbeDeclined("indexed QSA exact mode requires GQA=12")
+    threads = gqa * 32
+    if threads > 1024:
+        raise ValueError("indexed QSA GQA exceeds the Metal threadgroup limit")
+    sdpa_blocks = os.environ.get("MLX_SDPA_BLOCKS")
+    if sdpa_blocks not in (None, "", str(_SDPA_BLOCKS)):
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA requires MLX_SDPA_BLOCKS=128"
+        )
 
     _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+    token_width = u_width * _BLOCK_SIZE
+    if token_width <= 1024 or token_width > 8192:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA requires the MLX two-pass SDPA geometry"
+        )
+    architecture = str(mx.device_info().get("architecture", ""))
+    if architecture[-1:] not in {"s", "d"}:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA exact mode requires a 128-block MLX SDPA device"
+        )
     requested = indexed_splits_for(u_width) if splits is None else int(splits)
     if requested < 1 or requested > min(8, u_width):
         raise ValueError("splits must be in [1, min(8, u_width)]")
@@ -770,7 +753,7 @@ def qwen4_qsa_indexed_attention(
                 )
             if candidate is _MISSING:
                 candidate = None
-                for attempted in _candidate_ladder(requested):
+                for attempted in _candidate_ladder(requested, threads):
                     try:
                         partials = _partition_dispatch(
                             q,
@@ -781,7 +764,10 @@ def qwen4_qsa_indexed_attention(
                             threads=attempted[0],
                             splits=attempted[1],
                         )
-                        mx.eval(*partials)
+                        combined = _combine_sdpa_partials(
+                            *partials, output_dtype=q.dtype
+                        )
+                        mx.eval(combined)
                         candidate = attempted
                         _PROBE_RESULTS[key] = attempted
                         break
@@ -792,7 +778,6 @@ def qwen4_qsa_indexed_attention(
                     raise QSAIndexedProbeDeclined(
                         "indexed QSA candidate ladder was declined"
                     )
-                m, l, o = partials
                 record_qsa_indexed_receipt(
                     engaged=True,
                     reason="engaged",
@@ -801,7 +786,7 @@ def qwen4_qsa_indexed_attention(
                     splits=candidate[1],
                     candidate=candidate,
                 )
-                return _combine_indexed_partials(m, l, o, output_dtype=q.dtype)
+                return combined
 
     m, l, o = _partition_dispatch(
         q,
@@ -820,7 +805,7 @@ def qwen4_qsa_indexed_attention(
         splits=candidate[1],
         candidate=candidate,
     )
-    return _combine_indexed_partials(m, l, o, output_dtype=q.dtype)
+    return _combine_sdpa_partials(m, l, o, output_dtype=q.dtype)
 
 
 __all__ = [

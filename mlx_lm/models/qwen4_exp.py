@@ -3043,12 +3043,12 @@ def _capture_qsa_indexed_comparison(
         values.append(indexed_out)
     mx.eval(*values)
 
-    gather_np = np.asarray(gather_out).astype(np.float32)
-    mirror_np = np.asarray(mirror_out).astype(np.float32)
+    gather_np = np.asarray(gather_out.astype(mx.float32))
+    mirror_np = np.asarray(mirror_out.astype(mx.float32))
     mirror_delta = np.abs(mirror_np - gather_np)
     indexed_delta = None
     if indexed_out is not None:
-        indexed_np = np.asarray(indexed_out).astype(np.float32)
+        indexed_np = np.asarray(indexed_out.astype(mx.float32))
         indexed_delta = np.abs(indexed_np - gather_np)
         flat_argmax = int(np.argmax(indexed_delta))
         argmax = np.unravel_index(flat_argmax, indexed_delta.shape)

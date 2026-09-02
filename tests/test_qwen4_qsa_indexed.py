@@ -88,6 +88,28 @@ def _wide_compact(length=2, *, selected_width=127):
     )
 
 
+def _real_bf16_fixture():
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "qwen4_qsa_indexed_real_bf16_257.safetensors"
+    )
+    arrays = mx.load(str(path))
+    width = int(arrays["k"].shape[2])
+    blocks = width // 4
+    compact = QSACompactBlocks(
+        block_ids=mx.arange(blocks, dtype=mx.uint32)[None, None],
+        block_counts=mx.array([[blocks]], dtype=mx.int32),
+        tail_start=mx.array([[width]], dtype=mx.int32),
+        tail_stop=mx.array([[width]], dtype=mx.int32),
+        left_padding=mx.array([0], dtype=mx.int32),
+        block_size=4,
+        physical_width=width,
+        causal_mask=None,
+    )
+    return arrays["q"], arrays["k"], arrays["v"], compact
+
+
 class TestQSAIndexedReference(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -206,6 +228,51 @@ class TestQSAIndexedReference(unittest.TestCase):
 
     def test_metal_kernel_object_construction_does_not_dispatch(self):
         self.assertIsNotNone(indexed._partition_kernel())
+        self.assertIsNotNone(indexed._combine_kernel())
+
+    def test_real_capture_fixture_has_production_two_pass_geometry(self):
+        q, k, v, compact = _real_bf16_fixture()
+        self.assertEqual(q.shape, (1, 12, 1, 256))
+        self.assertEqual(k.shape, (1, 1, 1028, 256))
+        self.assertEqual(k.shape, v.shape)
+        self.assertEqual(q.dtype, mx.bfloat16)
+        self.assertEqual(indexed.indexed_splits_for(257), 5)
+        reference = indexed.qwen4_qsa_indexed_reference(
+            q, k, v, compact, scale=256**-0.5, splits=5
+        )
+        gather = _gather_qsa_attention(
+            q, k, v, compact, scale=256**-0.5, tile_rows=1
+        )
+        mx.eval(reference, gather)
+        self.assertEqual(reference.shape, gather.shape)
+        self.assertTrue(bool(mx.all(mx.isfinite(reference)).item()))
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
+    )
+    def test_real_capture_fixture_is_bit_exact_on_metal(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            q, k, v, compact = _real_bf16_fixture()
+            gather = _gather_qsa_attention(
+                q, k, v, compact, scale=256**-0.5, tile_rows=1
+            )
+            outputs = [
+                indexed.qwen4_qsa_indexed_attention(
+                    q, k, v, compact, scale=256**-0.5, splits=splits
+                )
+                for splits in (1, 4, 8)
+            ]
+            mx.eval(gather, *outputs)
+            for splits, output in zip((1, 4, 8), outputs):
+                self.assertTrue(
+                    bool(mx.array_equal(output, gather).item()),
+                    f"real fixture differs from gather at S={splits}",
+                )
+        finally:
+            mx.set_default_device(device)
 
     def test_synchronous_dispatch_failure_reuses_fetched_kv_for_gather(self):
         mx.random.seed(31)
@@ -248,7 +315,7 @@ class TestQSAIndexedReference(unittest.TestCase):
     def test_capture_writes_mismatch_and_returns_gather(self):
         mx.random.seed(37)
         compact = _compact(1, 3)
-        q, k, v = _arrays(1, 3)
+        q, k, v = _arrays(1, 3, dtype=mx.bfloat16)
         gather = _gather_qsa_attention(
             q, k, v, compact, scale=8**-0.5, tile_rows=1
         )
@@ -280,7 +347,10 @@ class TestQSAIndexedReference(unittest.TestCase):
                     gather_would_admit=False,
                 )
             mx.eval(actual, gather)
-            np.testing.assert_array_equal(np.asarray(actual), np.asarray(gather))
+            np.testing.assert_array_equal(
+                np.asarray(actual.astype(mx.float32)),
+                np.asarray(gather.astype(mx.float32)),
+            )
             rows = [
                 json.loads(line)
                 for line in Path(root, "calls.jsonl").read_text().splitlines()

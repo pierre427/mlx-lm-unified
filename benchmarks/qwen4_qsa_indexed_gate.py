@@ -38,9 +38,28 @@ class GateFailure(RuntimeError):
         self.phase = int(phase)
 
 
+class GateStop(RuntimeError):
+    pass
+
+
 @contextmanager
 def gpu_lock():
     """Take the lab-wide GPU lock and remove only this owner's file."""
+
+    inherited_owner = os.environ.get("MLXUAG_GPU_LOCK_ALREADY_HELD")
+    if inherited_owner:
+        owner_path = GPU_LOCK / "owner.json"
+        try:
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit("inherited GPU lock has no valid owner.json") from error
+        if owner.get("owner") != inherited_owner:
+            raise SystemExit(
+                f"inherited GPU lock belongs to {owner.get('owner')!r}, "
+                f"not {inherited_owner!r}"
+            )
+        yield owner
+        return
 
     try:
         os.mkdir(GPU_LOCK)
@@ -288,7 +307,7 @@ def cast_tie_counts(kernel_np, mirror_np, kernel_cast, mirror_cast, limit):
 
 
 def phase2_exactness(mx):
-    from mlx_lm.models.qwen4_exp import QSACompactBlocks
+    from mlx_lm.models.qwen4_exp import QSACompactBlocks, _gather_qsa_attention
     from mlx_lm.models.qwen4_qsa_indexed import (
         qwen4_qsa_indexed_attention,
         qwen4_qsa_indexed_reference,
@@ -351,13 +370,79 @@ def phase2_exactness(mx):
         )
         del q, k, v, outputs, mirror
         mx.clear_cache()
-    passed = all_s_equal and worst_relative <= 1.0e-4 and non_ties == 0
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "tests"
+        / "fixtures"
+        / "qwen4_qsa_indexed_real_bf16_257.safetensors"
+    )
+    fixture = mx.load(str(fixture_path))
+    fixture_width = int(fixture["k"].shape[2])
+    fixture_blocks = fixture_width // 4
+    fixture_compact = QSACompactBlocks(
+        block_ids=mx.arange(fixture_blocks, dtype=mx.uint32)[None, None],
+        block_counts=mx.array([[fixture_blocks]], dtype=mx.int32),
+        tail_start=mx.array([[fixture_width]], dtype=mx.int32),
+        tail_stop=mx.array([[fixture_width]], dtype=mx.int32),
+        left_padding=mx.array([0], dtype=mx.int32),
+        block_size=4,
+        physical_width=fixture_width,
+        causal_mask=None,
+    )
+    fixture_gather = _gather_qsa_attention(
+        fixture["q"],
+        fixture["k"],
+        fixture["v"],
+        fixture_compact,
+        scale=256**-0.5,
+        tile_rows=1,
+    )
+    fixture_outputs = {
+        splits: qwen4_qsa_indexed_attention(
+            fixture["q"],
+            fixture["k"],
+            fixture["v"],
+            fixture_compact,
+            scale=256**-0.5,
+            splits=splits,
+        )
+        for splits in (1, 4, 8)
+    }
+    mx.eval(fixture_gather, *fixture_outputs.values())
+    fixture_checks = {}
+    fixture_exact = True
+    for splits, output in fixture_outputs.items():
+        exact = bool(mx.array_equal(output, fixture_gather).item())
+        fixture_exact = fixture_exact and exact
+        fixture_checks[str(splits)] = {
+            "bit_equal_to_gather": exact,
+            "max_abs": float(
+                mx.max(
+                    mx.abs(
+                        output.astype(mx.float32)
+                        - fixture_gather.astype(mx.float32)
+                    )
+                ).item()
+            ),
+        }
+    passed = (
+        all_s_equal
+        and worst_relative <= 1.0e-4
+        and non_ties == 0
+        and fixture_exact
+    )
     result = {
         "phase": 2,
         "status": "PASS" if passed else "FAIL",
         "s_invariant": all_s_equal,
         "worst_kernel_mirror_relative": worst_relative,
         "non_tie_count": non_ties,
+        "real_capture_fixture": {
+            "path": str(fixture_path),
+            "source_geometry": list(map(int, fixture["q"].shape)),
+            "physical_width": fixture_width,
+            "checks": fixture_checks,
+        },
         "rows": rows,
     }
     if not passed:
@@ -1007,6 +1092,7 @@ def main():
     parser.add_argument("--timing-tokens", type=int, default=64)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--start-phase", type=int, choices=(1, 4), default=1)
+    parser.add_argument("--stop-after-phase", type=int, choices=(3, 5), default=5)
     parser.add_argument(
         "--swap-growth-abort-mib",
         type=float,
@@ -1041,6 +1127,7 @@ def main():
             "model": str(args.model),
             "outcome": "RUNNING",
             "start_phase": args.start_phase,
+            "stop_after_phase": args.stop_after_phase,
             "policy": {
                 "swap_growth_abort_mib": args.swap_growth_abort_mib,
                 "model_load_free_floor_percent": args.model_load_free_floor_percent,
@@ -1087,6 +1174,9 @@ def main():
                 report["phases"].append(phase2_exactness(mx))
                 current_phase = 3
                 report["phases"].append(phase3_gather(mx))
+                if args.stop_after_phase == 3:
+                    report["manifest"]["outcome"] = "PASS_PHASES_1_3"
+                    raise GateStop()
             current_phase = 4
             mx.clear_cache()
             gc.collect()
@@ -1157,6 +1247,8 @@ def main():
                         "message": phase4.get("safety_failure", phase4["status"]),
                     }
                     exit_code = 1
+        except GateStop:
+            pass
         except GateFailure as error:
             report["manifest"]["outcome"] = f"FAIL_PHASE_{error.phase}"
             report["failure"] = {"phase": error.phase, "message": str(error)}
