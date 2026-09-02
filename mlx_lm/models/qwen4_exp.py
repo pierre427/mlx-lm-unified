@@ -36,6 +36,11 @@ from .qwen4_fused_gdn import (
     qwen4_fused_gdn_decode,
     qwen4_fused_gdn_decode_outproj,
 )
+from .qwen4_fused_gdn_verify import (
+    admit_qwen4_fused_gdn_verify,
+    probe_qwen4_fused_gdn_verify,
+    qwen4_fused_gdn_verify,
+)
 from .qwen4_gdn_outproj import admit_qwen4_gdn_outproj
 from .qwen4_qsa_nax import (
     block_sparse_layout_supported,
@@ -113,6 +118,10 @@ _GDN_SHAPE_STABLE_PROJECTIONS = _env_flag(
 )
 _FUSED_GDN_DECODE = _env_flag("MLX_QWEN4_FUSED_GDN_DECODE")
 _FUSED_GDN_DECODE_MODES = ("stock", "fused", "fused_outproj")
+# Speculative-verify sibling of the single-token fused GDN kernel: default off,
+# selected independently of the decode mode.
+_FUSED_GDN_VERIFY = _env_flag("MLX_QWEN4_FUSED_GDN_VERIFY")
+_FUSED_GDN_VERIFY_MODES = ("stock", "fused")
 _SHAPE_STABLE_SHORT_FORWARD = _env_flag(
     "MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD"
 )
@@ -739,6 +748,10 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         self.fused_gdn_outproj_calls = 0
         self.fused_gdn_decode_fallbacks = 0
         self.fused_gdn_decode_last_fallback = None
+        self.fused_gdn_verify_mode = "fused" if _FUSED_GDN_VERIFY else "stock"
+        self.fused_gdn_verify_calls = 0
+        self.fused_gdn_verify_fallbacks = 0
+        self.fused_gdn_verify_last_fallback = None
         # Per-layer device rendezvous for the 12-block one-dispatch output
         # epilogue.  Length 64 keeps it a device buffer, not a Metal constant.
         object.__setattr__(
@@ -781,7 +794,122 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         self.fused_gdn_decode_last_fallback = reason
         return None
 
+    def set_fused_gdn_verify_mode(self, mode: str):
+        """Select the speculative-verify implementation; independent of decode."""
+        if mode not in _FUSED_GDN_VERIFY_MODES:
+            raise ValueError(
+                f"unknown fused GDN verify mode {mode!r}; "
+                f"expected one of {_FUSED_GDN_VERIFY_MODES}"
+            )
+        self.fused_gdn_verify_mode = mode
+
+    def _fused_gdn_verify_fallback(self, reason: str):
+        self.fused_gdn_verify_fallbacks += 1
+        self.fused_gdn_verify_last_fallback = reason
+        return None
+
+    def _try_fused_verify(self, qkv, z, b, a, mask, cache):
+        """Fuse a B=1 speculative verify block and record its restore points.
+
+        The stock path records a replay closure that recomputes the recurrence
+        over the first ``m`` tokens on rejection; this path records the
+        kernel's own per-token snapshots instead, which are bit-identical to
+        that replay and cost no recomputation.
+        """
+        if self.fused_gdn_verify_mode == "stock":
+            return None
+        if cache is None or cache[0] is None or cache[1] is None:
+            return self._fused_gdn_verify_fallback("uninitialized cache")
+        describe = getattr(cache, "rollback_spans", None)
+        if describe is None or not callable(getattr(cache, "record_rollback", None)):
+            return self._fused_gdn_verify_fallback("cache lacks rollback records")
+        steps = int(qkv.shape[1])
+        # ``()`` means unpadded rows that all advance ``steps``; anything else
+        # (a padded slab, or geometry the cache cannot describe) stays stock.
+        if describe(steps, mask) != ():
+            return self._fused_gdn_verify_fallback("padded rollback geometry")
+
+        admission = admit_qwen4_fused_gdn_verify(
+            qkv=qkv,
+            z=z,
+            b=b,
+            a=a,
+            conv_state=cache[0],
+            recurrent_state=cache[1],
+            conv_weight=self.conv1d.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            norm_weight=self.norm.weight,
+            mask=mask,
+            cache_lengths=getattr(cache, "lengths", None),
+            speculating=bool(getattr(cache, "speculating", False)),
+            training=bool(self.training),
+            sharded=self.sharding_group is not None,
+            num_key_heads=self.num_k_heads,
+            num_value_heads=self.num_v_heads,
+            key_head_dim=self.head_k_dim,
+            value_head_dim=self.head_v_dim,
+            conv_kernel=self.conv_kernel_size,
+            gate_activation=self.norm.activation,
+        )
+        if not admission.accepted:
+            return self._fused_gdn_verify_fallback(admission.reason)
+        if not fused_gdn_runtime_supported():
+            return self._fused_gdn_verify_fallback("Metal runtime unavailable")
+
+        try:
+            threadgroup_y = probe_qwen4_fused_gdn_verify(qkv.dtype, steps)
+            if threadgroup_y is None:
+                return self._fused_gdn_verify_fallback("Metal kernel probe declined")
+            (
+                out,
+                conv_state,
+                recurrent_state,
+                state_snapshots,
+                conv_snapshots,
+            ) = qwen4_fused_gdn_verify(
+                qkv,
+                z,
+                b,
+                a,
+                cache[0],
+                self.conv1d.weight,
+                self.A_log,
+                self.dt_bias,
+                cache[1],
+                self.norm.weight,
+                self.norm.eps,
+                threadgroup_y=threadgroup_y,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional fast path fails closed
+            return self._fused_gdn_verify_fallback(
+                f"Metal kernel dispatch failed: {type(exc).__name__}"
+            )
+
+        # Same record the stock path makes (Qwen4ArraysCache combines it with
+        # the PLE half staged earlier in this forward), recorded BEFORE the
+        # live slots change so a contract failure leaves the cache untouched.
+        def _rollback(m, conv=conv_snapshots, state=state_snapshots):
+            return [mx.contiguous(conv[:, m - 1]), state[:, m - 1]]
+
+        cache.record_rollback(steps, _rollback, [cache[0], cache[1]])
+        cache[0] = conv_state
+        cache[1] = recurrent_state
+        cache.advance(steps)
+        self.fused_gdn_verify_calls += 1
+        self.fused_gdn_verify_last_fallback = None
+        return self.out_proj(out)
+
     def _try_fused_decode(self, qkv, z, b, a, mask, cache):
+        # A speculative verify block (rollback recording, width above one) has
+        # its own fused path and counters; single-token forwards, speculating
+        # or not, keep the decode admission below.
+        if (
+            cache is not None
+            and getattr(cache, "speculating", False)
+            and qkv.shape[1] > 1
+        ):
+            return self._try_fused_verify(qkv, z, b, a, mask, cache)
         if self.fused_gdn_decode_mode == "stock":
             return None
         if cache is None or cache[0] is None or cache[1] is None:
@@ -907,8 +1035,25 @@ def set_qwen4_fused_gdn_mode(model: nn.Module, mode: str) -> int:
     return len(layers)
 
 
+def set_qwen4_fused_gdn_verify_mode(model: nn.Module, mode: str) -> int:
+    """Atomically switch all resident Qwen4 GDN layers' verify path."""
+    if mode not in _FUSED_GDN_VERIFY_MODES:
+        raise ValueError(
+            f"unknown fused GDN verify mode {mode!r}; "
+            f"expected one of {_FUSED_GDN_VERIFY_MODES}"
+        )
+    layers = [
+        module
+        for _, module in model.named_modules()
+        if isinstance(module, GatedDeltaNet)
+    ]
+    for layer in layers:
+        layer.set_fused_gdn_verify_mode(mode)
+    return len(layers)
+
+
 def qwen4_fused_gdn_mode_counts(model: nn.Module) -> dict[str, int]:
-    """Return resident GDN mode counts without evaluating model arrays."""
+    """Return resident GDN decode mode counts without evaluating model arrays."""
     counts = {mode: 0 for mode in _FUSED_GDN_DECODE_MODES}
     for _, module in model.named_modules():
         if isinstance(module, GatedDeltaNet):
@@ -916,13 +1061,29 @@ def qwen4_fused_gdn_mode_counts(model: nn.Module) -> dict[str, int]:
     return counts
 
 
+def qwen4_fused_gdn_verify_mode_counts(model: nn.Module) -> dict[str, int]:
+    """Return resident GDN verify mode counts without evaluating model arrays."""
+    counts = {mode: 0 for mode in _FUSED_GDN_VERIFY_MODES}
+    for _, module in model.named_modules():
+        if isinstance(module, GatedDeltaNet):
+            counts[module.fused_gdn_verify_mode] += 1
+    return counts
+
+
 def qwen4_fused_gdn_stats(model: nn.Module) -> dict[str, Any]:
-    """Return graph-selection and fallback counters without host synchronization."""
+    """Return graph-selection and fallback counters without host synchronization.
+
+    ``fused_calls``/``fallbacks``/``last_fallbacks`` describe the single-token
+    decode path; the ``verify_*`` keys describe the speculative-verify path.
+    """
     stats = {
         "fused_calls": 0,
         "fused_outproj_calls": 0,
         "fallbacks": 0,
         "last_fallbacks": {},
+        "verify_calls": 0,
+        "verify_fallbacks": 0,
+        "verify_last_fallbacks": {},
     }
     for _, module in model.named_modules():
         if not isinstance(module, GatedDeltaNet):
@@ -934,6 +1095,13 @@ def qwen4_fused_gdn_stats(model: nn.Module) -> dict[str, Any]:
         if reason is not None:
             stats["last_fallbacks"][reason] = (
                 stats["last_fallbacks"].get(reason, 0) + 1
+            )
+        stats["verify_calls"] += module.fused_gdn_verify_calls
+        stats["verify_fallbacks"] += module.fused_gdn_verify_fallbacks
+        reason = module.fused_gdn_verify_last_fallback
+        if reason is not None:
+            stats["verify_last_fallbacks"][reason] = (
+                stats["verify_last_fallbacks"].get(reason, 0) + 1
             )
     return stats
 
