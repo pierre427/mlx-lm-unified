@@ -349,7 +349,7 @@ def seed(args) -> int:
         },
     )
     save_seconds = time.perf_counter() - save_started
-    _, raw_metadata = mx.load(str(args.cache), return_metadata=True)
+    saved_arrays, raw_metadata = mx.load(str(args.cache), return_metadata=True)
     provenance = next(
         (
             json.loads(value)
@@ -360,6 +360,7 @@ def seed(args) -> int:
     )
     if provenance is None or not provenance.get("entries"):
         raise RuntimeError("saved cache has no QSA summary provenance")
+    del saved_arrays
     final = require_runtime_gates(
         floor=args.memory_floor, baseline_swap=baseline_swap, where="seed save"
     )
