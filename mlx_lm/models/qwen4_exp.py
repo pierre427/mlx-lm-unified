@@ -641,11 +641,6 @@ def _valid_span_end(mask):
     return mx.max(mx.where(mask, mx.arange(1, length + 1), 0), axis=1)
 
 
-def _trace_ple_mask_tail(mask):
-    record_verify_sync("qwen4.ple.mask_tail_asarray")
-    return np.asarray(mask)
-
-
 def _row_tail(values, end, width):
     """Per-row trailing window of ``[prev(width), new]`` ending at ``end``.
 
@@ -1589,6 +1584,8 @@ class NGramEmbedding(nn.Module):
             record_verify_sync("qwen4.ple.mask_asarray")
             mask_array = np.asarray(mask)
             tokens = np.where(mask_array, tokens, self.eos_token_id)
+        else:
+            mask_array = None
         history = np.concatenate([previous, tokens], axis=-1)
         if cache is not None:
             tail = (
@@ -1596,7 +1593,7 @@ class NGramEmbedding(nn.Module):
                 if mask is None
                 else _row_tail(
                     history,
-                    _valid_span_end(_trace_ple_mask_tail(mask)),
+                    _valid_span_end(mask_array),
                     self.context_len,
                 )
             )
@@ -1776,6 +1773,18 @@ class NGramEmbedding(nn.Module):
         cache: Optional[ArraysCache] = None,
         mask: Optional[mx.array] = None,
     ):
+        table = self.ngram_embedding
+        device_verify = (
+            self.file_backed
+            and input_ids.shape == (1, 3)
+            and mx.metal.is_available()
+            and table.verify_device_available
+            and table.verify_status["device_prepared"]
+        )
+        if device_verify:
+            table.record_verify_route("device")
+            ids = self._ngram_ids_metal(input_ids, cache, mask)
+            return table.lookup_verify_device(ids).reshape(*input_ids.shape, -1)
         # File-backed embeddings force the CPU id path: ids are hashed and
         # deduplicated on CPU and the rows are pread from NVMe, so a Metal
         # hash round-trip would only add a sync.
@@ -1787,6 +1796,8 @@ class NGramEmbedding(nn.Module):
                 and input_ids.shape[1] < self.metal_hash_min_tokens
             )
         ):
+            if self.file_backed:
+                table.record_verify_route("fallback")
             ids = self._ngram_ids_numpy(input_ids, cache, mask)
             return self.ngram_embedding.lookup_numpy(ids).reshape(
                 *input_ids.shape, -1

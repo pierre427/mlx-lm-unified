@@ -64,7 +64,7 @@ class TestVerifySyncTrace(unittest.TestCase):
         batch = attach_self_mtp_lanes(self.model, None, [lane])
         return (batch, first) if return_first else batch
 
-    def test_tiny_qwen4_greedy_syncs_drop_from_six_to_four(self):
+    def test_tiny_qwen4_greedy_syncs_drop_from_six_to_three(self):
         batch = self._batch()
         with trace_verify_syncs():
             propose_batched_self_mtp(self.model, batch)
@@ -72,14 +72,13 @@ class TestVerifySyncTrace(unittest.TestCase):
 
         self.assertEqual(status["round_count"], 1)
         self.assertEqual(sum(self.BASELINE_SITES.values()), 6)
-        self.assertEqual(status["total"], 4)
+        self.assertEqual(status["total"], 3)
         self.assertEqual(
             status["rounds"][0]["sites"],
             {
                 "hybrid.greedy.accept_boundary": 1,
                 "qwen4.ple.ids_eval": 1,
                 "qwen4.ple.mask_asarray": 1,
-                "qwen4.ple.mask_tail_asarray": 1,
             },
         )
 

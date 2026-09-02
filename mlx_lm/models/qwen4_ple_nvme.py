@@ -354,10 +354,9 @@ def assert_sidecar_not_in_weight_files(sidecar_path: str) -> None:
 class FileBackedShardedEmbedding(nn.Module):
     """Drop-in for ``ShardedEmbedding.lookup_numpy`` reading rows from NVMe.
 
-    Holds no MLX parameters. Per lookup: dedup row ids, ``pread`` only the
-    selected 100-byte rows on a thread pool (16 workers for decode-sized
-    inputs, 64 for prefill), dequantize them vectorized in numpy, and return
-    a bfloat16 ``mx.array`` shaped ``[*ids.shape, dims]``.
+    Holds no public MLX parameters. The optional private verify shards keep
+    lazy packed checkpoint arrays for a width-3 device route. Other shapes
+    deduplicate host ids, ``pread`` selected rows, and dequantize them once.
     """
 
     is_file_backed = True
@@ -369,6 +368,7 @@ class FileBackedShardedEmbedding(nn.Module):
         dims: int,
         num_shards: int,
         data_offset: int = 0,
+        verify_shards=None,
     ):
         super().__init__()
         if vocab_size % num_shards:
@@ -382,6 +382,11 @@ class FileBackedShardedEmbedding(nn.Module):
         self.rows_per_shard = vocab_size // num_shards
         self.row_bytes = dims // 2 + 2 * (dims // 32) * 2
         self.data_offset = data_offset
+        self._verify_shards = verify_shards
+        self._verify_owner_pid = os.getpid()
+        self._verify_device_lookups = 0
+        self._verify_fallback_lookups = 0
+        self._verify_device_prepared = False
         self.dequant_backend = os.getenv("MLX_QWEN4_PLE_NVME_DEQUANT", "numpy")
         if self.dequant_backend not in {"numpy", "mx"}:
             raise ValueError("MLX_QWEN4_PLE_NVME_DEQUANT must be numpy or mx")
@@ -633,6 +638,66 @@ class FileBackedShardedEmbedding(nn.Module):
         return result
 
     @property
+    def verify_device_available(self) -> bool:
+        return (
+            self._verify_shards is not None
+            and not self._closed
+            and os.getpid() == self._verify_owner_pid
+        )
+
+    def record_verify_route(self, route: str) -> None:
+        if route == "device":
+            self._verify_device_lookups += 1
+        elif route == "fallback":
+            self._verify_fallback_lookups += 1
+        else:
+            raise ValueError(f"unknown PLE verify route {route!r}")
+
+    @property
+    def verify_status(self):
+        return {
+            "device_available": self.verify_device_available,
+            "device_prepared": self._verify_device_prepared,
+            "device_lookups": self._verify_device_lookups,
+            "fallback_lookups": self._verify_fallback_lookups,
+        }
+
+    def prepare_verify_device(self) -> None:
+        """Stage private packed shards before the first verify command buffer."""
+        if not self.verify_device_available or self._verify_device_prepared:
+            return
+        for shard in self._verify_shards:
+            mx.eval(*shard)
+        self._verify_device_prepared = True
+
+    def lookup_verify_device(self, indices: mx.array) -> mx.array:
+        """Gather width-3 verify rows from private packed shard arrays."""
+        if not self.verify_device_available:
+            raise RuntimeError("PLE device verify table is unavailable")
+        shape = indices.shape
+        flat = indices.reshape(-1).astype(mx.int64)
+        output = None
+        for shard_index, (weight, scales, biases) in enumerate(
+            self._verify_shards
+        ):
+            start = shard_index * self.rows_per_shard
+            stop = start + self.rows_per_shard
+            active = (flat >= start) & (flat < stop)
+            local = mx.clip(flat - start, 0, self.rows_per_shard - 1)
+            values = mx.dequantize(
+                mx.take(weight, local, axis=0),
+                mx.take(scales, local, axis=0),
+                mx.take(biases, local, axis=0),
+                group_size=32,
+                bits=4,
+                mode="affine",
+            )
+            if output is None:
+                output = mx.zeros_like(values)
+            output = mx.where(active[:, None], values, output)
+        return output.reshape(*shape, self.dims)
+
+    @property
     def stats(self) -> LookupStats:
         # Hot-path increments may be numpy ints; normalize here (cold path)
         # so the record is JSON-serializable.
@@ -815,13 +880,33 @@ def install_file_backed_ple(model, weights: dict, sidecar_path: str, model_path)
                     f"PLE sidecar manifest {field}={manifest[field]} does not "
                     f"match the model ({expected}) at {prefix}"
                 )
-        ngram_embedding.ngram_embedding = FileBackedShardedEmbedding(
+        verify_shards = []
+        for shard_index in range(resident.num_shards):
+            shard = f"{prefix}.shard_{shard_index}"
+            keys = tuple(
+                f"{shard}.{field}" for field in ("weight", "scales", "biases")
+            )
+            if not all(key in weights for key in keys):
+                verify_shards = None
+                break
+            verify_shards.append(tuple(weights[key] for key in keys))
+        table = FileBackedShardedEmbedding(
             sidecar_path,
             vocab_size=manifest["total_rows"],
             dims=manifest["dims"],
             num_shards=manifest["num_shards"],
             data_offset=manifest["data_offset"],
+            verify_shards=(
+                None if verify_shards is None else tuple(verify_shards)
+            ),
         )
+        if (
+            os.getenv("MLX_QWEN4_PLE_VERIFY_DEVICE") == "1"
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+        ):
+            table.prepare_verify_device()
+        ngram_embedding.ngram_embedding = table
         # Optional static preheat of the LRU hot tier from a hot-rows
         # manifest (built by scripts/build_qwen4_ple_hot_rows.py). The
         # count lands on the embedding for bench/config observability.

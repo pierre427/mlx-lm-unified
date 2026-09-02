@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -368,6 +369,101 @@ class TestQwen4PleNvme(unittest.TestCase):
                 ).item()
             )
 
+    def test_private_verify_table_matches_resident_bits_on_cpu(self):
+        previous = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            resident = self.ngram_embedding(self.load_resident()).ngram_embedding
+            file_backed = self.ngram_embedding(self.load_nvme()).ngram_embedding
+            ids = np.arange(48, dtype=np.int64).reshape(1, 3, 16) % 88
+            expected = resident.lookup_numpy(ids)
+            actual = file_backed.lookup_verify_device(mx.array(ids))
+            mx.eval(expected, actual)
+            np.testing.assert_array_equal(
+                np.asarray(expected.view(mx.uint16)),
+                np.asarray(actual.view(mx.uint16)),
+            )
+        finally:
+            mx.set_default_device(previous)
+
+    @unittest.skipUnless(
+        mx.metal.is_available()
+        and environ.get("MLX_QWEN4_PLE_VERIFY_METAL_TESTS") == "1",
+        "requires the explicit PLE Metal test gate",
+    )
+    def test_width_three_verify_uses_no_numpy_hot_path(self):
+        from mlx_lm.verify_sync import (
+            trace_verify_syncs,
+            verify_sync_round,
+            verify_sync_status,
+        )
+
+        resident = self.load_resident()
+        with env_var("MLX_QWEN4_PLE_VERIFY_DEVICE", "1"):
+            nvme = self.load_nvme()
+        resident_embedding = self.ngram_embedding(resident)
+        embedding = self.ngram_embedding(nvme)
+        table = embedding.ngram_embedding
+        resident_cache = resident.make_cache()[1]
+        cache = nvme.make_cache()[1]
+        tokens = mx.array([[1, 2, 3]], dtype=mx.int64)
+        mask = mx.ones((1, 3), dtype=mx.bool_)
+        expected = resident_embedding(
+            tokens, cache=resident_cache, mask=mask
+        )
+        mx.eval(expected, resident_cache[3])
+        with (
+            patch.object(
+                embedding,
+                "_ngram_ids_numpy",
+                side_effect=AssertionError("NumPy hash used"),
+            ),
+            patch.object(
+                table,
+                "lookup_numpy",
+                side_effect=AssertionError("NumPy lookup used"),
+            ),
+            trace_verify_syncs(),
+        ):
+            with verify_sync_round():
+                output = embedding(tokens, cache=cache, mask=mask)
+                mx.eval(output, cache[3])
+        status = verify_sync_status()
+        np.testing.assert_array_equal(
+            np.asarray(expected.view(mx.uint16)),
+            np.asarray(output.view(mx.uint16)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(resident_cache[3]), np.asarray(cache[3])
+        )
+        self.assertEqual(status["total"], 0)
+        self.assertTrue(table.verify_status["device_prepared"])
+        self.assertEqual(table.verify_status["device_lookups"], 1)
+        self.assertEqual(table.verify_status["fallback_lookups"], 0)
+
+    def test_non_verify_shape_uses_sidecar_fallback_receipt(self):
+        previous = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            nvme = self.load_nvme()
+            embedding = self.ngram_embedding(nvme)
+            table = embedding.ngram_embedding
+            cache = nvme.make_cache()[1]
+            with patch.object(
+                table, "lookup_numpy", wraps=table.lookup_numpy
+            ) as fallback:
+                output = embedding(
+                    mx.array([[1, 2, 3, 4]], dtype=mx.int64),
+                    cache=cache,
+                    mask=mx.ones((1, 4), dtype=mx.bool_),
+                )
+                mx.eval(output)
+            self.assertEqual(fallback.call_count, 1)
+            self.assertEqual(table.verify_status["device_lookups"], 0)
+            self.assertEqual(table.verify_status["fallback_lookups"], 1)
+        finally:
+            mx.set_default_device(previous)
+
     def test_mx_fallback_dequant_backend_matches_numpy(self):
         file_backed = self.ngram_embedding(self.load_nvme()).ngram_embedding
         ids = np.arange(88).reshape(1, -1)
@@ -655,6 +751,7 @@ class TestQwen4PleNvme(unittest.TestCase):
             embedding.ngram_embedding, FileBackedShardedEmbedding
         )
         self.assertEqual(embedding.hash_backend, "routed_cpu")
+        self.assertEqual(len(embedding.ngram_embedding._verify_shards), 4)
         names = [name for name, _ in tree_flatten(model.parameters())]
         self.assertFalse(any(".ngram_embedding.shard_" in n for n in names))
 
