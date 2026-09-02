@@ -1185,6 +1185,18 @@ class TestModelLocalCacheClasses(unittest.TestCase):
             self.assertTrue(
                 any('"format": "qsa_apc_summaries"' in v for v in values)
             )
+
+            nested_path = os.path.join(
+                self.test_dir, "qsa_summary_cache_list.safetensors"
+            )
+            save_prompt_cache(nested_path, [CacheList(qsa)])
+            _, nested_metadata = mx.load(nested_path, return_metadata=True)
+            self.assertTrue(
+                any(
+                    '"cache_path": [0, 0]' in value
+                    for value in nested_metadata.values()
+                )
+            )
         finally:
             qwen4_exp._QSA_APC_SUMMARIES = previous
 

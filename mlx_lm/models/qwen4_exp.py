@@ -81,6 +81,7 @@ _QSA_SUMMARY_FORMAT_VERSION = 1
 _QSA_SUMMARY_PRODUCER_VERSION = "qwen4-pooled-key-v1"
 _QSA_SUMMARY_META_MARKER = "qsa_summary_v1"
 _QSA_SUMMARY_IDENTITY_FIELDS = (
+    "format_version",
     "model_config_hash",
     "block_size",
     "compress_ratio",

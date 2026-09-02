@@ -173,12 +173,22 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         del cache_data[key]
     cache_classes = [_cache_class_token(type(c)) for c in cache]
     summary_provenance = []
-    for index, (entry, info) in enumerate(zip(cache, cache_info)):
+
+    def collect_summary_provenance(entry, path):
+        children = getattr(entry, "caches", None)
+        if children is not None:
+            for child_index, child in enumerate(children):
+                collect_summary_provenance(child, [*path, child_index])
+            return
+        info = getattr(entry, "meta_state", ())
         if not isinstance(info, (list, tuple)) or "qsa_summary_v1" not in info:
-            continue
+            return
         identity = getattr(entry, "_qsa_summary_identity", None)
         if identity is not None:
-            summary_provenance.append({"cache_index": index, **identity})
+            summary_provenance.append({"cache_path": path, **identity})
+
+    for index, entry in enumerate(cache):
+        collect_summary_provenance(entry, [index])
     cache_metadata = [cache_info, metadata, cache_classes]
     if empty or summary_provenance:
         # Slot four is the backward-compatible empty-array manifest. Keep it
