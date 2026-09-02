@@ -85,7 +85,7 @@ GEOMETRY = dict(
 )
 
 
-def admission(steps=3, *, mask=None, cache_lengths=None, speculating=True, **overrides):
+def admission(steps=3, *, mask=None, spans=(), speculating=True, **overrides):
     values = production_values(steps)
     geometry = dict(GEOMETRY)
     for key, value in overrides.items():
@@ -93,7 +93,7 @@ def admission(steps=3, *, mask=None, cache_lengths=None, speculating=True, **ove
     return qwen4_fused_gdn_verify.admit_qwen4_fused_gdn_verify(
         **values,
         mask=mask,
-        cache_lengths=cache_lengths,
+        spans=spans,
         speculating=speculating,
         **geometry,
     )
@@ -130,7 +130,13 @@ def test_single_token_batch_mask_ragged_and_plain_forwards_fall_back():
     assert admission(wide).reason == f"verify width {wide} above 8"
     assert "qkv shape" in admission(qkv=FakeArray((2, 3, 10240), mx.bfloat16)).reason
     assert admission(mask=object()).reason == "masked verify"
-    assert admission(cache_lengths=object()).reason == "ragged cache lengths"
+    assert admission(spans=None).reason == "rollback geometry not describable"
+    assert admission(spans=[2]).reason == "padded rollback geometry"
+    assert admission(spans=[3, 3]).reason == "padded rollback geometry"
+    # A fully valid one-lane slab under a ragged engine: lengths stamped, mask
+    # derived from them (all ones), still exact for the mask-free kernel.
+    assert admission(spans=[3]).accepted
+    assert admission(spans=[3], mask=object()).accepted
     assert admission(speculating=False).reason == "not a speculative verify"
     assert admission(training=True).reason == "training"
     assert admission(sharded=True).reason == "distributed sharding"
@@ -288,10 +294,17 @@ def test_stock_mode_and_unfit_caches_do_not_probe_metal():
         cache = FakeCache(values["conv_state"], values["recurrent_state"])
         cache.spans = None  # undescribable padding geometry
         assert layer._try_fused_verify(*args, cache) is None
+        assert (
+            layer.fused_gdn_verify_last_fallback == "rollback geometry not describable"
+        )
+
+        cache = FakeCache(values["conv_state"], values["recurrent_state"])
+        cache.spans = [2]  # a right-padded lane
+        assert layer._try_fused_verify(*args, cache) is None
         assert layer.fused_gdn_verify_last_fallback == "padded rollback geometry"
 
         cache = FakeCache(values["conv_state"], values["recurrent_state"])
-        cache.spans = [3]  # a padded batch describes rows individually
+        cache.spans = [3, 3]  # more than one lane
         assert layer._try_fused_verify(*args, cache) is None
         assert layer.fused_gdn_verify_last_fallback == "padded rollback geometry"
 
@@ -301,7 +314,7 @@ def test_stock_mode_and_unfit_caches_do_not_probe_metal():
         assert layer._try_fused_verify(*args, cache) is None
         assert layer.fused_gdn_verify_last_fallback == "not a speculative verify"
     runtime.assert_not_called()
-    assert layer.fused_gdn_verify_fallbacks == 5
+    assert layer.fused_gdn_verify_fallbacks == 6
     assert layer.fused_gdn_verify_calls == 0
 
 
@@ -397,3 +410,40 @@ def test_record_failure_and_dispatch_failure_leave_cache_untouched():
     assert layer.fused_gdn_verify_last_fallback == (
         "Metal kernel dispatch failed: RuntimeError"
     )
+
+
+def test_ragged_engine_one_lane_geometry_is_admitted_and_recorded():
+    """A ragged self-MTP engine stamps ``lengths`` on every verify slab, so at
+    one fully valid lane ``rollback_spans`` is ``[steps]`` (not ``()``); the
+    hook must still dispatch and record exactly as in the unpadded case."""
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    layer.set_fused_gdn_verify_mode("fused")
+    layer.out_proj = Identity()
+    values = production_values(steps=3)
+    cache = FakeCache(values["conv_state"], values["recurrent_state"])
+    cache.spans = [3]
+    cache.lengths = mx.array([3])
+    fused_output = FakeArray((1, 3, 6144), mx.bfloat16)
+    next_conv, next_state = object(), object()
+    state_snapshots = mx.arange(2 * 2 * 2 * 2, dtype=mx.float32).reshape(1, 2, 2, 2, 2)
+    conv_snapshots = mx.arange(2 * 3 * 4, dtype=mx.float32).reshape(1, 2, 3, 4)
+    patches = _admitted_patches(
+        dict(
+            return_value=(
+                fused_output,
+                next_conv,
+                next_state,
+                state_snapshots,
+                conv_snapshots,
+            )
+        )
+    )
+    with patches[0], patches[1], patches[2], patches[3]:
+        result = layer._try_fused_verify(
+            values["qkv"], values["z"], values["b"], values["a"], None, cache
+        )
+    assert result is fused_output
+    assert layer.fused_gdn_verify_calls == 1
+    assert layer.fused_gdn_verify_fallbacks == 0
+    assert cache.events == [("record", 3), ("set", 0), ("set", 1), ("advance", 3)]

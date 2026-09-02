@@ -824,10 +824,10 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         if describe is None or not callable(getattr(cache, "record_rollback", None)):
             return self._fused_gdn_verify_fallback("cache lacks rollback records")
         steps = int(qkv.shape[1])
-        # ``()`` means unpadded rows that all advance ``steps``; anything else
-        # (a padded slab, or geometry the cache cannot describe) stays stock.
-        if describe(steps, mask) != ():
-            return self._fused_gdn_verify_fallback("padded rollback geometry")
+        # Host-side geometry of this forward; admission decides whether the
+        # mask-free kernel is exact for it (a ragged engine stamps ``lengths``
+        # on every verify slab, also at one lane).
+        spans = describe(steps, mask)
 
         admission = admit_qwen4_fused_gdn_verify(
             qkv=qkv,
@@ -841,7 +841,7 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             dt_bias=self.dt_bias,
             norm_weight=self.norm.weight,
             mask=mask,
-            cache_lengths=getattr(cache, "lengths", None),
+            spans=spans,
             speculating=bool(getattr(cache, "speculating", False)),
             training=bool(self.training),
             sharded=self.sharding_group is not None,
