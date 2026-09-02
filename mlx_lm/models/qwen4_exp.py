@@ -43,6 +43,14 @@ from .qwen4_qsa_nax import (
     nax_kernel_available,
     nax_qsa_attention,
 )
+from .qwen4_qsa_indexed import (
+    QSAIndexedProbeDeclined,
+    decide_qsa_indexed_admission,
+    indexed_splits_for,
+    qsa_indexed_enabled,
+    qwen4_qsa_indexed_attention,
+    record_qsa_indexed_receipt,
+)
 from .qwen4_qsa_stage1 import (
     qsa_stage1_kernel_cache_info,
     qsa_stage1_score_producer,
@@ -2892,19 +2900,59 @@ def _gather_qsa_attention(
         ).transpose(0, 2, 1, 3)
         tile_q = q_rows[start:stop, :, None, :]
         tile_mask = valid[start:stop, None, None, :]
-        outputs.append(
-            mx.fast.scaled_dot_product_attention(
-                tile_q,
-                gathered_k,
-                gathered_v,
-                scale=scale,
-                mask=tile_mask,
-            )[:, :, 0]
+        tile_out = mx.fast.scaled_dot_product_attention(
+            tile_q,
+            gathered_k,
+            gathered_v,
+            scale=scale,
+            mask=tile_mask,
+        )[:, :, 0]
+        # MLX SDPA does not define an all-false boolean-mask row. Keep the
+        # compact contract explicit: no attended token produces zero.
+        tile_out = mx.where(
+            mx.any(valid[start:stop], axis=-1)[:, None, None],
+            tile_out,
+            mx.zeros_like(tile_out),
         )
+        outputs.append(tile_out)
     return (
         mx.concatenate(outputs, axis=0)
         .reshape(batch, length, heads, dim)
         .transpose(0, 2, 1, 3)
+    )
+
+
+def _indexed_qsa_attention_or_gather(
+    q,
+    k,
+    v,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+    tile_rows: int,
+):
+    """Run indexed QSA or fall back with the same fetched cache tensors."""
+
+    length = int(q.shape[2])
+    context = int(compact.physical_width)
+    try:
+        return qwen4_qsa_indexed_attention(
+            q, k, v, compact, scale=scale, splits=splits
+        )
+    except QSAIndexedProbeDeclined:
+        reason = "probe_declined"
+    except Exception:
+        reason = "dispatch_raised"
+    record_qsa_indexed_receipt(
+        engaged=False,
+        reason=reason,
+        length=length,
+        context=context,
+        splits=splits,
+    )
+    return _gather_qsa_attention(
+        q, k, v, compact, scale=scale, tile_rows=tile_rows
     )
 
 
@@ -3397,6 +3445,22 @@ class Attention(nn.Module):
                 reason=reason,
                 context=selection.physical_width,
             )
+        if use_nax:
+            use_indexed, indexed_reason = False, "nax_engaged"
+        else:
+            use_indexed, indexed_reason = decide_qsa_indexed_admission(
+                selection,
+                length=length,
+                training=self.training,
+                layout_ok=self._nax_layout_ok,
+            )
+        if qsa_indexed_enabled() and not use_indexed:
+            record_qsa_indexed_receipt(
+                engaged=False,
+                reason=indexed_reason,
+                length=length,
+                context=selection.physical_width,
+            )
         gather_context_ok = (
             selection.physical_width >= _QSA_GATHER_MIN_CONTEXT
             and (
@@ -3407,6 +3471,7 @@ class Attention(nn.Module):
         use_gather = (
             _QSA_GATHER_KV
             and not use_nax
+            and not use_indexed
             and not self.training
             and selection.kind == "explicit"
             and length >= _QSA_GATHER_MIN_QUERY
@@ -3416,7 +3481,11 @@ class Attention(nn.Module):
         # Do NOT build the dense mask when either sparse representation is
         # engaged: avoiding that [B, 1, L, T] materialization is part of the
         # win, especially for ragged batches.
-        sparse_mask = None if (use_nax or use_gather) else selection.dense_mask()
+        sparse_mask = (
+            None
+            if (use_nax or use_indexed or use_gather)
+            else selection.dense_mask()
+        )
         if fused_index_qk is None:
             qg = self.q_proj(x)
             k_flat = self.k_proj(x)
@@ -3443,6 +3512,19 @@ class Attention(nn.Module):
                 scale=self.scale, u_width=u_width, total=total,
                 n_kv_heads=self.num_kv_heads,
             ).astype(q.dtype)
+        elif use_indexed:
+            compact = selection.compact_blocks()
+            _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+            splits = indexed_splits_for(u_width)
+            out = _indexed_qsa_attention_or_gather(
+                q,
+                k,
+                v,
+                compact,
+                scale=self.scale,
+                splits=splits,
+                tile_rows=_QSA_GATHER_TILE_ROWS,
+            )
         elif use_gather:
             out = _gather_qsa_attention(
                 q,

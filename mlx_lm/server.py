@@ -741,6 +741,12 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
         _reload_auto_flag,
         "mlx_lm.models.qwen4_exp",
     ),
+    "qwen4_qsa_indexed": MutableKey(
+        "module",
+        "_QSA_INDEXED_ENABLED",
+        _reload_flag,
+        "mlx_lm.models.qwen4_qsa_indexed",
+    ),
     "qwen4_ple_vector_shift": MutableKey(
         "module", "_PLE_VECTOR_SHIFT", _reload_flag, "mlx_lm.models.qwen4_exp"
     ),
@@ -4445,6 +4451,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_qwen4_qsa_nax_status()
         elif self.path == "/v1/status/qwen4-qsa-stage1":
             self.handle_qwen4_qsa_stage1_status()
+        elif self.path == "/v1/status/qwen4-qsa-indexed":
+            self.handle_qwen4_qsa_indexed_status()
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -4468,6 +4476,16 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
         self.wfile.write(json.dumps(qsa_stage1_status()).encode())
+        self.wfile.flush()
+
+    def handle_qwen4_qsa_indexed_status(self):
+        """Expose bounded indexed-QSA engagement evidence."""
+
+        from mlx_lm.models.qwen4_qsa_indexed import qsa_indexed_status
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(qsa_indexed_status()).encode())
         self.wfile.flush()
 
     def handle_health_check(self):
