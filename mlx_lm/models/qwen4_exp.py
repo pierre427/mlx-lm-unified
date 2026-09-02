@@ -519,8 +519,11 @@ _QSA_GATHER_MAX_CONTEXT = max(
 _QSA_GATHER_MIN_QUERY = max(
     1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MIN_QUERY", "3"))
 )
+# Mirrors the indexed window: the gather route is the exact fallback the
+# indexed dispatch drops into, and it tiles over query rows, so the two
+# admission windows must agree or ``gather_would_admit`` receipts lie.
 _QSA_GATHER_MAX_QUERY = max(
-    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_QUERY", "8"))
+    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_QUERY", "16"))
 )
 
 
