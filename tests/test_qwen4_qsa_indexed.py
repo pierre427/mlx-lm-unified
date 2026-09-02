@@ -2,7 +2,10 @@
 
 import io
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -241,6 +244,132 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertEqual(
             indexed.qsa_indexed_status()["counts"]["dispatch_raised"], 1
         )
+
+    def test_capture_writes_mismatch_and_returns_gather(self):
+        mx.random.seed(37)
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        gather = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=1
+        )
+        perturb = mx.zeros_like(gather)
+        perturb[..., 0] = 0.02
+
+        with tempfile.TemporaryDirectory() as root:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR": root},
+                ),
+                mock.patch.object(
+                    qwen4_exp,
+                    "qwen4_qsa_indexed_attention",
+                    return_value=gather + perturb,
+                ),
+            ):
+                actual = qwen4_exp._dispatch_qsa_indexed_with_optional_capture(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=8**-0.5,
+                    splits=4,
+                    tile_rows=1,
+                    layer_index=7,
+                    call_counter=11,
+                    gather_would_admit=False,
+                )
+            mx.eval(actual, gather)
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(gather))
+            rows = [
+                json.loads(line)
+                for line in Path(root, "calls.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["layer_index"], 7)
+            self.assertEqual(rows[0]["call_counter"], 11)
+            self.assertTrue(rows[0]["indexed_only_admission"])
+            self.assertGreater(rows[0]["indexed_vs_gather_max_abs_fp32"], 0.004)
+            captures = list(Path(root).glob("mismatch-*.safetensors"))
+            self.assertEqual(len(captures), 1)
+            self.assertTrue(captures[0].with_suffix(".json").exists())
+            saved = mx.load(str(captures[0]))
+            self.assertIn("causal_per_slot", saved)
+            self.assertIn("indexed_output", saved)
+            self.assertIn("gather_output", saved)
+
+    def test_capture_records_fallback_and_returns_gather(self):
+        mx.random.seed(41)
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        expected = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=1
+        )
+        with tempfile.TemporaryDirectory() as root:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR": root},
+                ),
+                mock.patch.object(
+                    qwen4_exp,
+                    "qwen4_qsa_indexed_attention",
+                    side_effect=RuntimeError("synthetic dispatch failure"),
+                ),
+            ):
+                actual = qwen4_exp._dispatch_qsa_indexed_with_optional_capture(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=8**-0.5,
+                    splits=4,
+                    tile_rows=1,
+                    layer_index=2,
+                    call_counter=3,
+                    gather_would_admit=True,
+                )
+            mx.eval(actual, expected)
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+            row = json.loads(Path(root, "calls.jsonl").read_text())
+            self.assertEqual(row["fallback"], "dispatch_raised")
+            self.assertIsNone(row["indexed_vs_gather_max_abs_fp32"])
+            self.assertFalse(list(Path(root).glob("mismatch-*.safetensors")))
+
+    def test_unset_capture_env_uses_normal_dispatch(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        sentinel = mx.zeros_like(q)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR": ""},
+            ),
+            mock.patch.object(
+                qwen4_exp,
+                "_capture_qsa_indexed_comparison",
+                side_effect=AssertionError("capture path ran"),
+            ),
+            mock.patch.object(
+                qwen4_exp,
+                "_indexed_qsa_attention_or_gather",
+                return_value=sentinel,
+            ) as normal,
+        ):
+            actual = qwen4_exp._dispatch_qsa_indexed_with_optional_capture(
+                q,
+                k,
+                v,
+                compact,
+                scale=8**-0.5,
+                splits=4,
+                tile_rows=1,
+                layer_index=0,
+                call_counter=0,
+                gather_would_admit=True,
+            )
+        self.assertIs(actual, sentinel)
+        normal.assert_called_once()
 
 
 class TestQSAIndexedAdmission(unittest.TestCase):
