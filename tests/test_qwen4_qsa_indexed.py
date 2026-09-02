@@ -16,6 +16,7 @@ import numpy as np
 from mlx_lm.models import qwen4_qsa_indexed as indexed
 from mlx_lm.models import qwen4_exp as qwen4_exp
 from mlx_lm.models.qwen4_exp import QSACompactBlocks, _gather_qsa_attention
+from mlx_lm.models.qwen4_qsa_nax import compact_token_validity
 from mlx_lm.server import (
     APIHandler,
     SOFT_RELOAD_KEYS,
@@ -210,6 +211,65 @@ class TestQSAIndexedReference(unittest.TestCase):
         mx.eval(baseline, changed)
         np.testing.assert_array_equal(
             np.asarray(baseline[:, :, 0]), np.asarray(changed[:, :, 0])
+        )
+
+    def test_shared_validity_matches_metal_slot_arithmetic_at_m3(self):
+        compact = _compact(2, 3, total=32)
+        (
+            ids,
+            counts,
+            n_sel,
+            u_width,
+            q_pos,
+            left_pad,
+            total,
+            physical,
+            valid,
+        ) = compact_token_validity(compact)
+        mx.eval(ids, counts, n_sel, q_pos, left_pad, physical, valid)
+        ids_np = np.asarray(ids)
+        counts_np = np.asarray(counts)
+        n_sel_np = np.asarray(n_sel)
+        q_pos_np = np.asarray(q_pos)
+        left_pad_np = np.asarray(left_pad)
+        mask_np = np.asarray(compact.causal_mask)
+        expected_physical = np.zeros(physical.shape, dtype=np.int32)
+        expected_valid = np.zeros(valid.shape, dtype=bool)
+        for batch in range(2):
+            for row in range(3):
+                complete = ((int(q_pos_np[batch, row]) + 1) // 4) * 4
+                for slot in range(u_width):
+                    for tail in range(4):
+                        logical = int(ids_np[batch, row, slot]) * 4 + tail
+                        source = int(left_pad_np[batch]) + logical
+                        expected_physical[batch, row, slot, tail] = np.clip(
+                            source, 0, total - 1
+                        )
+                        live = slot < int(counts_np[batch, row])
+                        live = live and 0 <= source < total
+                        live = live and logical <= int(q_pos_np[batch, row])
+                        live = live and (
+                            slot < int(n_sel_np[batch, row])
+                            or logical >= complete
+                        )
+                        if live:
+                            live = bool(mask_np[batch, 0, row, source])
+                        expected_valid[batch, row, slot, tail] = live
+        np.testing.assert_array_equal(np.asarray(physical), expected_physical)
+        np.testing.assert_array_equal(np.asarray(valid), expected_valid)
+        self.assertGreater(int(left_pad_np.max()), 0)
+        self.assertTrue(bool(expected_valid.any()))
+
+        q, k, v = _arrays(2, 3, total=32)
+        mirror = indexed.qwen4_qsa_indexed_reference(
+            q, k, v, compact, scale=8**-0.5, splits=8
+        )
+        gather = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=2
+        )
+        mx.eval(mirror, gather)
+        np.testing.assert_allclose(
+            np.asarray(mirror), np.asarray(gather), rtol=1.0e-5, atol=1.0e-5
         )
 
     def test_cache_prefix_views_pass_through_and_match_contiguous_mirror(self):

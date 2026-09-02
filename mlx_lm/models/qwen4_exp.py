@@ -42,6 +42,7 @@ from .qwen4_gdn_outproj import admit_qwen4_gdn_outproj
 from .qwen4_qsa_nax import (
     block_sparse_layout_supported,
     compact_blocks_to_kernel_inputs,
+    compact_token_validity,
     nax_kernel_available,
     nax_qsa_attention,
 )
@@ -2844,39 +2845,9 @@ def _gather_qsa_attention(
     if tile_rows < 1:
         raise ValueError("QSA gather tile_rows must be positive")
 
-    ids, counts, n_selected, u_width, q_pos, left_pad, total = (
-        compact_blocks_to_kernel_inputs(compact)
-    )
-    block_size = compact.block_size
-    # [B,L,U,BS] logical positions.  The padded U suffix is harmless because
-    # ``block_slot < counts`` rejects it before attention.
-    logical = (
-        ids.astype(mx.int32)[..., None] * block_size
-        + mx.arange(block_size, dtype=mx.int32)
-    )
-    block_slot = mx.arange(u_width, dtype=mx.int32)[None, None, :, None]
-    selected_slot = block_slot < n_selected.astype(mx.int32)[..., None, None]
-    present_slot = block_slot < counts.astype(mx.int32)[..., None, None]
-    tail_member = (logical >= compact.tail_start[..., None, None]) & (
-        logical < compact.tail_stop[..., None, None]
-    )
-    valid = present_slot & (selected_slot | tail_member)
-
-    physical = logical + left_pad[:, None, None, None]
-    valid = valid & (physical >= 0) & (physical < total)
-    # This upper bound is redundant for selected closed blocks, but makes the
-    # causal contract explicit and protects a malformed compact input.
-    valid = valid & (logical <= q_pos[..., None, None])
-    physical = mx.clip(physical, 0, total - 1).reshape(batch, length, -1)
+    _, _, _, _, _, _, _, physical, valid = compact_token_validity(compact)
+    physical = physical.reshape(batch, length, -1)
     valid = valid.reshape(batch, length, -1)
-
-    # Preserve every extra cache mask term (left/right padding and ragged
-    # continuation geometry) by gathering it at the same selected columns.
-    if compact.causal_mask is not None:
-        causal = mx.broadcast_to(
-            compact.causal_mask, (batch, 1, length, total)
-        )[:, 0]
-        valid = valid & mx.take_along_axis(causal, physical, axis=-1)
 
     rows = batch * length
     width = physical.shape[-1]
@@ -3006,15 +2977,8 @@ def _capture_qsa_indexed_comparison(
 
     capture_dir = Path(os.environ["MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"])
     capture_dir.mkdir(parents=True, exist_ok=True)
-    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
-        compact_blocks_to_kernel_inputs(compact)
-    )
-    logical = (
-        ids.astype(mx.int32)[..., None] * int(compact.block_size)
-        + mx.arange(int(compact.block_size), dtype=mx.int32)
-    )
-    physical = mx.clip(
-        logical + left_pad[:, None, None, None], 0, int(total) - 1
+    ids, counts, n_sel, u_width, q_pos, left_pad, total, physical, _ = (
+        compact_token_validity(compact)
     )
     causal_slots = _capture_qsa_causal_slots(compact, physical)
 

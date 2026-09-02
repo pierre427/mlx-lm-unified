@@ -13,7 +13,10 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from .qwen4_qsa_nax import compact_blocks_to_kernel_inputs
+from .qwen4_qsa_nax import (
+    compact_blocks_to_kernel_inputs,
+    compact_token_validity,
+)
 
 
 _BLOCK_SIZE = 4
@@ -332,50 +335,6 @@ def qsa_indexed_enabled() -> bool:
     return _qsa_indexed_mode() != "off"
 
 
-def _compact_token_inputs(compact):
-    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
-        compact_blocks_to_kernel_inputs(compact)
-    )
-    block_size = int(compact.block_size)
-    logical = (
-        ids.astype(mx.int32)[..., None] * block_size
-        + mx.arange(block_size, dtype=mx.int32)
-    )
-    slots = mx.arange(u_width, dtype=mx.int32)[None, None, :, None]
-    present = slots < counts.astype(mx.int32)[..., None, None]
-    selected = slots < n_sel.astype(mx.int32)[..., None, None]
-    tail = (logical >= compact.tail_start[..., None, None]) & (
-        logical < compact.tail_stop[..., None, None]
-    )
-    valid = present & (selected | tail)
-    physical = logical + left_pad[:, None, None, None]
-    valid = valid & (physical >= 0) & (physical < total)
-    valid = valid & (logical <= q_pos[..., None, None])
-    physical = mx.clip(physical, 0, total - 1)
-    if compact.causal_mask is not None:
-        batch, length = ids.shape[:2]
-        causal = mx.broadcast_to(
-            compact.causal_mask, (batch, 1, length, total)
-        )[:, 0]
-        gathered = mx.take_along_axis(
-            causal,
-            physical.reshape(batch, length, -1),
-            axis=-1,
-        ).reshape(physical.shape)
-        valid = valid & gathered
-    return (
-        ids,
-        counts,
-        n_sel,
-        u_width,
-        q_pos,
-        left_pad,
-        total,
-        physical,
-        valid,
-    )
-
-
 def _validate_no_duplicate_blocks(ids, counts) -> None:
     """Reject a malformed compact producer before it can double-count keys."""
 
@@ -398,7 +357,7 @@ def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
     if nkh < 1 or nqh % nkh:
         raise ValueError("indexed QSA requires integral GQA")
 
-    ids, counts, _, u_width, _, _, _, physical, valid = _compact_token_inputs(
+    ids, counts, _, u_width, _, _, _, physical, valid = compact_token_validity(
         compact
     )
     _validate_no_duplicate_blocks(ids, counts)

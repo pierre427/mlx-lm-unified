@@ -520,32 +520,77 @@ def phase3_gather(mx):
     from mlx_lm.models.qwen4_qsa_indexed import qwen4_qsa_indexed_attention
 
     rows = []
-    for length in range(1, 9):
-        batch = 1 + length % 2
-        mx.random.seed(20261001 + length)
-        compact = adversarial_fixture(
-            mx, QSACompactBlocks, batch=batch, length=length
-        )
-        q = mx.random.normal((batch, 24, length, 256)).astype(mx.bfloat16)
-        k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
-        v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
-        kernel = qwen4_qsa_indexed_attention(
-            q, k, v, compact, scale=256**-0.5
-        )
-        gather = _gather_qsa_attention(
-            q, k, v, compact, scale=256**-0.5, tile_rows=1
-        )
-        absolute, relative = max_scaled_error(mx, kernel, gather)
-        rows.append(
-            {
-                "batch": batch,
-                "length": length,
-                "max_abs": absolute,
-                "max_relative": relative,
-            }
-        )
-        del q, k, v, kernel, gather
-        mx.clear_cache()
+    for batch in (1, 2):
+        for length in range(1, 9):
+            mx.random.seed(20261001 + batch * 100 + length)
+            compact = adversarial_fixture(
+                mx, QSACompactBlocks, batch=batch, length=length
+            )
+            q = mx.random.normal((batch, 24, length, 256)).astype(mx.bfloat16)
+            k = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
+            v = mx.random.normal((batch, 2, 4096, 256)).astype(mx.bfloat16)
+            kernel = qwen4_qsa_indexed_attention(
+                q, k, v, compact, scale=256**-0.5
+            )
+            gather = _gather_qsa_attention(
+                q, k, v, compact, scale=256**-0.5, tile_rows=1
+            )
+            absolute, relative = max_scaled_error(mx, kernel, gather)
+            rows.append(
+                {
+                    "fixture": "adversarial",
+                    "batch": batch,
+                    "length": length,
+                    "u_width": 520,
+                    "max_abs": absolute,
+                    "max_relative": relative,
+                }
+            )
+            del q, k, v, kernel, gather
+            mx.clear_cache()
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "tests"
+        / "fixtures"
+        / "qwen4_qsa_indexed_real_bf16_m3.safetensors"
+    )
+    fixture = mx.load(str(fixture_path))
+    fixture_compact = QSACompactBlocks(
+        block_ids=fixture["ids"],
+        block_counts=fixture["n_sel"].astype(mx.int32),
+        tail_start=fixture["tail_start"],
+        tail_stop=fixture["tail_stop"],
+        left_padding=fixture["left_pad"],
+        block_size=4,
+        physical_width=int(fixture["total"].item()),
+        causal_mask=fixture["causal_mask"],
+    )
+    fixture_kernel = qwen4_qsa_indexed_attention(
+        fixture["q"],
+        fixture["k"],
+        fixture["v"],
+        fixture_compact,
+        scale=256**-0.5,
+    )
+    fixture_gather = _gather_qsa_attention(
+        fixture["q"],
+        fixture["k"],
+        fixture["v"],
+        fixture_compact,
+        scale=256**-0.5,
+        tile_rows=1,
+    )
+    absolute, relative = max_scaled_error(mx, fixture_kernel, fixture_gather)
+    rows.append(
+        {
+            "fixture": str(fixture_path),
+            "batch": 1,
+            "length": 3,
+            "u_width": 520,
+            "max_abs": absolute,
+            "max_relative": relative,
+        }
+    )
     passed = all(row["max_abs"] == 0.0 for row in rows)
     result = {
         "phase": 3,
