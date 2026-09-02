@@ -101,7 +101,7 @@ def _run_text(command):
 
 
 def safety_snapshot(label=None):
-    memory = _run_text(["/usr/bin/memory_pressure", "-Q"])
+    memory = _run_text(["/usr/bin/memory_pressure"])
     match = re.search(r"free percentage:\s*(\d+)%", memory)
     if match is None:
         raise RuntimeError(f"could not parse memory pressure: {memory!r}")
@@ -560,7 +560,17 @@ def qsa_mode(mode):
             setattr(qwen4_exp, name, value)
 
 
-def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
+def run_model_arm(
+    mx,
+    model,
+    token,
+    cache,
+    *,
+    mode,
+    max_tokens,
+    abort_event=None,
+    abort_phase=4,
+):
     from mlx_lm.hybrid_speculative import HybridStats, self_mtp_generate_step
     from mlx_lm.models.qwen4_qsa_indexed import qsa_indexed_status
 
@@ -580,6 +590,10 @@ def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
             prompt_cache=cache,
             stats=stats,
         ):
+            if abort_event is not None and abort_event.is_set():
+                raise GateFailure(
+                    abort_phase, "free memory fell below the 10% abort floor"
+                )
             output_token = int(output_token)
             tokens.append(output_token)
             chosen_logprobs.append(float(logprobs[output_token].item()))
@@ -740,11 +754,27 @@ def first_divergence(mx, model, token, base, gather, indexed):
     }
 
 
-def prefill_base(mx, model, prompt, make_prompt_cache):
+def prefill_base(
+    mx,
+    model,
+    prompt,
+    make_prompt_cache,
+    *,
+    abort_event=None,
+    chunk_size=None,
+    abort_phase=4,
+):
     base = make_prompt_cache(model)
-    inputs = mx.array(prompt[:-1], dtype=mx.uint32)[None]
-    output = model(inputs, cache=base)
-    mx.eval(output, [layer.state for layer in base])
+    tokens = prompt[:-1]
+    step = len(tokens) if chunk_size is None else chunk_size
+    for start in range(0, len(tokens), step):
+        inputs = mx.array(tokens[start : start + step], dtype=mx.uint32)[None]
+        output = model(inputs, cache=base)
+        mx.eval(output, [layer.state for layer in base])
+        if abort_event is not None and abort_event.is_set():
+            raise GateFailure(
+                abort_phase, "free memory fell below the 10% abort floor"
+            )
     return base, int(prompt[-1])
 
 
@@ -765,12 +795,15 @@ def phase4_model(
     run_free_floor,
     swap_growth_abort_mib,
     wall_deadline,
+    contexts=None,
+    abort_event=None,
+    prefill_chunk_size=None,
 ):
     from mlx_lm.models.cache import make_prompt_cache
 
     rows = []
     qsa_layers = model_qsa_layer_count(model)
-    for context in MODEL_CONTEXTS:
+    for context in MODEL_CONTEXTS if contexts is None else contexts:
         checkpoint = safety_snapshot(f"before_phase4_{context}")
         check_safety(
             checkpoint,
@@ -781,12 +814,31 @@ def phase4_model(
             swap_growth_abort_mib=swap_growth_abort_mib,
         )
         prompt = corpus_tokens(tokenizer, context)
-        base, token = prefill_base(mx, model, prompt, make_prompt_cache)
+        base, token = prefill_base(
+            mx,
+            model,
+            prompt,
+            make_prompt_cache,
+            abort_event=abort_event,
+            chunk_size=prefill_chunk_size,
+        )
         gather = run_model_arm(
-            mx, model, token, clone_cache(base), mode="gather", max_tokens=max_tokens
+            mx,
+            model,
+            token,
+            clone_cache(base),
+            mode="gather",
+            max_tokens=max_tokens,
+            abort_event=abort_event,
         )
         indexed = run_model_arm(
-            mx, model, token, clone_cache(base), mode="indexed", max_tokens=max_tokens
+            mx,
+            model,
+            token,
+            clone_cache(base),
+            mode="indexed",
+            max_tokens=max_tokens,
+            abort_event=abort_event,
         )
         divergence = first_divergence(mx, model, token, base, gather, indexed)
         max_logprob_delta = max(
