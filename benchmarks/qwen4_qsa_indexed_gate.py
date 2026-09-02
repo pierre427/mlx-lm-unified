@@ -520,7 +520,7 @@ def phase4_model(mx, model, tokenizer, max_tokens, swap_baseline):
     rows = []
     for context in MODEL_CONTEXTS:
         checkpoint = safety_snapshot()
-        check_safety(checkpoint, swap_baseline=swap_baseline)
+        check_safety(checkpoint, swap_baseline=swap_baseline, phase=4)
         prompt = corpus_tokens(tokenizer, context)
         base, token = prefill_base(mx, model, prompt, make_prompt_cache)
         gather = run_model_arm(
@@ -672,6 +672,8 @@ def write_artifacts(report, output):
     )
     jsonl = output.with_suffix(".jsonl")
     rows = [report["manifest"]] + report["phases"]
+    if "failure" in report:
+        rows.append({"type": "failure", **report["failure"]})
     jsonl.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
