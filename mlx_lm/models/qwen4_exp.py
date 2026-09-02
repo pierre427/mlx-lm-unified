@@ -2933,7 +2933,7 @@ def _indexed_qsa_attention_or_gather(
     compact,
     *,
     scale: float,
-    splits: int,
+    splits: int | None,
     tile_rows: int,
 ):
     """Run indexed QSA or fall back with the same fetched cache tensors.
@@ -2996,7 +2996,7 @@ def _capture_qsa_indexed_comparison(
     compact,
     *,
     scale: float,
-    splits: int,
+    splits: int | None,
     tile_rows: int,
     layer_index: int,
     call_counter: int,
@@ -3034,8 +3034,13 @@ def _capture_qsa_indexed_comparison(
     gather_out = _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
     )
+    mirror_splits = (
+        int(splits)
+        if splits is not None
+        else min(indexed_splits_for(u_width), u_width)
+    )
     mirror_out = qwen4_qsa_indexed_reference(
-        q, k, v, compact, scale=scale, splits=splits
+        q, k, v, compact, scale=scale, splits=mirror_splits
     )
 
     values = [
@@ -3090,7 +3095,7 @@ def _capture_qsa_indexed_comparison(
 
     status = qsa_indexed_status()
     candidate = status.get("candidate")
-    used_splits = splits if candidate is None else int(candidate[1])
+    used_splits = mirror_splits if candidate is None else int(candidate[1])
     row_axes = tuple(range(2, mirror_delta.ndim))
     ledger = {
         "layer_index": int(layer_index),
@@ -3109,7 +3114,7 @@ def _capture_qsa_indexed_comparison(
         "tail_stop": np.asarray(compact.tail_stop).astype(np.int64).tolist(),
         "causal_mask_present": compact.causal_mask is not None,
         "candidate": candidate,
-        "requested_splits": int(splits),
+        "requested_splits": None if splits is None else int(splits),
         "used_splits": int(used_splits),
         "u_width": int(u_width),
         "gather_would_admit": bool(gather_would_admit),
@@ -3173,7 +3178,7 @@ def _dispatch_qsa_indexed_with_optional_capture(
     compact,
     *,
     scale: float,
-    splits: int,
+    splits: int | None,
     tile_rows: int,
     layer_index: int,
     call_counter: int,
@@ -3765,8 +3770,7 @@ class Attention(nn.Module):
             compact = selection.compact_blocks()
             if int(k.shape[2]) != int(compact.physical_width):
                 raise ValueError("indexed QSA tensors do not match compact selection")
-            _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
-            splits = indexed_splits_for(u_width)
+            splits = None
             if os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"):
                 self._qsa_indexed_capture_calls += 1
             out = _dispatch_qsa_indexed_with_optional_capture(

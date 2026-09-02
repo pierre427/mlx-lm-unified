@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from collections import Counter
 from functools import lru_cache
 from typing import Any
@@ -19,6 +20,7 @@ _BLOCK_SIZE = 4
 _CHUNK_SLOTS = 64
 _CHUNK_TOKENS = _CHUNK_SLOTS * _BLOCK_SIZE
 _SDPA_BLOCKS = 128
+_SPLIT_CANDIDATES = (128, 64, 32, 16, 8)
 _EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
 _SDPA_VECTOR_HEADER_SHA256 = (
     "2100a4d1eaa8a524c5147c82c771cad75197495c72daffa03e7ea4c259aebf10"
@@ -87,17 +89,18 @@ def _mlx_build_hash() -> str | None:
 
 
 def indexed_splits_for(u_width: int) -> int:
-    """Return the static split count for a compact block-slot width."""
+    """Return the requested split ceiling for a compact block-slot width."""
 
     width = int(u_width)
     if width < 1:
         raise ValueError("u_width must be positive")
     requested = _SPLITS_OVERRIDE
     if requested == 0:
-        requested = min(8, max(1, math.ceil(width * _BLOCK_SIZE / 256)))
-    if width * _BLOCK_SIZE >= 512:
-        requested = max(4, requested)
-    return min(width, 8, requested)
+        requested = _SPLIT_CANDIDATES[0]
+    if requested not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    return requested
 
 
 def indexed_chunk_ranges(u_width: int) -> tuple[tuple[int, int], ...]:
@@ -119,8 +122,8 @@ def indexed_split_chunk_ranges(
 
     chunks = indexed_chunk_ranges(u_width)
     count = int(splits)
-    if count < 1 or count > min(8, int(u_width)):
-        raise ValueError("splits must be in [1, min(8, u_width)]")
+    if count < 1 or count > min(_SDPA_BLOCKS, int(u_width)):
+        raise ValueError("splits must be in [1, min(128, u_width)]")
     base, remainder = divmod(len(chunks), count)
     groups = []
     start = 0
@@ -198,6 +201,7 @@ _STATUS_WIDTHS = {
 }
 _STATUS_LAST = None
 _STATUS_CANDIDATE = None
+_STATUS_GEOMETRIES = {}
 _STATUS_FALLBACKS = 0
 
 
@@ -218,6 +222,8 @@ def record_qsa_indexed_receipt(
     splits: int | None = None,
     candidate: tuple[int, int] | None = None,
     exception_class: str | None = None,
+    geometry_key: str | None = None,
+    candidate_timings_ms: dict[int, float] | None = None,
 ) -> None:
     """Record bounded process evidence without evaluating device arrays."""
 
@@ -231,6 +237,15 @@ def record_qsa_indexed_receipt(
         "splits": None if splits is None else int(splits),
         "candidate": None if candidate is None else list(candidate),
         "exception_class": exception_class,
+        "geometry_key": geometry_key,
+        "candidate_timings_ms": (
+            None
+            if candidate_timings_ms is None
+            else {
+                str(split): float(elapsed)
+                for split, elapsed in candidate_timings_ms.items()
+            }
+        ),
         "fully_masked_output": "zero",
     }
     with _STATUS_LOCK:
@@ -244,6 +259,11 @@ def record_qsa_indexed_receipt(
             _STATUS_FALLBACKS += 1
         if candidate is not None:
             _STATUS_CANDIDATE = tuple(candidate)
+            if geometry_key is not None:
+                _STATUS_GEOMETRIES[geometry_key] = {
+                    "candidate": list(candidate),
+                    "candidate_timings_ms": receipt["candidate_timings_ms"],
+                }
         _STATUS_LAST = receipt
 
 
@@ -262,6 +282,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             "auto_min_context_m3": _AUTO_MIN_CONTEXT_M3,
             "auto_min_context_m1": _AUTO_MIN_CONTEXT_M1,
             "splits_override": _SPLITS_OVERRIDE,
+            "split_candidates": list(_SPLIT_CANDIDATES),
             "mlx_version": str(getattr(mx, "__version__", "unknown")),
             "mlx_build_hash": _mlx_build_hash(),
             "mlx_build_verified": (
@@ -281,6 +302,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             "candidate": (
                 None if _STATUS_CANDIDATE is None else list(_STATUS_CANDIDATE)
             ),
+            "geometry_candidates": dict(_STATUS_GEOMETRIES),
             "fallbacks": _STATUS_FALLBACKS,
             "fully_masked_output": "zero",
             "last_decision": _STATUS_LAST,
@@ -290,6 +312,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             for value in _STATUS_WIDTHS.values():
                 value.clear()
             _STATUS_CANDIDATE = None
+            _STATUS_GEOMETRIES.clear()
             _STATUS_FALLBACKS = 0
             _STATUS_LAST = None
     return report
@@ -689,14 +712,48 @@ class QSAIndexedProbeDeclined(RuntimeError):
 
 _PROBE_LOCK = threading.Lock()
 _PROBE_RESULTS = {}
+_PROBE_TIMINGS = {}
 _MISSING = object()
 
 
-def _candidate_ladder(splits: int, threads: int):
-    split_candidates = [int(splits)]
-    if splits > 4:
-        split_candidates.append(max(4, splits // 2))
+def _candidate_ladder(splits: int | None, threads: int):
+    split_candidates = (
+        _SPLIT_CANDIDATES if splits is None else (int(splits),)
+    )
     return tuple((int(threads), value) for value in split_candidates)
+
+
+def _measure_candidates(candidates, dispatch):
+    """Compile viable candidates, then time one real dispatch for each."""
+
+    viable = []
+    for candidate in candidates:
+        try:
+            output = dispatch(candidate)
+            mx.eval(output)
+            viable.append(candidate)
+        except RuntimeError:
+            continue
+
+    timings = {}
+    outputs = {}
+    for candidate in viable:
+        try:
+            started = time.perf_counter_ns()
+            output = dispatch(candidate)
+            mx.eval(output)
+            elapsed = time.perf_counter_ns() - started
+        except RuntimeError:
+            continue
+        timings[candidate[1]] = elapsed / 1.0e6
+        outputs[candidate] = output
+    if not timings:
+        return None, None, {}
+    selected = min(
+        outputs,
+        key=lambda candidate: (timings[candidate[1]], -candidate[1]),
+    )
+    return selected, outputs[selected], timings
 
 
 def _partition_dispatch(
@@ -830,9 +887,19 @@ def qwen4_qsa_indexed_attention(
         raise QSAIndexedProbeDeclined(
             "indexed QSA exact mode requires a 128-block MLX SDPA device"
         )
-    requested = indexed_splits_for(u_width) if splits is None else int(splits)
-    if requested < 1 or requested > min(8, u_width):
-        raise ValueError("splits must be in [1, min(8, u_width)]")
+    requested = (
+        None
+        if splits is None and _SPLITS_OVERRIDE == 0
+        else indexed_splits_for(u_width) if splits is None else int(splits)
+    )
+    if requested is not None and requested not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    geometry_key = (
+        f"B{int(q.shape[0])}-L{int(q.shape[2])}"
+        f"-T{int(compact.physical_width)}-U{int(u_width)}"
+        f"-mask{int(compact.causal_mask is not None)}"
+    )
     key = (
         mlx_version,
         str(q.dtype),
@@ -841,6 +908,10 @@ def qwen4_qsa_indexed_attention(
         int(k.shape[1]),
         int(compact.block_size),
         int(u_width),
+        int(q.shape[0]),
+        int(q.shape[2]),
+        int(compact.physical_width),
+        int(compact.causal_mask is not None),
         requested,
     )
 
@@ -855,32 +926,30 @@ def qwen4_qsa_indexed_attention(
                     "indexed QSA candidate ladder was declined"
                 )
             if candidate is _MISSING:
-                candidate = None
-                for attempted in _candidate_ladder(requested, threads):
-                    try:
-                        partials = _partition_dispatch(
-                            q,
-                            k,
-                            v,
-                            compact,
-                            scale=scale,
-                            threads=attempted[0],
-                            splits=attempted[1],
-                        )
-                        combined = _combine_sdpa_partials(
-                            *partials, output_dtype=q.dtype
-                        )
-                        mx.eval(combined)
-                        candidate = attempted
-                        _PROBE_RESULTS[key] = attempted
-                        break
-                    except RuntimeError:
-                        continue
+                def dispatch(attempted):
+                    partials = _partition_dispatch(
+                        q,
+                        k,
+                        v,
+                        compact,
+                        scale=scale,
+                        threads=attempted[0],
+                        splits=attempted[1],
+                    )
+                    return _combine_sdpa_partials(
+                        *partials, output_dtype=q.dtype
+                    )
+
+                candidate, combined, timings = _measure_candidates(
+                    _candidate_ladder(requested, threads), dispatch
+                )
                 if candidate is None:
                     _PROBE_RESULTS[key] = False
                     raise QSAIndexedProbeDeclined(
                         "indexed QSA candidate ladder was declined"
                     )
+                _PROBE_RESULTS[key] = candidate
+                _PROBE_TIMINGS[key] = timings
                 record_qsa_indexed_receipt(
                     engaged=True,
                     reason="engaged",
@@ -888,6 +957,8 @@ def qwen4_qsa_indexed_attention(
                     context=int(compact.physical_width),
                     splits=candidate[1],
                     candidate=candidate,
+                    geometry_key=geometry_key,
+                    candidate_timings_ms=timings,
                 )
                 return combined
 
@@ -907,6 +978,8 @@ def qwen4_qsa_indexed_attention(
         context=int(compact.physical_width),
         splits=candidate[1],
         candidate=candidate,
+        geometry_key=geometry_key,
+        candidate_timings_ms=_PROBE_TIMINGS.get(key),
     )
     return _combine_sdpa_partials(m, l, o, output_dtype=q.dtype)
 

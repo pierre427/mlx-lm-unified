@@ -301,7 +301,7 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertEqual(k.shape, (1, 1, 1028, 256))
         self.assertEqual(k.shape, v.shape)
         self.assertEqual(q.dtype, mx.bfloat16)
-        self.assertEqual(indexed.indexed_splits_for(257), 5)
+        self.assertEqual(indexed.indexed_splits_for(257), 128)
         reference = indexed.qwen4_qsa_indexed_reference(
             q, k, v, compact, scale=256**-0.5, splits=5
         )
@@ -360,10 +360,10 @@ class TestQSAIndexedReference(unittest.TestCase):
                 indexed.qwen4_qsa_indexed_attention(
                     q, k, v, compact, scale=256**-0.5, splits=splits
                 )
-                for splits in (1, 4, 8)
+                for splits in (8, 16, 32, 64, 128)
             ]
             mx.eval(gather, *outputs)
-            for splits, output in zip((1, 4, 8), outputs):
+            for splits, output in zip((8, 16, 32, 64, 128), outputs):
                 self.assertTrue(
                     bool(mx.array_equal(output, gather).item()),
                     f"real fixture differs from gather at S={splits}",
@@ -483,6 +483,32 @@ class TestQSAIndexedReference(unittest.TestCase):
                 indexed.qwen4_qsa_indexed_attention(
                     q, k, v, compact, scale=256**-0.5, splits=8
                 )
+
+    def test_default_ladder_is_timed_and_fastest_candidate_wins(self):
+        candidates = indexed._candidate_ladder(None, 384)
+        self.assertEqual(
+            candidates,
+            ((384, 128), (384, 64), (384, 32), (384, 16), (384, 8)),
+        )
+        calls = []
+
+        def dispatch(candidate):
+            calls.append(candidate)
+            return mx.array(candidate[1], dtype=mx.int32)
+
+        clock = iter(
+            (0, 500, 1_000, 1_200, 2_000, 2_100, 3_000, 3_400, 4_000, 4_300)
+        )
+        with mock.patch.object(
+            indexed.time, "perf_counter_ns", side_effect=lambda: next(clock)
+        ):
+            selected, output, timings = indexed._measure_candidates(
+                candidates, dispatch
+            )
+        self.assertEqual(selected, (384, 32))
+        self.assertEqual(int(output.item()), 32)
+        self.assertEqual(set(timings), {8, 16, 32, 64, 128})
+        self.assertEqual(calls, list(candidates) * 2)
 
     def test_capture_writes_mismatch_and_returns_gather(self):
         mx.random.seed(37)
@@ -726,12 +752,32 @@ class TestQSAIndexedAdmission(unittest.TestCase):
                 context=32_768,
                 splits=4,
             )
+        indexed.record_qsa_indexed_receipt(
+            engaged=True,
+            reason="engaged",
+            length=3,
+            context=32_768,
+            splits=32,
+            candidate=(384, 32),
+            geometry_key="B1-L3-T32768-U520-mask1",
+            candidate_timings_ms={
+                128: 0.7,
+                64: 0.5,
+                32: 0.4,
+                16: 0.6,
+                8: 0.8,
+            },
+        )
         status = indexed.qsa_indexed_status()
         self.assertEqual(status["counts"]["nax_engaged"], 1)
         self.assertEqual(status["fallbacks"], 2)
         self.assertEqual(status["query_width_counts"]["1"]["declined"], 1)
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
         self.assertEqual(status["query_width_counts"][">8"]["declined"], 1)
+        self.assertEqual(status["split_candidates"], [128, 64, 32, 16, 8])
+        geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
+        self.assertEqual(geometry["candidate"], [384, 32])
+        self.assertEqual(geometry["candidate_timings_ms"]["32"], 0.4)
 
     def test_env_unset_selects_guarded_auto(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -759,23 +805,17 @@ class TestQSAIndexedAdmission(unittest.TestCase):
                     self.assertEqual(repr(old).encode(), repr(new).encode())
 
     def test_split_table_and_override(self):
-        expected = {
-            8: 1,
-            64: 1,
-            65: 2,
-            127: 2,
-            128: 4,
-            256: 4,
-            512: 8,
-            520: 8,
-        }
+        expected = {8: 128, 64: 128, 520: 128}
         with mock.patch.object(indexed, "_SPLITS_OVERRIDE", 0):
             self.assertEqual(
                 {width: indexed.indexed_splits_for(width) for width in expected},
                 expected,
             )
         with mock.patch.object(indexed, "_SPLITS_OVERRIDE", 6):
-            self.assertEqual(indexed.indexed_splits_for(520), 6)
+            with self.assertRaisesRegex(ValueError, "8, 16, 32, 64, 128"):
+                indexed.indexed_splits_for(520)
+        with mock.patch.object(indexed, "_SPLITS_OVERRIDE", 64):
+            self.assertEqual(indexed.indexed_splits_for(520), 64)
         with self.assertRaises(ValueError):
             indexed.indexed_splits_for(0)
 
