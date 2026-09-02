@@ -7,9 +7,19 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    _contiguous_quant,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from .cache import CacheList, KVCache
-from .mla import MultiLinear, absorbed_max_query, use_absorbed_path
+from .mla import (
+    MultiLinear,
+    absorbed_max_query,
+    refuse_asymmetric_mla_kv_bits,
+    use_absorbed_path,
+)
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -168,7 +178,20 @@ class LongcatFlashMLA(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        # A QuantizedKVCache returns (weight, scales, biases) tuples for the
+        # cached latent and rope keys.
+        quantized = not isinstance(k_pe, mx.array)
+        if quantized:
+            refuse_asymmetric_mla_kv_bits(cache, "LongcatFlash")
+            pe_scores = mx.quantized_matmul(
+                q_pe * self.scale,
+                *k_pe,
+                transpose=True,
+                group_size=cache.group_size,
+                bits=cache.bits,
+            )
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
                 mask,
@@ -182,13 +205,23 @@ class LongcatFlashMLA(nn.Module):
         if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
         else:
+            if quantized:
+                kv_latent = mx.dequantize(
+                    *_contiguous_quant(kv_latent),
+                    group_size=cache.group_size,
+                    bits=cache.bits,
+                )
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
+            # k/v are materialized arrays here, so use the plain SDPA path
+            # even when the cache itself is quantized.
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=None, scale=self.scale, mask=pe_scores
+            )
         if absorbed:
             output = self.unembed_out(output)
 

@@ -16,7 +16,12 @@ from .base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from .mla import MultiLinear, absorbed_max_query, use_absorbed_path
+from .mla import (
+    MultiLinear,
+    absorbed_max_query,
+    refuse_asymmetric_mla_kv_bits,
+    use_absorbed_path,
+)
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -187,6 +192,7 @@ class DeepseekV3Attention(nn.Module):
         # cached latent and rope keys.
         quantized = not isinstance(k_pe, mx.array)
         if quantized:
+            refuse_asymmetric_mla_kv_bits(cache, "DeepseekV3")
             pe_scores = mx.quantized_matmul(
                 q_pe * self.scale,
                 *k_pe,

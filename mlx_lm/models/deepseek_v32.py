@@ -10,9 +10,19 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ._safe_reduce import sum_head_axis
 from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    _contiguous_quant,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from .cache import CacheList, KVCache
-from .mla import MultiLinear, absorbed_max_query, use_absorbed_path
+from .mla import (
+    MultiLinear,
+    absorbed_max_query,
+    refuse_asymmetric_mla_kv_bits,
+    use_absorbed_path,
+)
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -52,6 +62,32 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict = None
     attention_bias: bool = False
     indexer_rope_interleave: bool = False
+
+
+def _quant_parts(x):
+    """Flatten a cache tensor, or a quantized (weight, scales, biases) tuple,
+    into a list of arrays."""
+    if x is None:
+        return []
+    if isinstance(x, mx.array):
+        return [x]
+    return [p for p in x if p is not None]
+
+
+def _gather_seq(x, idx):
+    """Gather along the sequence axis of a cache tensor or quantized triple.
+
+    A QuantizedKVCache tensor is a (weight, scales, biases) tuple whose parts
+    share the sequence axis and differ only in the last dim, so each part is
+    gathered with its own broadcast width.
+    """
+    if x is None:
+        return None
+    if isinstance(x, mx.array):
+        return mx.take_along_axis(
+            x, mx.broadcast_to(idx, idx.shape[:-1] + (x.shape[-1],)), axis=2
+        )
+    return type(x)(_gather_seq(part, idx) for part in x)
 
 
 class Indexer(nn.Module):
@@ -100,9 +136,21 @@ class Indexer(nn.Module):
 
         if cache is not None:
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
-        if k.shape[2] <= self.index_topk:
+        # A QuantizedKVCache hands back a (weight, scales, biases) tuple.
+        quantized = not isinstance(k, mx.array)
+        k_len = k[0].shape[2] if quantized else k.shape[2]
+        if k_len <= self.index_topk:
             return None
-        scores = q @ k.swapaxes(-1, -2)
+        if quantized:
+            scores = mx.quantized_matmul(
+                q,
+                *k,
+                transpose=True,
+                group_size=cache.group_size,
+                bits=cache.key_bits,
+            )
+        else:
+            scores = q @ k.swapaxes(-1, -2)
         scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
@@ -224,25 +272,24 @@ class DeepseekV32Attention(nn.Module):
         else:
             cache = [None] * 2
 
+        # A QuantizedKVCache returns (weight, scales, biases) tuples for the
+        # cached latent and rope keys.
+        quantized = not isinstance(kv_latent, mx.array)
+        if quantized:
+            refuse_asymmetric_mla_kv_bits(cache[0], "DeepseekV32")
+        kv_len = kv_latent[0].shape[2] if quantized else kv_latent.shape[2]
+
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
-                kv_latent = mx.take_along_axis(
-                    kv_latent,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=2,
-                )
-                k_pe = mx.take_along_axis(
-                    k_pe,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
-                    axis=2,
-                )
+                kv_latent = _gather_seq(kv_latent, idx)
+                k_pe = _gather_seq(k_pe, idx)
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             else:
                 shape = list(topk_indices.shape)
-                shape[-1] = kv_latent.shape[2]
+                shape[-1] = kv_len
                 sparse_mask = mx.zeros(shape, dtype=mx.bool_)
                 sparse_mask = mx.put_along_axis(
                     sparse_mask, topk_indices, mx.array(True), axis=-1
@@ -253,9 +300,24 @@ class DeepseekV32Attention(nn.Module):
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
         if cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+            # A QuantizedKVCache stores (weight, scales, biases) tuples, which
+            # mx.depends cannot take nested, so flatten both sides.
+            deps = _quant_parts(cache[1].keys) + _quant_parts(cache[1].values)
+            if isinstance(cache[0].keys, mx.array):
+                cache[0].keys = mx.depends(cache[0].keys, deps)
+            else:
+                cache[0].keys = tuple(mx.depends(list(cache[0].keys), deps))
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if quantized:
+            pe_scores = mx.quantized_matmul(
+                q_pe * self.scale,
+                *k_pe,
+                transpose=True,
+                group_size=cache[0].group_size,
+                bits=cache[0].bits,
+            )
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
                 mask,
@@ -269,13 +331,25 @@ class DeepseekV32Attention(nn.Module):
         if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
+            # cache[0] (not the CacheList) is the leaf that carries the quant
+            # config the SDPA wrapper routes on.
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache[0], scale=self.scale, mask=pe_scores
+            )
         else:
+            if quantized:
+                kv_latent = mx.dequantize(
+                    *_contiguous_quant(kv_latent),
+                    group_size=cache[0].group_size,
+                    bits=cache[0].bits,
+                )
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
+            # k/v are materialized arrays here, so use the plain SDPA path
+            # even when the cache itself is quantized.
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=None, scale=self.scale, mask=pe_scores
+            )
         if absorbed:
             output = self.unembed_out(output)
 
