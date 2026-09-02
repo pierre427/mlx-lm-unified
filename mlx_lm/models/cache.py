@@ -172,10 +172,29 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     for key in empty:
         del cache_data[key]
     cache_classes = [_cache_class_token(type(c)) for c in cache]
+    summary_provenance = []
+    for index, (entry, info) in enumerate(zip(cache, cache_info)):
+        if not isinstance(info, (list, tuple)) or "qsa_summary_v1" not in info:
+            continue
+        identity = getattr(entry, "_qsa_summary_identity", None)
+        if identity is not None:
+            summary_provenance.append({"cache_index": index, **identity})
     cache_metadata = [cache_info, metadata, cache_classes]
-    if empty:
-        # Appended, so a cache with no empty arrays writes the older layout.
+    if empty or summary_provenance:
+        # Slot four is the backward-compatible empty-array manifest. Keep it
+        # present even when only the appended provenance slot is needed.
         cache_metadata.append(json.dumps(empty))
+    if summary_provenance:
+        cache_metadata.append(
+            json.dumps(
+                {
+                    "format": "qsa_apc_summaries",
+                    "version": 1,
+                    "entries": summary_provenance,
+                },
+                sort_keys=True,
+            )
+        )
     cache_metadata = dict(tree_flatten(cache_metadata))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
 
@@ -4953,6 +4972,28 @@ class PromptTrie:
         return PromptTrieResult(model, None, shorter, longer, common_prefix)
 
 
+def _mark_prompt_cache_restored(prompt_cache):
+    stack = list(prompt_cache)
+    while stack:
+        entry = stack.pop()
+        if isinstance(entry, CacheList):
+            stack.extend(entry.caches)
+            continue
+        if isinstance(entry, (list, tuple)):
+            stack.extend(entry)
+            continue
+        if hasattr(entry, "_qsa_summary_restored") and getattr(
+            entry, "_qsa_pooled_keys", None
+        ) is not None:
+            entry._qsa_summary_restored = True
+
+
+def _copy_prompt_cache_for_restore(prompt_cache):
+    restored = copy.deepcopy(prompt_cache)
+    _mark_prompt_cache_restored(restored)
+    return restored
+
+
 class LRUPromptCache:
     @dataclass
     class CacheEntry:
@@ -5009,7 +5050,7 @@ class LRUPromptCache:
         result = self._trie.search(model, tokens)
         if result.exact is not None and len(tokens) == 0:
             cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            return _copy_prompt_cache_for_restore(cache_entry.prompt_cache), []
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
             # Never hand back an empty remainder: the caller re-processes
@@ -5018,12 +5059,12 @@ class LRUPromptCache:
             # len(tokens) - 1. Trimmable caches give back the last token;
             # hybrids land on their deepest interior checkpoint.
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = _copy_prompt_cache_for_restore(cache_entry.prompt_cache)
                 trim_prompt_cache(cache, 1)
                 return cache, tokens[-1:]
             landing = achievable_trim(cache_entry.prompt_cache, 1)
             if landing is not None and landing[1] < len(tokens):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = _copy_prompt_cache_for_restore(cache_entry.prompt_cache)
                 trimmed = trim_prompt_cache(cache, 1, allow_partial=True)
                 landed = len(tokens) - trimmed
                 if 0 < landed <= len(tokens) - 1:
@@ -5038,7 +5079,7 @@ class LRUPromptCache:
             prefix = min(len(tokens) - 1, result.common_prefix)
             num_to_trim = len(result.longer) - prefix
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                cache = _copy_prompt_cache_for_restore(cache_entry.prompt_cache)
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
             # A hybrid (recurrent + KV) cache can only land on a recorded
@@ -5049,7 +5090,7 @@ class LRUPromptCache:
             if landing is not None:
                 landed = len(result.longer) - landing[1]
                 if 0 < landed <= len(tokens) - 1 and landed > short_length:
-                    cache = copy.deepcopy(cache_entry.prompt_cache)
+                    cache = _copy_prompt_cache_for_restore(cache_entry.prompt_cache)
                     trimmed = trim_prompt_cache(
                         cache, num_to_trim, allow_partial=True
                     )
@@ -5058,7 +5099,10 @@ class LRUPromptCache:
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            return (
+                _copy_prompt_cache_for_restore(cache_entry.prompt_cache),
+                tokens[short_length:],
+            )
 
         return None, tokens
 

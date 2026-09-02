@@ -21,6 +21,8 @@ from typing import Any, Hashable, Iterable, List, Optional
 import mlx.core as mx
 
 from .models.cache import (
+    _copy_prompt_cache_for_restore,
+    _mark_prompt_cache_restored,
     ArraysCache,
     CacheList,
     KVCache,
@@ -245,14 +247,16 @@ class AutomaticPrefixCache(LRUPromptCache):
             self._apc_stats["lookups"] += 1
             self._apc_stats["hits"] += 1
             self._apc_stats["cached_tokens"] += covered
+            restored_sidecar = copy.deepcopy(sidecar)
+            _mark_prompt_cache_restored(restored_sidecar.state[0])
             return APCLookup(
-                copy.deepcopy(entry.prompt_cache),
+                _copy_prompt_cache_for_restore(entry.prompt_cache),
                 tokens[covered:],
                 covered,
                 True,
                 "mtp_sidecar",
                 None,
-                sidecar=copy.deepcopy(sidecar),
+                sidecar=restored_sidecar,
             )
         cache, remaining = super().fetch_nearest_cache(key, tokens)
         cached_tokens = len(tokens) - len(remaining) if cache is not None else 0
