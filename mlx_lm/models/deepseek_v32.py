@@ -12,7 +12,7 @@ from ._safe_reduce import sum_head_axis
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
-from .mla import MultiLinear
+from .mla import MultiLinear, absorbed_max_query, absorbed_query_limit
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -158,6 +158,14 @@ class DeepseekV32Attention(nn.Module):
             self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
+        # Absorbed MLA is cheaper than the expanded form for every query width
+        # up to this crossover (see mla.absorbed_max_query for the derivation),
+        # not just for L == 1 -- which covers the whole speculative-verify
+        # range (L = k+1) and modest chunked prefill.
+        self.absorbed_max_query = absorbed_max_query(
+            self.kv_lora_rank, self.qk_nope_head_dim, self.v_head_dim
+        )
+
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -249,7 +257,8 @@ class DeepseekV32Attention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L <= absorbed_query_limit(self.absorbed_max_query)
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -259,7 +268,7 @@ class DeepseekV32Attention(nn.Module):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

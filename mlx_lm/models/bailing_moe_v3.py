@@ -15,7 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
-from .mla import MultiLinear
+from .mla import MultiLinear, absorbed_max_query, absorbed_query_limit
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -202,6 +202,14 @@ class BailingMLA(nn.Module):
         self.unembed_out = MultiLinear(
             args.kv_lora_rank, args.v_head_dim, args.num_attention_heads
         )
+
+        # Absorbed MLA is cheaper than the expanded form for every query width
+        # up to this crossover (see mla.absorbed_max_query for the derivation),
+        # not just for L == 1 -- which covers the whole speculative-verify
+        # range (L = k+1) and modest chunked prefill.
+        self.absorbed_max_query = absorbed_max_query(
+            self.kv_lora_rank, self.qk_nope_head_dim, self.v_head_dim
+        )
         self.g_proj = nn.Linear(args.hidden_size, args.num_attention_heads, bias=False)
         self.dense = nn.Linear(
             args.num_attention_heads * args.v_head_dim,
@@ -257,7 +265,8 @@ class BailingMLA(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if length == 1:
+        absorbed = length <= absorbed_query_limit(self.absorbed_max_query)
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             keys = values = kv_latent
         else:
@@ -272,7 +281,7 @@ class BailingMLA(nn.Module):
             scale=self.scale,
             mask=pe_scores,
         )
-        if length == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3)
