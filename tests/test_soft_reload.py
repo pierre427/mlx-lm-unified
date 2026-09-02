@@ -308,6 +308,29 @@ class TestWhitelist(unittest.TestCase):
         finally:
             qwen4_exp._QSA_STAGE1_KERNEL = original
 
+    def test_qwen4_indexed_lever_accepts_auto_and_boolean_modes(self):
+        from mlx_lm.models import qwen4_qsa_indexed
+
+        cli_args = make_cli_args()
+        original = qwen4_qsa_indexed._QSA_INDEXED_ENABLED
+        try:
+            qwen4_qsa_indexed._QSA_INDEXED_ENABLED = False
+            plan = plan_soft_reload(cli_args, {"qwen4_qsa_indexed": "auto"})
+            changes = apply_soft_reload(cli_args, plan)
+            self.assertEqual(
+                changes,
+                {"qwen4_qsa_indexed": {"old": False, "new": None}},
+            )
+            self.assertIsNone(qwen4_qsa_indexed._QSA_INDEXED_ENABLED)
+
+            plan = plan_soft_reload(cli_args, {"qwen4_qsa_indexed": True})
+            apply_soft_reload(cli_args, plan)
+            self.assertTrue(qwen4_qsa_indexed._QSA_INDEXED_ENABLED)
+            with self.assertRaisesRegex(SoftReloadError, "expected a boolean"):
+                plan_soft_reload(cli_args, {"qwen4_qsa_indexed": "sometimes"})
+        finally:
+            qwen4_qsa_indexed._QSA_INDEXED_ENABLED = original
+
 
 class TestHardTierRefusal(unittest.TestCase):
     def test_model_path_is_refused_with_a_restart_message(self):

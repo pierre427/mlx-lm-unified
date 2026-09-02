@@ -2989,6 +2989,61 @@ class TestQSASelectionObject(unittest.TestCase):
             finally:
                 qwen4_exp_module._gather_qsa_attention = original
 
+    def test_z_indexed_explicit_zero_preserves_real_gather_route_byte_exactly(self):
+        from mlx_lm.models import qwen4_qsa_indexed
+
+        model = self._model()
+        model.eval()
+        prefill = mx.array([list(range(1, 13))], dtype=mx.int32)
+        decode = mx.array([[13]], dtype=mx.int32)
+
+        def run(cache):
+            mx.eval(model(prefill, cache=cache))
+            output = model(decode, cache=cache)
+            mx.eval(output)
+            return output
+
+        with mock.patch.dict(
+            environ, {"MLX_QWEN4_QSA_INDEXED": "0"}, clear=False
+        ):
+            hard_off = qwen4_qsa_indexed._env_mode("MLX_QWEN4_QSA_INDEXED")
+        self.assertFalse(hard_off)
+
+        with (
+            lever_flag("_QSA_GATHER_KV"),
+            lever_flag("_QSA_GATHER_TILE_ROWS", 2),
+            lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
+            lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
+            lever_flag("_QSA_GATHER_MIN_QUERY", 1),
+            mock.patch.object(qwen4_qsa_indexed, "_QSA_INDEXED_ENABLED", hard_off),
+        ):
+            expected = run(model.make_cache())
+            original = qwen4_exp_module._gather_qsa_attention
+            calls = []
+
+            def gather_spy(*args, **kwargs):
+                calls.append(args[0].shape)
+                return original(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    qwen4_exp_module,
+                    "qwen4_qsa_indexed_attention",
+                    side_effect=AssertionError("indexed route ran while disabled"),
+                ),
+                mock.patch.object(
+                    qwen4_exp_module,
+                    "record_qsa_indexed_receipt",
+                    side_effect=AssertionError("indexed receipt ran while disabled"),
+                ),
+                mock.patch.object(
+                    qwen4_exp_module, "_gather_qsa_attention", gather_spy
+                ),
+            ):
+                actual = run(model.make_cache())
+        self.assertEqual(len(calls), 4)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
     def test_implicit_all_compacts_to_every_causally_valid_block(self):
         args = tiny_args()
         indexer = QSAIndexer(args)

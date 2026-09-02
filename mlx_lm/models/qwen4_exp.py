@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -47,6 +49,16 @@ from .qwen4_qsa_nax import (
     compact_blocks_to_kernel_inputs,
     nax_kernel_available,
     nax_qsa_attention,
+)
+from .qwen4_qsa_indexed import (
+    QSAIndexedProbeDeclined,
+    decide_qsa_indexed_admission,
+    indexed_splits_for,
+    qsa_indexed_enabled,
+    qsa_indexed_status,
+    qwen4_qsa_indexed_attention,
+    qwen4_qsa_indexed_reference,
+    record_qsa_indexed_receipt,
 )
 from .qwen4_qsa_stage1 import (
     qsa_stage1_kernel_cache_info,
@@ -3060,19 +3072,290 @@ def _gather_qsa_attention(
         ).transpose(0, 2, 1, 3)
         tile_q = q_rows[start:stop, :, None, :]
         tile_mask = valid[start:stop, None, None, :]
-        outputs.append(
-            mx.fast.scaled_dot_product_attention(
-                tile_q,
-                gathered_k,
-                gathered_v,
-                scale=scale,
-                mask=tile_mask,
-            )[:, :, 0]
+        tile_out = mx.fast.scaled_dot_product_attention(
+            tile_q,
+            gathered_k,
+            gathered_v,
+            scale=scale,
+            mask=tile_mask,
+        )[:, :, 0]
+        # MLX SDPA does not define an all-false boolean-mask row. Keep the
+        # compact contract explicit: no attended token produces zero.
+        tile_out = mx.where(
+            mx.any(valid[start:stop], axis=-1)[:, None, None],
+            tile_out,
+            mx.zeros_like(tile_out),
         )
+        outputs.append(tile_out)
     return (
         mx.concatenate(outputs, axis=0)
         .reshape(batch, length, heads, dim)
         .transpose(0, 2, 1, 3)
+    )
+
+
+def _indexed_qsa_attention_or_gather(
+    q,
+    k,
+    v,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+    tile_rows: int,
+):
+    """Run indexed QSA or fall back with the same fetched cache tensors."""
+
+    length = int(q.shape[2])
+    context = int(compact.physical_width)
+    try:
+        return qwen4_qsa_indexed_attention(
+            q, k, v, compact, scale=scale, splits=splits
+        )
+    except QSAIndexedProbeDeclined as error:
+        reason = error.reason
+    except Exception:
+        reason = "dispatch_raised"
+    record_qsa_indexed_receipt(
+        engaged=False,
+        reason=reason,
+        length=length,
+        context=context,
+        splits=splits,
+    )
+    return _gather_qsa_attention(
+        q, k, v, compact, scale=scale, tile_rows=tile_rows
+    )
+
+
+_QSA_INDEXED_CAPTURE_LOCK = threading.Lock()
+_QSA_INDEXED_CAPTURE_LIMIT = 4
+_QSA_INDEXED_CAPTURE_THRESHOLD = 4.0e-3
+
+
+def _capture_qsa_causal_slots(compact, physical):
+    batch, length = map(int, physical.shape[:2])
+    if compact.causal_mask is None:
+        return mx.ones(physical.shape, dtype=mx.bool_)
+    causal = mx.broadcast_to(
+        compact.causal_mask,
+        (batch, 1, length, int(compact.physical_width)),
+    )[:, 0]
+    return mx.take_along_axis(
+        causal,
+        physical.reshape(batch, length, -1),
+        axis=-1,
+    ).reshape(physical.shape)
+
+
+def _capture_qsa_indexed_comparison(
+    q,
+    k,
+    v,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+    tile_rows: int,
+    layer_index: int,
+    call_counter: int,
+    gather_would_admit: bool,
+):
+    """Capture indexed and gather outputs, then preserve the gather path."""
+
+    capture_dir = Path(os.environ["MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"])
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
+        compact_blocks_to_kernel_inputs(compact)
+    )
+    logical = (
+        ids.astype(mx.int32)[..., None] * int(compact.block_size)
+        + mx.arange(int(compact.block_size), dtype=mx.int32)
+    )
+    physical = mx.clip(
+        logical + left_pad[:, None, None, None], 0, int(total) - 1
+    )
+    causal_slots = _capture_qsa_causal_slots(compact, physical)
+
+    fallback_reason = None
+    try:
+        indexed_out = qwen4_qsa_indexed_attention(
+            q, k, v, compact, scale=scale, splits=splits
+        )
+    except QSAIndexedProbeDeclined as error:
+        indexed_out = None
+        fallback_reason = error.reason
+    except Exception:
+        indexed_out = None
+        fallback_reason = "dispatch_raised"
+    gather_out = _gather_qsa_attention(
+        q, k, v, compact, scale=scale, tile_rows=tile_rows
+    )
+    mirror_out = qwen4_qsa_indexed_reference(
+        q, k, v, compact, scale=scale, splits=splits
+    )
+
+    values = [
+        gather_out,
+        mirror_out,
+        ids,
+        counts,
+        n_sel,
+        q_pos,
+        left_pad,
+        compact.tail_start,
+        compact.tail_stop,
+        causal_slots,
+    ]
+    if indexed_out is not None:
+        values.append(indexed_out)
+    mx.eval(*values)
+
+    gather_np = np.asarray(gather_out.astype(mx.float32))
+    mirror_np = np.asarray(mirror_out.astype(mx.float32))
+    mirror_delta = np.abs(mirror_np - gather_np)
+    indexed_delta = None
+    if indexed_out is not None:
+        indexed_np = np.asarray(indexed_out.astype(mx.float32))
+        indexed_delta = np.abs(indexed_np - gather_np)
+        flat_argmax = int(np.argmax(indexed_delta))
+        argmax = np.unravel_index(flat_argmax, indexed_delta.shape)
+        per_row_head_max = indexed_delta.max(axis=-1).transpose(0, 2, 1)
+        per_row_head_mean = indexed_delta.mean(axis=-1).transpose(0, 2, 1)
+        max_delta = float(indexed_delta.reshape(-1)[flat_argmax])
+        mean_delta = float(indexed_delta.mean())
+        argmax_detail = {
+            "batch": int(argmax[0]),
+            "head": int(argmax[1]),
+            "row": int(argmax[2]),
+            "channel": int(argmax[3]),
+        }
+    else:
+        per_row_head_max = None
+        per_row_head_mean = None
+        max_delta = None
+        mean_delta = None
+        argmax_detail = None
+        record_qsa_indexed_receipt(
+            engaged=False,
+            reason=fallback_reason,
+            length=int(q.shape[2]),
+            context=int(compact.physical_width),
+            splits=splits,
+        )
+
+    status = qsa_indexed_status()
+    candidate = status.get("candidate")
+    used_splits = splits if candidate is None else int(candidate[1])
+    row_axes = tuple(range(2, mirror_delta.ndim))
+    ledger = {
+        "layer_index": int(layer_index),
+        "call_counter": int(call_counter),
+        "L": int(q.shape[2]),
+        "B": int(q.shape[0]),
+        "k_shape": list(map(int, k.shape)),
+        "physical_width": int(compact.physical_width),
+        "counts_min": int(np.asarray(counts).min()),
+        "counts_max": int(np.asarray(counts).max()),
+        "n_sel_min": int(np.asarray(n_sel).min()),
+        "n_sel_max": int(np.asarray(n_sel).max()),
+        "left_pad": np.asarray(left_pad).astype(np.int64).tolist(),
+        "q_pos": np.asarray(q_pos).astype(np.int64).tolist(),
+        "tail_start": np.asarray(compact.tail_start).astype(np.int64).tolist(),
+        "tail_stop": np.asarray(compact.tail_stop).astype(np.int64).tolist(),
+        "causal_mask_present": compact.causal_mask is not None,
+        "candidate": candidate,
+        "requested_splits": int(splits),
+        "used_splits": int(used_splits),
+        "u_width": int(u_width),
+        "gather_would_admit": bool(gather_would_admit),
+        "indexed_only_admission": not bool(gather_would_admit),
+        "fallback": fallback_reason,
+        "indexed_vs_gather_max_abs_fp32": max_delta,
+        "indexed_vs_gather_mean_abs_fp32": mean_delta,
+        "indexed_vs_gather_per_row_head_max_abs_fp32": (
+            None if per_row_head_max is None else per_row_head_max.tolist()
+        ),
+        "indexed_vs_gather_per_row_head_mean_abs_fp32": (
+            None if per_row_head_mean is None else per_row_head_mean.tolist()
+        ),
+        "indexed_vs_gather_argmax": argmax_detail,
+        "mirror_vs_gather_max_abs_fp32": float(mirror_delta.max()),
+        "mirror_vs_gather_mean_abs_fp32": float(mirror_delta.mean()),
+        "mirror_vs_gather_per_batch_max_abs_fp32": (
+            mirror_delta.max(axis=row_axes).tolist()
+        ),
+    }
+
+    with _QSA_INDEXED_CAPTURE_LOCK:
+        if max_delta is not None and max_delta > _QSA_INDEXED_CAPTURE_THRESHOLD:
+            saved = len(list(capture_dir.glob("mismatch-*.safetensors")))
+            if saved < _QSA_INDEXED_CAPTURE_LIMIT:
+                stem = (
+                    f"mismatch-{saved + 1:02d}-layer-{int(layer_index):03d}"
+                    f"-call-{int(call_counter):06d}"
+                )
+                tensor_path = capture_dir / f"{stem}.safetensors"
+                sidecar = capture_dir / f"{stem}.json"
+                mx.save_safetensors(
+                    str(tensor_path),
+                    {
+                        "q": q,
+                        "k": k,
+                        "v": v,
+                        "ids": ids,
+                        "counts": counts,
+                        "n_sel": n_sel,
+                        "q_pos": q_pos,
+                        "left_pad": left_pad,
+                        "total": mx.array([int(total)], dtype=mx.int32),
+                        "causal_per_slot": causal_slots,
+                        "indexed_output": indexed_out,
+                        "gather_output": gather_out,
+                        "mirror_output": mirror_out,
+                    },
+                )
+                ledger["capture_file"] = tensor_path.name
+                sidecar.write_text(json.dumps(ledger, indent=2) + "\n")
+        with (capture_dir / "calls.jsonl").open("a") as stream:
+            stream.write(json.dumps(ledger, separators=(",", ":")) + "\n")
+    return gather_out
+
+
+def _dispatch_qsa_indexed_with_optional_capture(
+    q,
+    k,
+    v,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+    tile_rows: int,
+    layer_index: int,
+    call_counter: int,
+    gather_would_admit: bool,
+):
+    if os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"):
+        return _capture_qsa_indexed_comparison(
+            q,
+            k,
+            v,
+            compact,
+            scale=scale,
+            splits=splits,
+            tile_rows=tile_rows,
+            layer_index=layer_index,
+            call_counter=call_counter,
+            gather_would_admit=gather_would_admit,
+        )
+    return _indexed_qsa_attention_or_gather(
+        q,
+        k,
+        v,
+        compact,
+        scale=scale,
+        splits=splits,
+        tile_rows=tile_rows,
     )
 
 
@@ -3440,8 +3723,10 @@ class QSAIndexer(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextModelArgs):
+    def __init__(self, args: TextModelArgs, layer_idx: int = -1):
         super().__init__()
+        self.layer_idx = int(layer_idx)
+        self._qsa_indexed_capture_calls = 0
         self.num_kv_heads = args.num_key_value_heads
         self.num_heads = args.num_attention_heads
         self.head_dim = args.head_dim
@@ -3565,6 +3850,22 @@ class Attention(nn.Module):
                 reason=reason,
                 context=selection.physical_width,
             )
+        if use_nax:
+            use_indexed, indexed_reason = False, "nax_engaged"
+        else:
+            use_indexed, indexed_reason = decide_qsa_indexed_admission(
+                selection,
+                length=length,
+                training=self.training,
+                layout_ok=self._nax_layout_ok,
+            )
+        if qsa_indexed_enabled() and not use_indexed:
+            record_qsa_indexed_receipt(
+                engaged=False,
+                reason=indexed_reason,
+                length=length,
+                context=selection.physical_width,
+            )
         gather_context_ok = (
             selection.physical_width >= _QSA_GATHER_MIN_CONTEXT
             and (
@@ -3575,6 +3876,7 @@ class Attention(nn.Module):
         use_gather = (
             _QSA_GATHER_KV
             and not use_nax
+            and not use_indexed
             and not self.training
             and selection.kind == "explicit"
             and length >= _QSA_GATHER_MIN_QUERY
@@ -3584,7 +3886,11 @@ class Attention(nn.Module):
         # Do NOT build the dense mask when either sparse representation is
         # engaged: avoiding that [B, 1, L, T] materialization is part of the
         # win, especially for ragged batches.
-        sparse_mask = None if (use_nax or use_gather) else selection.dense_mask()
+        sparse_mask = (
+            None
+            if (use_nax or use_indexed or use_gather)
+            else selection.dense_mask()
+        )
         if fused_index_qk is None:
             qg = self.q_proj(x)
             k_flat = self.k_proj(x)
@@ -3611,6 +3917,34 @@ class Attention(nn.Module):
                 scale=self.scale, u_width=u_width, total=total,
                 n_kv_heads=self.num_kv_heads,
             ).astype(q.dtype)
+        elif use_indexed:
+            compact = selection.compact_blocks()
+            if int(k.shape[2]) != int(compact.physical_width):
+                raise ValueError("indexed QSA tensors do not match compact selection")
+            _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+            splits = indexed_splits_for(u_width)
+            if os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"):
+                self._qsa_indexed_capture_calls += 1
+            out = _dispatch_qsa_indexed_with_optional_capture(
+                q,
+                k,
+                v,
+                compact,
+                scale=self.scale,
+                splits=splits,
+                tile_rows=_QSA_GATHER_TILE_ROWS,
+                layer_index=self.layer_idx,
+                call_counter=self._qsa_indexed_capture_calls,
+                gather_would_admit=(
+                    _QSA_GATHER_KV
+                    and not use_nax
+                    and not self.training
+                    and selection.kind == "explicit"
+                    and length >= _QSA_GATHER_MIN_QUERY
+                    and length <= _QSA_GATHER_MAX_QUERY
+                    and gather_context_ok
+                ),
+            )
         elif use_gather:
             out = _gather_qsa_attention(
                 q,
@@ -3633,7 +3967,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.is_linear = args.layer_types[layer_idx] == "linear_attention"
         self.linear_attn = GatedDeltaNet(args) if self.is_linear else None
-        self.self_attn = None if self.is_linear else Attention(args)
+        self.self_attn = None if self.is_linear else Attention(args, layer_idx)
         self.mlp = SparseMoeBlock(args)
         ple_index = args.ple_layer_ids.index(layer_idx + 1) if layer_idx + 1 in args.ple_layer_ids else None
         self.ple = PLELayer(args, layer_idx, ple_index) if ple_index is not None else None
