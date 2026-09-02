@@ -60,6 +60,12 @@ from .tokenizer_utils import TokenizerWrapper
 from .prompt_lookup import HybridStats as _PromptLookupStatsBase
 from .prompt_lookup import plan_proposal_around_verify_cliff
 from .speculation_router import RoutedSpeculationPolicy
+from .verify_sync import (
+    record_verify_sync,
+    trace_verify_syncs,
+    verify_sync_round,
+    verify_sync_status,
+)
 
 _GREEDY = make_sampler(temp=0.0)
 
@@ -1394,7 +1400,9 @@ def _sample_from_logprobs(logprobs, sampling_temp: float = 0.0, *, rng=None) -> 
     # Greedy takes no draw, so it consumes no lane key (see the RNG note in
     # ``_mtp_draft_verify_loop_impl``).
     if sampling_temp and sampling_temp > 0:
+        record_verify_sync("hybrid.sample.categorical_item")
         return int(mx.random.categorical(logprobs, key=draw_key(rng)).item())
+    record_verify_sync("hybrid.sample.argmax_item")
     return int(mx.argmax(logprobs).item())
 
 
@@ -1410,10 +1418,13 @@ def _residual_sample(
     # per-token rule) multiplies bit-exactly, so the default is unchanged.
     residual = mx.maximum(scale * mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
     total = mx.sum(residual)
+    record_verify_sync("hybrid.residual.total_eval")
     mx.eval(total)
+    record_verify_sync("hybrid.residual.total_item")
     if float(total.item()) <= 0.0:
         return _sample_from_logprobs(target_logprobs, sampling_temp, rng=rng)
     residual_logprobs = mx.log(residual / total)
+    record_verify_sync("hybrid.residual.categorical_item")
     return int(mx.random.categorical(residual_logprobs, key=draw_key(rng)).item())
 
 
@@ -1457,7 +1468,10 @@ def _batched_residual_verify(
     draft_at = mx.take_along_axis(mx.stack(draft_logprobs), d, axis=-1)[:, 0]
     ratios = mx.exp(mx.minimum(target_at - draft_at, 0.0))
     us = _draw_mtp_acceptance_uniforms(k, rng=rng)
+    record_verify_sync("hybrid.residual_verify.eval")
     mx.eval(ratios, us)
+    record_verify_sync("hybrid.residual_verify.ratios_tolist")
+    record_verify_sync("hybrid.residual_verify.uniforms_tolist")
     ratios, us = ratios.tolist(), us.tolist()
     n_accept = 0
     while (
@@ -1492,7 +1506,10 @@ def _accept_sampled_draft(
     log_ratio = mx.minimum(target_logprobs[token] - draft_logprobs[token], 0.0)
     ratio = mx.exp(log_ratio)
     u = mx.random.uniform(shape=(), key=draw_key(rng))
+    record_verify_sync("hybrid.accept_sampled.eval")
     mx.eval(ratio, u)
+    record_verify_sync("hybrid.accept_sampled.uniform_item")
+    record_verify_sync("hybrid.accept_sampled.ratio_item")
     return float(u.item()) <= float(ratio.item())
 
 
@@ -1522,18 +1539,21 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float, *, rng
     """
     k = len(drafts)
     etas = _draw_mtp_acceptance_uniforms(k, rng=rng)
+    record_verify_sync("hybrid.block_verify.uniforms_eval")
     mx.eval(etas)
     p_cums = [1.0]
     p_cum = 1.0
     tau = 0
     for i in range(k):
         d = drafts[i]
+        record_verify_sync("hybrid.block_verify.log_ratio_item")
         log_ratio = float((logprobs[i][d] - draft_logprobs[i][d]).item())
         p_cum = min(p_cum * math.exp(log_ratio), 1.0)
         p_cums.append(p_cum)
         if i == k - 1:
             h = p_cum
         else:
+            record_verify_sync("hybrid.block_verify.residual_item")
             s = float(
                 mx.sum(
                     mx.maximum(
@@ -1544,6 +1564,7 @@ def _block_verify(logprobs, draft_logprobs, drafts, sampling_temp: float, *, rng
             )
             denom = s + (1.0 - p_cum)
             h = 1.0 if denom <= 0.0 else s / denom
+        record_verify_sync("hybrid.block_verify.uniform_item")
         if float(etas[i].item()) <= h:
             tau = i + 1
     if tau == k:
@@ -1942,6 +1963,14 @@ def _propose_batched_self_mtp_impl(
     batch: BatchedSelfMTPState,
 ) -> SelfMTPCycleResult:
     """Open one batched draft/verify transaction over the current membership."""
+    with verify_sync_round():
+        return _propose_batched_self_mtp_round(model, batch)
+
+
+def _propose_batched_self_mtp_round(
+    model: nn.Module,
+    batch: BatchedSelfMTPState,
+) -> SelfMTPCycleResult:
     if batch.proposal_open:
         raise RuntimeError("a self-MTP proposal is already open")
     if not batch.lanes:
@@ -2141,7 +2170,9 @@ def _propose_batched_self_mtp_impl(
                 )
             elif lane.accept_rule == "exact":
                 sampled = mx.random.categorical(logprobs, key=draw_key(lane.rng))
+                record_verify_sync("hybrid.exact.sampled_eval")
                 mx.eval(sampled)
+                record_verify_sync("hybrid.exact.sampled_tolist")
                 sampled = sampled.tolist()
                 n_accept = 0
                 while n_accept < k and sampled[n_accept] == drafts[row][n_accept]:
@@ -2168,6 +2199,7 @@ def _propose_batched_self_mtp_impl(
                         logprobs[n_accept], lane.sampling_temp, rng=lane.rng
                     )
         else:
+            record_verify_sync("hybrid.greedy.targets_tolist")
             targets = mx.argmax(logprobs, axis=-1).tolist()
             n_accept = 0
             while n_accept < k and targets[n_accept] == drafts[row][n_accept]:

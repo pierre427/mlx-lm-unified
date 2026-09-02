@@ -85,6 +85,7 @@ from .qwen3_next import (
     transform_moe_weights,
 )
 from .rope_utils import initialize_rope
+from ..verify_sync import record_verify_sync
 
 
 # Opt-in micro-levers, each read once at import.  Off keeps the stock path,
@@ -638,6 +639,11 @@ def _valid_span_end(mask):
     if isinstance(mask, np.ndarray):
         return np.max(np.where(mask, np.arange(1, length + 1), 0), axis=1)
     return mx.max(mx.where(mask, mx.arange(1, length + 1), 0), axis=1)
+
+
+def _trace_ple_mask_tail(mask):
+    record_verify_sync("qwen4.ple.mask_tail_asarray")
+    return np.asarray(mask)
 
 
 def _row_tail(values, end, width):
@@ -1559,6 +1565,7 @@ class NGramEmbedding(nn.Module):
         mask: Optional[mx.array] = None,
         previous: Optional[np.ndarray] = None,
     ) -> np.ndarray:
+        record_verify_sync("qwen4.ple.ids_eval")
         mx.eval(input_ids, mask)
         tokens = np.asarray(input_ids, dtype=np.int64)
         batch, seq_len = tokens.shape
@@ -1579,14 +1586,18 @@ class NGramEmbedding(nn.Module):
             # A pad id is not a token.  EOS is the segment sentinel the shift
             # already resets on, so substituting it makes a padded row hash
             # and store exactly what that row hashes and stores alone.
-            tokens = np.where(np.asarray(mask), tokens, self.eos_token_id)
+            record_verify_sync("qwen4.ple.mask_asarray")
+            mask_array = np.asarray(mask)
+            tokens = np.where(mask_array, tokens, self.eos_token_id)
         history = np.concatenate([previous, tokens], axis=-1)
         if cache is not None:
             tail = (
                 history[:, -self.context_len :]
                 if mask is None
                 else _row_tail(
-                    history, _valid_span_end(np.asarray(mask)), self.context_len
+                    history,
+                    _valid_span_end(_trace_ple_mask_tail(mask)),
+                    self.context_len,
                 )
             )
             cache[3] = mx.array(tail, dtype=mx.int64)
@@ -2201,6 +2212,7 @@ class BatchQSAKVCache(BatchKVCache):
         padding = self.left_padding
         cached = self._max_left_pad
         if cached is None or cached[0] is not padding:
+            record_verify_sync("qwen4.qsa.max_left_padding_item")
             self._max_left_pad = (padding, int(padding.max().item()))
         return self._max_left_pad[1]
 
