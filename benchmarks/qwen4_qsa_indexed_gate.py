@@ -852,7 +852,9 @@ def phase4_model(
         )
         status = indexed["indexed_status"]
         reached = status["query_width_counts"].get("2-8", {}).get("engaged", 0)
-        cycles = indexed["stats"].get("cycles", 0)
+        cycles = indexed["stats"].get(
+            "draft_cycles", indexed["stats"].get("cycles", 0)
+        )
         expected_verify_calls = qsa_layers * cycles
         receipt = {
             "qsa_layers": qsa_layers,
