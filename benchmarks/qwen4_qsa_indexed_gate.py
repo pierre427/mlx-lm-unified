@@ -983,6 +983,10 @@ def phase4_model(
         )
         expected_verify_calls = qsa_layers * cycles
         device = status["device_attestation"]
+        expected_device_calls = sum(
+            bucket.get("engaged", 0)
+            for bucket in status["query_width_counts"].values()
+        )
         receipt = {
             "qsa_layers": qsa_layers,
             "self_mtp_rounds": cycles,
@@ -993,6 +997,7 @@ def phase4_model(
             ),
             "candidate": status["candidate"],
             "fallbacks": status["fallbacks"],
+            "expected_device_dispatch_calls": expected_device_calls,
             "device_attestation": device,
         }
         passed = (
@@ -1001,8 +1006,9 @@ def phase4_model(
             and not status["fallbacks"]
             and status["candidate"] is not None
             and reached == expected_verify_calls
-            and device["expected"] == expected_verify_calls
-            and device["observed"] == expected_verify_calls
+            and status["counts"].get("engaged", 0) == expected_device_calls
+            and device["expected"] == expected_device_calls
+            and device["observed"] == expected_device_calls
             and device["mismatches"] == 0
             and divergence is None
         )
