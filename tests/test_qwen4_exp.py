@@ -3212,10 +3212,11 @@ class TestQSASelectionObject(unittest.TestCase):
             lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
             lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
             lever_flag("_QSA_GATHER_MIN_QUERY", 1),
+            lever_flag("_QSA_GATHER_MAX_QUERY", 8),
         ):
             qwen4_exp_module._gather_qsa_attention = spy
             try:
-                # M=12 exceeds the default gather max-query latch; the next
+                # M=12 exceeds the pinned gather max-query latch; the next
                 # M=1 call is explicit QSA and must route all four FA layers.
                 mx.eval(
                     model(
@@ -3230,6 +3231,42 @@ class TestQSASelectionObject(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(shape[2] == 1 for shape, _tile in calls))
         self.assertTrue(all(tile == 2 for _shape, tile in calls))
+
+    def test_shipped_gather_window_mirrors_the_indexed_default(self):
+        """Both windows ship at 8; PLD's width-17 blocks stay off both."""
+        self.assertEqual(qwen4_exp_module._QSA_GATHER_MAX_QUERY, 8)
+        for width, expected in ((12, 0), (17, 0)):
+            with self.subTest(width=width):
+                model = self._model()
+                model.eval()
+                cache = model.make_cache()
+                calls = []
+                original = qwen4_exp_module._gather_qsa_attention
+
+                def spy(*args, **kwargs):
+                    calls.append(args[0].shape)
+                    return original(*args, **kwargs)
+
+                with (
+                    lever_flag("_QSA_GATHER_KV"),
+                    lever_flag("_QSA_GATHER_TILE_ROWS", 1),
+                    lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
+                    lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
+                    lever_flag("_QSA_GATHER_MIN_QUERY", 1),
+                ):
+                    qwen4_exp_module._gather_qsa_attention = spy
+                    try:
+                        mx.eval(
+                            model(
+                                mx.array(
+                                    [list(range(1, width + 1))], dtype=mx.int32
+                                ),
+                                cache=cache,
+                            )
+                        )
+                    finally:
+                        qwen4_exp_module._gather_qsa_attention = original
+                self.assertEqual(len(calls), expected)
 
     def test_gather_min_query_keeps_width_one_decode_on_stock_path(self):
         model = self._model()
@@ -3285,6 +3322,7 @@ class TestQSASelectionObject(unittest.TestCase):
             lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
             lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
             lever_flag("_QSA_GATHER_MIN_QUERY", 1),
+            lever_flag("_QSA_GATHER_MAX_QUERY", 8),
             mock.patch.object(qwen4_qsa_indexed, "_QSA_INDEXED_ENABLED", hard_off),
         ):
             expected = run(model.make_cache())

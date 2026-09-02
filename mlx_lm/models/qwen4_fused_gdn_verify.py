@@ -56,9 +56,36 @@ from .qwen4_fused_gdn import (
 
 logger = logging.getLogger(__name__)
 
-# Production self-MTP verifies ``k + 1`` tokens (k = 2 on Flash-Next); prompt
-# lookup can widen the block. The bound keeps every compiled specialization
-# and its snapshot outputs small; wider blocks use the stock path.
+# Production self-MTP verifies ``k + 1`` tokens (k = 2 on Flash-Next); adaptive
+# prompt lookup presents much wider blocks, and the bound is what decides
+# whether those reach this kernel at all. A PLD verify forward is the pending
+# bonus token followed by the proposal, so its width is ``max_span + 1``: at
+# the serving profile's ``max_span=16`` the measured distribution is 17 x 14,
+# 15 x 1, 1 x 3 per 256-token generation. The bound is therefore 17, not 16 --
+# a bound of 16 admits one speculative forward in fifteen.
+#
+# Nothing in the kernel's geometry depends on ``S``: the threadgroup is
+# ``(32, TY, 1)`` over one value head, the register tile is ``st[DV/TY][DK/32]``
+# and every threadgroup array is sized by ``DK``/``DV``. ``S`` is a template
+# constant that sets the trip count of the token loop and the leading extent of
+# the two snapshot outputs. So raising the bound compiles more specializations
+# (one per width) and holds more snapshot memory until the accept boundary --
+# ``state_snapshots`` is ``(S - 1) * HV * DV * DK`` float32, about 3 MiB per
+# extra step per linear layer -- but it does not change the arithmetic of any
+# width that was already admitted. The kernel source is pinned by hash in
+# ``tests/test_qwen4_fused_gdn_verify_contract.py`` to keep that true.
+#
+# ``MAX_VERIFY_WIDTH_PROVEN`` is how wide the kernel has been gated bit-exact
+# against the stock path on Metal; ``MAX_VERIFY_STEPS`` is what production
+# admits. They differ deliberately. The composed gate of 2026-09-02 turned
+# every PLD verify forward fused (0 calls / 540 fallbacks -> 540 calls / 0
+# fallbacks, digest-identical) and measured NO decode gain for it, against
+# +4.3 GiB peak. This kernel's measured win is at ``S = k + 1 = 3`` on the
+# self-MTP route (+3.9% / +6.1%), where it removes launches; at S = 17 its one
+# threadgroup per value head walks 17 tokens serially, which is plausibly why
+# the win does not survive. Raise the admitted bound only with a cell that
+# shows a gain: wiki/docs/experiments/qwen4-pld-width-levers-2026-09-02.md.
+MAX_VERIFY_WIDTH_PROVEN = 17
 MAX_VERIFY_STEPS = 8
 
 
@@ -422,9 +449,14 @@ def qwen4_fused_gdn_verify(
             f"expected one of {_THREADGROUP_Y_CANDIDATES}"
         )
     steps = int(qkv.shape[1])
-    if not 2 <= steps <= MAX_VERIFY_STEPS:
+    # The dispatch and the probe are bounded by what the kernel is PROVEN to
+    # compute, not by what production admits: ``admit_qwen4_fused_gdn_verify``
+    # is the production gate, and a bench that widens it must still be able to
+    # build the graph.
+    if not 2 <= steps <= MAX_VERIFY_WIDTH_PROVEN:
         raise ValueError(
-            f"unsupported verify width {steps}; expected 2..{MAX_VERIFY_STEPS}"
+            f"unsupported verify width {steps}; "
+            f"expected 2..{MAX_VERIFY_WIDTH_PROVEN}"
         )
     outputs = _kernel()(
         inputs=[
@@ -482,7 +514,10 @@ def probe_qwen4_fused_gdn_verify(dtype, steps: int) -> Optional[int]:
     with _PROBE_LOCK:
         if steps in _PROBED_STEPS:
             return _PROBED_STEPS[steps]
-        if not 2 <= steps <= MAX_VERIFY_STEPS or not fused_gdn_runtime_supported():
+        if (
+            not 2 <= steps <= MAX_VERIFY_WIDTH_PROVEN
+            or not fused_gdn_runtime_supported()
+        ):
             _PROBED_STEPS[steps] = None
             return None
         start = probe_qwen4_fused_gdn_decode(dtype)
@@ -541,6 +576,7 @@ def probe_qwen4_fused_gdn_verify(dtype, steps: int) -> Optional[int]:
 
 __all__ = [
     "MAX_VERIFY_STEPS",
+    "MAX_VERIFY_WIDTH_PROVEN",
     "admit_qwen4_fused_gdn_verify",
     "probe_qwen4_fused_gdn_verify",
     "qwen4_fused_gdn_verify",

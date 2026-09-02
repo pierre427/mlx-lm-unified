@@ -338,6 +338,54 @@ class TestQSAIndexedReference(unittest.TestCase):
             np.asarray(mirror), np.asarray(gather), rtol=1.0e-5, atol=1.0e-5
         )
 
+    def test_pld_verify_widths_mirror_gather_with_ragged_tails_and_masks(self):
+        """The CPU mirror band for the widths adaptive PLD actually proposes.
+
+        Kernel-vs-gather exactness is asserted on Metal by the gate; on CPU
+        the contract is that the indexed reference and the gather reference
+        agree at every width in the widened admission window, with ragged
+        per-row block counts, non-zero left padding and a dense causal mask.
+        """
+        for length in (9, 12, 15, 16, 17):
+            for splits in (1, 4, 8):
+                with self.subTest(length=length, splits=splits):
+                    mx.random.seed(1300 + length)
+                    compact = _compact(2, length, total=64, selected_width=15)
+                    counts = np.asarray(compact.block_counts)
+                    self.assertGreater(int(counts.max()), int(counts.min()))
+                    self.assertGreater(int(np.asarray(compact.left_padding).max()), 0)
+                    self.assertIsNotNone(compact.causal_mask)
+                    q, k, v = _arrays(2, length, total=64)
+                    mirror = indexed.qwen4_qsa_indexed_reference(
+                        q, k, v, compact, scale=8**-0.5, splits=splits
+                    )
+                    gather = _gather_qsa_attention(
+                        q, k, v, compact, scale=8**-0.5, tile_rows=2
+                    )
+                    mx.eval(mirror, gather)
+                    np.testing.assert_allclose(
+                        np.asarray(mirror),
+                        np.asarray(gather),
+                        rtol=1.0e-5,
+                        atol=1.0e-5,
+                    )
+
+    def test_pld_verify_widths_are_split_invariant_without_a_mask(self):
+        for length in (9, 12, 15, 16, 17):
+            with self.subTest(length=length):
+                mx.random.seed(2300 + length)
+                compact = _wide_compact(length=length)
+                q, k, v = _arrays(1, length, total=512)
+                outputs = [
+                    indexed.qwen4_qsa_indexed_reference(
+                        q, k, v, compact, scale=8**-0.5, splits=splits
+                    )
+                    for splits in (1, 2, 8, 32, 127)
+                ]
+                mx.eval(*outputs)
+                for other in outputs[1:]:
+                    self.assertTrue(bool(mx.array_equal(outputs[0], other).item()))
+
     def test_cache_prefix_views_pass_through_and_match_contiguous_mirror(self):
         mx.random.seed(30)
         total = 32
@@ -921,6 +969,9 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         with (
             mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", None),
             mock.patch.object(indexed, "indexed_kernel_available", return_value=True),
+            # The shipped default is 8; this matrix is about the window's
+            # behaviour at the widths the kernel is proven exact for.
+            mock.patch.object(indexed, "_MAX_QUERY", 17),
         ):
             cases = [
                 (1, 65_535, False, "auto_context_out_of_range"),
@@ -928,7 +979,16 @@ class TestQSAIndexedAdmission(unittest.TestCase):
                 (2, 16_383, False, "auto_context_out_of_range"),
                 (2, 16_384, True, "engaged"),
                 (3, 16_384, True, "engaged"),
-                (9, 65_536, False, "width_out_of_range"),
+                # PLD verifies spans up to 16 wide; the kernel runs one
+                # independent grid row per query token, so these admit.
+                (9, 16_384, True, "engaged"),
+                (12, 16_384, True, "engaged"),
+                (15, 16_384, True, "engaged"),
+                (16, 16_384, True, "engaged"),
+                # A PLD verify forward is the bonus token plus the proposal,
+                # so its width is max_span + 1 = 17. This is the common one.
+                (17, 16_384, True, "engaged"),
+                (18, 65_536, False, "width_out_of_range"),
             ]
             for length, context, engage, reason in cases:
                 with self.subTest(length=length, context=context):
@@ -1004,6 +1064,7 @@ class TestQSAIndexedAdmission(unittest.TestCase):
             ("nax_engaged", 1),
             ("probe_declined", 3),
             ("dispatch_raised", 12),
+            ("width_out_of_range", 32),
         ):
             indexed.record_qsa_indexed_receipt(
                 engaged=False,
@@ -1033,11 +1094,26 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         self.assertEqual(status["fallbacks"], 2)
         self.assertEqual(status["query_width_counts"]["1"]["declined"], 1)
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
-        self.assertEqual(status["query_width_counts"][">8"]["declined"], 1)
+        self.assertEqual(status["query_width_counts"]["9-17"]["declined"], 1)
+        self.assertEqual(status["query_width_counts"][">17"]["declined"], 1)
         self.assertEqual(status["split_candidates"], [128, 64, 32, 16, 8])
         geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
         self.assertEqual(geometry["candidate"], [384, 32])
         self.assertEqual(geometry["candidate_timings_ms"]["32"], 0.4)
+
+    def test_shipped_indexed_window_is_the_gated_default(self):
+        """The gate measured no gain from widening, so the default stays 8."""
+        self.assertEqual(indexed._MAX_QUERY, 8)
+        with mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", None), \
+                mock.patch.object(
+                    indexed, "indexed_kernel_available", return_value=True
+                ):
+            self.assertEqual(
+                self.decide(
+                    selection=self.selection(physical_width=16_384), length=17
+                ),
+                (False, "width_out_of_range"),
+            )
 
     def test_env_unset_selects_guarded_auto(self):
         with mock.patch.dict(os.environ, {}, clear=True):

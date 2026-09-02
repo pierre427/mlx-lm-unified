@@ -2,6 +2,7 @@
 
 """Contracts for the default-off fused Qwen4 GDN speculative-verify path."""
 
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -122,12 +123,77 @@ def test_production_verify_widths_are_admitted():
     for steps in range(2, qwen4_fused_gdn_verify.MAX_VERIFY_STEPS + 1):
         result = admission(steps)
         assert result.accepted, (steps, result.reason)
+    # Adaptive prompt lookup proposes spans up to 16 wide; those are the
+    # widths that were declining before the bound was raised.
+    # The admitted bound is the gated default; the kernel is proven wider.
+    assert qwen4_fused_gdn_verify.MAX_VERIFY_STEPS == 8
+    assert qwen4_fused_gdn_verify.MAX_VERIFY_WIDTH_PROVEN == 17
+    # 17 is the width adaptive PLD actually presents (bonus + max_span), and
+    # it dispatches correctly; it is simply not admitted by default.
+    with patch.object(qwen4_fused_gdn_verify, "MAX_VERIFY_STEPS", 17):
+        for steps in (9, 15, 16, 17):
+            assert admission(steps).accepted
+
+
+def test_verify_kernel_source_is_pinned_across_the_width_bound():
+    """``S`` is a template constant, so widening the bound must not touch it.
+
+    Every admitted width compiles from this one source; pinning its hash is
+    what makes "the arithmetic for S <= 8 is unchanged" a checked claim
+    rather than a reading of the diff.
+    """
+    digest = hashlib.sha256(qwen4_fused_gdn_verify._SOURCE.encode()).hexdigest()
+    assert digest == (
+        "2d5d84dc1869b7d74115605f2391e6a8e0767916db4f2214df19321641c90842"
+    )
+
+
+@pytest.mark.parametrize("steps", [2, 8, 9, 15, 16, 17])
+def test_wide_dispatch_shapes_scale_only_the_token_axis(steps):
+    """Geometry is width independent; only the snapshot extents move."""
+    calls = []
+
+    def fake_kernel(**kwargs):
+        calls.append(kwargs)
+        return [
+            FakeArray(shape, dtype)
+            for shape, dtype in zip(kwargs["output_shapes"], kwargs["output_dtypes"])
+        ]
+
+    values = production_values(steps=steps)
+    with patch.object(qwen4_fused_gdn_verify, "_kernel", return_value=fake_kernel):
+        outputs = qwen4_fused_gdn_verify.qwen4_fused_gdn_verify(
+            values["qkv"],
+            values["z"],
+            values["b"],
+            values["a"],
+            values["conv_state"],
+            values["conv_weight"],
+            values["A_log"],
+            values["dt_bias"],
+            values["recurrent_state"],
+            values["norm_weight"],
+            1.0e-6,
+            threadgroup_y=16,
+        )
+    assert calls[0]["grid"] == (32, 16, 48)
+    assert calls[0]["threadgroup"] == (32, 16, 1)
+    assert ("S", steps) in calls[0]["template"]
+    assert [item.shape for item in outputs] == [
+        (1, steps, 6144),
+        (1, 3, 10240),
+        (1, 48, 128, 128),
+        (1, steps - 1, 48, 128, 128),
+        (1, steps - 1, 3, 10240),
+    ]
 
 
 def test_single_token_batch_mask_ragged_and_plain_forwards_fall_back():
     assert admission(1).reason == "verify width 1 below 2"
     wide = qwen4_fused_gdn_verify.MAX_VERIFY_STEPS + 1
-    assert admission(wide).reason == f"verify width {wide} above 8"
+    assert admission(wide).reason == (
+        f"verify width {wide} above {qwen4_fused_gdn_verify.MAX_VERIFY_STEPS}"
+    )
     assert "qkv shape" in admission(qkv=FakeArray((2, 3, 10240), mx.bfloat16)).reason
     assert admission(mask=object()).reason == "masked verify"
     assert admission(spans=None).reason == "rollback geometry not describable"

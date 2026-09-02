@@ -73,6 +73,27 @@ def _env_mode(name: str) -> bool | None:
 
 _QSA_INDEXED_ENABLED = _env_mode("MLX_QWEN4_QSA_INDEXED")
 _MIN_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_QUERY", 2, minimum=1)
+# The kernel flattens (batch, query row) into the dispatch grid and runs the
+# native ``sdpa_vector_2pass`` arithmetic at ``q_len == 1`` per row, so a
+# wider verify block is the same work per row and nothing in the source or
+# the threadgroup geometry depends on this bound. It is admission policy.
+#
+# It is set to the widest block adaptive prompt lookup actually presents, which
+# is ``max_span + 1``, not ``max_span``: a PLD verify forward is the pending
+# bonus token followed by the proposal (``verify_rows = len(pending) + n_prop``
+# in ``hybrid_speculative``). At the serving profile's ``max_span=16`` the
+# measured distribution is 17 x 14, 15 x 1, 1 x 3 per 256-token generation, so
+# a bound of 16 admits one speculative forward in fifteen.
+#
+# The kernel is PROVEN EXACT at every width up to 17 (kernel == gather to
+# max_abs 0.0 at B1/B2 x L in {9, 12, 16, 17} on Metal, split-invariant,
+# 48/48 device-attested), and end to end the widened path is token-identical.
+# The DEFAULT nonetheless stays 8: the composed gate of 2026-09-02 measured no
+# decode gain from widening (0.971x on the one clean 32K PLD cell, inside that
+# arm's own 6.7% spread) against +4.3 GiB peak, and it moved this window and
+# the fused GDN verify bound together, so it cannot say which lever spent the
+# memory. Widen with the env var to opt in; see
+# wiki/docs/experiments/qwen4-pld-width-levers-2026-09-02.md.
 _MAX_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_QUERY", 8, minimum=1)
 _MIN_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_CONTEXT", 16384)
 _MAX_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_CONTEXT", 0)
@@ -235,7 +256,8 @@ _STATUS_COUNTS = Counter()
 _STATUS_WIDTHS = {
     "1": Counter(),
     "2-8": Counter(),
-    ">8": Counter(),
+    "9-17": Counter(),
+    ">17": Counter(),
 }
 _STATUS_LAST = None
 _STATUS_CANDIDATE = None
@@ -255,7 +277,9 @@ def _width_bucket(width: int) -> str:
         return "1"
     if width <= 8:
         return "2-8"
-    return ">8"
+    if width <= 17:
+        return "9-17"
+    return ">17"
 
 
 def record_qsa_indexed_receipt(
