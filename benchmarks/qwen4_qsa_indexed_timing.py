@@ -201,7 +201,7 @@ def settle_to_baseline(baseline):
         band_pct=5.0,
         consecutive=2,
         min_s=0.0,
-        max_s=60.0,
+        max_s=180.0,
         read_signals=thermal_settle.read_thermal_signals,
     )
     if not record["settled"]:
@@ -780,10 +780,44 @@ def run_remaining(args):
     return 0
 
 
+def run_end_to_end_32k(args):
+    started = time.monotonic()
+    deadline = started + args.wall_limit_minutes * 60.0
+    combined_path = args.output_dir / f"{PREFIX}-e2e32-resume.json"
+    combined = {
+        "manifest": {
+            "record": "manifest",
+            "schema": "mlx-uag.qwen4-qsa-indexed-timing.v1",
+            "agent": "codex-n-timing",
+            "started_at": utc_now(),
+            "model": str(args.model),
+            "gpu_wall_limit_minutes": args.wall_limit_minutes,
+            "outcome": "RUNNING",
+        },
+        "records": [],
+    }
+    with owned_gpu_lock() as owner:
+        combined["manifest"]["lock_owner"] = owner
+        result = run_child(
+            args,
+            "end-to-end",
+            context=32_768,
+            deadline=deadline,
+            attempt="r3",
+        )
+        combined["records"].append({"record": "child", **result})
+        combined["manifest"]["outcome"] = result["status"]
+        combined["manifest"]["gpu_wall_seconds"] = time.monotonic() - started
+        combined["manifest"]["finished_at"] = utc_now()
+        write_report(combined, combined_path)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-all", action="store_true")
     parser.add_argument("--run-remaining", action="store_true")
+    parser.add_argument("--run-e2e32", action="store_true")
     parser.add_argument(
         "--cell", choices=("phase4", "isolated", "end-to-end")
     )
@@ -797,6 +831,8 @@ def main():
         return run_all(args)
     if args.run_remaining:
         return run_remaining(args)
+    if args.run_e2e32:
+        return run_end_to_end_32k(args)
     if args.cell is None or args.output is None:
         parser.error("a child run requires --cell and --output")
     if args.cell in {"phase4", "end-to-end"} and args.context is None:
