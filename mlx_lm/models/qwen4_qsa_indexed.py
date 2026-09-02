@@ -509,14 +509,19 @@ _SOURCE = r"""
     float q_values[D / 32];
     for (uint part = 0; part < elements; ++part) {
         const uint d = lane * elements + part;
-        q_values[part] = float(scale[0]) * float(
-            q[((size_t)(b * NQH + qh) * L + row) * D + d]
-        );
+        const size_t q_index =
+            (size_t)b * q_strides[0] +
+            (size_t)qh * q_strides[1] +
+            (size_t)row * q_strides[2] +
+            (size_t)d * q_strides[3];
+        q_values[part] = float(scale[0]) * float(q[q_index]);
     }
 
     const uint slot_base = (b * L + row) * uint(U);
-    const device T* kb = k + (size_t)(b * NKVH + hkv) * TOT * D;
-    const device T* vb = v + (size_t)(b * NKVH + hkv) * TOT * D;
+    const size_t k_head =
+        (size_t)b * k_strides[0] + (size_t)hkv * k_strides[1];
+    const size_t v_head =
+        (size_t)b * v_strides[0] + (size_t)hkv * v_strides[1];
     for (uint local_block = 0; local_block < block_count; ++local_block) {
         const uint block_idx = block_begin + local_block;
         float out_values[D / 32] = {0};
@@ -535,15 +540,24 @@ _SOURCE = r"""
                 physical = lpad + logical;
                 live = physical >= 0 && physical < TOT && logical <= qp;
                 live = live && (slot < selected || logical >= complete);
-                if (HAS_MASK && live)
-                    live = mask[(size_t)(b * L + row) * TOT + physical];
+                if (HAS_MASK && live) {
+                    const uint mask_batch = mask_shape[0] == 1 ? 0 : b;
+                    const size_t mask_index =
+                        (size_t)mask_batch * mask_strides[0] +
+                        (size_t)row * mask_strides[2] +
+                        (size_t)physical * mask_strides[3];
+                    live = mask[mask_index];
+                }
             }
             if (!live) continue;
 
             float score = 0.0f;
             for (uint part = 0; part < elements; ++part) {
                 const uint d = lane * elements + part;
-                score += q_values[part] * float(kb[(size_t)physical * D + d]);
+                const size_t k_index =
+                    k_head + (size_t)physical * k_strides[2] +
+                    (size_t)d * k_strides[3];
+                score += q_values[part] * float(k[k_index]);
             }
             score = simd_sum(score);
             const float new_max = metal::max(maximum, score);
@@ -554,7 +568,10 @@ _SOURCE = r"""
             for (uint part = 0; part < elements; ++part) {
                 const uint d = lane * elements + part;
                 out_values[part] = out_values[part] * factor
-                    + probability * float(vb[(size_t)physical * D + d]);
+                    + probability * float(
+                        v[v_head + (size_t)physical * v_strides[2] +
+                          (size_t)d * v_strides[3]]
+                    );
             }
         }
 
@@ -644,7 +661,7 @@ def _partition_kernel():
         output_names=["part_m", "part_l", "part_o"],
         header=_HEADER,
         source=_SOURCE,
-        ensure_row_contiguous=True,
+        ensure_row_contiguous=False,
     )
 
 
@@ -700,24 +717,24 @@ def _partition_dispatch(
     if threads != required_threads:
         raise ValueError("indexed QSA pass 1 requires one SIMD group per GQA head")
     if compact.causal_mask is None:
-        mask = mx.ones((1,), dtype=mx.bool_)
+        mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
         has_mask = False
     else:
-        mask = mx.broadcast_to(
-            compact.causal_mask, (batch, 1, length, total)
-        )[:, 0]
+        mask = compact.causal_mask
+        if int(mask.shape[0]) == 1 and batch > 1:
+            mask = mx.broadcast_to(mask, (batch, 1, length, total))
         has_mask = True
     return _partition_kernel()(
         inputs=[
-            mx.contiguous(q),
-            mx.contiguous(k),
-            mx.contiguous(v),
+            q,
+            k,
+            v,
             mx.contiguous(ids.astype(mx.uint32)),
             mx.contiguous(counts.astype(mx.uint32)),
             mx.contiguous(n_sel.astype(mx.uint32)),
             mx.contiguous(q_pos.astype(mx.int32)),
             mx.contiguous(left_pad.astype(mx.int32)),
-            mx.contiguous(mask),
+            mask,
             mx.array([scale], dtype=mx.float32),
             mx.array([length, total, u_width], dtype=mx.int32),
         ],

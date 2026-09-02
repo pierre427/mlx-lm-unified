@@ -212,6 +212,50 @@ class TestQSAIndexedReference(unittest.TestCase):
             np.asarray(baseline[:, :, 0]), np.asarray(changed[:, :, 0])
         )
 
+    def test_cache_prefix_views_pass_through_and_match_contiguous_mirror(self):
+        mx.random.seed(30)
+        total = 32
+        compact = _compact(1, 3, total=total)
+        q = mx.random.normal((1, 4, 3, 8))
+        k_buffer = mx.random.normal((1, 2, 256, 8))
+        v_buffer = mx.random.normal((1, 2, 256, 8))
+        k_view = k_buffer[:, :, :total]
+        v_view = v_buffer[:, :, :total]
+        k_contiguous = mx.contiguous(k_view)
+        v_contiguous = mx.contiguous(v_view)
+
+        view_output = indexed.qwen4_qsa_indexed_reference(
+            q, k_view, v_view, compact, scale=8**-0.5, splits=4
+        )
+        contiguous_output = indexed.qwen4_qsa_indexed_reference(
+            q, k_contiguous, v_contiguous, compact, scale=8**-0.5, splits=4
+        )
+        mx.eval(view_output, contiguous_output)
+        np.testing.assert_array_equal(
+            np.asarray(view_output), np.asarray(contiguous_output)
+        )
+
+        captured = {}
+
+        def dispatch(**kwargs):
+            captured["inputs"] = kwargs["inputs"]
+            return (mx.zeros((1,), dtype=mx.float32),)
+
+        with mock.patch.object(indexed, "_partition_kernel", return_value=dispatch):
+            indexed._partition_dispatch(
+                q,
+                k_view,
+                v_view,
+                compact,
+                scale=8**-0.5,
+                threads=64,
+                splits=4,
+            )
+        self.assertIs(captured["inputs"][0], q)
+        self.assertIs(captured["inputs"][1], k_view)
+        self.assertIs(captured["inputs"][2], v_view)
+        self.assertIs(captured["inputs"][8], compact.causal_mask)
+
     def test_duplicate_block_ids_fail_closed(self):
         compact = QSACompactBlocks(
             block_ids=mx.array([[[1, 1]]], dtype=mx.uint32),
