@@ -2125,17 +2125,25 @@ def _qsa_join_ledger_width(index_keys, cursor: int, who: str) -> int:
     the ledger with the KV quantity, which is exact only while the two agree.
     Where they diverge the join used to fail at ``concatenate`` with a bare
     shape message, or, single-lane, return a ledger the cursor does not
-    describe. Say which quantity disagreed instead.
+    describe. Say which quantity disagreed instead. An ABSENT ledger is width
+    0 and is refused on the same rule: it is legitimate only on a lane that
+    holds no KV either.
     """
-    if index_keys is None:
-        return 0
-    width = index_keys.shape[1]
+    width = 0 if index_keys is None else index_keys.shape[1]
     if width < cursor:
         raise RuntimeError(
             f"{who}: the QSA raw-key ledger holds {width} positions but the "
             f"cursor is at {cursor}. A join reads each lane by its ledger "
             "width, not by its KV offset; a short ledger means a shared-top-k "
             "draft cycle was joined without rewinding the drafted span."
+            + (
+                " This lane has no ledger at all: zero-filling it would give "
+                "the joined row raw keys the lane never wrote, and the width "
+                "the join stamps would then satisfy the next forward's "
+                "desync check."
+                if index_keys is None
+                else ""
+            )
         )
     return width
 
@@ -2495,8 +2503,10 @@ class BatchQSAKVCache(BatchKVCache):
                     index = mx.zeros((batch, 0, dims), dtype=dtype)
                 else:
                     index = index[:, :idx]
-                # Pad from the row's own width, not the KV cursor: an absent
-                # ledger contributes zero columns while its lane holds ``idx``.
+                # Pad from the row's own width, not the KV cursor. They agree
+                # whenever the ledger spans the cursor, which the guard above
+                # has already required, and differ for an EMPTY lane, whose
+                # ledger is absent and whose cursor is 0.
                 return mx.pad(
                     index, [(0, 0), (max_idx - index.shape[1], 0), (0, 0)]
                 )
@@ -2580,7 +2590,7 @@ class BatchQSAKVCache(BatchKVCache):
                     values = values[:, :length]
                 # Left padding comes from the row's own ledger width. The old
                 # form used ``width - cache.size()``, a KV quantity, short by
-                # the ledger's shortfall -- an absent ledger above all.
+                # the ledger's shortfall.
                 rows.append(
                     mx.pad(
                         values, [(0, 0), (width - values.shape[1], 0), (0, 0)]
@@ -3035,8 +3045,10 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
                     index = mx.zeros((batch, 0, dims), dtype=dtype)
                 else:
                     index = index[:, :idx]
-                # Pad from the row's own width, not the KV cursor: an absent
-                # ledger contributes zero columns while its lane holds ``idx``.
+                # Pad from the row's own width, not the KV cursor. They agree
+                # whenever the ledger spans the cursor, which the guard above
+                # has already required, and differ for an EMPTY lane, whose
+                # ledger is absent and whose cursor is 0.
                 return mx.pad(
                     index, [(0, 0), (max_idx - index.shape[1], 0), (0, 0)]
                 )

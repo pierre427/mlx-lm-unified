@@ -118,18 +118,40 @@ class TestSingletonMergeJoins(unittest.TestCase):
         self.assertEqual(backward.index_keys.shape, (3, 8, DI))
 
     def test_merge_with_an_unpopulated_lane_is_order_independent(self):
-        """A lane that never ran a QSA layer must not decide the template."""
+        """A lane that never ran a QSA layer must not decide the template.
+
+        The legitimate shape of "no ledger" is a lane with no KV either: a
+        fresh admission joining warm lanes. It contributes a zero row of the
+        join width, in either operand order.
+        """
         empty = QSAKVCache()
-        empty.keys = mx.zeros((1, H, 4, DK), dtype=mx.float32)
-        empty.values = mx.zeros((1, H, 4, DK), dtype=mx.float32)
-        empty.offset = 4
         populated = _lane(6, 7)
         first = QSAKVCache.merge([empty, populated])
         second = QSAKVCache.merge([populated, empty])
         self.assertEqual(first.index_keys.shape, second.index_keys.shape)
         self.assertTrue(
+            mx.array_equal(first.index_keys[0], second.index_keys[1]).item()
+        )
+        self.assertTrue(
             mx.array_equal(first.index_keys[1], second.index_keys[0]).item()
         )
+        self.assertEqual(first.index_keys.shape, (2, 6, DI))
+
+    def test_merge_refuses_kv_with_no_ledger_at_all(self):
+        """An absent ledger over live KV is the shortest possible ledger.
+
+        Zero-filling it would hand the joined row raw keys the lane never
+        wrote, and the width the join stamps then satisfies the next
+        forward's desync check -- silent wrong state where the same lane
+        expressed as a zero-width ledger array is refused.
+        """
+        unledgered = QSAKVCache()
+        unledgered.keys = mx.zeros((1, H, 4, DK), dtype=mx.float32)
+        unledgered.values = mx.zeros((1, H, 4, DK), dtype=mx.float32)
+        unledgered.offset = 4
+        with self.assertRaises(RuntimeError) as ctx:
+            QSAKVCache.merge([unledgered, _lane(6, 7)])
+        self.assertIn("ledger", str(ctx.exception).lower())
 
     def test_merge_indexer_selection_matches_the_unjoined_lane(self):
         """Top-k over the joined row selects the same logical tokens."""
