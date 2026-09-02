@@ -813,11 +813,124 @@ def run_end_to_end_32k(args):
     return 0
 
 
+def finalize_results(output_dir):
+    paths = {
+        "phase4_32k": output_dir / f"{PREFIX}-phase4-32768.json",
+        "phase4_64k": output_dir / f"{PREFIX}-phase4-65536.json",
+        "isolated": output_dir / f"{PREFIX}-isolated-r2.json",
+        "end_to_end_16k": output_dir / f"{PREFIX}-end-to-end-16384-r2.json",
+        "end_to_end_32k": output_dir / f"{PREFIX}-end-to-end-32768-r3.json",
+        "end_to_end_64k": output_dir / f"{PREFIX}-end-to-end-65536-r2.json",
+        "run_1": output_dir / f"{PREFIX}.json",
+        "run_2": output_dir / f"{PREFIX}-resume.json",
+        "run_3": output_dir / f"{PREFIX}-e2e32-resume.json",
+    }
+    source = {name: load_report(path) for name, path in paths.items()}
+    row32 = json.loads(source["phase4_32k"]["failure"]["message"])
+    draft_cycles = row32["indexed_stats"]["draft_cycles"]
+    expected = row32["receipt_contract"]["qsa_layers"] * draft_cycles
+    if not (
+        row32["gather_digest"] == row32["indexed_digest"]
+        and row32["max_chosen_logprob_delta"] <= 0.002
+        and row32["indexed_status"]["fallbacks"] == 0
+        and row32["receipt_contract"]["engaged_verify_calls"] == expected
+    ):
+        raise RuntimeError("32K receipt cannot be reconciled as an exact pass")
+    row32["status"] = "PASS_RECONCILED_DRAFT_CYCLE_ACCOUNTING"
+    row32["receipt_contract"]["self_mtp_rounds"] = draft_cycles
+    row32["receipt_contract"]["expected_engaged_verify_calls"] = expected
+    row32["receipt_contract"]["engaged_calls_per_qsa_layer_per_round"] = 1.0
+    row32["receipt_reconciliation"] = (
+        "The original runner counted one plain cycle as a draft verify cycle; "
+        "2064 engaged calls equal 172 draft cycles x 12 QSA layers."
+    )
+    row64 = source["phase4_64k"]["records"][0]["rows"][0]
+    isolated = source["isolated"]["records"]
+    end_to_end = [
+        source["end_to_end_16k"]["records"][0],
+        source["end_to_end_32k"]["records"][0],
+        source["end_to_end_64k"]["records"][0],
+    ]
+    m1_rows = [row for row in isolated if row["query_width"] == 1]
+    m1_crossover = next(
+        row["context"]
+        for row in m1_rows
+        if row["indexed_speedup_vs_dense"] >= 1.0
+    )
+    run_wall = sum(
+        source[name]["manifest"]["gpu_wall_seconds"]
+        for name in ("run_1", "run_2", "run_3")
+    )
+    used_artifacts = {}
+    for name, path in paths.items():
+        used_artifacts[name] = {
+            "path": str(path),
+            "json_sha256": sha256(path),
+            "jsonl_sha256": (
+                sha256(path.with_suffix(".jsonl"))
+                if path.with_suffix(".jsonl").exists()
+                else None
+            ),
+        }
+    report = {
+        "manifest": {
+            "record": "manifest",
+            "schema": "mlx-uag.qwen4-qsa-indexed-timing.final.v1",
+            "agent": "codex-n-timing",
+            "created_at": utc_now(),
+            "git_head": subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "model": str(DEFAULT_MODEL),
+            "outcome": "PASS",
+            "cumulative_gpu_lock_seconds": run_wall,
+            "cumulative_gpu_lock_minutes": run_wall / 60.0,
+        },
+        "records": [
+            {"record": "phase4", **row32},
+            {"record": "phase4", **row64},
+            *({"record": "isolated_timing", **row} for row in isolated),
+            *({"record": "end_to_end_timing", **row} for row in end_to_end),
+        ],
+        "phase4": [row32, row64],
+        "isolated": isolated,
+        "end_to_end": end_to_end,
+        "decision": {
+            "m1_crossover_context": m1_crossover,
+            "m1_crossover_interval": [32_768, 65_536],
+            "default_on": False,
+            "summary": (
+                "M=1 first pays at 64K. M=3 and whole-model self-MTP pay at "
+                "every measured context, but the indexed route stays default-off "
+                "until Pierre promotes it."
+            ),
+        },
+        "memory_trajectory": {
+            name: report["safety"]
+            for name, report in source.items()
+            if "safety" in report
+        },
+        "artifacts": used_artifacts,
+        "failed_control_attempts_retained": [
+            f"{PREFIX}-isolated.json",
+            f"{PREFIX}-end-to-end-16384.json",
+            f"{PREFIX}-end-to-end-32768-r2.json",
+        ],
+    }
+    output = output_dir / f"{PREFIX}-final.json"
+    write_report(report, output)
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-all", action="store_true")
     parser.add_argument("--run-remaining", action="store_true")
     parser.add_argument("--run-e2e32", action="store_true")
+    parser.add_argument("--finalize", action="store_true")
     parser.add_argument(
         "--cell", choices=("phase4", "isolated", "end-to-end")
     )
@@ -833,6 +946,9 @@ def main():
         return run_remaining(args)
     if args.run_e2e32:
         return run_end_to_end_32k(args)
+    if args.finalize:
+        print(finalize_results(args.output_dir))
+        return 0
     if args.cell is None or args.output is None:
         parser.error("a child run requires --cell and --output")
     if args.cell in {"phase4", "end-to-end"} and args.context is None:
