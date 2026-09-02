@@ -75,11 +75,16 @@ from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 from . import qwen3_next
 from .qwen3_next import (
+    _build_hyper_gate,
+    _build_hyper_mix,
+    _build_inject_apply,
     _concat_tables,
     _env_flag,
     _proj_identity,
     _proj_signature,
     _proj_table,
+    _run_glue,
+    compile_glue_enabled,
     check_materialization_budget,
     table_bytes,
     transform_moe_weights,
@@ -1691,12 +1696,28 @@ class GatedResidual(nn.Module):
                 )
             return mx.concatenate(tokens, axis=1)
 
+        glue = compile_glue_enabled()
         normed = self.hc_norm(hyper_input)
-        weights = nn.silu(self.input_mix_weight_down(normed) / self.hc_count)
+        gate_input = self.input_mix_weight_down(normed)
+        weights = None
+        if glue:
+            weights = _run_glue(
+                ("hyper_gate", self.hc_count),
+                lambda: _build_hyper_gate(self.hc_count),
+                gate_input,
+            )
+        if weights is None:
+            weights = nn.silu(gate_input / self.hc_count)
+        # The sigmoid stays eager: a fused graph would lower it to the fast
+        # Metal variant, which disagrees with the stock op at x = -6.85.
         weights = mx.sigmoid(self.input_mix_weight_up(weights))
-        streams = normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
         weights = weights.reshape(*weights.shape[:-1], self.hc_count, self.hidden_size)
-        mixed = mx.mean(weights * streams, axis=-2)
+        streams = normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
+        mixed = None
+        if glue:
+            mixed = _run_glue(("hyper_mix",), _build_hyper_mix, weights, streams)
+        if mixed is None:
+            mixed = mx.mean(weights * streams, axis=-2)
         if not hasattr(self, "block_inject_weight"):
             return mixed
         inject = 2 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
@@ -5148,6 +5169,22 @@ class Attention(nn.Module):
         return self.o_proj(out * mx.sigmoid(gate))
 
 
+def _apply_inject(residual, branch, inject):
+    """Broadcast one branch back into the H residual streams and add.
+
+    Both reshapes are views on contiguous arrays, so the compiled span sees the
+    stream layout without a copy and the caller gets the flat layout back.
+    """
+    if compile_glue_enabled():
+        streams = residual.reshape(
+            *branch.shape[:-1], inject.shape[-1], branch.shape[-1]
+        )
+        out = _run_glue(("inject_apply",), _build_inject_apply, streams, branch, inject)
+        if out is not None:
+            return out.reshape(*residual.shape)
+    return residual + (branch[..., None, :] * inject[..., None]).reshape(*residual.shape)
+
+
 class DecoderLayer(nn.Module):
     def __init__(
         self, args: TextModelArgs, layer_idx: int, summary_layer_id=None
@@ -5174,10 +5211,10 @@ class DecoderLayer(nn.Module):
             branch = self.linear_attn(mixed, ssm_mask, cache)
         else:
             branch = self.self_attn(mixed, mask, cache)
-        x = residual + (branch[..., None, :] * inject[..., None]).reshape(*residual.shape)
+        x = _apply_inject(residual, branch, inject)
         mixed, residual, inject = self.mlp_hyper_connection(x)
         branch = self.mlp(mixed)
-        return residual + (branch[..., None, :] * inject[..., None]).reshape(*residual.shape)
+        return _apply_inject(residual, branch, inject)
 
 
 class Qwen4ExpTextModel(PipelineMixin, nn.Module):

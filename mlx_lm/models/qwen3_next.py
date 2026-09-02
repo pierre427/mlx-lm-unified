@@ -73,6 +73,124 @@ _MOE_ROUTER_MODES = ("stock", "fused")
 _MOE_GATE_COMPILE_MAX_TOKENS = 8
 
 
+# ``mx.compile`` over the per-layer elementwise glue: the hyper-connection
+# mixer tail in qwen4_exp.GatedResidual, the decoder inject/residual apply, and
+# the MoE gated shared add below.  At M=1 that glue is ~1k tiny dispatches per
+# token across 48 layers and no kernel at all -- pure launch overhead.
+#
+# NO SPAN MAY CONTAIN ``mx.sigmoid``.  MEASURED on Metal over all 65,280 finite
+# bf16 values: a fused graph lowers it to the fast variant, which disagrees
+# with the stock op on exactly one input (x = -6.85, 0.0010604858 vs
+# 0.0010681152) -- the same boundary Rapid-MLX #2912 hit, and one reached by
+# real Flash-Next activations.  ``1/(1+exp(-x))`` (518 mismatches) and the
+# tanh form (1620) are worse, so the sigmoid stays with the caller and the
+# spans carry only the arithmetic that swept clean.
+#
+# Weights are never captured: every span takes arrays only, so a rebound
+# parameter cannot be baked into a traced graph as a constant (the trap
+# documented for the PLE device chain in qwen4_exp).
+_COMPILE_GLUE_DEFAULT = False
+_COMPILE_GLUE = _env_flag("MLX_QWEN4_COMPILE_GLUE", default=_COMPILE_GLUE_DEFAULT)
+_GLUE_COMPILE_CACHE: Dict[Any, Any] = {}
+_GLUE_STATS = {"builds": 0, "calls": 0, "fallbacks": 0, "skips": 0}
+_GLUE_LAST_RECEIPT: Optional[dict] = None
+
+
+def compile_glue_enabled() -> bool:
+    """Live read of the glue lever, so the toggle needs no module reload."""
+    return _COMPILE_GLUE
+
+
+def set_qwen4_compile_glue(enabled: bool) -> bool:
+    """Live-toggle the compiled glue between requests. Returns the new state."""
+    global _COMPILE_GLUE
+    _COMPILE_GLUE = bool(enabled)
+    return _COMPILE_GLUE
+
+
+def qwen4_compile_glue_status(*, reset: bool = False) -> dict:
+    """Bounded receipts. ``fallbacks`` MUST be 0 on a healthy run."""
+    global _GLUE_LAST_RECEIPT
+    report = {
+        "enabled": bool(_COMPILE_GLUE),
+        "counts": dict(_GLUE_STATS),
+        "spans": sorted(repr(key) for key in _GLUE_COMPILE_CACHE),
+        "last_receipt": _GLUE_LAST_RECEIPT,
+    }
+    if reset:
+        for key in _GLUE_STATS:
+            _GLUE_STATS[key] = 0
+        _GLUE_LAST_RECEIPT = None
+    return report
+
+
+def _run_glue(key, builder, *args):
+    """Run one compiled span, or return ``None`` to mean "stay eager".
+
+    Fail-closed: a span that raises is demoted for the life of the process and
+    the caller answers from the eager arithmetic, which is the same math.
+    """
+    global _GLUE_LAST_RECEIPT
+    for arg in args:
+        if arg.dtype != mx.bfloat16:
+            # MEASURED on Metal: at bf16 every span matched eager over all
+            # 65,280 finite values, swept operand by operand (218 sweeps), and
+            # over 25,350 real span calls in 32 decode steps at 1K and 16K. At
+            # fp32 the fused sigmoid's 1 ULP shows through (2.4e-7) and at fp16
+            # the fused chain drifts 2.0e-3, and neither was swept, so the
+            # lever -- which may change COST ONLY -- runs eager there.
+            _GLUE_STATS["skips"] += 1
+            return None
+    compiled = _GLUE_COMPILE_CACHE.get(key, False)
+    if compiled is False:
+        compiled = mx.compile(builder(), shapeless=True)
+        _GLUE_COMPILE_CACHE[key] = compiled
+        _GLUE_STATS["builds"] += 1
+    if compiled is None:
+        return None
+    try:
+        out = compiled(*args)
+    except Exception as exc:  # pragma: no cover - defensive
+        _GLUE_COMPILE_CACHE[key] = None
+        _GLUE_STATS["fallbacks"] += 1
+        _GLUE_LAST_RECEIPT = {"span": repr(key), "error": repr(exc)}
+        return None
+    _GLUE_STATS["calls"] += 1
+    return out
+
+
+def _build_hyper_gate(hc_count: int):
+    def hyper_gate(down):
+        return nn.silu(down / hc_count)
+
+    return hyper_gate
+
+
+def _build_hyper_mix():
+    """Mean the already-gated streams. The sigmoid stays with the caller."""
+
+    def hyper_mix(weights, streams):
+        return mx.mean(weights * streams, axis=-2)
+
+    return hyper_mix
+
+
+def _build_inject_apply():
+    def inject_apply(residual_streams, branch, inject):
+        return residual_streams + branch[..., None, :] * inject[..., None]
+
+    return inject_apply
+
+
+def _build_moe_combine():
+    """``gate`` arrives as the sigmoid output, computed by the caller."""
+
+    def moe_combine(y, gate, shared_y):
+        return y + gate * shared_y
+
+    return moe_combine
+
+
 # 2026-08-27 decode-decomposition levers (results/qwen38-decode-decomposition
 # -20260827.json): the decode GPU window is 86% of the step at only 22% of
 # bandwidth — latency/occupancy-bound on tiny 640-wide expert tiles, not
@@ -1056,6 +1174,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.norm_topk_prob:
                 scores = scores / scores.sum(axis=-1, keepdims=True)
 
+        glue = _COMPILE_GLUE
         if self.shared_folded:
             # The shared expert is routed row E; it is added ungated by the
             # router, exactly as the separate shared branch was.
@@ -1084,9 +1203,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 y = self.switch_mlp(x, inds)
                 y = (y * scores[..., None]).sum(axis=-2)
             shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        gate = mx.sigmoid(self.shared_expert_gate(x))
 
-        y = y + shared_y
+        combined = None
+        if glue:
+            combined = _run_glue(
+                ("moe_combine",), _build_moe_combine, y, gate, shared_y
+            )
+        y = y + gate * shared_y if combined is None else combined
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
