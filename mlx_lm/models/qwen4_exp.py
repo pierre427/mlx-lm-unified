@@ -12,6 +12,7 @@ import math
 import os
 import threading
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -99,10 +100,58 @@ from ..verify_sync import record_verify_sync
 # MLX_QWEN4_RMSNORM_FAST: run the reduction through ``mx.fast.rms_norm``
 # instead of the ``Square/Sum/Add/Rsqrt/Multiply`` chain.  On Metal that is one
 # fused primitive, and ``GroupRMSNorm`` is the model's densest call site --
-# MEASURED 147 calls per token.  The kernel is fed fp32 (see
-# ``GroupRMSNorm.__call__``), so the arithmetic differs from the stock chain
-# only in the reduction's accumulation order.
-_RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
+# MEASURED 147 calls per token, 11 -> 6 dispatching graph nodes each.  The
+# kernel is fed fp32 (see ``GroupRMSNorm.__call__``), so the arithmetic differs
+# from the stock chain only in the reduction's accumulation order.
+#
+# TOLERANCE CLASS: fp64-equidistant reduction reorder (max 1 ULP, no extra
+# rounding), accepted by Pierre 2026-09-02 for norm reductions at decode widths
+# <= 8; prefill stays stock.  Measured on 2026-09-02: identical fp64 distance
+# to the stock chain (RMS ratio 1.0000000 in every case), bit-identical on the
+# CPU device and on every gain-1.0 Metal shape, and ~2 ppm of elements at
+# exactly 1 ULP elsewhere.  See
+# wiki/docs/lessons/exactness-tolerance-classes.md and
+# wiki/docs/experiments/qwen4-rmsnorm-fast-ab-2026-09-02.md.
+#
+# PROMOTED default-on 2026-09-02 at decode widths only.  ``=0`` reverts every
+# width to the stock chain; the ``qwen4_rmsnorm_fast`` soft-reload key still
+# writes this constant live.
+_RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST", default=True)
+
+# The width gate.  Decode (1), self-MTP verify slabs (k+1, 2-8) and the short
+# batched widths sit under it; prefill chunks (2048) and every wide verify slab
+# do not.  Why a gate at all, when the per-call tolerance is width-independent:
+# prefill runs the norms over every prompt position, so a ppm-level per-element
+# reorder there is amplified into a different FIRST TOKEN and from there into
+# unrelated text -- MEASURED at 16K, where the two arms diverge at token 0.
+# Confining the lever to decode widths keeps prefill, and therefore the
+# prompt-cache contents and TTFT, bit-identical to the stock chain, so the
+# accepted tolerance is spent only on the steps it actually speeds up.
+_RMSNORM_FAST_MAX_WIDTH = max(
+    0, int(os.environ.get("MLX_QWEN4_RMSNORM_FAST_MAX_WIDTH", "8"))
+)
+
+# A caller that DECOMPOSES a wide slab into width-1 calls makes the array's
+# own width a lie: ``_GDN_SHAPE_STABLE_PROJECTIONS`` re-runs the hyper-
+# connection mixer one token at a time, so a 2048-wide prefill chunk would
+# arrive at ``hc_norm`` as 2048 separate width-1 arrays and every one of them
+# would clear a width gate the slab itself does not.  The lever is default-off
+# and diagnostic, but "prefill stays stock" has to be TRUE, not true-unless-a
+# -diagnostic-flag-is-set, so the decomposing caller declares the real width
+# and the gate believes it over the array.
+_RMSNORM_FAST_WIDTH_OVERRIDE: Optional[int] = None
+
+
+@contextmanager
+def _declared_width(width: int):
+    """Pin the query width the gate sees, for a caller that has split a slab."""
+    global _RMSNORM_FAST_WIDTH_OVERRIDE
+    previous = _RMSNORM_FAST_WIDTH_OVERRIDE
+    _RMSNORM_FAST_WIDTH_OVERRIDE = int(width)
+    try:
+        yield
+    finally:
+        _RMSNORM_FAST_WIDTH_OVERRIDE = previous
 
 # ---------------------------------------------------------------------------
 # Compile-cache invalidation when a traced lever moves.
@@ -136,7 +185,7 @@ def invalidate_compiled_traces() -> int:
 
 def _trace_flags() -> tuple:
     """Every module-tier value a compiled region in this module branches on."""
-    return (_TRACE_EPOCH, bool(_RMSNORM_FAST))
+    return (_TRACE_EPOCH, bool(_RMSNORM_FAST), int(_RMSNORM_FAST_MAX_WIDTH))
 
 
 # ``mx.compile`` over the device half of the PLE forward -- the two
@@ -976,6 +1025,22 @@ class GroupRMSNorm(nn.Module):
         self.group_size = group_size
         self.eps = eps
 
+    def _use_fast(self, x: mx.array) -> bool:
+        """Fast path only for a query width inside the accepted class.
+
+        The width is read off the SEQUENCE axis of the caller's array, before
+        the grouped reshape splits the feature axis -- after the reshape
+        ``shape[-2]`` is the group count, which is not a width at all.  A
+        rank-1 input has no sequence axis and counts as width 1.
+        """
+        if not _RMSNORM_FAST:
+            return False
+        if _RMSNORM_FAST_WIDTH_OVERRIDE is not None:
+            width = _RMSNORM_FAST_WIDTH_OVERRIDE
+        else:
+            width = x.shape[-2] if x.ndim >= 2 else 1
+        return width <= _RMSNORM_FAST_MAX_WIDTH
+
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
         # ONE upcast, shared by both branches.  Feeding fp32 into
@@ -988,11 +1053,11 @@ class GroupRMSNorm(nn.Module):
         # qwen4-rmsnorm-fast-ab-2026-09-02.md).  With an fp32 input the
         # normalised value stays fp32 through the weight multiply exactly as
         # the stock chain holds it, so the ONLY difference left is the
-        # reduction's accumulation order.
+        # reduction's accumulation order -- the accepted tolerance class.
         xf = x.astype(mx.float32)
         if self.group_size is not None:
             xf = xf.reshape(*xf.shape[:-1], -1, self.group_size)
-        if _RMSNORM_FAST:
+        if self._use_fast(x):
             # Per-group weights differ, so the weight cannot ride the kernel's
             # ``w`` argument (it broadcasts across groups); it is applied
             # outside, in fp32, exactly where the stock chain applies it.
@@ -1765,10 +1830,13 @@ class GatedResidual(nn.Module):
 
     def __call__(self, hyper_input: mx.array):
         if _GDN_SHAPE_STABLE_PROJECTIONS and hyper_input.shape[1] > 1:
-            tokens = [
-                self(hyper_input[:, index : index + 1])
-                for index in range(hyper_input.shape[1])
-            ]
+            # The recursion hands ``hc_norm`` width-1 arrays; the slab is not
+            # width 1, so the RMSNorm width gate is told the real width.
+            with _declared_width(hyper_input.shape[1]):
+                tokens = [
+                    self(hyper_input[:, index : index + 1])
+                    for index in range(hyper_input.shape[1])
+                ]
             if isinstance(tokens[0], tuple):
                 return tuple(
                     mx.concatenate([token[field] for token in tokens], axis=1)
