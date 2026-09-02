@@ -206,6 +206,13 @@ _STATUS_LAST = None
 _STATUS_CANDIDATE = None
 _STATUS_GEOMETRIES = {}
 _STATUS_FALLBACKS = 0
+_STATUS_DEVICE_PENDING = None
+_STATUS_DEVICE_PENDING_EXPECTED = 0
+_STATUS_DEVICE_PENDING_WIDTHS = Counter()
+_STATUS_DEVICE_PENDING_LAST = None
+_STATUS_DEVICE_EXPECTED = 0
+_STATUS_DEVICE_OBSERVED = 0
+_STATUS_DEVICE_MISMATCHES = 0
 
 
 def _width_bucket(width: int) -> str:
@@ -270,11 +277,94 @@ def record_qsa_indexed_receipt(
         _STATUS_LAST = receipt
 
 
+def _device_attest_output(
+    output,
+    counter,
+    *,
+    length: int,
+    context: int,
+    splits: int,
+    candidate: tuple[int, int],
+    geometry_key: str,
+    candidate_timings_ms: dict[int, float],
+):
+    """Attach one device counter and defer host credit until status readback."""
+
+    global _STATUS_CANDIDATE, _STATUS_DEVICE_PENDING
+    global _STATUS_DEVICE_PENDING_EXPECTED, _STATUS_DEVICE_PENDING_LAST
+    timings = {
+        str(split): float(elapsed)
+        for split, elapsed in candidate_timings_ms.items()
+    }
+    receipt = {
+        "engaged": True,
+        "reason": "engaged",
+        "query_width": int(length),
+        "physical_kv": int(context),
+        "splits": int(splits),
+        "candidate": list(candidate),
+        "exception_class": None,
+        "geometry_key": geometry_key,
+        "candidate_timings_ms": timings,
+        "device_attested": False,
+        "fully_masked_output": "zero",
+    }
+    with _STATUS_LOCK:
+        _STATUS_DEVICE_PENDING = (
+            counter
+            if _STATUS_DEVICE_PENDING is None
+            else _STATUS_DEVICE_PENDING + counter
+        )
+        _STATUS_DEVICE_PENDING_EXPECTED += 1
+        _STATUS_DEVICE_PENDING_WIDTHS[_width_bucket(int(length))] += 1
+        _STATUS_DEVICE_PENDING_LAST = receipt
+        _STATUS_CANDIDATE = tuple(candidate)
+        _STATUS_GEOMETRIES[geometry_key] = {
+            "candidate": list(candidate),
+            "candidate_timings_ms": timings,
+        }
+        dependency = _STATUS_DEVICE_PENDING
+    return mx.depends(output, dependency)
+
+
+def _reconcile_device_receipts_locked() -> None:
+    global _STATUS_DEVICE_PENDING, _STATUS_DEVICE_PENDING_EXPECTED
+    global _STATUS_DEVICE_PENDING_LAST, _STATUS_DEVICE_EXPECTED
+    global _STATUS_DEVICE_OBSERVED, _STATUS_DEVICE_MISMATCHES, _STATUS_LAST
+    if _STATUS_DEVICE_PENDING is None:
+        return
+    observed = int(_STATUS_DEVICE_PENDING.item())
+    expected = int(_STATUS_DEVICE_PENDING_EXPECTED)
+    _STATUS_DEVICE_EXPECTED += expected
+    _STATUS_DEVICE_OBSERVED += observed
+    receipt = dict(_STATUS_DEVICE_PENDING_LAST)
+    receipt["device_attested"] = observed == expected
+    receipt["device_counter_observed"] = observed
+    receipt["device_counter_expected"] = expected
+    if observed == expected:
+        _STATUS_COUNTS["engaged"] += observed
+        for bucket, count in _STATUS_DEVICE_PENDING_WIDTHS.items():
+            _STATUS_WIDTHS[bucket]["engaged"] += count
+    else:
+        _STATUS_COUNTS["device_attestation_mismatch"] += 1
+        _STATUS_DEVICE_MISMATCHES += 1
+        receipt["engaged"] = False
+        receipt["reason"] = "device_attestation_mismatch"
+    _STATUS_LAST = receipt
+    _STATUS_DEVICE_PENDING = None
+    _STATUS_DEVICE_PENDING_EXPECTED = 0
+    _STATUS_DEVICE_PENDING_WIDTHS.clear()
+    _STATUS_DEVICE_PENDING_LAST = None
+
+
 def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
     """Return indexed-QSA admission, candidate, and fallback evidence."""
 
     global _STATUS_CANDIDATE, _STATUS_FALLBACKS, _STATUS_LAST
+    global _STATUS_DEVICE_EXPECTED, _STATUS_DEVICE_OBSERVED
+    global _STATUS_DEVICE_MISMATCHES
     with _STATUS_LOCK:
+        _reconcile_device_receipts_locked()
         report = {
             "enabled": _qsa_indexed_mode() != "off",
             "mode": _qsa_indexed_mode(),
@@ -307,6 +397,12 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             ),
             "geometry_candidates": dict(_STATUS_GEOMETRIES),
             "fallbacks": _STATUS_FALLBACKS,
+            "device_attestation": {
+                "expected": _STATUS_DEVICE_EXPECTED,
+                "observed": _STATUS_DEVICE_OBSERVED,
+                "mismatches": _STATUS_DEVICE_MISMATCHES,
+                "pending": _STATUS_DEVICE_PENDING_EXPECTED,
+            },
             "fully_masked_output": "zero",
             "last_decision": _STATUS_LAST,
         }
@@ -318,6 +414,9 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             _STATUS_GEOMETRIES.clear()
             _STATUS_FALLBACKS = 0
             _STATUS_LAST = None
+            _STATUS_DEVICE_EXPECTED = 0
+            _STATUS_DEVICE_OBSERVED = 0
+            _STATUS_DEVICE_MISMATCHES = 0
     return report
 
 
@@ -571,6 +670,8 @@ _SOURCE = r"""
             part_o[state * D + d] = T(out_values[part]);
         }
     }
+    if (unit == 0 && row == 0 && head == 0 && lane == 0)
+        engaged[0] = 1;
 """
 
 
@@ -642,7 +743,7 @@ def _partition_kernel():
             "scale",
             "dims",
         ],
-        output_names=["part_m", "part_l", "part_o"],
+        output_names=["part_m", "part_l", "part_o", "engaged"],
         header=_HEADER,
         source=_SOURCE,
         ensure_row_contiguous=False,
@@ -688,7 +789,7 @@ def _measure_candidates(candidates, dispatch):
     viable = []
     for candidate in candidates:
         try:
-            output = dispatch(candidate)
+            output, _ = dispatch(candidate)
             mx.eval(output)
             viable.append(candidate)
         except RuntimeError:
@@ -699,20 +800,21 @@ def _measure_candidates(candidates, dispatch):
     for candidate in viable:
         try:
             started = time.perf_counter_ns()
-            output = dispatch(candidate)
+            output, counter = dispatch(candidate)
             mx.eval(output)
             elapsed = time.perf_counter_ns() - started
         except RuntimeError:
             continue
         timings[candidate[1]] = elapsed / 1.0e6
-        outputs[candidate] = output
+        outputs[candidate] = (output, counter)
     if not timings:
-        return None, None, {}
+        return None, None, None, {}
     selected = min(
         outputs,
         key=lambda candidate: (timings[candidate[1]], -candidate[1]),
     )
-    return selected, outputs[selected], timings
+    output, counter = outputs[selected]
+    return selected, output, counter, timings
 
 
 def _partition_dispatch(
@@ -773,17 +875,18 @@ def _partition_dispatch(
             (batch, nqh, length, _SDPA_BLOCKS),
             (batch, nqh, length, _SDPA_BLOCKS),
             (batch, nqh, length, _SDPA_BLOCKS, dim),
+            (1,),
         ],
-        output_dtypes=[mx.float32, mx.float32, q.dtype],
+        output_dtypes=[mx.float32, mx.float32, q.dtype, mx.uint32],
     )
 
 
-def _combine_sdpa_partials(m, l, o, *, output_dtype):
+def _combine_sdpa_partials(m, l, o, engaged, *, output_dtype):
     batch, nqh, length, blocks = map(int, m.shape)
     dim = int(o.shape[-1])
     if blocks != _SDPA_BLOCKS or dim % 32:
         raise ValueError("indexed QSA pass 2 has unsupported partial geometry")
-    return _combine_kernel()(
+    output = _combine_kernel()(
         inputs=[m, l, o, mx.array([length], dtype=mx.int32)],
         template=[
             ("T", output_dtype),
@@ -795,6 +898,7 @@ def _combine_sdpa_partials(m, l, o, *, output_dtype):
         output_shapes=[(batch, nqh, length, dim)],
         output_dtypes=[output_dtype],
     )[0]
+    return output, engaged
 
 
 def qwen4_qsa_indexed_attention(
@@ -856,7 +960,7 @@ def qwen4_qsa_indexed_attention(
         raise ValueError(f"indexed QSA splits must be one of {allowed}")
     geometry_key = (
         f"B{int(q.shape[0])}-L{int(q.shape[2])}"
-        f"-T{int(compact.physical_width)}-U{int(u_width)}"
+        f"-U{int(u_width)}-dtype{q.dtype}"
         f"-mask{int(compact.causal_mask is not None)}"
     )
     key = (
@@ -869,7 +973,6 @@ def qwen4_qsa_indexed_attention(
         int(u_width),
         int(q.shape[0]),
         int(q.shape[2]),
-        int(compact.physical_width),
         int(compact.causal_mask is not None),
         requested,
     )
@@ -899,7 +1002,7 @@ def qwen4_qsa_indexed_attention(
                         *partials, output_dtype=q.dtype
                     )
 
-                candidate, combined, timings = _measure_candidates(
+                candidate, combined, counter, timings = _measure_candidates(
                     _candidate_ladder(requested, threads), dispatch
                 )
                 if candidate is None:
@@ -909,9 +1012,9 @@ def qwen4_qsa_indexed_attention(
                     )
                 _PROBE_RESULTS[key] = candidate
                 _PROBE_TIMINGS[key] = timings
-                record_qsa_indexed_receipt(
-                    engaged=True,
-                    reason="engaged",
+                return _device_attest_output(
+                    combined,
+                    counter,
                     length=int(q.shape[2]),
                     context=int(compact.physical_width),
                     splits=candidate[1],
@@ -919,9 +1022,8 @@ def qwen4_qsa_indexed_attention(
                     geometry_key=geometry_key,
                     candidate_timings_ms=timings,
                 )
-                return combined
 
-    m, l, o = _partition_dispatch(
+    m, l, o, counter = _partition_dispatch(
         q,
         k,
         v,
@@ -930,17 +1032,19 @@ def qwen4_qsa_indexed_attention(
         threads=candidate[0],
         splits=candidate[1],
     )
-    record_qsa_indexed_receipt(
-        engaged=True,
-        reason="engaged",
+    output, counter = _combine_sdpa_partials(
+        m, l, o, counter, output_dtype=q.dtype
+    )
+    return _device_attest_output(
+        output,
+        counter,
         length=int(q.shape[2]),
         context=int(compact.physical_width),
         splits=candidate[1],
         candidate=candidate,
         geometry_key=geometry_key,
-        candidate_timings_ms=_PROBE_TIMINGS.get(key),
+        candidate_timings_ms=_PROBE_TIMINGS[key],
     )
-    return _combine_sdpa_partials(m, l, o, output_dtype=q.dtype)
 
 
 __all__ = [

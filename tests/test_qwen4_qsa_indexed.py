@@ -554,7 +554,10 @@ class TestQSAIndexedReference(unittest.TestCase):
 
         def dispatch(candidate):
             calls.append(candidate)
-            return mx.array(candidate[1], dtype=mx.int32)
+            return (
+                mx.array(candidate[1], dtype=mx.int32),
+                mx.array(1, dtype=mx.uint32),
+            )
 
         clock = iter(
             (0, 500, 1_000, 1_200, 2_000, 2_100, 3_000, 3_400, 4_000, 4_300)
@@ -562,13 +565,39 @@ class TestQSAIndexedReference(unittest.TestCase):
         with mock.patch.object(
             indexed.time, "perf_counter_ns", side_effect=lambda: next(clock)
         ):
-            selected, output, timings = indexed._measure_candidates(
+            selected, output, counter, timings = indexed._measure_candidates(
                 candidates, dispatch
             )
         self.assertEqual(selected, (384, 32))
         self.assertEqual(int(output.item()), 32)
+        self.assertEqual(int(counter.item()), 1)
         self.assertEqual(set(timings), {8, 16, 32, 64, 128})
         self.assertEqual(calls, list(candidates) * 2)
+
+    def test_device_engagement_is_credited_only_after_reconciliation(self):
+        indexed.qsa_indexed_status(reset=True)
+        output = mx.array([7], dtype=mx.int32)
+        for context in (16_384, 16_385):
+            output = indexed._device_attest_output(
+                output,
+                mx.array([1], dtype=mx.uint32),
+                length=3,
+                context=context,
+                splits=32,
+                candidate=(384, 32),
+                geometry_key="B1-L3-U520-dtypemlx.core.bfloat16-mask0",
+                candidate_timings_ms={32: 0.4},
+            )
+        self.assertEqual(indexed._STATUS_COUNTS.get("engaged", 0), 0)
+        mx.eval(output)
+        status = indexed.qsa_indexed_status()
+        self.assertEqual(status["counts"]["engaged"], 2)
+        self.assertEqual(
+            status["device_attestation"],
+            {"expected": 2, "observed": 2, "mismatches": 0, "pending": 0},
+        )
+        self.assertTrue(status["last_decision"]["device_attested"])
+        self.assertEqual(status["last_decision"]["device_counter_observed"], 2)
 
     def test_capture_writes_mismatch_and_returns_gather(self):
         mx.random.seed(37)

@@ -290,7 +290,14 @@ def phase1_candidate(mx):
     )
     mx.eval(output)
     status = qsa_indexed_status()
-    if status["candidate"] is None or status["fallbacks"]:
+    device = status["device_attestation"]
+    if (
+        status["candidate"] is None
+        or status["fallbacks"]
+        or device["expected"] != 1
+        or device["observed"] != 1
+        or device["mismatches"]
+    ):
         raise GateFailure(1, f"candidate probe did not engage cleanly: {status}")
     return {"phase": 1, "status": "PASS", "receipt": status}
 
@@ -975,6 +982,7 @@ def phase4_model(
             "draft_cycles", indexed["stats"].get("cycles", 0)
         )
         expected_verify_calls = qsa_layers * cycles
+        device = status["device_attestation"]
         receipt = {
             "qsa_layers": qsa_layers,
             "self_mtp_rounds": cycles,
@@ -985,12 +993,16 @@ def phase4_model(
             ),
             "candidate": status["candidate"],
             "fallbacks": status["fallbacks"],
+            "device_attestation": device,
         }
         passed = (
             max_logprob_delta <= 0.002
             and not status["fallbacks"]
             and status["candidate"] is not None
             and reached == expected_verify_calls
+            and device["expected"] == expected_verify_calls
+            and device["observed"] == expected_verify_calls
+            and device["mismatches"] == 0
             and (divergence is None or divergence["classification"] == "NEAR_TIE")
         )
         row = {
