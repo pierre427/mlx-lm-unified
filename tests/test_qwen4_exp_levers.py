@@ -1644,3 +1644,139 @@ class TestQSADenseShortCircuit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGDNFusedInProjTable(unittest.TestCase):
+    """MLX_QWEN4_GDN_FUSED_INPROJ: one qmm for the four GDN input projections.
+
+    The concatenation is exact by construction (affine quantization packs each
+    output row independently, groups run along K), so what these tests are
+    actually pinning is the two things construction does NOT give: that the
+    fused path serves only row counts where MLX's width-dependent kernel
+    dispatch agrees with the split calls, and that an ineligible quartet
+    refuses to build a table rather than building a wrong one.
+    """
+
+    def setUp(self):
+        self._previous_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.clear_cache()
+        mx.set_default_device(self._previous_device)
+
+    def _layer(self):
+        holder = GDNHolder()
+        # Serving mode. The fused table refuses a training layer, so a test
+        # that forgot this would compare the stock path against itself and
+        # pass while measuring nothing.
+        holder.eval()
+        return holder.layer
+
+    def test_fused_projections_are_bit_identical_at_served_widths(self):
+        layer = self._layer()
+        for rows in (1, 3, 8):
+            inputs = (
+                mx.random.normal((1, rows, 256), key=mx.random.key(700 + rows)) * 0.3
+            ).astype(mx.bfloat16)
+            with lever(layer, "gdn_fused_inproj"):
+                fused = layer._input_projections(inputs)
+            with lever(layer, "gdn_fused_inproj", False):
+                stock = layer._input_projections(inputs)
+            self.assertEqual(len(fused), 4)
+            for got, want in zip(fused, stock):
+                _bytes_equal(self, got, want)
+        # Assert the mechanism ran: one fused matmul per width probed.
+        self.assertEqual(layer.gdn_fused_inproj_calls, 3)
+
+    def test_widths_above_the_cap_keep_the_stock_quartet(self):
+        layer = self._layer()
+        inputs = (
+            mx.random.normal((1, 17, 256), key=mx.random.key(717)) * 0.3
+        ).astype(mx.bfloat16)
+        with lever(layer, "gdn_fused_inproj"):
+            self.assertIsNone(layer._fused_input_projections(inputs))
+            fused = layer._input_projections(inputs)
+        with lever(layer, "gdn_fused_inproj", False):
+            stock = layer._input_projections(inputs)
+        for got, want in zip(fused, stock):
+            _bytes_equal(self, got, want)
+        self.assertEqual(layer.gdn_fused_inproj_calls, 0)
+
+    def test_flag_off_never_builds_a_table(self):
+        layer = self._layer()
+        inputs = (
+            mx.random.normal((1, 1, 256), key=mx.random.key(11)) * 0.3
+        ).astype(mx.bfloat16)
+        with lever(layer, "gdn_fused_inproj", False):
+            layer._input_projections(inputs)
+        self.assertIsNone(layer._gdn_inproj_fused_cache)
+        self.assertEqual(layer.gdn_fused_inproj_calls, 0)
+
+    def test_table_is_rebuilt_when_the_source_weights_are_replaced(self):
+        layer = self._layer()
+        first = layer._fused_inproj_table()
+        self.assertIsNotNone(first)
+        self.assertIs(layer._fused_inproj_table(), first)
+        layer.in_proj_z.update({"scales": mx.array(layer.in_proj_z["scales"])})
+        second = layer._fused_inproj_table()
+        self.assertIsNotNone(second)
+        self.assertIsNot(second, first)
+
+    def test_a_sharded_layer_refuses_the_table(self):
+        layer = self._layer()
+        layer.sharding_group = object()
+        self.assertIsNone(layer._fused_inproj_table())
+
+    def test_a_mixed_quantization_quartet_refuses_the_table(self):
+        layer = self._layer()
+        layer.in_proj_b = nn.Linear(256, layer.num_v_heads, bias=False)
+        mx.eval(layer.parameters())
+        self.assertIsNone(layer._fused_inproj_table())
+
+    def test_a_layer_already_rewritten_in_place_refuses_the_table(self):
+        layer = self._layer()
+        _fuse_gdn_projection_layer(layer, frozenset({mx.bfloat16}))
+        self.assertIsNone(layer._fused_inproj_table())
+
+    def test_a_training_layer_refuses_the_fused_path(self):
+        layer = self._layer()
+        layer.train()
+        inputs = (
+            mx.random.normal((1, 1, 256), key=mx.random.key(13)) * 0.3
+        ).astype(mx.bfloat16)
+        with lever(layer, "gdn_fused_inproj"):
+            self.assertIsNone(layer._fused_input_projections(inputs))
+
+    def test_model_level_arm_and_probe(self):
+        model = GDNHolder()
+        model.eval()
+        self.assertEqual(qwen4_exp.set_qwen4_gdn_fused_inproj(model, True), 1)
+        stats = qwen4_exp.qwen4_gdn_fused_inproj_stats(model)
+        self.assertEqual(stats["layers"], 1)
+        self.assertEqual(stats["armed"], 1)
+        self.assertEqual(stats["eligible"], 1)
+        report = qwen4_exp.probe_qwen4_gdn_fused_inproj(model)
+        self.assertEqual(report["layers"], 1)
+        self.assertGreater(report["checked"], 0)
+        self.assertEqual(report["mismatches"], [])
+        self.assertEqual(qwen4_exp.set_qwen4_gdn_fused_inproj(model, False), 1)
+        self.assertEqual(
+            qwen4_exp.qwen4_gdn_fused_inproj_stats(model)["armed"], 0
+        )
+
+    def test_shape_stable_projections_compose_with_the_fused_table(self):
+        layer = self._layer()
+        inputs = (
+            mx.random.normal((1, 3, 256), key=mx.random.key(303)) * 0.3
+        ).astype(mx.bfloat16)
+        with lever(qwen4_exp, "_GDN_SHAPE_STABLE_PROJECTIONS"):
+            with lever(layer, "gdn_fused_inproj", False):
+                stock = layer._input_projections(inputs)
+            layer.gdn_fused_inproj_calls = 0
+            with lever(layer, "gdn_fused_inproj"):
+                fused = layer._input_projections(inputs)
+        # One fused matmul per token, not one for the slab.
+        self.assertEqual(layer.gdn_fused_inproj_calls, 3)
+        for got, want in zip(fused, stock):
+            _bytes_equal(self, got, want)

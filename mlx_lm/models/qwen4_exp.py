@@ -14,7 +14,7 @@ import threading
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -295,6 +295,38 @@ _PLE_GATHER_CONCAT = _env_flag("MLX_QWEN4_PLE_GATHER_CONCAT")
 _GDN_SHAPE_STABLE_PROJECTIONS = _env_flag(
     "MLX_QWEN4_GDN_SHAPE_STABLE_PROJECTIONS"
 )
+# MLX_QWEN4_GDN_FUSED_INPROJ (2026-09-02 per-layer-megakernel step one): run
+# the GDN layer's four input projections -- ``in_proj_qkv`` (N=10240),
+# ``in_proj_z`` (N=6144) and the two 48-row ``in_proj_b``/``in_proj_a``
+# slivers -- as ONE quantized matmul over a lazily concatenated table, split
+# after.  Same shape as the attention layer's ``_QSA_FUSED_PROJ`` table and
+# built from the same helpers.
+#
+# Exactness: affine quantization packs each output ROW independently and the
+# groups run along K, so concatenating along N preserves every weight, scale
+# and bias byte, and each output element stays the same independent dot
+# product over the same K.  What is NOT guaranteed by that argument is MLX's
+# kernel dispatch: ``quantized_matmul`` selects on N as well as M, so a wide
+# fused table can land on a different accumulation order than a 48-row
+# sliver.  Two independent prior probes on this hardware (mlx-lm
+# ``qwen3_5._probe_gdn_projection_parity`` and Rapid-MLX
+# ``gdn_in_proj_fusion``) both found byte-parity up to M=8 and divergence
+# from M=12, so the fused path is hard-capped at ``_GDN_FUSED_INPROJ_MAX_ROWS``
+# and everything wider keeps the four stock matmuls.
+# ``probe_qwen4_gdn_fused_inproj`` re-checks parity on the real weights.
+#
+# Why a lazy table and not the in-place rewrite ``qwen3_5.
+# fuse_gated_delta_net_projections`` already implements: that one DELETES the
+# split modules, and the deployed Rapid-MLX MTP chunk-split verify path
+# (``vllm_mlx/spec_decode/mtp/cache_patch.py``) reads ``self.in_proj_qkv`` and
+# friends directly off the layer.  Keeping the originals resident costs a
+# second copy of the in-projection weights and keeps every other reader
+# working, exactly as ``_QSA_FUSED_PROJ`` does for attention.
+_GDN_FUSED_INPROJ = _env_flag("MLX_QWEN4_GDN_FUSED_INPROJ")
+# Byte-parity boundary of the narrow quantized-matmul kernel family; wider
+# forwards take the stock four matmuls, which are byte-exact by construction.
+_GDN_FUSED_INPROJ_MAX_ROWS = 8
+_GDN_INPROJ_MODULES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _FUSED_GDN_DECODE = _env_flag("MLX_QWEN4_FUSED_GDN_DECODE")
 _FUSED_GDN_DECODE_MODES = ("stock", "fused", "fused_outproj")
 # Speculative-verify sibling of the single-token fused GDN kernel: default off,
@@ -949,6 +981,12 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         self.fused_gdn_outproj_calls = 0
         self.fused_gdn_decode_fallbacks = 0
         self.fused_gdn_decode_last_fallback = None
+        # Lazy MLX_QWEN4_GDN_FUSED_INPROJ table, identity-keyed by the source
+        # weight arrays exactly like ``_qsa_fused_cache``; in ``__dict__`` so
+        # it never reaches ``parameters()``/``state``.
+        object.__setattr__(self, "_gdn_inproj_fused_cache", None)
+        self.gdn_fused_inproj = _GDN_FUSED_INPROJ
+        self.gdn_fused_inproj_calls = 0
         self.fused_gdn_verify_mode = "fused" if _FUSED_GDN_VERIFY else "stock"
         self.fused_gdn_verify_calls = 0
         self.fused_gdn_verify_fallbacks = 0
@@ -1216,18 +1254,189 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             return out
         return self.out_proj(out)
 
+    def set_gdn_fused_inproj(self, enabled: bool) -> bool:
+        """Live-toggle the fused input-projection table for this layer."""
+        self.gdn_fused_inproj = bool(enabled)
+        return self.gdn_fused_inproj
+
+    def _fused_inproj_table(self):
+        """Lazy ``(table, split_points)`` for the four input projections.
+
+        Returns ``None`` -- and stays returning ``None`` for these arrays --
+        whenever the quartet is not concatenable: a non-quantized or biased
+        projection, a mixed ``group_size``/``bits``/``mode``, a differing K
+        or storage dtype, a sharded layer, or a layer whose split modules
+        were already replaced by ``qwen3_5``'s in-place rewrite.
+        """
+        if self.sharding_group is not None:
+            return None
+        try:
+            modules = [getattr(self, name) for name in _GDN_INPROJ_MODULES]
+        except AttributeError:
+            return None
+        key = tuple(part for m in modules for part in _proj_identity(m))
+        cached = self._gdn_inproj_fused_cache
+        if cached is not None and all(
+            new is old for new, old in zip(key, cached[0])
+        ):
+            return cached[1]
+        entry = None
+        signatures = [_proj_signature(m) for m in modules]
+        base = signatures[0]
+        if (
+            base is not None
+            and base[0] == "quantized"
+            and all(s == base for s in signatures)
+        ):
+            parts = [_proj_table(m) for m in modules]
+            widths = [m["weight"].shape[0] for m in modules]
+            k_packed = parts[0][0].shape[1]
+            uniform = all(
+                part[0].shape[1] == k_packed
+                and part[0].dtype == parts[0][0].dtype
+                and part[1].dtype == parts[0][1].dtype
+                and (part[2] is None) == (parts[0][2] is None)
+                and (part[2] is None or part[2].dtype == parts[0][2].dtype)
+                for part in parts
+            )
+            if uniform:
+                # This IS a runtime second copy, so size it first.
+                check_materialization_budget(
+                    sum(table_bytes(part) for part in parts),
+                    "GDN fused input projection",
+                )
+                bounds = []
+                total = 0
+                for width in widths[:-1]:
+                    total += width
+                    bounds.append(total)
+                entry = (_concat_tables(parts, axis=0), tuple(bounds))
+        object.__setattr__(self, "_gdn_inproj_fused_cache", (key, entry))
+        return entry
+
+    def _fused_input_projections(self, inputs: mx.array):
+        """The four projection outputs from one matmul, or ``None``."""
+        if not self.gdn_fused_inproj or self.training:
+            return None
+        if inputs.shape[0] * inputs.shape[1] > _GDN_FUSED_INPROJ_MAX_ROWS:
+            return None
+        entry = self._fused_inproj_table()
+        if entry is None:
+            return None
+        table, bounds = entry
+        self.gdn_fused_inproj_calls += 1
+        return tuple(mx.split(_table_matmul(table, inputs), bounds, axis=-1))
+
     def _input_projections(self, inputs: mx.array):
         if not _GDN_SHAPE_STABLE_PROJECTIONS or inputs.shape[1] <= 1:
+            fused = self._fused_input_projections(inputs)
+            if fused is not None:
+                return fused
             return super()._input_projections(inputs)
 
         per_token = [
-            super(GatedDeltaNet, self)._input_projections(inputs[:, i : i + 1])
+            self._input_projections(inputs[:, i : i + 1])
             for i in range(inputs.shape[1])
         ]
         return tuple(
             mx.concatenate([token[projection] for token in per_token], axis=1)
             for projection in range(4)
         )
+
+
+_UINT_OF_SIZE = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}
+
+
+def _bitwise_equal(a: mx.array, b: mx.array) -> bool:
+    """Compare two same-dtype arrays by bit pattern, not by value.
+
+    ``array_equal`` would call ``-0.0 == 0.0`` equal and every NaN unequal;
+    a parity probe wants neither, so compare the raw words instead.
+    """
+    if a.shape != b.shape:
+        return False
+    word = _UINT_OF_SIZE[a.dtype.size]
+    return bool(mx.array_equal(mx.view(a, word), mx.view(b, word)).item())
+
+
+def set_qwen4_gdn_fused_inproj(model: nn.Module, enabled: bool) -> int:
+    """Arm or disarm the fused GDN input-projection table on every layer."""
+    layers = [
+        module
+        for _, module in model.named_modules()
+        if isinstance(module, GatedDeltaNet)
+    ]
+    for layer in layers:
+        layer.set_gdn_fused_inproj(enabled)
+    return len(layers)
+
+
+def qwen4_gdn_fused_inproj_stats(
+    model: nn.Module, *, reset: bool = False
+) -> dict[str, Any]:
+    """Engagement receipt for the fused GDN input-projection table.
+
+    ``eligible`` counts layers whose quartet is concatenable AT ALL; it is
+    reported separately from ``armed`` so a run that silently never built a
+    table -- a sharded layer, a non-quantized checkpoint, or a layer already
+    rewritten in place by ``qwen3_5.fuse_gated_delta_net_projections`` -- is
+    distinguishable from one that simply had the flag off.
+    """
+    stats = {"layers": 0, "armed": 0, "eligible": 0, "calls": 0}
+    for _, module in model.named_modules():
+        if not isinstance(module, GatedDeltaNet):
+            continue
+        stats["layers"] += 1
+        stats["armed"] += int(bool(module.gdn_fused_inproj))
+        stats["eligible"] += int(module._fused_inproj_table() is not None)
+        stats["calls"] += module.gdn_fused_inproj_calls
+        if reset:
+            module.gdn_fused_inproj_calls = 0
+    return stats
+
+
+def probe_qwen4_gdn_fused_inproj(
+    model: nn.Module, *, rows: Optional[Sequence[int]] = None
+) -> dict[str, Any]:
+    """Byte-compare the fused table against the four stock projections.
+
+    The concatenation argument is exact by construction; MLX's width-dependent
+    kernel dispatch is not, so this re-checks it on the loaded weights at every
+    row count the fused path will actually serve. Returns the failing
+    ``(layer, batch, rows)`` triples, which an empty list means none of.
+    """
+    widths = tuple(rows) if rows else tuple(range(1, _GDN_FUSED_INPROJ_MAX_ROWS + 1))
+    shapes = [(1, w) for w in widths] + [(2, 4)]
+    report = {"layers": 0, "checked": 0, "mismatches": []}
+    for name, module in model.named_modules():
+        if not isinstance(module, GatedDeltaNet):
+            continue
+        entry = module._fused_inproj_table()
+        if entry is None:
+            continue
+        report["layers"] += 1
+        parts = [getattr(module, part) for part in _GDN_INPROJ_MODULES]
+        table, bounds = entry
+        hidden = module.hidden_size
+        for batch, width in shapes:
+            if batch * width > _GDN_FUSED_INPROJ_MAX_ROWS:
+                continue
+            inputs = (
+                mx.random.normal(
+                    (batch, width, hidden), key=mx.random.key(batch * 100 + width)
+                )
+                * 0.3
+            ).astype(parts[0]["scales"].dtype)
+            fused = mx.split(_table_matmul(table, inputs), bounds, axis=-1)
+            stock = [part(inputs) for part in parts]
+            mx.eval(fused, stock)
+            report["checked"] += 1
+            if any(
+                a.dtype != b.dtype or not _bitwise_equal(a, b)
+                for a, b in zip(stock, fused)
+            ):
+                report["mismatches"].append((name, batch, width))
+    return report
 
 
 def set_qwen4_fused_gdn_mode(model: nn.Module, mode: str) -> int:
