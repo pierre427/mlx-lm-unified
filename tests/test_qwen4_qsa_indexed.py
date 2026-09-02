@@ -65,6 +65,26 @@ def _arrays(batch, length, *, total=32, dtype=mx.float32):
     return q, k, v
 
 
+def _wide_compact(length=2, *, selected_width=127):
+    total = 512
+    ids = mx.broadcast_to(
+        mx.arange(selected_width, dtype=mx.uint32)[None, None],
+        (1, length, selected_width),
+    )
+    counts = mx.full((1, length), selected_width, dtype=mx.int32)
+    tail_stop = mx.full((1, length), total, dtype=mx.int32)
+    return QSACompactBlocks(
+        block_ids=ids,
+        block_counts=counts,
+        tail_start=tail_stop,
+        tail_stop=tail_stop,
+        left_padding=None,
+        block_size=4,
+        physical_width=total,
+        causal_mask=None,
+    )
+
+
 class TestQSAIndexedReference(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -96,23 +116,32 @@ class TestQSAIndexedReference(unittest.TestCase):
                     atol=1.0e-5,
                 )
 
-    def test_split_count_is_bit_exact_at_attention_dtype(self):
+    def test_split_count_is_bit_exact_in_fp32(self):
         mx.random.seed(23)
-        compact = _compact(2, 4)
-        q, k, v = _arrays(2, 4, dtype=mx.bfloat16)
+        compact = _wide_compact()
+        q = mx.random.normal((1, 24, 2, 256)).astype(mx.float32)
+        k = mx.random.normal((1, 2, 512, 256)).astype(mx.float32)
+        v = mx.random.normal((1, 2, 512, 256)).astype(mx.float32)
         outputs = [
             indexed.qwen4_qsa_indexed_reference(
-                q, k, v, compact, scale=8**-0.5, splits=splits
+                q, k, v, compact, scale=256**-0.5, splits=splits
             )
             for splits in (1, 2, 4, 8)
         ]
         mx.eval(*outputs)
-        first = np.asarray(outputs[0].astype(mx.float32))
+        first = np.asarray(outputs[0])
         for splits, output in zip((1, 2, 4, 8), outputs):
             self.assertTrue(
-                np.array_equal(first, np.asarray(output.astype(mx.float32))),
-                f"split count {splits} changed the final attention dtype",
+                np.array_equal(first, np.asarray(output)),
+                f"split count {splits} changed the fp32 result",
             )
+
+    def test_fixed_chunk_boundaries_do_not_depend_on_splits(self):
+        expected = indexed.indexed_chunk_ranges(520)
+        for splits in (1, 8):
+            groups = indexed.indexed_split_chunk_ranges(520, splits)
+            flattened = tuple(chunk for group in groups for chunk in group)
+            self.assertEqual(flattened, expected)
 
     def test_query_rows_are_independent(self):
         mx.random.seed(29)
