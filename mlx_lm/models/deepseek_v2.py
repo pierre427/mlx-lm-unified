@@ -17,7 +17,7 @@ from .base import (
     rotate_last,
     scaled_dot_product_attention,
 )
-from .mla import MultiLinear, absorbed_max_query, absorbed_query_limit
+from .mla import MultiLinear, absorbed_max_query, use_absorbed_path
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
@@ -178,12 +178,18 @@ class DeepseekV2Attention(nn.Module):
         )
 
         # Absorbed MLA is cheaper than the expanded form for every query width
-        # up to this crossover (see mla.absorbed_max_query for the derivation),
-        # not just for L == 1 -- which covers the whole speculative-verify
-        # range (L = k+1) and modest chunked prefill.
-        self.absorbed_max_query = absorbed_max_query(
-            self.kv_lora_rank, self.qk_nope_head_dim, self.v_head_dim
+        # up to a crossover that depends on both the geometry and the attended
+        # cache length (see mla.absorbed_max_query for the derivation), not just
+        # for L == 1 -- which covers the whole speculative-verify range
+        # (L = k+1) against a warm cache.  self.absorbed_max_query is the
+        # asymptotic (long-cache) value, kept for receipts; the forward gate
+        # resolves the S-aware limit per call.
+        self.absorbed_geometry = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
         )
+        self.absorbed_max_query = absorbed_max_query(*self.absorbed_geometry)
 
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
@@ -315,7 +321,9 @@ class DeepseekV2Attention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        absorbed = L <= absorbed_query_limit(self.absorbed_max_query)
+        absorbed = use_absorbed_path(
+            L, pe_scores.shape[-1], self.absorbed_geometry
+        )
         if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent

@@ -26,6 +26,8 @@ from mlx_lm.models.cache import make_prompt_cache
 
 # Files that carry an absorbed/expanded MLA attention branch.  sarvam_mla and
 # longcat_flash_ngram reuse deepseek_v3 / longcat_flash attention wholesale.
+# This list is *checked* against the tree (see test_every_twin_consults_the_gate)
+# rather than trusted, so a new twin cannot quietly copy-paste the old gate.
 MLA_TWINS = [
     "bailing_moe_v3",
     "deepseek_v2",
@@ -116,10 +118,63 @@ class TestAbsorbedCrossover(unittest.TestCase):
                 mla.absorbed_max_query(r, dn, dv), (r * (dn + dv)) // denom
             )
 
-    def test_degenerate_geometry_falls_back_to_decode_only(self):
-        # 2r <= dn+dv: expanded is never the more expensive form at large S.
-        self.assertEqual(mla.absorbed_max_query(4, 32, 16), 1)
-        self.assertEqual(mla.absorbed_max_query(64, 64, 64), 1)
+    def test_degenerate_geometry_is_absorbed_at_every_width(self):
+        # 2r <= dn+dv: L*(S(2r-D) + rD) <= SrD holds for every L, so the
+        # absorbed form is the cheaper one at every query width.
+        self.assertEqual(mla.absorbed_max_query(4, 32, 16), mla.ABSORBED_UNBOUNDED)
+        self.assertEqual(mla.absorbed_max_query(64, 64, 64), mla.ABSORBED_UNBOUNDED)
+        self.assertTrue(mla.use_absorbed_path(64, 4096, (4, 32, 16)))
+
+    def test_limit_depends_on_the_attended_cache_length(self):
+        geom = (512, 128, 128)  # DeepSeek-V2/V3/Sarvam
+        # A cold prefill (S == L) is never worth absorbing above decode: with
+        # S = L the inequality reduces to 2r <= dn+dv, which this geometry
+        # (1024 > 256) does not satisfy.
+        for length in (2, 8, 32, 128, 170, 512):
+            self.assertFalse(
+                mla.use_absorbed_path(length, length, geom), f"cold L={length}"
+            )
+        self.assertTrue(mla.use_absorbed_path(1, 1, geom))
+        # Verify widths against a warm cache are comfortably inside the band,
+        # and the limit rises toward the asymptote as the cache grows.
+        for cache_len in (1024, 4096, 16384, 32768):
+            self.assertTrue(mla.use_absorbed_path(8, cache_len, geom), cache_len)
+        limits = [mla.absorbed_max_query(*geom, cache_len=s) for s in (1024, 32768)]
+        self.assertLess(limits[0], limits[1])
+        self.assertLess(limits[-1], mla.absorbed_max_query(*geom))
+        self.assertEqual(mla.absorbed_max_query(*geom), 170)
+
+    def test_forward_consults_the_gate_with_the_attended_cache_length(self):
+        """Assert the mechanism ran: the forward must pass (L, S), not (L,)."""
+        from mlx_lm.models import deepseek_v2
+
+        model, args = _tiny_v2()
+        model.eval()
+        seen = []
+        real = deepseek_v2.use_absorbed_path
+
+        def spy(query_len, cache_len, geometry):
+            seen.append((query_len, cache_len, geometry))
+            return real(query_len, cache_len, geometry)
+
+        deepseek_v2.use_absorbed_path = spy
+        try:
+            cache = make_prompt_cache(model)
+            mx.eval(model(mx.zeros((1, 12), dtype=mx.int32), cache=cache))
+            prefill = list(seen)
+            seen.clear()
+            mx.eval(model(mx.zeros((1, 3), dtype=mx.int32), cache=cache))
+            verify = list(seen)
+        finally:
+            deepseek_v2.use_absorbed_path = real
+
+        self.assertEqual(len(prefill), args.num_hidden_layers)
+        self.assertEqual({(q, s) for q, s, _ in prefill}, {(12, 12)})
+        self.assertEqual({(q, s) for q, s, _ in verify}, {(3, 15)})
+        # Cold 12-token prefill goes expanded; the 3-row verify chunk against
+        # the warm cache goes absorbed.
+        self.assertFalse(real(*prefill[0]))
+        self.assertTrue(real(*verify[0]))
 
     def test_override_replaces_the_geometric_limit(self):
         self.assertEqual(mla.absorbed_query_limit(170), 170)
@@ -131,32 +186,55 @@ class TestAbsorbedCrossover(unittest.TestCase):
         self.assertEqual(mla.absorbed_query_limit(170), 170)
 
     def test_env_parser(self):
-        for raw, want in [(None, None), ("", None), ("  ", None), ("junk", None),
-                          ("0", 0), ("8", 8), ("-3", 0)]:
-            if raw is None:
-                os.environ.pop(mla._ABSORBED_MAX_QUERY_ENV, None)
-            else:
-                os.environ[mla._ABSORBED_MAX_QUERY_ENV] = raw
-            self.assertEqual(mla._absorbed_env_override(), want, raw)
-        os.environ.pop(mla._ABSORBED_MAX_QUERY_ENV, None)
+        try:
+            for raw, want in [(None, None), ("", None), ("  ", None),
+                              ("0", 0), ("8", 8), ("-3", 0)]:
+                if raw is None:
+                    os.environ.pop(mla._ABSORBED_MAX_QUERY_ENV, None)
+                else:
+                    os.environ[mla._ABSORBED_MAX_QUERY_ENV] = raw
+                self.assertEqual(mla._absorbed_env_override(), want, raw)
+            # A typo must fail closed, not silently disable the knob.
+            os.environ[mla._ABSORBED_MAX_QUERY_ENV] = "junk"
+            with self.assertRaises(ValueError):
+                mla._absorbed_env_override()
+        finally:
+            os.environ.pop(mla._ABSORBED_MAX_QUERY_ENV, None)
 
     # ------------------------------------------------------------------ wiring
 
     def test_every_twin_consults_the_gate(self):
-        import importlib
-        import inspect
+        import pathlib
 
-        for name in MLA_TWINS:
-            mod = importlib.import_module(f"mlx_lm.models.{name}")
-            src = inspect.getsource(mod)
-            self.assertIn("self.absorbed_max_query = absorbed_max_query(", src, name)
-            self.assertIn("absorbed_query_limit(self.absorbed_max_query)", src, name)
+        models_dir = pathlib.Path(mla.__file__).parent
+        # Discover the twins from the tree instead of trusting the list above:
+        # a module that builds its own absorbed-MLA output projection carries
+        # the branch, so a *new* twin that copy-pastes the old gate is caught
+        # here rather than shipping ungated.
+        found = {
+            path.stem: path.read_text()
+            for path in sorted(models_dir.glob("*.py"))
+            if "self.unembed_out = MultiLinear(" in path.read_text()
+        }
+        self.assertEqual(
+            sorted(found), sorted(MLA_TWINS), "MLA twin set changed: update the gate"
+        )
+        for name, src in found.items():
+            self.assertIn("self.absorbed_geometry = (", src, name)
+            self.assertIn(
+                "use_absorbed_path(\n            L, pe_scores.shape[-1], "
+                "self.absorbed_geometry\n        )",
+                src.replace("length, pe_scores", "L, pe_scores"),
+                name,
+            )
             self.assertIn("if absorbed:\n            output = self.unembed_out", src, name)
             # The stale decode-only gate must be gone from the attention branch.
             self.assertNotIn("if L == 1:\n            q_nope = self.embed_q", src, name)
             self.assertNotIn(
                 "if length == 1:\n            q_nope = self.embed_q", src, name
             )
+            # And no twin may re-introduce a cache-length-blind limit.
+            self.assertNotIn("absorbed_query_limit(self.absorbed_max_query)", src, name)
 
     def test_attention_threshold_from_resolved_geometry(self):
         _, args = _tiny_v2()
