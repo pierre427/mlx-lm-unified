@@ -30,7 +30,7 @@ _CHUNK_SLOTS = 64
 _CHUNK_TOKENS = _CHUNK_SLOTS * _BLOCK_SIZE
 _SDPA_BLOCKS = 128
 _SPLIT_CANDIDATES = (128, 64, 32, 16, 8)
-_HPT_CANDIDATES = (12, 6, 3, 1)
+_HPT_LADDER = (12, 6, 3, 1)
 _HPT_ALLOWED = (12, 6, 4, 3, 2, 1)
 _EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
 _SDPA_VECTOR_HEADER_SHA256 = (
@@ -86,6 +86,14 @@ _AUTO_MIN_CONTEXT_M1 = _env_int(
 )
 _SPLITS_OVERRIDE = _env_int("MLX_QWEN4_QSA_INDEXED_SPLITS", 0)
 _HPT_OVERRIDE = _env_int("MLX_QWEN4_QSA_INDEXED_HPT", 0)
+# The 2026-09-02 sweep measured the whole (S, HPT) grid: every point is
+# bit-exact, but no HPT below GQA wins reproducibly, and timing twenty
+# candidates once each mis-selects often enough to cost 1.1-1.7% of decode.
+# The shipped probe therefore stays on the split ladder at HPT = GQA; set
+# MLX_QWEN4_QSA_INDEXED_HPT_LADDER=1 to re-time the wide grid.
+_HPT_CANDIDATES = (
+    _HPT_LADDER if _env_flag("MLX_QWEN4_QSA_INDEXED_HPT_LADDER") else (12,)
+)
 
 
 def _qsa_indexed_mode() -> str:
@@ -460,6 +468,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             "split_candidates": list(_SPLIT_CANDIDATES),
             "hpt_override": _HPT_OVERRIDE,
             "hpt_candidates": list(_HPT_CANDIDATES),
+            "hpt_ladder_enabled": _HPT_CANDIDATES != (12,),
             "mlx_version": str(getattr(mx, "__version__", "unknown")),
             "mlx_build_hash": _mlx_build_hash(),
             "mlx_build_verified": (

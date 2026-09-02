@@ -922,8 +922,15 @@ class TestQSAIndexedHeadsPerThreadgroup(unittest.TestCase):
     def test_quantized_pass1_uses_the_same_head_decomposition(self):
         self.assertIn(_HPT_PASS1_PREAMBLE, indexed._QUANTIZED_SOURCE)
 
-    def test_candidate_ladder_covers_the_split_by_hpt_grid(self):
+    def test_default_ladder_keeps_one_threadgroup_per_gqa_fan_out(self):
+        """The 2026-09-02 sweep left HPT=GQA as the shipped probe grid."""
         ladder = indexed._candidate_ladder(None, 12)
+        self.assertEqual(len(ladder), len(indexed._SPLIT_CANDIDATES))
+        self.assertEqual({hpt for _, _, hpt in ladder}, {12})
+
+    def test_opt_in_ladder_covers_the_split_by_hpt_grid(self):
+        with mock.patch.object(indexed, "_HPT_CANDIDATES", indexed._HPT_LADDER):
+            ladder = indexed._candidate_ladder(None, 12)
         self.assertEqual(len(ladder), 5 * 4)
         self.assertEqual(ladder[0], (384, 128, 12))
         self.assertEqual(ladder[-1], (32, 8, 1))
@@ -1210,7 +1217,8 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
         self.assertEqual(status["query_width_counts"][">8"]["declined"], 1)
         self.assertEqual(status["split_candidates"], [128, 64, 32, 16, 8])
-        self.assertEqual(status["hpt_candidates"], [12, 6, 3, 1])
+        self.assertEqual(status["hpt_candidates"], [12])
+        self.assertFalse(status["hpt_ladder_enabled"])
         geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
         self.assertEqual(geometry["candidate"], [384, 32, 12])
         self.assertEqual(geometry["candidate_timings_ms"]["32x12"], 0.4)
