@@ -352,12 +352,26 @@ _QSA_STAGE1_KERNEL = _env_auto_flag("MLX_QWEN4_QSA_STAGE1_KERNEL")
 _QSA_STAGE1_MIN_QUERY = int(
     os.environ.get("MLX_QWEN4_QSA_STAGE1_MIN_QUERY", "64")
 )
+# qwen4-composed-stack-ladder-20260902.json reached 65,535 physical tokens.
+# The viability page begins at 64K; keep one 512-token prefill block margin.
 _QSA_STAGE1_MIN_PHYSICAL_KV = int(
-    os.environ.get("MLX_QWEN4_QSA_STAGE1_MIN_PHYSICAL_KV", "65536")
+    os.environ.get("MLX_QWEN4_QSA_STAGE1_MIN_PHYSICAL_KV", "65024")
 )
 _QSA_STAGE1_STATS_LOCK = threading.Lock()
 _QSA_STAGE1_STATS = Counter()
 _QSA_STAGE1_LAST_DECISION = None
+
+
+def _qsa_stage1_admission_reason(
+    query_width: int, physical_width: int
+) -> str | None:
+    if _QSA_STAGE1_KERNEL is False:
+        return "disabled"
+    if int(query_width) < _QSA_STAGE1_MIN_QUERY:
+        return "query_below_min"
+    if int(physical_width) < _QSA_STAGE1_MIN_PHYSICAL_KV:
+        return "context_below_min"
+    return None
 
 # Minimum query length for the kernel to engage. It tiles M by query heads, so
 # it needs many tokens to amortize its launch: it wins on the 512-wide prefill
@@ -4149,14 +4163,12 @@ class QSAIndexer(nn.Module):
                 all_raw, n_blocks, starts, cache, length, left_pad
             )
             k = min(self.block_topk, n_blocks)
-            stage1_reason = "disabled"
+            stage1_reason = _qsa_stage1_admission_reason(
+                length, n_blocks * self.compress_ratio
+            )
             stage1_engaged = False
-            if _QSA_STAGE1_KERNEL is not False:
-                if length < _QSA_STAGE1_MIN_QUERY:
-                    stage1_reason = "query_below_min"
-                elif n_blocks * self.compress_ratio < _QSA_STAGE1_MIN_PHYSICAL_KV:
-                    stage1_reason = "context_below_min"
-                elif qsa_stage1_supported(
+            if stage1_reason is None:
+                if qsa_stage1_supported(
                     q,
                     pooled,
                     q_pos,

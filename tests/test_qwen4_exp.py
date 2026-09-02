@@ -2571,6 +2571,17 @@ class TestQSASelectionObject(unittest.TestCase):
             tiny_args(ple_layer_ids=[], layer_types=["full_attention"] * 4)
         )
 
+    def test_stage1_auto_boundary_admits_the_64k_block_margin(self):
+        self.assertEqual(qwen4_exp_module._QSA_STAGE1_MIN_PHYSICAL_KV, 65_024)
+        with mock.patch.object(qwen4_exp_module, "_QSA_STAGE1_KERNEL", None):
+            self.assertEqual(
+                qwen4_exp_module._qsa_stage1_admission_reason(64, 65_023),
+                "context_below_min",
+            )
+            self.assertIsNone(
+                qwen4_exp_module._qsa_stage1_admission_reason(64, 65_024)
+            )
+
     def test_native_stage1_reaches_model_path_without_changing_logits(self):
         model = self._model()
         tokens = mx.array([list(range(1, 33))], dtype=mx.int32)
