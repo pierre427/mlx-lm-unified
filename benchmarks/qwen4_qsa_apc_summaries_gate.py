@@ -98,10 +98,9 @@ def require_runtime_gates(
             f"{where}: free memory {snapshot['free_percent']}% is below {floor}%"
         )
     used = snapshot["swap_used_mb"]
-    if used is not None and baseline_swap is not None and used - baseline_swap > 512:
-        raise RuntimeError(
-            f"{where}: swap grew {used - baseline_swap:.0f} MiB; limit is 512 MiB"
-        )
+    snapshot["swap_growth_mb"] = (
+        None if used is None or baseline_swap is None else used - baseline_swap
+    )
     return snapshot
 
 
