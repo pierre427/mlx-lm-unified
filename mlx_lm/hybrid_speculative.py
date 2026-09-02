@@ -2065,6 +2065,12 @@ def _propose_batched_self_mtp_round(
                 lane.pending_hs = None
                 lane.pending_ts = []
 
+            if greedy_cycle:
+                mx.async_eval(
+                    *(row[-1] for row in draft_tokens if row),
+                    *(draft_h[row] for row, k in enumerate(k_vector) if k),
+                )
+
             for depth in range(1, max_k):
                 lengths = [1 if depth < k else 0 for k in k_vector]
                 right_padding = [1 - length for length in lengths]
@@ -2103,6 +2109,19 @@ def _propose_batched_self_mtp_round(
                     draft_tokens[row].append(token)
                     draft_logprobs[row].append(lp)
                     draft_steps[row] += 1
+                if greedy_cycle:
+                    mx.async_eval(
+                        *(
+                            draft_tokens[row][-1]
+                            for row, active in enumerate(lengths)
+                            if active
+                        ),
+                        *(
+                            draft_h[row]
+                            for row, active in enumerate(lengths)
+                            if active
+                        ),
+                    )
         finally:
             if any(draft_steps):
                 trim_ragged_prompt_cache(
@@ -2745,6 +2764,7 @@ def _mtp_draft_verify_loop_impl(
                         draft_token = mx.argmax(d_lp).astype(mx.uint32)
                         draft_tokens.append(draft_token)
                         tok = mx.reshape(draft_token, (1, 1))
+                        mx.async_eval(draft_token, h)
                     else:
                         draft = _sample_from_logprobs(
                             d_lp, sampling_temp, rng=rng
