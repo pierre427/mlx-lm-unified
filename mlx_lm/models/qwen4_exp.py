@@ -47,11 +47,14 @@ from .qwen4_qsa_nax import (
 )
 from .qwen4_qsa_indexed import (
     QSAIndexedProbeDeclined,
+    dequantize_qsa_quantized_kv,
     decide_qsa_indexed_admission,
     indexed_splits_for,
     qsa_indexed_enabled,
+    qsa_indexed_quantized_cache_config,
     qsa_indexed_status,
     qwen4_qsa_indexed_attention,
+    qwen4_qsa_indexed_quantized_attention,
     qwen4_qsa_indexed_reference,
     record_qsa_indexed_receipt,
 )
@@ -2926,6 +2929,32 @@ def _gather_qsa_attention(
     )
 
 
+def _gather_qsa_quantized_attention(
+    q,
+    q_keys,
+    q_values,
+    compact,
+    *,
+    scale: float,
+    tile_rows: int,
+    group_size: int,
+    key_bits: int,
+    value_bits: int,
+):
+    """Use MLX's affine dequant boundary before the existing gather path."""
+
+    keys, values = dequantize_qsa_quantized_kv(
+        q_keys,
+        q_values,
+        group_size=group_size,
+        key_bits=key_bits,
+        value_bits=value_bits,
+    )
+    return _gather_qsa_attention(
+        q, keys, values, compact, scale=scale, tile_rows=tile_rows
+    )
+
+
 def _indexed_qsa_attention_or_gather(
     q,
     k,
@@ -2957,6 +2986,59 @@ def _indexed_qsa_attention_or_gather(
     )
     return _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
+    )
+
+
+def _indexed_qsa_quantized_attention_or_gather(
+    q,
+    q_keys,
+    q_values,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+    tile_rows: int,
+    group_size: int,
+    key_bits: int,
+    value_bits: int,
+):
+    """Run packed indexed QSA or dequantize into the existing gather route."""
+
+    length = int(q.shape[2])
+    context = int(compact.physical_width)
+    try:
+        return qwen4_qsa_indexed_quantized_attention(
+            q,
+            q_keys,
+            q_values,
+            compact,
+            scale=scale,
+            splits=splits,
+            group_size=group_size,
+            key_bits=key_bits,
+            value_bits=value_bits,
+        )
+    except QSAIndexedProbeDeclined:
+        reason = "quantized_probe_declined"
+    except Exception:
+        reason = "quantized_dispatch_raised"
+    record_qsa_indexed_receipt(
+        engaged=False,
+        reason=reason,
+        length=length,
+        context=context,
+        splits=splits,
+    )
+    return _gather_qsa_quantized_attention(
+        q,
+        q_keys,
+        q_values,
+        compact,
+        scale=scale,
+        tile_rows=tile_rows,
+        group_size=group_size,
+        key_bits=key_bits,
+        value_bits=value_bits,
     )
 
 
@@ -3620,6 +3702,7 @@ class Attention(nn.Module):
 
     def __call__(self, x: mx.array, mask: mx.array, cache: Optional[QSAKVCache]):
         batch, length, _ = x.shape
+        quantized_indexed = qsa_indexed_quantized_cache_config(cache)
         fused_index_qk = None
         if _QSA_FUSED_PROJ and not self.training:
             table = self._fused_projection_table()
@@ -3690,6 +3773,7 @@ class Attention(nn.Module):
                 length=length,
                 training=self.training,
                 layout_ok=self._nax_layout_ok,
+                cache=cache,
             )
         if qsa_indexed_enabled() and not use_indexed:
             record_qsa_indexed_receipt(
@@ -3709,6 +3793,13 @@ class Attention(nn.Module):
             _QSA_GATHER_KV
             and not use_nax
             and not use_indexed
+            and not (
+                quantized_indexed is not None
+                and (
+                    quantized_indexed["rotate"]
+                    or quantized_indexed["normalize"]
+                )
+            )
             and not self.training
             and selection.kind == "explicit"
             and length >= _QSA_GATHER_MIN_QUERY
@@ -3751,41 +3842,74 @@ class Attention(nn.Module):
             ).astype(q.dtype)
         elif use_indexed:
             compact = selection.compact_blocks()
-            if int(k.shape[2]) != int(compact.physical_width):
+            cached_width = (
+                k[0].shape[2] if quantized_indexed is not None else k.shape[2]
+            )
+            if int(cached_width) != int(compact.physical_width):
                 raise ValueError("indexed QSA tensors do not match compact selection")
             _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
             splits = indexed_splits_for(u_width)
-            if os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"):
+            if (
+                quantized_indexed is None
+                and os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR")
+            ):
                 self._qsa_indexed_capture_calls += 1
-            out = _dispatch_qsa_indexed_with_optional_capture(
-                q,
-                k,
-                v,
-                compact,
-                scale=self.scale,
-                splits=splits,
-                tile_rows=_QSA_GATHER_TILE_ROWS,
-                layer_index=self.layer_idx,
-                call_counter=self._qsa_indexed_capture_calls,
-                gather_would_admit=(
-                    _QSA_GATHER_KV
-                    and not use_nax
-                    and not self.training
-                    and selection.kind == "explicit"
-                    and length >= _QSA_GATHER_MIN_QUERY
-                    and length <= _QSA_GATHER_MAX_QUERY
-                    and gather_context_ok
-                ),
-            )
+            if quantized_indexed is not None:
+                out = _indexed_qsa_quantized_attention_or_gather(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=self.scale,
+                    splits=splits,
+                    tile_rows=_QSA_GATHER_TILE_ROWS,
+                    group_size=quantized_indexed["group_size"],
+                    key_bits=quantized_indexed["key_bits"],
+                    value_bits=quantized_indexed["value_bits"],
+                )
+            else:
+                out = _dispatch_qsa_indexed_with_optional_capture(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=self.scale,
+                    splits=splits,
+                    tile_rows=_QSA_GATHER_TILE_ROWS,
+                    layer_index=self.layer_idx,
+                    call_counter=self._qsa_indexed_capture_calls,
+                    gather_would_admit=(
+                        _QSA_GATHER_KV
+                        and not use_nax
+                        and not self.training
+                        and selection.kind == "explicit"
+                        and length >= _QSA_GATHER_MIN_QUERY
+                        and length <= _QSA_GATHER_MAX_QUERY
+                        and gather_context_ok
+                    ),
+                )
         elif use_gather:
-            out = _gather_qsa_attention(
-                q,
-                k,
-                v,
-                selection.compact_blocks(),
-                scale=self.scale,
-                tile_rows=_QSA_GATHER_TILE_ROWS,
-            )
+            if quantized_indexed is not None:
+                out = _gather_qsa_quantized_attention(
+                    q,
+                    k,
+                    v,
+                    selection.compact_blocks(),
+                    scale=self.scale,
+                    tile_rows=_QSA_GATHER_TILE_ROWS,
+                    group_size=quantized_indexed["group_size"],
+                    key_bits=quantized_indexed["key_bits"],
+                    value_bits=quantized_indexed["value_bits"],
+                )
+            else:
+                out = _gather_qsa_attention(
+                    q,
+                    k,
+                    v,
+                    selection.compact_blocks(),
+                    scale=self.scale,
+                    tile_rows=_QSA_GATHER_TILE_ROWS,
+                )
         else:
             out = scaled_dot_product_attention(
                 q, k, v, cache=cache, scale=self.scale, mask=sparse_mask

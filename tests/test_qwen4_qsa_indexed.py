@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import hashlib
 import io
 import json
 import os
@@ -14,7 +15,11 @@ import numpy as np
 
 from mlx_lm.models import qwen4_qsa_indexed as indexed
 from mlx_lm.models import qwen4_exp as qwen4_exp
-from mlx_lm.models.qwen4_exp import QSACompactBlocks, _gather_qsa_attention
+from mlx_lm.models.qwen4_exp import (
+    QSACompactBlocks,
+    _gather_qsa_attention,
+    _gather_qsa_quantized_attention,
+)
 from mlx_lm.server import (
     APIHandler,
     SOFT_RELOAD_KEYS,
@@ -140,6 +145,67 @@ class TestQSAIndexedReference(unittest.TestCase):
                     rtol=1.0e-5,
                     atol=1.0e-5,
                 )
+
+    def test_quantized_reference_matches_one_token_gather_bit_exact(self):
+        compact = QSACompactBlocks(
+            block_ids=mx.zeros((1, 3, 1), dtype=mx.uint32),
+            block_counts=mx.zeros((1, 3), dtype=mx.int32),
+            tail_start=mx.zeros((1, 3), dtype=mx.int32),
+            tail_stop=mx.ones((1, 3), dtype=mx.int32),
+            left_padding=None,
+            block_size=4,
+            physical_width=4,
+            causal_mask=None,
+        )
+        for bits in (8, 4):
+            with self.subTest(bits=bits):
+                mx.random.seed(40 + bits)
+                q = mx.random.normal((1, 4, 3, 32)).astype(mx.bfloat16)
+                k = mx.random.normal((1, 2, 4, 32)).astype(mx.bfloat16)
+                v = mx.random.normal((1, 2, 4, 32)).astype(mx.bfloat16)
+                q_keys = mx.quantize(k, group_size=32, bits=bits)
+                q_values = mx.quantize(v, group_size=32, bits=bits)
+                mirror = indexed.qwen4_qsa_indexed_quantized_reference(
+                    q,
+                    q_keys,
+                    q_values,
+                    compact,
+                    scale=32**-0.5,
+                    splits=1,
+                    group_size=32,
+                    key_bits=bits,
+                    value_bits=bits,
+                )
+                gather = _gather_qsa_quantized_attention(
+                    q,
+                    q_keys,
+                    q_values,
+                    compact,
+                    scale=32**-0.5,
+                    tile_rows=2,
+                    group_size=32,
+                    key_bits=bits,
+                    value_bits=bits,
+                )
+                mx.eval(mirror, gather)
+                self.assertTrue(
+                    np.array_equal(
+                        np.asarray(mirror.astype(mx.float32)),
+                        np.asarray(gather.astype(mx.float32)),
+                    )
+                )
+
+    def test_bf16_kernel_sources_are_pinned(self):
+        pass_one = hashlib.sha256(indexed._SOURCE.encode()).hexdigest()
+        pass_two = hashlib.sha256(indexed._COMBINE_SOURCE.encode()).hexdigest()
+        self.assertEqual(
+            pass_one,
+            "a8b7e40486465044ac51e1a5ff7ea43cae877af8aa637a41dbbe7160b6832840",
+        )
+        self.assertEqual(
+            pass_two,
+            "0ae2acf66aba304934b62f5e51015d4fc1fd4ad9532e2e8d182f5192a5197407",
+        )
 
     def test_split_count_is_bit_exact_in_fp32(self):
         mx.random.seed(23)
@@ -486,6 +552,34 @@ class TestQSAIndexedAdmission(unittest.TestCase):
             mock.patch.object(indexed, "indexed_kernel_available", return_value=False),
         ):
             self.assertEqual(self.decide(), (False, "kernel_unavailable"))
+
+    def test_quantized_admission_reason_matrix(self):
+        cache = SimpleNamespace(
+            group_size=64,
+            key_bits=8,
+            value_bits=8,
+            rotate=False,
+            normalize=False,
+        )
+        with (
+            mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", True),
+            mock.patch.object(indexed, "indexed_kernel_available", return_value=True),
+        ):
+            self.assertEqual(self.decide(cache=cache), (True, "engaged"))
+            self.assertEqual(
+                self.decide(
+                    cache=SimpleNamespace(**{**vars(cache), "group_size": 16})
+                ),
+                (False, "quantized_group_size_unsupported"),
+            )
+            self.assertEqual(
+                self.decide(cache=SimpleNamespace(**{**vars(cache), "key_bits": 3})),
+                (False, "quantized_bits_unsupported"),
+            )
+            self.assertEqual(
+                self.decide(cache=SimpleNamespace(**{**vars(cache), "rotate": True})),
+                (False, "quantized_transform_unsupported"),
+            )
 
     def test_runtime_refusal_reasons_and_width_buckets_are_receipted(self):
         indexed.qsa_indexed_status(reset=True)
