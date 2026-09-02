@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -315,6 +316,36 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertIs(captured["inputs"][1], k_view)
         self.assertIs(captured["inputs"][2], v_view)
         self.assertIs(captured["inputs"][8], compact.causal_mask)
+
+    def test_partition_dispatch_declines_unsupported_mask_layouts(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        invalid_masks = (
+            mx.ones((1, 3, 32), dtype=mx.bool_),
+            mx.ones((1, 2, 3, 32), dtype=mx.bool_),
+            mx.ones((1, 1, 3, 32), dtype=mx.float32),
+            mx.ones((2, 1, 3, 32), dtype=mx.bool_),
+        )
+        for mask in invalid_masks:
+            with self.subTest(shape=mask.shape, dtype=mask.dtype):
+                with (
+                    mock.patch.object(
+                        indexed,
+                        "_partition_kernel",
+                        side_effect=AssertionError("kernel must not run"),
+                    ),
+                    self.assertRaises(indexed.QSAIndexedProbeDeclined) as raised,
+                ):
+                    indexed._partition_dispatch(
+                        q,
+                        k,
+                        v,
+                        replace(compact, causal_mask=mask),
+                        scale=8**-0.5,
+                        threads=64,
+                        splits=4,
+                    )
+                self.assertEqual(raised.exception.reason, "unsupported_mask_layout")
 
     def test_duplicate_block_ids_fail_closed(self):
         compact = QSACompactBlocks(

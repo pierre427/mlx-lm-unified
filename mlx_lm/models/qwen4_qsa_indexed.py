@@ -841,6 +841,22 @@ def _partition_dispatch(
         has_mask = False
     else:
         mask = compact.causal_mask
+        if (
+            mask.ndim != 4
+            or int(mask.shape[1]) != 1
+            or int(mask.shape[2]) != length
+            or int(mask.shape[3]) != total
+            or mask.dtype != mx.bool_
+        ):
+            raise QSAIndexedProbeDeclined(
+                "indexed QSA requires a rank-4 [B|1, 1, L, T] bool cache mask",
+                reason="unsupported_mask_layout",
+            )
+        if int(mask.shape[0]) not in (1, batch):
+            raise QSAIndexedProbeDeclined(
+                "indexed QSA cache mask batch must be 1 or B",
+                reason="unsupported_mask_layout",
+            )
         if int(mask.shape[0]) == 1 and batch > 1:
             mask = mx.broadcast_to(mask, (batch, 1, length, total))
         has_mask = True
