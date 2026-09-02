@@ -196,7 +196,9 @@ def _assert_verify_kernel_matches_stock(steps, threadgroup_y, blocks=6):
         mx.set_default_device(previous)
 
 
-@pytest.mark.parametrize("steps", [2, 3, 5, fused_verify.MAX_VERIFY_STEPS])
+@pytest.mark.parametrize(
+    "steps", [2, 3, 5, 8, 9, 15, fused_verify.MAX_VERIFY_STEPS]
+)
 def test_real_metal_verify_matches_stock_for_every_supported_threadgroup(steps):
     supported = []
     for threadgroup_y in fused_gdn._THREADGROUP_Y_CANDIDATES:

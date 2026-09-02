@@ -56,10 +56,21 @@ from .qwen4_fused_gdn import (
 
 logger = logging.getLogger(__name__)
 
-# Production self-MTP verifies ``k + 1`` tokens (k = 2 on Flash-Next); prompt
-# lookup can widen the block. The bound keeps every compiled specialization
-# and its snapshot outputs small; wider blocks use the stock path.
-MAX_VERIFY_STEPS = 8
+# Production self-MTP verifies ``k + 1`` tokens (k = 2 on Flash-Next); adaptive
+# prompt lookup proposes spans up to 16 wide, and the bound is what decides
+# whether those reach this kernel at all.
+#
+# Nothing in the kernel's geometry depends on ``S``: the threadgroup is
+# ``(32, TY, 1)`` over one value head, the register tile is ``st[DV/TY][DK/32]``
+# and every threadgroup array is sized by ``DK``/``DV``. ``S`` is a template
+# constant that sets the trip count of the token loop and the leading extent of
+# the two snapshot outputs. So raising the bound compiles more specializations
+# (one per width) and holds more snapshot memory until the accept boundary --
+# ``state_snapshots`` is ``(S - 1) * HV * DV * DK`` float32, about 3 MiB per
+# extra step per linear layer -- but it does not change the arithmetic of any
+# width that was already admitted. The kernel source is pinned by hash in
+# ``tests/test_qwen4_fused_gdn_verify_contract.py`` to keep that true.
+MAX_VERIFY_STEPS = 16
 
 
 def admit_qwen4_fused_gdn_verify(
