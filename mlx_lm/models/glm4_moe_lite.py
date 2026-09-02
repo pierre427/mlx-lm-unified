@@ -15,7 +15,7 @@ from .base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from .mla import MultiLinear
+from .mla import MultiLinear, absorbed_max_query, use_absorbed_path
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -104,6 +104,20 @@ class Glm4MoeLiteAttention(nn.Module):
             self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
+        # Absorbed MLA is cheaper than the expanded form for every query width
+        # up to a crossover that depends on both the geometry and the attended
+        # cache length (see mla.absorbed_max_query for the derivation), not just
+        # for L == 1 -- which covers the whole speculative-verify range
+        # (L = k+1) against a warm cache.  self.absorbed_max_query is the
+        # asymptotic (long-cache) value, kept for receipts; the forward gate
+        # resolves the S-aware limit per call.
+        self.absorbed_geometry = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
+        self.absorbed_max_query = absorbed_max_query(*self.absorbed_geometry)
+
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -175,7 +189,10 @@ class Glm4MoeLiteAttention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = use_absorbed_path(
+            L, pe_scores.shape[-1], self.absorbed_geometry
+        )
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
             output = scaled_dot_product_attention(
@@ -195,7 +212,7 @@ class Glm4MoeLiteAttention(nn.Module):
             output = scaled_dot_product_attention(
                 q_nope, k, v, cache=None, scale=self.scale, mask=pe_scores
             )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
