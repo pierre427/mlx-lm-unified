@@ -79,6 +79,13 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--e2e-repeats", type=int, default=4)
     parser.add_argument("--layer-only", action="store_true")
+    parser.add_argument(
+        "--prepared-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="layer phase stamps lengths=[k+1] on every verify slab and rolls "
+        "back with trim_ragged, the way the ragged self-MTP engine does",
+    )
     parser.add_argument("--skip-rounds", action="store_true")
     parser.add_argument("--skip-e2e", action="store_true")
     parser.add_argument(
@@ -354,11 +361,29 @@ def phase_layer(args, layer, mx, cache_type, stats_fn, set_verify_mode):
     mismatch = None
     before = stats_fn(layer)
     restores = []
+
+    def prepare(cache):
+        if args.prepared_geometry:
+            cache.prepare(lengths=[steps])
+
+    def finalize(cache):
+        if args.prepared_geometry:
+            cache.finalize()
+
+    def rewind(cache, n):
+        if args.prepared_geometry:
+            return cache.trim_ragged([n])
+        return cache.trim(n)
+
     for block in range(args.layer_blocks):
         set_verify_mode(layer, "stock")
+        prepare(stock_cache)
         stock = layer(hidden[block], cache=stock_cache)
+        finalize(stock_cache)
         set_verify_mode(layer, "fused")
+        prepare(fused_cache)
         fused = layer(hidden[block], cache=fused_cache)
+        finalize(fused_cache)
         mx.eval(stock, fused, *stock_cache.cache, *fused_cache.cache)
         output_equal = arrays_equal(stock, fused, mx)
         slots_equal = all(
@@ -378,8 +403,8 @@ def phase_layer(args, layer, mx, cache_type, stats_fn, set_verify_mode):
         n_to_drop = block % steps
         restores.append(n_to_drop)
         if n_to_drop:
-            stock_cache.trim(n_to_drop)
-            fused_cache.trim(n_to_drop)
+            rewind(stock_cache, n_to_drop)
+            rewind(fused_cache, n_to_drop)
             mx.eval(*stock_cache.cache, *fused_cache.cache)
             if not all(
                 arrays_equal(a, b, mx)
@@ -398,6 +423,7 @@ def phase_layer(args, layer, mx, cache_type, stats_fn, set_verify_mode):
         and set(restores) == set(range(steps)),
         "blocks": args.layer_blocks,
         "verify_width": steps,
+        "prepared_geometry": bool(args.prepared_geometry),
         "mismatch": mismatch,
         "verify_calls": verify_calls,
         "verify_fallbacks": fallbacks,
@@ -417,7 +443,9 @@ def phase_layer(args, layer, mx, cache_type, stats_fn, set_verify_mode):
             output = None
             for block in range(args.layer_timing_blocks):
                 cache._rollbacks.clear()
+                prepare(cache)
                 output = layer(hidden[block % len(hidden)], cache=cache)
+                finalize(cache)
             mx.eval(output, *cache.cache)
             timings[mode].append(time.perf_counter() - started)
     medians = {name: statistics.median(values) for name, values in timings.items()}

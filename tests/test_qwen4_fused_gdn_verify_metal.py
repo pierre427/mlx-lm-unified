@@ -234,11 +234,16 @@ def _production_layer():
     return layer, args
 
 
+@pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("slots", [2, 4])
-def test_real_metal_layer_verify_records_exact_restore_points_and_trims(slots):
+def test_real_metal_layer_verify_records_exact_restore_points_and_trims(
+    slots, prepared
+):
     """Drive GatedDeltaNet under a speculating cache: the fused record must
     replay identically to the stock replay closure, and ``trim`` must land on
-    the same state. ``slots=4`` mimics a PLE layer whose half is staged first."""
+    the same state. ``slots=4`` mimics a PLE layer whose half is staged first;
+    ``prepared`` stamps ``lengths=[steps]`` on every slab and rewinds with
+    ``trim_ragged``, the geometry a ragged self-MTP engine presents at one lane."""
     _require_metal()
     previous = mx.default_device()
     mx.set_default_device(mx.gpu)
@@ -274,10 +279,18 @@ def test_real_metal_layer_verify_records_exact_restore_points_and_trims(slots):
             )
             layer.set_fused_gdn_verify_mode("stock")
             stage_ple(stock_cache, block)
+            if prepared:
+                stock_cache.prepare(lengths=[steps])
             stock_out = layer(hidden, cache=stock_cache)
+            if prepared:
+                stock_cache.finalize()
             layer.set_fused_gdn_verify_mode("fused")
             stage_ple(fused_cache, block)
+            if prepared:
+                fused_cache.prepare(lengths=[steps])
             fused_out = layer(hidden, cache=fused_cache)
+            if prepared:
+                fused_cache.finalize()
             mx.eval(stock_out, fused_out, *stock_cache.cache, *fused_cache.cache)
             assert mx.array_equal(stock_out, fused_out).item(), block
             for slot in range(slots):
@@ -296,7 +309,10 @@ def test_real_metal_layer_verify_records_exact_restore_points_and_trims(slots):
                 for slot, (x, y) in enumerate(zip(left, right)):
                     assert mx.array_equal(x, y).item(), (block, m, slot)
             n_to_drop = block % steps
-            if n_to_drop:
+            if n_to_drop and prepared:
+                stock_cache.trim_ragged([n_to_drop])
+                fused_cache.trim_ragged([n_to_drop])
+            elif n_to_drop:
                 assert stock_cache.trim(n_to_drop) == n_to_drop
                 assert fused_cache.trim(n_to_drop) == n_to_drop
                 mx.eval(*stock_cache.cache, *fused_cache.cache)
