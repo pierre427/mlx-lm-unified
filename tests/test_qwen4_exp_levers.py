@@ -190,10 +190,90 @@ class TestRMSNormFast(unittest.TestCase):
         return grouped, flat
 
     def test_flag_off_is_byte_identical_to_reference(self):
-        self.assertFalse(qwen4_exp._RMSNORM_FAST)
+        """``MLX_QWEN4_RMSNORM_FAST=0`` must restore the stock chain at EVERY
+        width, decode widths included -- it is the operator's off switch, not
+        a second gate."""
         x = mx.random.normal((2, 3, 32), key=mx.random.key(0)).astype(mx.float16)
+        with lever(qwen4_exp, "_RMSNORM_FAST", False):
+            for norm in self._norms():
+                for width in (1, 3, 8, 9, 2048):
+                    wide = mx.broadcast_to(x[:, :1], (2, width, 32))
+                    _bytes_equal(self, norm(wide), self._reference(norm, wide))
+
+    def test_the_lever_is_default_on(self):
+        """Promoted 2026-09-02 (Pierre) for decode widths; prefill stays stock."""
+        self.assertTrue(qwen4_exp._RMSNORM_FAST)
+        self.assertEqual(qwen4_exp._RMSNORM_FAST_MAX_WIDTH, 8)
+
+    def test_only_decode_widths_take_the_fast_path(self):
+        """Width gate: <= 8 fused, > 8 stock, and stock means BYTE-identical.
+
+        The probe is the branch itself -- ``mx.fast.rms_norm`` is wrapped in a
+        counter -- because at these shapes the two paths often agree bitwise
+        anyway, so equality alone cannot tell which one ran.
+        """
+        real = mx.fast.rms_norm
+        calls = []
+
+        def counted(*a, **k):
+            calls.append(1)
+            return real(*a, **k)
+
         for norm in self._norms():
-            _bytes_equal(self, norm(x), self._reference(norm, x))
+            for width, expect_fast in ((1, True), (3, True), (8, True),
+                                       (9, False), (2048, False)):
+                with self.subTest(width=width, grouped=norm.group_size):
+                    mx.random.seed(width)
+                    x = mx.random.normal((2, width, 32)).astype(mx.float16)
+                    self.assertEqual(norm._use_fast(x), expect_fast)
+                    calls.clear()
+                    mx.fast.rms_norm = counted
+                    try:
+                        out = norm(x)
+                        mx.eval(out)
+                    finally:
+                        mx.fast.rms_norm = real
+                    self.assertEqual(bool(calls), expect_fast)
+                    if not expect_fast:
+                        # Above the gate the caller gets the stock chain
+                        # bit for bit, not a tolerance.
+                        _bytes_equal(self, out, self._reference(norm, x))
+
+    def test_a_decomposing_caller_declares_the_real_width(self):
+        """A split slab must not smuggle prefill through the decode gate.
+
+        ``_GDN_SHAPE_STABLE_PROJECTIONS`` re-runs the hyper-connection mixer
+        one token at a time, so a 2048-wide chunk reaches ``hc_norm`` as 2048
+        width-1 arrays. Without the declaration each would clear the gate and
+        "prefill stays stock" would be false whenever that diagnostic lever is
+        set.
+        """
+        grouped, _ = self._norms()
+        narrow = mx.zeros((2, 1, 32), mx.float16)
+        self.assertTrue(grouped._use_fast(narrow))
+        with qwen4_exp._declared_width(2048):
+            self.assertFalse(grouped._use_fast(narrow))
+            # A genuinely narrow slab is unaffected by the mechanism.
+            with qwen4_exp._declared_width(3):
+                self.assertTrue(grouped._use_fast(narrow))
+            self.assertFalse(grouped._use_fast(narrow))
+        # The override is restored, not leaked, on the way out.
+        self.assertIsNone(qwen4_exp._RMSNORM_FAST_WIDTH_OVERRIDE)
+        self.assertTrue(grouped._use_fast(narrow))
+
+    def test_the_width_is_read_before_the_grouped_reshape(self):
+        """After the grouped reshape ``shape[-2]`` is the GROUP COUNT.
+
+        Reading the gate there would misclassify by the number of streams
+        rather than the query width: this norm has 32/8 = 4 groups, so a
+        2048-wide prefill slab would have read as width 4 and taken the fast
+        path.
+        """
+        grouped, _ = self._norms()
+        self.assertEqual(32 // grouped.group_size, 4)
+        wide = mx.zeros((2, 2048, 32), mx.float16)
+        self.assertEqual(wide.reshape(2, 2048, 4, 8).shape[-2], 4)
+        self.assertFalse(grouped._use_fast(wide))
 
     def test_flag_on_is_within_one_ulp_of_the_stock_chain(self):
         """The fast path may reorder the reduction and nothing else.
@@ -208,7 +288,8 @@ class TestRMSNormFast(unittest.TestCase):
         """
         x = mx.random.normal((2, 5, 32), key=mx.random.key(1)).astype(mx.float16)
         for norm in self._norms():
-            expected = self._reference(norm, x)
+            with lever(qwen4_exp, "_RMSNORM_FAST", False):
+                expected = self._reference(norm, x)
             with lever(qwen4_exp, "_RMSNORM_FAST"):
                 actual = norm(x)
             mx.eval(expected, actual)
