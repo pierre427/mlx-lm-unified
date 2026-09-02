@@ -96,6 +96,19 @@ _GLUE_STATS = {"builds": 0, "calls": 0, "fallbacks": 0, "skips": 0}
 _GLUE_LAST_RECEIPT: Optional[dict] = None
 
 
+def invalidate_compiled_traces() -> int:
+    """Drop every compiled glue span, for the same reason as in qwen4_exp.
+
+    The spans here close over no module-tier flag today -- they are pure
+    arithmetic and the levers are read at the CALL site -- but the soft-reload
+    path invalidates every trace-holding model module uniformly, so that a
+    span which later grows a flag branch cannot answer from a stale graph
+    just because nobody remembered to wire it up.
+    """
+    _GLUE_COMPILE_CACHE.clear()
+    return len(_GLUE_COMPILE_CACHE)
+
+
 def compile_glue_enabled() -> bool:
     """Live read of the glue lever, so the toggle needs no module reload."""
     return _COMPILE_GLUE

@@ -95,7 +95,49 @@ from ..verify_sync import record_verify_sync
 
 # Opt-in micro-levers, each read once at import.  Off keeps the stock path,
 # EXCEPT where a lever has been promoted (``default=True``) -- see below.
+#
+# MLX_QWEN4_RMSNORM_FAST: run the reduction through ``mx.fast.rms_norm``
+# instead of the ``Square/Sum/Add/Rsqrt/Multiply`` chain.  On Metal that is one
+# fused primitive, and ``GroupRMSNorm`` is the model's densest call site --
+# MEASURED 147 calls per token.  The kernel is fed fp32 (see
+# ``GroupRMSNorm.__call__``), so the arithmetic differs from the stock chain
+# only in the reduction's accumulation order.
 _RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
+
+# ---------------------------------------------------------------------------
+# Compile-cache invalidation when a traced lever moves.
+#
+# ``mx.compile`` traces a Python function ONCE per cache key and replays that
+# trace; any ``if _SOME_FLAG:`` inside the traced region is therefore resolved
+# at TRACE time and baked into the graph.  The PLE device chain calls three
+# ``GroupRMSNorm``s, and its cache was keyed on shape and dtype alone -- so
+# flipping ``qwen4_rmsnorm_fast`` (soft reload, or in-process in an A/B) left
+# every already-traced signature answering from the old branch.  MEASURED
+# 2026-09-02: 2 stale traces per flip, on an arm that believed it had flipped.
+#
+# The fix is to make the lever part of the key.  ``_trace_flags`` carries the
+# module-tier values a traced region branches on, plus an epoch that any
+# soft-reload write bumps -- so a lever added later is still covered even if
+# nobody remembers to list it here.
+_TRACE_EPOCH = 0
+
+
+def invalidate_compiled_traces() -> int:
+    """Drop every compiled trace that could have baked in a lever value.
+
+    Called by the soft-reload path after it writes a module-tier constant.
+    Cheap and idempotent: it bumps an integer that every compile-cache key
+    carries, so the next call retraces instead of replaying a stale graph.
+    """
+    global _TRACE_EPOCH
+    _TRACE_EPOCH += 1
+    return _TRACE_EPOCH
+
+
+def _trace_flags() -> tuple:
+    """Every module-tier value a compiled region in this module branches on."""
+    return (_TRACE_EPOCH, bool(_RMSNORM_FAST))
+
 
 # ``mx.compile`` over the device half of the PLE forward -- the two
 # projections, three ``GroupRMSNorm``s, the gate arithmetic, the pad ``where``s,
@@ -126,6 +168,7 @@ _PLE_COMPILE_STATS = {
     "overflow": 0,
     "skips": 0,
     "retraces": 0,
+    "invalidations": 0,
 }
 _PLE_COMPILE_LAST_RECEIPT: Optional[dict] = None
 
@@ -935,22 +978,29 @@ class GroupRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        if _RMSNORM_FAST:
-            # The stock path is a pure (not mean-centred) RMS norm, so
-            # ``mx.fast.rms_norm`` matches it up to fp32 accumulation order.
-            # Per-group weights differ, so the weight is applied outside.
-            if self.group_size is not None:
-                grouped = x.reshape(*x.shape[:-1], -1, self.group_size)
-                out = mx.fast.rms_norm(grouped, None, self.eps).reshape(x.shape)
-            else:
-                out = mx.fast.rms_norm(x, None, self.eps)
-            return (
-                out.astype(mx.float32) * self.weight.astype(mx.float32)
-            ).astype(dtype)
+        # ONE upcast, shared by both branches.  Feeding fp32 into
+        # ``mx.fast.rms_norm`` is the whole point of the fast path as it now
+        # stands: the kernel's output dtype is its INPUT dtype, so a bf16
+        # input rounds the normalised value before the weight multiply and
+        # costs a second rounding the stock chain never pays (measured
+        # 2026-09-02: 1 ULP on 25.7-30.5% of elements, 1.41x = sqrt(2) further
+        # from an fp64 reference -- wiki experiments/
+        # qwen4-rmsnorm-fast-ab-2026-09-02.md).  With an fp32 input the
+        # normalised value stays fp32 through the weight multiply exactly as
+        # the stock chain holds it, so the ONLY difference left is the
+        # reduction's accumulation order.
         xf = x.astype(mx.float32)
         if self.group_size is not None:
             xf = xf.reshape(*xf.shape[:-1], -1, self.group_size)
-        out = xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
+        if _RMSNORM_FAST:
+            # Per-group weights differ, so the weight cannot ride the kernel's
+            # ``w`` argument (it broadcasts across groups); it is applied
+            # outside, in fp32, exactly where the stock chain applies it.
+            out = mx.fast.rms_norm(xf, None, self.eps)
+        else:
+            out = xf * mx.rsqrt(
+                mx.mean(xf * xf, axis=-1, keepdims=True) + self.eps
+            )
         if self.group_size is not None:
             out = out.reshape(*x.shape)
         return (out * self.weight.astype(mx.float32)).astype(dtype)
@@ -2306,9 +2356,17 @@ class PLELayer(nn.Module):
         receipt, not one exception per round.
         """
         cache = getattr(self, "_ple_compile_cache", None)
-        if cache is None:
+        flags = _trace_flags()
+        if cache is None or getattr(self, "_ple_compile_flags", None) != flags:
+            # A lever the traced region branches on moved.  Every existing
+            # entry baked in the OLD branch, so the cache is dropped rather
+            # than left to answer with it -- and dropped, not merely
+            # out-keyed, so a flip cannot walk the bound to ``overflow``.
+            if cache:
+                _record_ple_compile("invalidations", flags=repr(flags))
             cache = {}
             self._ple_compile_cache = cache
+            self._ple_compile_flags = flags
         params = self._chain_params()
         entry = cache.get(signature)
         if entry is not None:
@@ -2392,6 +2450,7 @@ class PLELayer(nn.Module):
             bool(write_state),
             str(hidden.dtype),
             str(embeddings.dtype),
+            _trace_flags(),
         )
         compiled = self._compiled_chain(signature, has_mask, has_state, write_state)
         if compiled is None:

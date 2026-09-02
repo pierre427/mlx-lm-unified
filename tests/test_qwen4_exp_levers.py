@@ -195,15 +195,67 @@ class TestRMSNormFast(unittest.TestCase):
         for norm in self._norms():
             _bytes_equal(self, norm(x), self._reference(norm, x))
 
-    def test_flag_on_matches_within_fp16_tolerance(self):
+    def test_flag_on_is_within_one_ulp_of_the_stock_chain(self):
+        """The fast path may reorder the reduction and nothing else.
+
+        It feeds ``mx.fast.rms_norm`` an fp32 array, so the normalised value
+        reaches the weight multiply in fp32 exactly as the stock chain holds
+        it and the output carries ONE rounding, not two.  The earlier
+        bf16-input form rounded first and paid a second: 1 ULP on 26-30% of
+        elements and sqrt(2) further from an fp64 reference (wiki
+        experiments/qwen4-rmsnorm-fast-ab-2026-09-02.md).  A 1e-3 relative
+        bound passed for both, so it is not the assertion this lever needs.
+        """
         x = mx.random.normal((2, 5, 32), key=mx.random.key(1)).astype(mx.float16)
         for norm in self._norms():
-            expected = self._reference(norm, x).astype(mx.float32)
+            expected = self._reference(norm, x)
             with lever(qwen4_exp, "_RMSNORM_FAST"):
-                actual = norm(x).astype(mx.float32)
+                actual = norm(x)
             mx.eval(expected, actual)
-            rel = mx.abs(actual - expected) / (mx.abs(expected) + 1e-6)
-            self.assertLess(rel.max().item(), 1e-3)
+            self.assertEqual(actual.dtype, expected.dtype)
+            gap = np.abs(
+                np.asarray(actual.view(mx.uint16), dtype=np.int32)
+                - np.asarray(expected.view(mx.uint16), dtype=np.int32)
+            )
+            # Same sign and exponent field in every case here, so the raw bit
+            # gap IS the ULP distance.
+            self.assertLessEqual(int(gap.max()), 1, "fast path moved > 1 ULP")
+
+    def test_flag_on_is_no_further_from_an_fp64_reference(self):
+        """The lever may change COST ONLY -- so it may not lose accuracy.
+
+        This is the assertion the bf16-input form failed: it was uniformly the
+        less accurate of the two paths, never the more.
+        """
+        x = mx.random.normal((4, 7, 32), key=mx.random.key(3)).astype(mx.float16)
+        for norm in self._norms():
+            ref = (
+                np.asarray(x.astype(mx.float32), dtype=np.float64).reshape(
+                    *x.shape[:-1], -1, norm.group_size or 32
+                )
+            )
+            ref = ref / np.sqrt((ref * ref).mean(axis=-1, keepdims=True) + norm.eps)
+            ref = ref.reshape(*x.shape) * np.asarray(
+                norm.weight.astype(mx.float32), dtype=np.float64
+            )
+            stock = norm(x)
+            with lever(qwen4_exp, "_RMSNORM_FAST"):
+                fast = norm(x)
+            mx.eval(stock, fast)
+            err = {
+                name: float(
+                    np.sqrt(
+                        (
+                            (np.asarray(v.astype(mx.float32), dtype=np.float64) - ref)
+                            ** 2
+                        ).mean()
+                    )
+                )
+                for name, v in (("stock", stock), ("fast", fast))
+            }
+            self.assertLessEqual(
+                err["fast"], err["stock"] * 1.02, f"fast path lost accuracy: {err}"
+            )
 
 
 class TestQSAPooledKeyCache(unittest.TestCase):
@@ -1000,12 +1052,14 @@ class TestQSALeftPaddedBatchComposition(unittest.TestCase):
             set(pooled), {"_pooled_keys", "_pool_blocks_left_padded"}
         )
         # _RMSNORM_FAST is deliberately NOT in this list: it is the one
-        # tolerance-class lever in the bundle (mx.fast.rms_norm rounds the
-        # normalized value once before the per-stream weight multiply, a
-        # documented <=1 fp16 ulp deviation), so asserting bitwise equality
-        # for it asserts something the lever never claimed. It is gated by
-        # tolerance in TestRMSNormFast and disqualified-on-mismatch in the
-        # lever bench, not here.
+        # tolerance-class lever in the bundle. Since 2026-09-02 it feeds
+        # mx.fast.rms_norm an fp32 array, so it no longer rounds the
+        # normalized value before the per-stream weight multiply and the only
+        # difference left from the stock chain is the reduction's
+        # accumulation order -- but a reordered reduction is still not a
+        # bitwise identity, so it is gated by tolerance in TestRMSNormFast
+        # (<= 1 ULP, and no further from fp64 than stock) and
+        # disqualified-on-mismatch in the lever bench, not here.
         for flag in ("_QSA_SCATTER_CHOSEN",):
             with self.subTest(flag=flag):
                 with lever(qwen4_exp, flag, True):
