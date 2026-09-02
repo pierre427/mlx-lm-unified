@@ -1346,6 +1346,10 @@ class Qwen4ArraysCache(ArraysCache):
         ]
         if idx < len(self._checkpoints):
             cache._checkpoints = [list(self._checkpoints[idx])]
+        # The stamp base ArraysCache.extract sets: rollback records are
+        # whole-batch closures, so an extracted row must say why it cannot
+        # replay them. An override has to carry it too.
+        cache._rollback_invalid_reason = "extract() left the batch behind"
         return cache
 
 
@@ -2113,6 +2117,29 @@ def _init_qsa_summary_state(cache, identity=None) -> None:
     cache._qsa_pending_pooled = None
 
 
+def _qsa_join_ledger_width(index_keys, cursor: int, who: str) -> int:
+    """Width of a lane's raw-key ledger for a join, refused if it runs short.
+
+    A lane has two lengths and they are not the same quantity: the KV cursor
+    (``_idx`` / ``size()``) and the width of ``index_keys``. The joins slice
+    the ledger with the KV quantity, which is exact only while the two agree.
+    Where they diverge the join used to fail at ``concatenate`` with a bare
+    shape message, or, single-lane, return a ledger the cursor does not
+    describe. Say which quantity disagreed instead.
+    """
+    if index_keys is None:
+        return 0
+    width = index_keys.shape[1]
+    if width < cursor:
+        raise RuntimeError(
+            f"{who}: the QSA raw-key ledger holds {width} positions but the "
+            f"cursor is at {cursor}. A join reads each lane by its ledger "
+            "width, not by its KV offset; a short ledger means a shared-top-k "
+            "draft cycle was joined without rewinding the drafted span."
+        )
+    return width
+
+
 def _qsa_merge_summaries(caches, logical_lengths):
     if not _QSA_APC_SUMMARIES or not caches:
         return None, None
@@ -2453,6 +2480,9 @@ class BatchQSAKVCache(BatchKVCache):
     def extend(self, other):
         index_a, index_b = self.index_keys, other.index_keys
         idx_a, idx_b = self._idx, other._idx
+        who = "BatchQSAKVCache.extend"
+        _qsa_join_ledger_width(index_a, idx_a, who)
+        _qsa_join_ledger_width(index_b, idx_b, who)
         if index_a is None and index_b is None:
             merged_index = None
         else:
@@ -2465,7 +2495,11 @@ class BatchQSAKVCache(BatchKVCache):
                     index = mx.zeros((batch, 0, dims), dtype=dtype)
                 else:
                     index = index[:, :idx]
-                return mx.pad(index, [(0, 0), (max_idx - idx, 0), (0, 0)])
+                # Pad from the row's own width, not the KV cursor: an absent
+                # ledger contributes zero columns while its lane holds ``idx``.
+                return mx.pad(
+                    index, [(0, 0), (max_idx - index.shape[1], 0), (0, 0)]
+                )
 
             merged_index = mx.concatenate(
                 [
@@ -2535,13 +2569,23 @@ class BatchQSAKVCache(BatchKVCache):
         if populated is not None:
             dims, dtype = populated.shape[-1], populated.dtype
             rows = []
-            for cache, length, left in zip(caches, lengths, padding):
+            for cache, length in zip(caches, lengths):
+                _qsa_join_ledger_width(
+                    cache.index_keys, length, "BatchQSAKVCache.merge"
+                )
                 values = cache.index_keys
                 if values is None:
                     values = mx.zeros((1, 0, dims), dtype=dtype)
                 else:
                     values = values[:, :length]
-                rows.append(mx.pad(values, [(0, 0), (left, 0), (0, 0)]))
+                # Left padding comes from the row's own ledger width. The old
+                # form used ``width - cache.size()``, a KV quantity, short by
+                # the ledger's shortfall -- an absent ledger above all.
+                rows.append(
+                    mx.pad(
+                        values, [(0, 0), (width - values.shape[1], 0), (0, 0)]
+                    )
+                )
             batch.index_keys = mx.concatenate(rows)
         pooled, identity = _qsa_merge_summaries(caches, lengths)
         if pooled is not None:
@@ -2976,6 +3020,9 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
     def extend(self, other):
         index_a, index_b = self.index_keys, other.index_keys
         idx_a, idx_b = self._idx, other._idx
+        who = "BatchQSAQuantizedKVCache.extend"
+        _qsa_join_ledger_width(index_a, idx_a, who)
+        _qsa_join_ledger_width(index_b, idx_b, who)
         if index_a is None and index_b is None:
             merged_index = None
         else:
@@ -2988,7 +3035,11 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
                     index = mx.zeros((batch, 0, dims), dtype=dtype)
                 else:
                     index = index[:, :idx]
-                return mx.pad(index, [(0, 0), (max_idx - idx, 0), (0, 0)])
+                # Pad from the row's own width, not the KV cursor: an absent
+                # ledger contributes zero columns while its lane holds ``idx``.
+                return mx.pad(
+                    index, [(0, 0), (max_idx - index.shape[1], 0), (0, 0)]
+                )
 
             merged_index = mx.concatenate(
                 [
@@ -3069,13 +3120,19 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
             dims, dtype = populated.shape[-1], populated.dtype
             rows = []
             for cache, length in zip(caches, lengths):
+                _qsa_join_ledger_width(
+                    cache.index_keys, length, "BatchQSAQuantizedKVCache.merge"
+                )
                 values = cache.index_keys
                 if values is None:
                     values = mx.zeros((1, 0, dims), dtype=dtype)
                 else:
                     values = values[:, :length]
+                # Pad from the row's own ledger width; see the float twin.
                 rows.append(
-                    mx.pad(values, [(0, 0), (width - length, 0), (0, 0)])
+                    mx.pad(
+                        values, [(0, 0), (width - values.shape[1], 0), (0, 0)]
+                    )
                 )
             batch.index_keys = mx.concatenate(rows)
         pooled, identity = _qsa_merge_summaries(caches, lengths)

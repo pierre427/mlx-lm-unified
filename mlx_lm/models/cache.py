@@ -2652,6 +2652,15 @@ class ArraysCache(_BaseCache):
             for i in range(B):
                 if caches[i][e] is None:
                     continue
+                # The slot template is the first lane that reached it, so a
+                # lane whose state disagrees would BROADCAST into the row
+                # instead of being rejected. Shapes cost no sync to compare.
+                if tuple(caches[i][e].shape[1:]) != tuple(shape[1:]):
+                    raise ValueError(
+                        f"ArraysCache.merge: state slot {e} of lane {i} has "
+                        f"shape {tuple(caches[i][e].shape)}, which does not "
+                        f"fit a batched slot of {tuple(shape)}."
+                    )
                 cache[e][i : i + 1] = caches[i][e]
         cache._checkpoints = [
             list(c._checkpoints[0]) if len(c._checkpoints) == 1 else []
