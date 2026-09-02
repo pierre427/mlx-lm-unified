@@ -342,6 +342,7 @@ _FUSED_GDN_VERIFY_MODES = ("stock", "fused")
 # before folding the tail into ``other``; admission reasons embed widths and
 # shapes, so the bound is what keeps a long-lived server's counter finite.
 _VERIFY_FALLBACK_REASON_LIMIT = 32
+_DECODE_FALLBACK_REASON_LIMIT = 32
 _SHAPE_STABLE_SHORT_FORWARD = _env_flag(
     "MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD"
 )
@@ -986,6 +987,14 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         self.fused_gdn_outproj_calls = 0
         self.fused_gdn_decode_fallbacks = 0
         self.fused_gdn_decode_last_fallback = None
+        # Durable decline histogram, the decode twin of
+        # ``fused_gdn_verify_fallback_reasons``: ``last_fallback`` is cleared
+        # by the next admitted call, so a run that declines and then succeeds
+        # receipts an empty ``last_fallbacks`` and no reason at all -- which
+        # is exactly what the 2026-09-02 deployed smoke reported. Set through
+        # ``object`` and mutated in place so this dict stays out of the
+        # parameter tree (``nn.Module.__setattr__`` registers dicts).
+        object.__setattr__(self, "fused_gdn_decode_fallback_reasons", {})
         # Lazy MLX_QWEN4_GDN_FUSED_INPROJ table, identity-keyed by the source
         # weight arrays exactly like ``_qsa_fused_cache``; in ``__dict__`` so
         # it never reaches ``parameters()``/``state``.
@@ -1041,6 +1050,12 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
     def _fused_gdn_fallback(self, reason: str):
         self.fused_gdn_decode_fallbacks += 1
         self.fused_gdn_decode_last_fallback = reason
+        reasons = self.fused_gdn_decode_fallback_reasons
+        # Admission reasons carry widths and shapes, so the key set is capped
+        # and the tail folds into one bucket rather than growing unbounded.
+        if reason not in reasons and len(reasons) >= _DECODE_FALLBACK_REASON_LIMIT:
+            reason = "other"
+        reasons[reason] = reasons.get(reason, 0) + 1
         return None
 
     def set_fused_gdn_verify_mode(self, mode: str):
@@ -1170,6 +1185,15 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         if cache is None or cache[0] is None or cache[1] is None:
             return self._fused_gdn_fallback("uninitialized cache")
 
+        # Host-side geometry of this forward, exactly as ``_try_fused_verify``
+        # reads it. A ragged engine stamps ``lengths`` on every slab, a plain
+        # one-lane decode step included, so admission is decided by the span
+        # that metadata describes, not by its presence. A cache with no
+        # rollback surface at all has no length metadata either, which is the
+        # unpadded ``()`` case.
+        describe = getattr(cache, "rollback_spans", None)
+        spans = describe(int(qkv.shape[1]), mask) if callable(describe) else ()
+
         admission = admit_qwen4_fused_gdn_decode(
             qkv=qkv,
             z=z,
@@ -1182,7 +1206,7 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             dt_bias=self.dt_bias,
             norm_weight=self.norm.weight,
             mask=mask,
-            cache_lengths=getattr(cache, "lengths", None),
+            spans=spans,
             speculating=bool(getattr(cache, "speculating", False)),
             training=bool(self.training),
             sharded=self.sharding_group is not None,
@@ -1502,11 +1526,12 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
     ``fused_calls``/``fallbacks``/``last_fallbacks`` describe the single-token
     decode path; the ``verify_*`` keys describe the speculative-verify path.
 
-    ``verify_last_fallbacks`` is a snapshot of each layer's *most recent*
-    decline, which the next admitted call clears; ``verify_fallback_reasons``
-    is the durable per-reason histogram of every decline since the layer was
-    built (or since the last ``reset``), so a run that declines and then
-    succeeds still receipts why it declined.
+    ``last_fallbacks``/``verify_last_fallbacks`` are snapshots of each layer's
+    *most recent* decline, which the next admitted call clears;
+    ``decode_fallback_reasons``/``verify_fallback_reasons`` are the durable
+    per-reason histograms of every decline since the layer was built (or since
+    the last ``reset``), so a run that declines and then succeeds still
+    receipts why it declined.
 
     ``reset`` zeroes every counter this function reports, on the model's
     layers, after reading them.
@@ -1516,6 +1541,7 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
         "fused_outproj_calls": 0,
         "fallbacks": 0,
         "last_fallbacks": {},
+        "decode_fallback_reasons": {},
         "verify_calls": 0,
         "verify_fallbacks": 0,
         "verify_last_fallbacks": {},
@@ -1539,6 +1565,9 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
             stats["verify_last_fallbacks"][reason] = (
                 stats["verify_last_fallbacks"].get(reason, 0) + 1
             )
+        durable = stats["decode_fallback_reasons"]
+        for reason, count in module.fused_gdn_decode_fallback_reasons.items():
+            durable[reason] = durable.get(reason, 0) + count
         durable = stats["verify_fallback_reasons"]
         for reason, count in module.fused_gdn_verify_fallback_reasons.items():
             durable[reason] = durable.get(reason, 0) + count
@@ -1547,6 +1576,7 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
             module.fused_gdn_outproj_calls = 0
             module.fused_gdn_decode_fallbacks = 0
             module.fused_gdn_decode_last_fallback = None
+            module.fused_gdn_decode_fallback_reasons.clear()
             module.fused_gdn_verify_calls = 0
             module.fused_gdn_verify_fallbacks = 0
             module.fused_gdn_verify_last_fallback = None

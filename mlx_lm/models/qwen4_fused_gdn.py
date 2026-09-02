@@ -44,6 +44,39 @@ def _dtype(value: Any) -> Any:
     return getattr(value, "dtype", None)
 
 
+def _slab_width(value: Any) -> int:
+    """Sequence extent of a ``(B, S, D)`` activation, or 0 when it has none."""
+    shape = _shape(value)
+    return int(shape[1]) if len(shape) > 1 else 0
+
+
+def admit_rollback_span(
+    spans: Any, mask: Any, width: int, *, masked_reason: str
+) -> Optional[FusedGdnAdmission]:
+    """Shared mask-free slab predicate for both fused GDN kernels.
+
+    ``spans`` is the cache's host-side rollback geometry for this forward
+    (``ArraysCache.rollback_spans``).  Neither kernel reads a mask, so only a
+    slab whose single row advances every position is exact: ``()`` (no length
+    metadata and no mask) or a one-row span equal to the width, which is how a
+    ragged engine describes a fully valid lane -- its mask, derived from that
+    same metadata, is then all ones.  A shorter span is right padding, more
+    than one row is a batch this kernel does not serve, and ``None`` is
+    geometry the cache cannot describe row-wise.
+
+    Returns the refusal, or ``None`` when the slab is admissible.
+    """
+    if spans is None:
+        return FusedGdnAdmission(False, "rollback geometry not describable")
+    if spans == ():
+        if mask is not None:
+            return FusedGdnAdmission(False, masked_reason)
+        return None
+    if len(spans) != 1 or int(spans[0]) != int(width):
+        return FusedGdnAdmission(False, "padded rollback geometry")
+    return None
+
+
 def admit_qwen4_fused_gdn_decode(
     *,
     qkv: Any,
@@ -57,7 +90,7 @@ def admit_qwen4_fused_gdn_decode(
     dt_bias: Any,
     norm_weight: Any,
     mask: Any,
-    cache_lengths: Any,
+    spans: Any,
     speculating: bool,
     training: bool,
     sharded: bool,
@@ -75,10 +108,14 @@ def admit_qwen4_fused_gdn_decode(
         return FusedGdnAdmission(False, "distributed sharding")
     if speculating:
         return FusedGdnAdmission(False, "speculative rollback")
-    if mask is not None:
-        return FusedGdnAdmission(False, "masked decode")
-    if cache_lengths is not None:
-        return FusedGdnAdmission(False, "ragged cache lengths")
+    # A ragged engine stamps ``lengths`` on every slab, one lane included, so
+    # the presence of length metadata is not itself a refusal: the span the
+    # cache derives from it is.  Same predicate as the verify admission.
+    refusal = admit_rollback_span(
+        spans, mask, _slab_width(qkv), masked_reason="masked decode"
+    )
+    if refusal is not None:
+        return refusal
     if gate_activation != "sigmoid":
         return FusedGdnAdmission(False, f"output gate {gate_activation!r}")
 
@@ -850,6 +887,7 @@ def probe_qwen4_fused_gdn_decode(dtype) -> Optional[int]:
 __all__ = [
     "FusedGdnAdmission",
     "admit_qwen4_fused_gdn_decode",
+    "admit_rollback_span",
     "fused_gdn_runtime_supported",
     "probe_qwen4_fused_gdn_decode",
     "qwen4_fused_gdn_decode",
