@@ -69,20 +69,62 @@ class TestFusedMoeAdmission(unittest.TestCase):
             FakeArray((512, 2560, 10), mx.bfloat16),
         )
 
-    def test_exact_decode_and_mtp_shapes_are_admitted(self):
-        for tokens in (1, 3):
+    def test_only_qualified_widths_are_admitted(self):
+        # Width is an explicit decision of the admission, not a side effect
+        # of the switch_layers sort threshold: M=1 is qualified, M=3 is
+        # refused by name until it is re-qualified on hardware.
+        result = qwen4_fused_moe.admit_qwen4_fused_down(
+            *self.production_inputs(1)
+        )
+        self.assertTrue(result.accepted, result.reason)
+        self.assertEqual(result.tokens, 1)
+
+        self.assertNotIn(3, qwen4_fused_moe.QUALIFIED_TOKEN_WIDTHS)
+        result = qwen4_fused_moe.admit_qwen4_fused_down(
+            *self.production_inputs(3)
+        )
+        self.assertFalse(result.accepted)
+        self.assertIn("M=3 is not qualified", result.reason)
+        self.assertEqual(result.tokens, 3)
+
+        with patch.object(qwen4_fused_moe, "QUALIFIED_TOKEN_WIDTHS", (1, 3)):
             result = qwen4_fused_moe.admit_qwen4_fused_down(
-                *self.production_inputs(tokens)
+                *self.production_inputs(3)
             )
-            self.assertTrue(result.accepted, result.reason)
-            self.assertEqual(result.tokens, tokens)
+        self.assertTrue(result.accepted, result.reason)
+        self.assertEqual(result.tokens, 3)
+
+    def test_auto_variant_follows_one_table(self):
+        self.assertEqual(qwen4_fused_moe.auto_variant(1), "tile4")
+        self.assertEqual(
+            qwen4_fused_moe.auto_variant(3),
+            qwen4_fused_moe.AUTO_VARIANT_BY_WIDTH[3],
+        )
+        with self.assertRaisesRegex(ValueError, "no auto variant"):
+            qwen4_fused_moe.auto_variant(4)
+        for width in qwen4_fused_moe.QUALIFIED_TOKEN_WIDTHS:
+            self.assertIn(width, qwen4_fused_moe.AUTO_VARIANT_BY_WIDTH)
+
+    def test_kernels_address_routing_tensors_through_strides(self):
+        # The router's top-k slice of a [M, 512] gate matrix is a strided
+        # view; a kernel that indexes indices[token * 10 + slot] reads the
+        # wrong experts for every token past the first. Guard both kernels.
+        for source in (
+            qwen4_fused_moe._DOWN_REDUCE_SOURCE,
+            qwen4_fused_moe._DOWN_REDUCE_TILE4_SOURCE,
+        ):
+            for name in ("indices", "scores", "hidden"):
+                self.assertIn(f"{name}_strides", source)
+                self.assertIn(f"{name}_shape", source)
+            self.assertNotIn("indices[token * TOPK + slot]", source)
+            self.assertNotIn("scores[token * TOPK + slot]", source)
 
     def test_prefill_and_wrong_quantization_fall_back(self):
         result = qwen4_fused_moe.admit_qwen4_fused_down(
             *self.production_inputs(4)
         )
         self.assertFalse(result.accepted)
-        self.assertIn("M=1 or M=3", result.reason)
+        self.assertIn("M=4 is not qualified", result.reason)
 
         result = qwen4_fused_moe.admit_qwen4_fused_down(
             *self.production_inputs(1), bits=8
@@ -105,6 +147,8 @@ class TestFusedMoeAdmission(unittest.TestCase):
 
         values = self.production_inputs(3)
         with patch.object(
+            qwen4_fused_moe, "QUALIFIED_TOKEN_WIDTHS", (1, 3)
+        ), patch.object(
             qwen4_fused_moe, "_kernel", return_value=fake_kernel
         ) as select:
             for variant, grid, threadgroup in (
@@ -121,6 +165,10 @@ class TestFusedMoeAdmission(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unknown Qwen4 fused-down variant"):
             qwen4_fused_moe.qwen4_fused_down(*values, variant="bogus")
+
+        # Outside the qualified widths the dispatcher refuses, not the kernel.
+        with self.assertRaisesRegex(ValueError, "M=3 is not qualified"):
+            qwen4_fused_moe.qwen4_fused_down(*values, variant="scalar")
 
 
 class TestFusedMoeIntegration(unittest.TestCase):
@@ -189,7 +237,7 @@ class TestFusedMoeIntegration(unittest.TestCase):
     def test_auto_selects_qualified_variant_by_token_width(self):
         down = FakeQuantizedDown()
         sentinel = object()
-        for tokens, expected in ((1, "tile4"), (3, "scalar")):
+        for tokens, expected in ((1, "tile4"), (3, "tile4")):
             hidden = FakeArray((1, tokens, 10, 1, 640), mx.bfloat16)
             indices = FakeArray((1, tokens, 10), mx.uint32)
             scores = FakeArray((1, tokens, 10), mx.bfloat16)
@@ -212,6 +260,16 @@ class TestFusedMoeIntegration(unittest.TestCase):
                 )
             self.assertIs(result, sentinel)
             self.assertEqual(execute.call_args.kwargs["variant"], expected)
+
+    def test_receipt_outcome_matches_auto_table(self):
+        for tokens in (1, 3):
+            indices = FakeArray((1, tokens, 10), mx.uint32)
+            indices.size = tokens * 10
+            self.assertEqual(
+                qwen3_next._fused_outcome("auto", indices),
+                qwen4_fused_moe.AUTO_VARIANT_BY_WIDTH[tokens],
+            )
+            self.assertEqual(qwen3_next._fused_outcome("tile4", indices), "tile4")
 
     def test_switch_singleton_is_removed_before_kernel(self):
         hidden = FakeArray((1, 1, 10, 1, 640), mx.bfloat16)

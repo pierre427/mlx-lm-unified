@@ -41,6 +41,17 @@ _SORTED_GATHER_TAIL_BUG = True
 # +2.08% MTP-verify win (bit-identical output, non-overlapping IQRs at n=12).
 # 20 not lower: sorting at M=1 costs ~0.78% and reuse there is exactly 1.00x,
 # so decode (M=1, 10 assignments) stays unsorted.
+# Re-measured 2026-09-02 (engine-direct self-MTP k=2 at 16K, 6 reps per arm,
+# counterbalanced): 20 -> 40 (M=3 unsorted) is token-identical and moves the
+# round from 42.61 to 42.40 ms, i.e. noise. The "-6.3%" once attributed to
+# leaving M=3 unsorted was the defective fused-down kernel's repetition loop
+# (acceptance 1.0, no rollbacks), not the sort. Note this threshold is NOT
+# what keeps the fused-down kernel off M=3: qwen4_fused_moe refuses the
+# width by name (QUALIFIED_TOKEN_WIDTHS), so raising this alone is safe and
+# buys nothing; raising it to 40 together with qualifying M=3 there engages
+# the fixed tile4 kernel at verify width and measured 41.85 ms per round
+# (-1.8%), with a changed verify token stream. Left at 20 pending that
+# sign-off. See results/qwen4-fused-down-m3-20260902*.json.
 _GATHER_SORT_MIN_ASSIGNMENTS = 20
 
 
