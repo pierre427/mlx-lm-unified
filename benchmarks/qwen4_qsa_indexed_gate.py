@@ -996,14 +996,15 @@ def phase4_model(
             "device_attestation": device,
         }
         passed = (
-            max_logprob_delta <= 0.002
+            gather["digest"] == indexed["digest"]
+            and max_logprob_delta == 0.0
             and not status["fallbacks"]
             and status["candidate"] is not None
             and reached == expected_verify_calls
             and device["expected"] == expected_verify_calls
             and device["observed"] == expected_verify_calls
             and device["mismatches"] == 0
-            and (divergence is None or divergence["classification"] == "NEAR_TIE")
+            and divergence is None
         )
         row = {
             "context": context,
