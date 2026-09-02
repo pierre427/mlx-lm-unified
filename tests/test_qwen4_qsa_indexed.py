@@ -1211,6 +1211,98 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         )
         self.assertEqual(indexed.qsa_indexed_status()["fallbacks"], 1)
 
+    def _current_build_allowlist(self):
+        return mock.patch.object(
+            indexed,
+            "_EXACT_MLX_BUILDS",
+            frozenset({str(getattr(mx, "__version__", "unknown"))}),
+        )
+
+    def _header_digest(self, digest):
+        return mock.patch.object(
+            indexed, "_sdpa_vector_header_sha256", return_value=digest
+        )
+
+    def _no_escape_hatch(self):
+        return mock.patch.dict(
+            os.environ,
+            {"MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX": ""},
+        )
+
+    def test_absent_sdpa_header_digests_to_none(self):
+        missing = Path(tempfile.gettempdir()) / "qsa-absent-sdpa_vector.h"
+        self.assertFalse(missing.exists())
+        with mock.patch.object(
+            indexed, "_sdpa_vector_header_path", return_value=missing
+        ):
+            indexed._sdpa_vector_header_sha256.cache_clear()
+            try:
+                self.assertIsNone(indexed._sdpa_vector_header_sha256())
+                self.assertEqual(
+                    indexed._sdpa_header_state(),
+                    (False, None, "sdpa_header_missing"),
+                )
+            finally:
+                indexed._sdpa_vector_header_sha256.cache_clear()
+        self.assertIsNotNone(indexed._sdpa_vector_header_sha256())
+
+    def test_pinned_sdpa_header_admits_past_the_exactness_gate(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        indexed.qsa_indexed_status(reset=True)
+        with (
+            self._current_build_allowlist(),
+            self._header_digest(indexed._SDPA_VECTOR_HEADER_SHA256),
+            self._no_escape_hatch(),
+        ):
+            status = indexed.qsa_indexed_status()
+            self.assertTrue(status["mlx_build_verified"])
+            self.assertTrue(status["sdpa_header_verified"])
+            self.assertEqual(
+                status["sdpa_header_sha256_prefix"],
+                indexed._SDPA_VECTOR_HEADER_SHA256[:12],
+            )
+            qwen4_exp._indexed_qsa_attention_or_gather(
+                q, k, v, compact, scale=8**-0.5, splits=4, tile_rows=1
+            )
+        counts = indexed.qsa_indexed_status()["counts"]
+        self.assertNotIn("mlx_build_unverified", counts)
+        self.assertNotIn("sdpa_header_mismatch", counts)
+        self.assertNotIn("sdpa_header_missing", counts)
+
+    def _assert_header_decline(self, digest, reason, prefix):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        expected = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=1
+        )
+        indexed.qsa_indexed_status(reset=True)
+        with (
+            self._current_build_allowlist(),
+            self._header_digest(digest),
+            self._no_escape_hatch(),
+        ):
+            status = indexed.qsa_indexed_status()
+            self.assertTrue(status["mlx_build_verified"])
+            self.assertFalse(status["sdpa_header_verified"])
+            self.assertEqual(status["sdpa_header_sha256_prefix"], prefix)
+            actual = qwen4_exp._indexed_qsa_attention_or_gather(
+                q, k, v, compact, scale=8**-0.5, splits=4, tile_rows=1
+            )
+        mx.eval(actual, expected)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        status = indexed.qsa_indexed_status()
+        self.assertEqual(status["counts"][reason], 1)
+        self.assertEqual(status["fallbacks"], 1)
+        self.assertEqual(status["last_decision"]["reason"], reason)
+        self.assertFalse(status["last_decision"]["engaged"])
+
+    def test_mismatched_sdpa_header_falls_back_with_specific_receipt(self):
+        self._assert_header_decline("0" * 64, "sdpa_header_mismatch", "0" * 12)
+
+    def test_missing_sdpa_header_falls_back_with_specific_receipt(self):
+        self._assert_header_decline(None, "sdpa_header_missing", None)
+
     def test_quantized_admission_reason_matrix(self):
         cache = SimpleNamespace(
             group_size=64,
