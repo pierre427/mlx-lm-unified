@@ -4739,6 +4739,14 @@ class TextModel(nn.Module):
                 "MLX_QWEN4_NORM_CONVENTION must be 'raw' or 'converted', "
                 f"got {override!r}"
             )
+        # Fold trigger: the conv1d layout proxy.  HF ships conv1d as (C, 1, K)
+        # so shape[-1] == K != 1 means "raw"; anything we converted carries
+        # (C, K, 1) and must not be folded twice.  Upstream mlx-lm #1788
+        # (ac83bb4) keys the same fold on the `model.language_model.` key
+        # prefix instead; both proxies are correct for their own converter's
+        # output, so a checkpoint that is HF-prefixed but conv1d-converted (or
+        # the reverse) would be read differently by the two loaders.  The
+        # convention check below is what makes that failure loud.
         raw = any("conv1d.weight" in key and value.shape[-1] != 1 for key, value in weights.items())
         if override:
             raw = override == "raw"
@@ -4760,60 +4768,113 @@ class TextModel(nn.Module):
                 weights[key] = value.moveaxis(2, 1)
             if raw and any(key.endswith(suffix) for suffix in zero_centered):
                 weights[key] = value + 1.0
-        if not override:
+        # The env override selects the fold; it does not skip the check.  Use
+        # MLX_QWEN4_NORM_CONVENTION_UNCHECKED=1 only to gate a checkpoint whose
+        # gains genuinely cannot carry the evidence.
+        if os.environ.get("MLX_QWEN4_NORM_CONVENTION_UNCHECKED", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
             self._check_norm_convention(weights, zero_centered, raw)
         return weights
 
-    @staticmethod
-    def _check_norm_convention(weights, zero_centered, raw):
-        """Refuse the exact +-1 signature of a wrong convention guess.
+    NORM_CONVENTION_MARGIN = 0.25
 
-        A wrong zero-vs-ones-centered guess loads cleanly and produces
-        deterministic garbage (mlx-vlm #2041/#2045 class). The check is
-        comparative, not a legitimacy window on learned gains: it refuses
-        only when the opposite convention fits gains-near-1 decisively
-        better across the per-family aggregates.
+    @classmethod
+    def _check_norm_convention(cls, weights, zero_centered, raw):
+        """Require decisive evidence that the loaded gains are one-centered.
+
+        A wrong zero-vs-one-centered guess loads cleanly and produces
+        deterministic garbage (mlx-vlm #2041/#2045 class).  After `sanitize`
+        has applied (or declined) the fold, our in-memory convention is
+        one-centered, so the gains themselves have to say so.  Group every
+        gain whose key ends in a `zero_centered` suffix by family, take each
+        family's mean, and score three count-weighted aggregates over the
+        summed n:
+
+            A_one  = sum(n * |mean - 1|) / sum(n)          # what we applied
+            A_zero = sum(n * |mean|) / sum(n)              # +1 fold missing
+            A_alt  = sum(n * |mean + shift - 1|) / sum(n)  # opposite fold
+
+        where ``shift`` un-applies the fold (-1 if it ran, +1 if it did not;
+        for the not-folded case A_alt is identically A_zero).  The applied
+        convention must beat both by the margin: ``A_one + MARGIN <= A_zero``
+        and ``A_one + MARGIN <= A_alt``.
+
+        A_one/A_zero is an absolute score against the one-centered target
+        rather than a comparison of the two fold outcomes, so it fails closed
+        twice: on a decisive wrong convention (``A_zero + MARGIN < A_one``)
+        *and* on ambiguity (the two within MARGIN).  Ambiguity is the point --
+        a norm-sparse artifact such as a standalone MTP head separates the
+        hypotheses by only ~0.15, which a purely comparative guard passes
+        silently, and that slice is exactly where a wrong answer is
+        unrecoverable.  A_alt keeps the double-add signature (gains near 2,
+        which is decisively neither zero- nor one-centered but sits far from
+        both) refused as before.
+
+        `linear_attn.norm.weight` is deliberately absent from `zero_centered`
+        and so excluded here: the gated GDN norm is one-centered by
+        construction in the source checkpoint and is never folded.
         """
         families = {}
         for key, value in weights.items():
             for suffix in zero_centered:
                 if key.endswith(suffix):
                     families.setdefault(suffix, []).append(
-                        (key, value.astype(mx.float32).mean().item())
+                        value.astype(mx.float32).mean().item()
                     )
                     break
         if not families:
             return
-        # Post-sanitize means; the alternative convention differs by -1
-        # (raw applied +1 that converted would not) or +1 (the reverse).
+        margin = cls.NORM_CONVENTION_MARGIN
         shift = -1.0 if raw else 1.0
-        total = chosen = alternative = 0.0
+        total = a_one = a_zero = a_alt = 0.0
         rows = []
-        for suffix, entries in families.items():
-            count = len(entries)
-            mean = sum(value for _, value in entries) / count
-            chosen += count * abs(mean - 1.0)
-            alternative += count * abs(mean + shift - 1.0)
+        for suffix, means in families.items():
+            count = len(means)
+            mean = sum(means) / count
+            a_one += count * abs(mean - 1.0)
+            a_zero += count * abs(mean)
+            a_alt += count * abs(mean + shift - 1.0)
             total += count
-            rows.append((abs(mean - 1.0), suffix, count, mean))
-        if alternative / total + 0.25 >= chosen / total:
+            rows.append((abs(mean - 1.0) - min(abs(mean), abs(mean + shift - 1.0)),
+                         suffix, count, mean))
+        a_one /= total
+        a_zero /= total
+        a_alt /= total
+        if a_one + margin <= a_zero and a_one + margin <= a_alt:
             return
         rows.sort(reverse=True)
         worst = ", ".join(
             f"{suffix} (n={count}, mean {mean:.3f})"
             for _, suffix, count, mean in rows[:4]
         )
-        applied, other = "raw (+1 offset)", "converted (no offset)"
-        if not raw:
-            applied, other = other, applied
+        applied = "raw (+1 offset applied)" if raw else "converted (no offset applied)"
+        if a_zero + margin < a_one:
+            verdict = (
+                "the stored RMSNorm gains are decisively zero-centered, so the "
+                "+1 fold is missing"
+            )
+        elif a_alt + margin < a_one:
+            verdict = (
+                "the opposite fold fits the stored RMSNorm gains decisively "
+                "better, so the offset has been applied the wrong number of "
+                "times"
+            )
+        else:
+            verdict = (
+                "the stored RMSNorm gains do not decisively favour either "
+                "convention, so the applied fold cannot be verified"
+            )
         raise ValueError(
-            "norm convention mismatch: the conv1d layout proxy chose the "
-            f"{applied} convention, but the {other} convention fits the "
-            f"stored RMSNorm gains decisively better (mean |gain-1| "
-            f"{chosen / total:.3f} vs {alternative / total:.3f}). Worst "
-            f"families: {worst}. If the proxy misreads this checkpoint, set "
-            "MLX_QWEN4_NORM_CONVENTION=raw|converted to force the "
-            "convention and skip this check."
+            f"norm convention check failed: the fold trigger chose the {applied} "
+            f"convention, but {verdict} (A_one {a_one:.3f} vs A_zero {a_zero:.3f} "
+            f"vs A_alt {a_alt:.3f}; required A_one + {margin:.2f} <= both, over "
+            f"n={int(total)} gains in {len(families)} families). Worst families: "
+            f"{worst}. Set MLX_QWEN4_NORM_CONVENTION=raw|converted to force the "
+            "fold (the check still runs), or "
+            "MLX_QWEN4_NORM_CONVENTION_UNCHECKED=1 to skip this check entirely."
         )
 
     @property
