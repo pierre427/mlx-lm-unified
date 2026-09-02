@@ -378,6 +378,52 @@ class TestQSAIndexedReference(unittest.TestCase):
             indexed.qsa_indexed_status()["counts"]["dispatch_raised"], 1
         )
 
+    def test_quantized_dispatch_failure_uses_dequantized_gather(self):
+        mx.random.seed(35)
+        compact = _compact(1, 3)
+        q = mx.random.normal((1, 4, 3, 32)).astype(mx.bfloat16)
+        k = mx.random.normal((1, 2, 32, 32)).astype(mx.bfloat16)
+        v = mx.random.normal((1, 2, 32, 32)).astype(mx.bfloat16)
+        q_keys = mx.quantize(k, group_size=32, bits=8)
+        q_values = mx.quantize(v, group_size=32, bits=8)
+        expected = _gather_qsa_quantized_attention(
+            q,
+            q_keys,
+            q_values,
+            compact,
+            scale=32**-0.5,
+            tile_rows=1,
+            group_size=32,
+            key_bits=8,
+            value_bits=8,
+        )
+        indexed.qsa_indexed_status(reset=True)
+        with mock.patch.object(
+            qwen4_exp,
+            "qwen4_qsa_indexed_quantized_attention",
+            side_effect=RuntimeError("synthetic quantized dispatch failure"),
+        ):
+            actual = qwen4_exp._indexed_qsa_quantized_attention_or_gather(
+                q,
+                q_keys,
+                q_values,
+                compact,
+                scale=32**-0.5,
+                splits=4,
+                tile_rows=1,
+                group_size=32,
+                key_bits=8,
+                value_bits=8,
+            )
+        mx.eval(actual, expected)
+        np.testing.assert_array_equal(
+            np.asarray(actual.astype(mx.float32)),
+            np.asarray(expected.astype(mx.float32)),
+        )
+        status = indexed.qsa_indexed_status()
+        self.assertEqual(status["counts"]["quantized_dispatch_raised"], 1)
+        self.assertEqual(status["fallbacks"], 1)
+
     def test_capture_writes_mismatch_and_returns_gather(self):
         mx.random.seed(37)
         compact = _compact(1, 3)
