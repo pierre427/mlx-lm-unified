@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import threading
 import time
 from collections import Counter
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -129,6 +131,49 @@ def _mlx_build_hash() -> str | None:
     if len(marker) == 2 and marker[1]:
         return marker[1]
     return None
+
+
+def _sdpa_vector_header_path() -> Path | None:
+    """Return the installed MLX ``sdpa_vector.h``, or None when unlocatable."""
+
+    core_file = getattr(mx, "__file__", None)
+    if not core_file:
+        return None
+    return (
+        Path(core_file).resolve().parent
+        / "include"
+        / "mlx"
+        / "backend"
+        / "metal"
+        / "kernels"
+        / "sdpa_vector.h"
+    )
+
+
+@lru_cache(maxsize=1)
+def _sdpa_vector_header_sha256() -> str | None:
+    """Digest the installed header once, or None when it is not shipped."""
+
+    path = _sdpa_vector_header_path()
+    if path is None or not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _sdpa_header_state() -> tuple[bool, str | None, str | None]:
+    """Return (verified, observed digest, decline reason) for the source pin.
+
+    The version allowlist only names a build string; a local rebuild can keep
+    that string while shipping different ``sdpa_vector_2pass`` arithmetic, and
+    the exactness contract is a clone of *that source*. Both must hold.
+    """
+
+    observed = _sdpa_vector_header_sha256()
+    if observed is None:
+        return False, None, "sdpa_header_missing"
+    if observed != _SDPA_VECTOR_HEADER_SHA256:
+        return False, observed, "sdpa_header_mismatch"
+    return True, observed, None
 
 
 def indexed_splits_for(u_width: int) -> int:
@@ -372,6 +417,8 @@ def record_qsa_indexed_receipt(
         _STATUS_WIDTHS[_width_bucket(int(length))][outcome] += 1
         if reason in {
             "mlx_build_unverified",
+            "sdpa_header_mismatch",
+            "sdpa_header_missing",
             "probe_declined",
             "dispatch_raised",
             "quantized_probe_declined",
@@ -477,6 +524,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
     global _STATUS_CANDIDATE, _STATUS_FALLBACKS, _STATUS_LAST
     global _STATUS_DEVICE_EXPECTED, _STATUS_DEVICE_OBSERVED
     global _STATUS_DEVICE_MISMATCHES
+    header_verified, header_sha, _ = _sdpa_header_state()
     with _STATUS_LOCK:
         _reconcile_device_receipts_locked()
         report = {
@@ -504,6 +552,10 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
                     "MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX"
                 )
                 == "1"
+            ),
+            "sdpa_header_verified": header_verified,
+            "sdpa_header_sha256_prefix": (
+                None if header_sha is None else header_sha[:12]
             ),
             "counts": dict(_STATUS_COUNTS),
             "query_width_counts": {
@@ -1361,6 +1413,13 @@ def qwen4_qsa_indexed_attention(
             f"indexed QSA exactness is unproven on mlx {mlx_version}",
             reason="mlx_build_unverified",
         )
+    header_verified, _, header_reason = _sdpa_header_state()
+    if not header_verified and not allow_unverified:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA exactness clones the installed sdpa_vector.h "
+            f"({header_reason})",
+            reason=header_reason,
+        )
     if not indexed_kernel_available():
         raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
     if q.ndim != 4 or k.ndim != 4 or k.shape != v.shape:
@@ -1526,6 +1585,13 @@ def qwen4_qsa_indexed_quantized_attention(
         raise QSAIndexedProbeDeclined(
             f"indexed QSA exactness is unproven on mlx {mlx_version}",
             reason="mlx_build_unverified",
+        )
+    header_verified, _, header_reason = _sdpa_header_state()
+    if not header_verified and not allow_unverified:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA exactness clones the installed sdpa_vector.h "
+            f"({header_reason})",
+            reason=header_reason,
         )
     if not indexed_kernel_available():
         raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
