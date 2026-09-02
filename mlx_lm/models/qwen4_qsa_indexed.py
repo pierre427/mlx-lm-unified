@@ -1267,7 +1267,7 @@ def qwen4_qsa_indexed_attention(
             "indexed QSA requires MLX_SDPA_BLOCKS=128"
         )
 
-    _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+    u_width = compact_u_width(compact)
     token_width = u_width * _BLOCK_SIZE
     if token_width <= 1024 or token_width > 8192:
         raise QSAIndexedProbeDeclined(

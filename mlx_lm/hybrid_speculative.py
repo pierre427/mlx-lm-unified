@@ -1993,10 +1993,12 @@ def _propose_batched_self_mtp_round(
         raise ValueError("mixed shared-QSA modes cannot share a draft cycle")
 
     drafts: List[List[int]] = [[] for _ in batch.lanes]
+    draft_tokens: List[List[mx.array]] = [[] for _ in batch.lanes]
     draft_logprobs: List[List[mx.array]] = [[] for _ in batch.lanes]
     draft_h = [lane.seed_h for lane in batch.lanes]
     draft_steps = [0] * n_lanes
     max_k = max(k_vector)
+    greedy_cycle = all(lane.sampling_temp <= 0 for lane in batch.lanes)
     if max_k > 0:
         start_cycle = getattr(model, "mtp_start_cycle", None)
         if start_cycle is not None:
@@ -2049,8 +2051,15 @@ def _propose_batched_self_mtp_round(
                 pos = valid - 1
                 draft_h[row] = post[row : row + 1, pos : pos + 1, :]
                 lp = _lane_mtp_logprobs(lane, d_logits[row, pos])
-                token = _sample_from_logprobs(lp, lane.sampling_temp, rng=lane.rng)
-                drafts[row].append(token)
+                if greedy_cycle:
+                    token = mx.argmax(lp).astype(mx.uint32)
+                else:
+                    hosted_token = _sample_from_logprobs(
+                        lp, lane.sampling_temp, rng=lane.rng
+                    )
+                    token = mx.array(hosted_token, mx.uint32)
+                    drafts[row].append(hosted_token)
+                draft_tokens[row].append(token)
                 draft_logprobs[row].append(lp)
                 draft_steps[row] += 1
                 lane.pending_hs = None
@@ -2060,9 +2069,14 @@ def _propose_batched_self_mtp_round(
                 lengths = [1 if depth < k else 0 for k in k_vector]
                 right_padding = [1 - length for length in lengths]
                 hidden = mx.concatenate(draft_h)
-                tokens = mx.array(
-                    [[drafts[row][-1] if lengths[row] else 0] for row in range(n_lanes)],
-                    mx.uint32,
+                tokens = mx.concatenate(
+                    [
+                        mx.reshape(draft_tokens[row][-1], (1, 1))
+                        if lengths[row]
+                        else mx.zeros((1, 1), mx.uint32)
+                        for row in range(n_lanes)
+                    ],
+                    axis=0,
                 )
                 _prepare_self_mtp_cache_group(
                     batch.caches.draft, lengths, right_padding
@@ -2078,10 +2092,15 @@ def _propose_batched_self_mtp_round(
                         continue
                     draft_h[row] = post[row : row + 1, -1:, :]
                     lp = _lane_mtp_logprobs(lane, d_logits[row, -1])
-                    token = _sample_from_logprobs(
-                        lp, lane.sampling_temp, rng=lane.rng
-                    )
-                    drafts[row].append(token)
+                    if greedy_cycle:
+                        token = mx.argmax(lp).astype(mx.uint32)
+                    else:
+                        hosted_token = _sample_from_logprobs(
+                            lp, lane.sampling_temp, rng=lane.rng
+                        )
+                        token = mx.array(hosted_token, mx.uint32)
+                        drafts[row].append(hosted_token)
+                    draft_tokens[row].append(token)
                     draft_logprobs[row].append(lp)
                     draft_steps[row] += 1
         finally:
@@ -2100,11 +2119,17 @@ def _propose_batched_self_mtp_round(
     valid_lengths = tuple(k + 1 for k in k_vector)
     width = max(valid_lengths)
     right_padding = tuple(width - valid for valid in valid_lengths)
-    verify_rows = [
-        [lane.cur] + row + [0] * (width - len(row) - 1)
-        for lane, row in zip(batch.lanes, drafts)
-    ]
-    verify_ids = mx.array(verify_rows, mx.uint32)
+    verify_rows = []
+    for lane, row in zip(batch.lanes, draft_tokens):
+        verify_rows.append(
+            mx.concatenate(
+                [mx.array([[lane.cur]], mx.uint32)]
+                + [mx.reshape(token, (1, 1)) for token in row]
+                + [mx.zeros((1, width - len(row) - 1), mx.uint32)],
+                axis=1,
+            )
+        )
+    verify_ids = mx.concatenate(verify_rows, axis=0)
     _prepare_self_mtp_cache_group(
         batch.caches.target, valid_lengths, right_padding
     )
@@ -2118,39 +2143,72 @@ def _propose_batched_self_mtp_round(
 
     old_curs = tuple(lane.cur for lane in batch.lanes)
     old_seed_hs = tuple(lane.seed_h for lane in batch.lanes)
-    accepted: List[int] = []
-    bonuses: List[int] = []
     lane_logprobs: List[mx.array] = []
     lane_hiddens: List[mx.array] = []
-    output_rows: List[Tuple[MTPToken, ...]] = []
     for row, (lane, k, valid) in enumerate(
         zip(batch.lanes, k_vector, valid_lengths)
     ):
-        processed = []
-        for pos in range(valid):
-            processor_tokens = mx.concatenate(
-                [
-                    lane.token_prefix,
-                    mx.array([lane.cur] + drafts[row][:pos], mx.uint32),
-                ]
-            )
-            processed.append(
-                _apply_logits_processors(
-                    lane.logits_processors,
-                    processor_tokens,
-                    batched_logits[row, pos],
+        if lane.logits_processors:
+            processed = []
+            for pos in range(valid):
+                processor_tokens = mx.concatenate(
+                    [lane.token_prefix, mx.array([lane.cur], mx.uint32)]
+                    + [
+                        mx.reshape(token, (1,))
+                        for token in draft_tokens[row][:pos]
+                    ]
                 )
-            )
-        logprobs = _lane_mtp_logprobs(lane, mx.stack(processed))
+                processed.append(
+                    _apply_logits_processors(
+                        lane.logits_processors,
+                        processor_tokens,
+                        batched_logits[row, pos],
+                    )
+                )
+            logits = mx.stack(processed)
+        else:
+            logits = batched_logits[row, :valid]
+        logprobs = _lane_mtp_logprobs(lane, logits)
         hidden = batched_hidden[row : row + 1, :valid, :]
         lane_logprobs.append(logprobs)
         lane_hiddens.append(hidden)
 
-        if k == 0:
-            n_accept = 0
-            bonus = _sample_from_logprobs(
-                logprobs[0], lane.sampling_temp, rng=lane.rng
+    greedy_targets = None
+    if greedy_cycle:
+        target_rows = []
+        drafted_rows = []
+        for row, (k, valid) in enumerate(zip(k_vector, valid_lengths)):
+            target = mx.argmax(lane_logprobs[row], axis=-1).astype(mx.uint32)
+            target_rows.append(mx.pad(target, [(0, width - valid)]))
+            drafted = (
+                mx.stack(draft_tokens[row])
+                if k
+                else mx.zeros((0,), mx.uint32)
             )
+            drafted_rows.append(mx.pad(drafted, [(0, width - k)]))
+        accept_payload = mx.stack(
+            [mx.stack(target_rows), mx.stack(drafted_rows)]
+        )
+        record_verify_sync("hybrid.greedy.accept_boundary")
+        mx.eval(accept_payload)
+        greedy_targets, hosted_drafts = accept_payload.tolist()
+        drafts = [row[:k] for row, k in zip(hosted_drafts, k_vector)]
+
+    accepted: List[int] = []
+    bonuses: List[int] = []
+    output_rows: List[Tuple[MTPToken, ...]] = []
+    for row, (lane, k) in enumerate(zip(batch.lanes, k_vector)):
+        logprobs = lane_logprobs[row]
+
+        if k == 0:
+            if greedy_cycle:
+                n_accept = 0
+                bonus = int(greedy_targets[row][0])
+            else:
+                n_accept = 0
+                bonus = _sample_from_logprobs(
+                    logprobs[0], lane.sampling_temp, rng=lane.rng
+                )
         elif lane.sampling_temp > 0:
             if lane.logprob_transform is not None:
                 n_accept, bonus = _batched_residual_verify(
@@ -2199,8 +2257,11 @@ def _propose_batched_self_mtp_round(
                         logprobs[n_accept], lane.sampling_temp, rng=lane.rng
                     )
         else:
-            record_verify_sync("hybrid.greedy.targets_tolist")
-            targets = mx.argmax(logprobs, axis=-1).tolist()
+            if greedy_cycle:
+                targets = greedy_targets[row]
+            else:
+                record_verify_sync("hybrid.greedy.targets_tolist")
+                targets = mx.argmax(logprobs, axis=-1).tolist()
             n_accept = 0
             while n_accept < k and targets[n_accept] == drafts[row][n_accept]:
                 n_accept += 1
@@ -2659,98 +2720,132 @@ def _mtp_draft_verify_loop_impl(
             continue
         stats.cycles += 1
 
-        # ---- draft k tokens with the MTP head (chained) ----------------------
-        if not persistent:
-            mtp_cache = model.make_mtp_cache()
-        if hasattr(model, "mtp_start_cycle"):
-            model.mtp_start_cycle(mtp_cache, share_qsa_indices and k > 1)
-        drafts: List[int] = []
-        draft_logprobs: List[mx.array] = []
-        h, tok = seed_h, mx.array([[cur]], mx.uint32)
-        with mx.stream(generation_stream):
-            for i in range(k):
-                if i == 0 and pending_hs is not None:
-                    hs = mx.concatenate([pending_hs, h], axis=1)
-                    ts = mx.array([pending_ts + [cur]], mx.uint32)
+        with verify_sync_round():
+            # ---- draft k tokens with the MTP head (chained) ------------------
+            if not persistent:
+                mtp_cache = model.make_mtp_cache()
+            if hasattr(model, "mtp_start_cycle"):
+                model.mtp_start_cycle(mtp_cache, share_qsa_indices and k > 1)
+            greedy_device = not sampling_temp and not logits_processors
+            drafts: List[int] = []
+            draft_tokens: List[mx.array] = []
+            draft_logprobs: List[mx.array] = []
+            h, tok = seed_h, mx.array([[cur]], mx.uint32)
+            with mx.stream(generation_stream):
+                for i in range(k):
+                    if i == 0 and pending_hs is not None:
+                        hs = mx.concatenate([pending_hs, h], axis=1)
+                        ts = mx.array([pending_ts + [cur]], mx.uint32)
+                    else:
+                        hs, ts = h, tok
+                    d_logits, post = model.mtp_step(hs, ts, mtp_cache)
+                    h = post[:, -1:, :]
+                    d_lp = _logprobs(d_logits[0, -1])
+                    if greedy_device:
+                        draft_token = mx.argmax(d_lp).astype(mx.uint32)
+                        draft_tokens.append(draft_token)
+                        tok = mx.reshape(draft_token, (1, 1))
+                    else:
+                        draft = _sample_from_logprobs(
+                            d_lp, sampling_temp, rng=rng
+                        )
+                        drafts.append(draft)
+                        tok = mx.array([[draft]], mx.uint32)
+                    draft_logprobs.append(d_lp)
+
+            # ---- verify: trunk over [cur, drafts...] in one forward ----------
+            verify_in = (
+                mx.concatenate(
+                    [mx.array([[cur]], mx.uint32)]
+                    + [mx.reshape(token, (1, 1)) for token in draft_tokens],
+                    axis=1,
+                )
+                if greedy_device
+                else mx.array([[cur] + drafts], mx.uint32)
+            )
+            with mx.stream(generation_stream):
+                vlogit_hidden, vhidden = _mtp_backbone(model, verify_in, cache)
+                vlogits = model.logits(vlogit_hidden)
+                if greedy_device:
+                    logprobs = _logprobs(vlogits[0])
                 else:
-                    hs, ts = h, tok
-                d_logits, post = model.mtp_step(hs, ts, mtp_cache)
-                h = post[:, -1:, :]
-                d_lp = _logprobs(d_logits[0, -1])
-                d = _sample_from_logprobs(d_lp, sampling_temp, rng=rng)
-                drafts.append(d)
-                draft_logprobs.append(d_lp)
-                tok = mx.array([[d]], mx.uint32)
+                    processed_logits = []
+                    for i in range(k + 1):
+                        proc_tokens = mx.concatenate(
+                            [
+                                token_prefix,
+                                mx.array([cur] + drafts[:i], mx.uint32),
+                            ]
+                        )
+                        processed_logits.append(
+                            _apply_logits_processors(
+                                logits_processors, proc_tokens, vlogits[0, i]
+                            )
+                        )
+                    logprobs = _logprobs(mx.stack(processed_logits))
+                targets = mx.argmax(logprobs, axis=-1).astype(mx.uint32)
 
-        # ---- verify: trunk over [cur, drafts...] in one forward --------------
-        verify_in = mx.array([[cur] + drafts], mx.uint32)   # [1, k+1]
-        with mx.stream(generation_stream):
-            vlogit_hidden, vhidden = _mtp_backbone(model, verify_in, cache)
-            vlogits = model.logits(vlogit_hidden)
-            processed_logits = []
-            for i in range(k + 1):
-                proc_tokens = mx.concatenate(
-                    [
-                        token_prefix,
-                        mx.array([cur] + drafts[:i], mx.uint32),
-                    ]
+            if greedy_device:
+                padded_drafts = mx.concatenate(
+                    [mx.stack(draft_tokens), mx.zeros((1,), mx.uint32)]
                 )
-                processed_logits.append(
-                    _apply_logits_processors(
-                        logits_processors, proc_tokens, vlogits[0, i]
+                accept_payload = mx.stack([targets, padded_drafts])
+                record_verify_sync("hybrid.greedy.accept_boundary")
+                mx.eval(accept_payload, vhidden)
+                targets, hosted_drafts = accept_payload.tolist()
+                drafts = hosted_drafts[:k]
+            else:
+                mx.eval(targets, vhidden)
+
+            n_accept = 0
+            if sampling_temp and sampling_temp > 0:
+                if logprob_transform is not None:
+                    # Transformed distributions: batched residual acceptance
+                    # (one sync for the whole scan). Kept off the incumbent
+                    # paths so their sync pattern and RNG stream are untouched.
+                    n_accept, bonus = _batched_residual_verify(
+                        logprobs, draft_logprobs, drafts, sampling_temp, rng=rng
                     )
-                )
-            logprobs = _logprobs(mx.stack(processed_logits))
-            targets = mx.argmax(logprobs, axis=-1)
-        mx.eval(targets, vhidden)
-
-        n_accept = 0
-        if sampling_temp and sampling_temp > 0:
-            if logprob_transform is not None:
-                # Transformed distributions: batched residual acceptance
-                # (one sync for the whole scan). Kept off the incumbent
-                # paths so their sync pattern and RNG stream are untouched.
-                n_accept, bonus = _batched_residual_verify(
-                    logprobs, draft_logprobs, drafts, sampling_temp, rng=rng
-                )
-            elif accept_rule == "block":
-                n_accept, bonus = _block_verify(
-                    logprobs, draft_logprobs, drafts, sampling_temp, rng=rng
-                )
-            elif accept_rule == "exact":
-                # Upstream external-draft semantics: sample the target's own
-                # token at every position, accept while it equals the draft's
-                # sample; the first mismatch commits the target sample.
-                sampled = mx.random.categorical(logprobs, key=draw_key(rng))
-                mx.eval(sampled)
-                sampled = sampled.tolist()
-                while n_accept < k and sampled[n_accept] == drafts[n_accept]:
-                    n_accept += 1
-                bonus = int(sampled[n_accept])
-            else:  # "residual" — Leviathan/SpecDec rejection sampling
-                while n_accept < k and _accept_sampled_draft(
-                    logprobs[n_accept],
-                    draft_logprobs[n_accept],
-                    drafts[n_accept],
-                    rng=rng,
-                ):
-                    n_accept += 1
-                if n_accept < k:
-                    bonus = _residual_sample(
+                elif accept_rule == "block":
+                    n_accept, bonus = _block_verify(
+                        logprobs, draft_logprobs, drafts, sampling_temp, rng=rng
+                    )
+                elif accept_rule == "exact":
+                    # Upstream external-draft semantics: sample the target's own
+                    # token at every position, accept while it equals the draft's
+                    # sample; the first mismatch commits the target sample.
+                    sampled = mx.random.categorical(logprobs, key=draw_key(rng))
+                    mx.eval(sampled)
+                    sampled = sampled.tolist()
+                    while n_accept < k and sampled[n_accept] == drafts[n_accept]:
+                        n_accept += 1
+                    bonus = int(sampled[n_accept])
+                else:  # "residual" — Leviathan/SpecDec rejection sampling
+                    while n_accept < k and _accept_sampled_draft(
                         logprobs[n_accept],
                         draft_logprobs[n_accept],
-                        sampling_temp,
+                        drafts[n_accept],
                         rng=rng,
-                    )
-                else:
-                    bonus = _sample_from_logprobs(
-                        logprobs[n_accept], sampling_temp, rng=rng
-                    )
-        else:
-            targets = targets.tolist()
-            while n_accept < k and targets[n_accept] == drafts[n_accept]:
-                n_accept += 1
-            bonus = targets[n_accept]
+                    ):
+                        n_accept += 1
+                    if n_accept < k:
+                        bonus = _residual_sample(
+                            logprobs[n_accept],
+                            draft_logprobs[n_accept],
+                            sampling_temp,
+                            rng=rng,
+                        )
+                    else:
+                        bonus = _sample_from_logprobs(
+                            logprobs[n_accept], sampling_temp, rng=rng
+                        )
+            else:
+                if not greedy_device:
+                    record_verify_sync("hybrid.greedy.targets_tolist")
+                    targets = targets.tolist()
+                while n_accept < k and targets[n_accept] == drafts[n_accept]:
+                    n_accept += 1
+                bonus = int(targets[n_accept])
 
         # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
         trim_prompt_cache(cache, k - n_accept)
