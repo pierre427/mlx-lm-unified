@@ -222,7 +222,7 @@ class TestQSAIndexedReference(unittest.TestCase):
         pass_two = hashlib.sha256(indexed._COMBINE_SOURCE.encode()).hexdigest()
         self.assertEqual(
             pass_one,
-            "8e07306835760abd975c048615e8fb2af128642518a388178afdd4980b7bb26f",
+            "f5980991e8d5fb819a6f73bfb97c3444914cd236006911dee93577fe9eb262bf",
         )
         self.assertEqual(
             pass_two,
@@ -376,6 +376,7 @@ class TestQSAIndexedReference(unittest.TestCase):
                 scale=8**-0.5,
                 threads=64,
                 splits=4,
+                hpt=2,
             )
         self.assertIs(captured["inputs"][0], q)
         self.assertIs(captured["inputs"][1], k_view)
@@ -409,6 +410,7 @@ class TestQSAIndexedReference(unittest.TestCase):
                         scale=8**-0.5,
                         threads=64,
                         splits=4,
+                        hpt=2,
                     )
                 self.assertEqual(raised.exception.reason, "unsupported_mask_layout")
 
@@ -642,10 +644,16 @@ class TestQSAIndexedReference(unittest.TestCase):
                 )
 
     def test_default_ladder_is_timed_and_fastest_candidate_wins(self):
-        candidates = indexed._candidate_ladder(None, 384)
+        candidates = indexed._candidate_ladder(None, 12, 12)
         self.assertEqual(
             candidates,
-            ((384, 128), (384, 64), (384, 32), (384, 16), (384, 8)),
+            (
+                (384, 128, 12),
+                (384, 64, 12),
+                (384, 32, 12),
+                (384, 16, 12),
+                (384, 8, 12),
+            ),
         )
         calls = []
 
@@ -665,10 +673,13 @@ class TestQSAIndexedReference(unittest.TestCase):
             selected, output, counter, timings = indexed._measure_candidates(
                 candidates, dispatch
             )
-        self.assertEqual(selected, (384, 32))
+        self.assertEqual(selected, (384, 32, 12))
         self.assertEqual(int(output.item()), 32)
         self.assertEqual(int(counter.item()), 1)
-        self.assertEqual(set(timings), {8, 16, 32, 64, 128})
+        self.assertEqual(
+            set(timings),
+            {(8, 12), (16, 12), (32, 12), (64, 12), (128, 12)},
+        )
         self.assertEqual(calls, list(candidates) * 2)
 
     def test_device_engagement_is_credited_only_after_reconciliation(self):
@@ -681,9 +692,10 @@ class TestQSAIndexedReference(unittest.TestCase):
                 length=3,
                 context=context,
                 splits=32,
-                candidate=(384, 32),
+                hpt=12,
+                candidate=(384, 32, 12),
                 geometry_key="B1-L3-U520-dtypemlx.core.bfloat16-mask0",
-                candidate_timings_ms={32: 0.4},
+                candidate_timings_ms={(32, 12): 0.4},
             )
         self.assertEqual(indexed._STATUS_COUNTS.get("engaged", 0), 0)
         mx.eval(output)
@@ -872,6 +884,168 @@ class TestQSAIndexedReference(unittest.TestCase):
         normal.assert_called_once()
 
 
+_LEGACY_PASS1_PREAMBLE = """    const uint lane = thread_index_in_simdgroup;
+    const uint head = simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint unit = threadgroup_position_in_grid.z;
+    const uint split = unit % S;
+    const uint bkv = unit / S;
+"""
+
+_HPT_PASS1_PREAMBLE = """    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint unit = threadgroup_position_in_grid.z;
+    const uint slices = GQA / HPT;
+    const uint hslice = unit % slices;
+    const uint rest = unit / slices;
+    const uint head = hslice * HPT + simdgroup_index_in_threadgroup;
+    const uint split = rest % S;
+    const uint bkv = rest / S;
+"""
+
+
+class TestQSAIndexedHeadsPerThreadgroup(unittest.TestCase):
+    """HPT must change only which threadgroup owns a head, never the math."""
+
+    def test_pass1_source_is_legacy_modulo_head_indexing(self):
+        legacy = (
+            Path(__file__).parent
+            / "fixtures"
+            / "qwen4_qsa_indexed_pass1_legacy.metal"
+        ).read_text()
+        self.assertIn(_HPT_PASS1_PREAMBLE, indexed._SOURCE)
+        rebuilt = indexed._SOURCE.replace(
+            _HPT_PASS1_PREAMBLE, _LEGACY_PASS1_PREAMBLE
+        )
+        self.assertEqual(rebuilt.strip("\n"), legacy.strip("\n"))
+
+    def test_quantized_pass1_uses_the_same_head_decomposition(self):
+        self.assertIn(_HPT_PASS1_PREAMBLE, indexed._QUANTIZED_SOURCE)
+
+    def test_candidate_ladder_covers_the_split_by_hpt_grid(self):
+        ladder = indexed._candidate_ladder(None, 12)
+        self.assertEqual(len(ladder), 5 * 4)
+        self.assertEqual(ladder[0], (384, 128, 12))
+        self.assertEqual(ladder[-1], (32, 8, 1))
+        for threads, splits, hpt in ladder:
+            self.assertEqual(threads, hpt * 32)
+            self.assertEqual(12 % hpt, 0)
+            self.assertIn(splits, indexed._SPLIT_CANDIDATES)
+
+    def test_candidate_ladder_pins_a_requested_pair(self):
+        self.assertEqual(
+            indexed._candidate_ladder(32, 12, 6), ((192, 32, 6),)
+        )
+
+    def test_validate_hpt_rejects_unlisted_and_non_divisors(self):
+        with self.assertRaises(ValueError):
+            indexed.validate_hpt(5, 12)
+        with self.assertRaises(ValueError):
+            indexed.validate_hpt(4, 6)
+        self.assertEqual(indexed.validate_hpt(3, 12), 3)
+
+    def test_env_override_pins_heads_per_threadgroup(self):
+        with mock.patch.object(indexed, "_HPT_OVERRIDE", 6):
+            self.assertEqual(indexed.indexed_hpt_for(12), 6)
+        with mock.patch.object(indexed, "_HPT_OVERRIDE", 0):
+            self.assertEqual(indexed.indexed_hpt_for(12), 12)
+
+    def test_pass1_dispatch_rejects_a_thread_count_that_is_not_hpt_simds(self):
+        q, k, v, compact = _real_bf16_fixture()
+        with self.assertRaises(ValueError):
+            indexed._partition_dispatch(
+                q, k, v, compact, scale=256**-0.5, threads=384, splits=8, hpt=6
+            )
+        with self.assertRaises(ValueError):
+            indexed._partition_dispatch(
+                q, k, v, compact, scale=256**-0.5, threads=160, splits=8, hpt=5
+            )
+
+    def test_receipt_keys_timings_by_split_and_hpt(self):
+        indexed.qsa_indexed_status(reset=True)
+        indexed.record_qsa_indexed_receipt(
+            engaged=True,
+            reason="engaged",
+            length=3,
+            context=65_536,
+            splits=64,
+            hpt=3,
+            candidate=(96, 64, 3),
+            geometry_key="B1-L3-U520-hpt",
+            candidate_timings_ms={(64, 3): 0.31, (64, 12): 0.44},
+        )
+        status = indexed.qsa_indexed_status(reset=True)
+        geometry = status["geometry_candidates"]["B1-L3-U520-hpt"]
+        self.assertEqual(geometry["candidate"], [96, 64, 3])
+        self.assertEqual(geometry["candidate_timings_ms"]["64x3"], 0.31)
+        self.assertEqual(status["last_decision"]["heads_per_threadgroup"], 3)
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
+    )
+    def test_real_m3_fixture_is_bit_exact_across_the_hpt_grid(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            q, k, v, compact = _real_bf16_m3_fixture()
+            gather = _gather_qsa_attention(
+                q, k, v, compact, scale=256**-0.5, tile_rows=1
+            )
+            grid = [
+                (splits, hpt)
+                for splits in (8, 32, 128)
+                for hpt in (12, 6, 4, 3, 2, 1)
+            ]
+            outputs = {
+                (splits, hpt): indexed.qwen4_qsa_indexed_attention(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=256**-0.5,
+                    splits=splits,
+                    hpt=hpt,
+                )
+                for splits, hpt in grid
+            }
+            mx.eval(gather, *outputs.values())
+            reference = outputs[(8, 12)]
+            for point, output in outputs.items():
+                self.assertTrue(
+                    bool(mx.array_equal(output, gather).item()),
+                    f"S/HPT {point} differs from gather",
+                )
+                self.assertTrue(
+                    bool(mx.array_equal(output, reference).item()),
+                    f"S/HPT {point} differs from (8, 12)",
+                )
+        finally:
+            mx.set_default_device(device)
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
+    )
+    def test_probe_cache_admits_hpt_as_part_of_the_key(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            q, k, v, compact = _real_bf16_m3_fixture()
+            indexed._PROBE_RESULTS.clear()
+            for hpt in (12, 3):
+                mx.eval(
+                    indexed.qwen4_qsa_indexed_attention(
+                        q, k, v, compact, scale=256**-0.5, splits=32, hpt=hpt
+                    )
+                )
+            selected = sorted(indexed._PROBE_RESULTS.values())
+            self.assertEqual(selected, [(96, 32, 3), (384, 32, 12)])
+        finally:
+            indexed._PROBE_RESULTS.clear()
+            mx.set_default_device(device)
+
+
 class TestQSAIndexedAdmission(unittest.TestCase):
     def selection(self, **overrides):
         values = dict(
@@ -1018,14 +1192,15 @@ class TestQSAIndexedAdmission(unittest.TestCase):
             length=3,
             context=32_768,
             splits=32,
-            candidate=(384, 32),
+            hpt=12,
+            candidate=(384, 32, 12),
             geometry_key="B1-L3-T32768-U520-mask1",
             candidate_timings_ms={
-                128: 0.7,
-                64: 0.5,
-                32: 0.4,
-                16: 0.6,
-                8: 0.8,
+                (128, 12): 0.7,
+                (64, 12): 0.5,
+                (32, 12): 0.4,
+                (16, 12): 0.6,
+                (8, 12): 0.8,
             },
         )
         status = indexed.qsa_indexed_status()
@@ -1035,9 +1210,10 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
         self.assertEqual(status["query_width_counts"][">8"]["declined"], 1)
         self.assertEqual(status["split_candidates"], [128, 64, 32, 16, 8])
+        self.assertEqual(status["hpt_candidates"], [12, 6, 3, 1])
         geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
-        self.assertEqual(geometry["candidate"], [384, 32])
-        self.assertEqual(geometry["candidate_timings_ms"]["32"], 0.4)
+        self.assertEqual(geometry["candidate"], [384, 32, 12])
+        self.assertEqual(geometry["candidate_timings_ms"]["32x12"], 0.4)
 
     def test_env_unset_selects_guarded_auto(self):
         with mock.patch.dict(os.environ, {}, clear=True):

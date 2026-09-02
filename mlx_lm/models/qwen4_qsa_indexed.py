@@ -30,6 +30,8 @@ _CHUNK_SLOTS = 64
 _CHUNK_TOKENS = _CHUNK_SLOTS * _BLOCK_SIZE
 _SDPA_BLOCKS = 128
 _SPLIT_CANDIDATES = (128, 64, 32, 16, 8)
+_HPT_CANDIDATES = (12, 6, 3, 1)
+_HPT_ALLOWED = (12, 6, 4, 3, 2, 1)
 _EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
 _SDPA_VECTOR_HEADER_SHA256 = (
     "2100a4d1eaa8a524c5147c82c771cad75197495c72daffa03e7ea4c259aebf10"
@@ -83,6 +85,7 @@ _AUTO_MIN_CONTEXT_M1 = _env_int(
     "MLX_QWEN4_QSA_INDEXED_AUTO_MIN_CONTEXT_M1", 65536
 )
 _SPLITS_OVERRIDE = _env_int("MLX_QWEN4_QSA_INDEXED_SPLITS", 0)
+_HPT_OVERRIDE = _env_int("MLX_QWEN4_QSA_INDEXED_HPT", 0)
 
 
 def _qsa_indexed_mode() -> str:
@@ -112,6 +115,35 @@ def indexed_splits_for(u_width: int) -> int:
         allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
         raise ValueError(f"indexed QSA splits must be one of {allowed}")
     return requested
+
+
+def indexed_hpt_for(gqa: int) -> int:
+    """Return the requested heads-per-threadgroup for a GQA fan-out."""
+
+    heads = int(gqa)
+    if heads < 1:
+        raise ValueError("gqa must be positive")
+    requested = _HPT_OVERRIDE
+    if requested == 0:
+        requested = heads
+    validate_hpt(requested, heads)
+    return requested
+
+
+def validate_hpt(hpt: int, gqa: int) -> int:
+    """Reject a heads-per-threadgroup that is not an allowed divisor of GQA."""
+
+    value = int(hpt)
+    if value not in _HPT_ALLOWED:
+        allowed = ", ".join(map(str, reversed(_HPT_ALLOWED)))
+        raise ValueError(
+            f"indexed QSA heads per threadgroup must be one of {allowed}"
+        )
+    if int(gqa) % value:
+        raise ValueError(
+            "indexed QSA heads per threadgroup must divide GQA"
+        )
+    return value
 
 
 def indexed_chunk_ranges(u_width: int) -> tuple[tuple[int, int], ...]:
@@ -250,6 +282,14 @@ _STATUS_DEVICE_OBSERVED = 0
 _STATUS_DEVICE_MISMATCHES = 0
 
 
+def _timing_key(key) -> str:
+    """Render a probe-ladder key as "<splits>x<heads per threadgroup>"."""
+
+    if isinstance(key, tuple):
+        return "x".join(str(int(part)) for part in key)
+    return str(int(key))
+
+
 def _width_bucket(width: int) -> str:
     if width == 1:
         return "1"
@@ -265,10 +305,11 @@ def record_qsa_indexed_receipt(
     length: int,
     context: int,
     splits: int | None = None,
-    candidate: tuple[int, int] | None = None,
+    hpt: int | None = None,
+    candidate: tuple[int, int, int] | None = None,
     exception_class: str | None = None,
     geometry_key: str | None = None,
-    candidate_timings_ms: dict[int, float] | None = None,
+    candidate_timings_ms: dict | None = None,
 ) -> None:
     """Record bounded process evidence without evaluating device arrays."""
 
@@ -280,6 +321,7 @@ def record_qsa_indexed_receipt(
         "query_width": int(length),
         "physical_kv": int(context),
         "splits": None if splits is None else int(splits),
+        "heads_per_threadgroup": None if hpt is None else int(hpt),
         "candidate": None if candidate is None else list(candidate),
         "exception_class": exception_class,
         "geometry_key": geometry_key,
@@ -287,8 +329,8 @@ def record_qsa_indexed_receipt(
             None
             if candidate_timings_ms is None
             else {
-                str(split): float(elapsed)
-                for split, elapsed in candidate_timings_ms.items()
+                _timing_key(entry): float(elapsed)
+                for entry, elapsed in candidate_timings_ms.items()
             }
         ),
         "fully_masked_output": "zero",
@@ -321,9 +363,10 @@ def _device_attest_output(
     length: int,
     context: int,
     splits: int,
-    candidate: tuple[int, int],
+    hpt: int,
+    candidate: tuple[int, int, int],
     geometry_key: str,
-    candidate_timings_ms: dict[int, float],
+    candidate_timings_ms: dict,
     reason: str = "engaged",
 ):
     """Attach one device counter and defer host credit until status readback."""
@@ -331,8 +374,8 @@ def _device_attest_output(
     global _STATUS_CANDIDATE, _STATUS_DEVICE_PENDING
     global _STATUS_DEVICE_PENDING_EXPECTED, _STATUS_DEVICE_PENDING_LAST
     timings = {
-        str(split): float(elapsed)
-        for split, elapsed in candidate_timings_ms.items()
+        _timing_key(entry): float(elapsed)
+        for entry, elapsed in candidate_timings_ms.items()
     }
     receipt = {
         "engaged": True,
@@ -340,6 +383,7 @@ def _device_attest_output(
         "query_width": int(length),
         "physical_kv": int(context),
         "splits": int(splits),
+        "heads_per_threadgroup": int(hpt),
         "candidate": list(candidate),
         "exception_class": None,
         "geometry_key": geometry_key,
@@ -414,6 +458,8 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
             "auto_min_context_m1": _AUTO_MIN_CONTEXT_M1,
             "splits_override": _SPLITS_OVERRIDE,
             "split_candidates": list(_SPLIT_CANDIDATES),
+            "hpt_override": _HPT_OVERRIDE,
+            "hpt_candidates": list(_HPT_CANDIDATES),
             "mlx_version": str(getattr(mx, "__version__", "unknown")),
             "mlx_build_hash": _mlx_build_hash(),
             "mlx_build_verified": (
@@ -635,11 +681,14 @@ _SOURCE = r"""
     // Match MLX sdpa_vector_2pass_1 on the compact token order. Splits only
     // distribute the fixed 128 blocks; every block keeps its global index.
     const uint lane = thread_index_in_simdgroup;
-    const uint head = simdgroup_index_in_threadgroup;
     const uint row = threadgroup_position_in_grid.y;
     const uint unit = threadgroup_position_in_grid.z;
-    const uint split = unit % S;
-    const uint bkv = unit / S;
+    const uint slices = GQA / HPT;
+    const uint hslice = unit % slices;
+    const uint rest = unit / slices;
+    const uint head = hslice * HPT + simdgroup_index_in_threadgroup;
+    const uint split = rest % S;
+    const uint bkv = rest / S;
     const uint b = bkv / NKVH;
     const uint hkv = bkv % NKVH;
 
@@ -748,11 +797,14 @@ _SOURCE = r"""
 _QUANTIZED_SOURCE = r"""
     // Keep the bf16 SDPA order while dequantizing only selected K/V values.
     const uint lane = thread_index_in_simdgroup;
-    const uint head = simdgroup_index_in_threadgroup;
     const uint row = threadgroup_position_in_grid.y;
     const uint unit = threadgroup_position_in_grid.z;
-    const uint split = unit % S;
-    const uint bkv = unit / S;
+    const uint slices = GQA / HPT;
+    const uint hslice = unit % slices;
+    const uint rest = unit / slices;
+    const uint head = hslice * HPT + simdgroup_index_in_threadgroup;
+    const uint split = rest % S;
+    const uint bkv = rest / S;
     const uint b = bkv / NKVH;
     const uint hkv = bkv % NKVH;
 
@@ -907,7 +959,7 @@ _COMBINE_SOURCE = r"""
 @lru_cache(maxsize=None)
 def _partition_kernel():
     return mx.fast.metal_kernel(
-        name="qwen4_qsa_indexed_sdpa_pass1_v3",
+        name="qwen4_qsa_indexed_sdpa_pass1_v4",
         input_names=[
             "q",
             "k",
@@ -931,7 +983,7 @@ def _partition_kernel():
 @lru_cache(maxsize=None)
 def _quantized_partition_kernel():
     return mx.fast.metal_kernel(
-        name="qwen4_qsa_indexed_quantized_sdpa_pass1_v1",
+        name="qwen4_qsa_indexed_quantized_sdpa_pass1_v2",
         input_names=[
             "q",
             "k_w",
@@ -983,11 +1035,23 @@ _QUANTIZED_PROBE_RESULTS = {}
 _MISSING = object()
 
 
-def _candidate_ladder(splits: int | None, threads: int):
+def _candidate_ladder(splits: int | None, gqa: int, hpt: int | None = None):
+    """Return the (threads, splits, hpt) grid the first use times."""
+
     split_candidates = (
         _SPLIT_CANDIDATES if splits is None else (int(splits),)
     )
-    return tuple((int(threads), value) for value in split_candidates)
+    if hpt is None:
+        hpt_candidates = tuple(
+            value for value in _HPT_CANDIDATES if int(gqa) % value == 0
+        )
+    else:
+        hpt_candidates = (validate_hpt(hpt, gqa),)
+    return tuple(
+        (heads * 32, value, heads)
+        for value in split_candidates
+        for heads in hpt_candidates
+    )
 
 
 def _measure_candidates(candidates, dispatch):
@@ -1012,13 +1076,17 @@ def _measure_candidates(candidates, dispatch):
             elapsed = time.perf_counter_ns() - started
         except RuntimeError:
             continue
-        timings[candidate[1]] = elapsed / 1.0e6
+        timings[(candidate[1], candidate[2])] = elapsed / 1.0e6
         outputs[candidate] = (output, counter)
     if not timings:
         return None, None, None, {}
     selected = min(
         outputs,
-        key=lambda candidate: (timings[candidate[1]], -candidate[1]),
+        key=lambda candidate: (
+            timings[(candidate[1], candidate[2])],
+            -candidate[1],
+            -candidate[2],
+        ),
     )
     output, counter = outputs[selected]
     return selected, output, counter, timings
@@ -1033,6 +1101,7 @@ def _partition_dispatch(
     scale: float,
     threads: int,
     splits: int,
+    hpt: int,
 ):
     batch, nqh, length, dim = map(int, q.shape)
     nkh = int(k.shape[1])
@@ -1040,9 +1109,12 @@ def _partition_dispatch(
     ids, counts, n_sel, u_width, q_pos, left_pad, total = (
         compact_blocks_to_kernel_inputs(compact)
     )
-    required_threads = gqa * 32
+    if int(hpt) < 1 or gqa % int(hpt):
+        raise ValueError("indexed QSA heads per threadgroup must divide GQA")
+    required_threads = int(hpt) * 32
     if threads != required_threads:
-        raise ValueError("indexed QSA pass 1 requires one SIMD group per GQA head")
+        raise ValueError("indexed QSA pass 1 requires one SIMD group per head")
+    head_slices = gqa // int(hpt)
     if compact.causal_mask is None:
         mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
         has_mask = False
@@ -1089,10 +1161,11 @@ def _partition_dispatch(
             ("GQA", gqa),
             ("BS", int(compact.block_size)),
             ("S", int(splits)),
+            ("HPT", int(hpt)),
             ("BLOCKS", _SDPA_BLOCKS),
             ("HAS_MASK", int(has_mask)),
         ],
-        grid=(threads, length, batch * nkh * splits),
+        grid=(threads, length, batch * nkh * splits * head_slices),
         threadgroup=(threads, 1, 1),
         output_shapes=[
             (batch, nqh, length, _SDPA_BLOCKS),
@@ -1113,6 +1186,7 @@ def _quantized_partition_dispatch(
     scale: float,
     threads: int,
     splits: int,
+    hpt: int,
     group_size: int,
     key_bits: int,
     value_bits: int,
@@ -1123,9 +1197,12 @@ def _quantized_partition_dispatch(
     ids, counts, n_sel, u_width, q_pos, left_pad, total = (
         compact_blocks_to_kernel_inputs(compact)
     )
-    required_threads = gqa * 32
+    if int(hpt) < 1 or gqa % int(hpt):
+        raise ValueError("indexed QSA heads per threadgroup must divide GQA")
+    required_threads = int(hpt) * 32
     if threads != required_threads:
-        raise ValueError("indexed QSA pass 1 requires one SIMD group per GQA head")
+        raise ValueError("indexed QSA pass 1 requires one SIMD group per head")
+    head_slices = gqa // int(hpt)
     if compact.causal_mask is None:
         mask = mx.ones((1,), dtype=mx.bool_)
         has_mask = False
@@ -1173,13 +1250,14 @@ def _quantized_partition_dispatch(
             ("GQA", gqa),
             ("BS", int(compact.block_size)),
             ("S", int(splits)),
+            ("HPT", int(hpt)),
             ("BLOCKS", _SDPA_BLOCKS),
             ("HAS_MASK", int(has_mask)),
             ("GROUP_SIZE", int(group_size)),
             ("KBITS", int(key_bits)),
             ("VBITS", int(value_bits)),
         ],
-        grid=(threads, length, batch * nkh * splits),
+        grid=(threads, length, batch * nkh * splits * head_slices),
         threadgroup=(threads, 1, 1),
         output_shapes=[
             (batch, nqh, length, _SDPA_BLOCKS),
@@ -1230,7 +1308,14 @@ def _record_merge_fallback() -> None:
 
 
 def qwen4_qsa_indexed_attention(
-    q, k, v, compact, *, scale: float, splits: int | None = None
+    q,
+    k,
+    v,
+    compact,
+    *,
+    scale: float,
+    splits: int | None = None,
+    hpt: int | None = None,
 ):
     """Dispatch indexed attention with MLX SDPA's two-pass reduction tree."""
 
@@ -1258,8 +1343,12 @@ def qwen4_qsa_indexed_attention(
     gqa = int(q.shape[1]) // int(k.shape[1])
     if gqa != 12:
         raise QSAIndexedProbeDeclined("indexed QSA exact mode requires GQA=12")
-    threads = gqa * 32
-    if threads > 1024:
+    requested_hpt = (
+        None
+        if hpt is None and _HPT_OVERRIDE == 0
+        else indexed_hpt_for(gqa) if hpt is None else validate_hpt(hpt, gqa)
+    )
+    if gqa * 32 > 1024:
         raise ValueError("indexed QSA GQA exceeds the Metal threadgroup limit")
     sdpa_blocks = os.environ.get("MLX_SDPA_BLOCKS")
     if sdpa_blocks not in (None, "", str(_SDPA_BLOCKS)):
@@ -1303,6 +1392,7 @@ def qwen4_qsa_indexed_attention(
         int(q.shape[2]),
         int(compact.causal_mask is not None),
         requested,
+        requested_hpt,
     )
 
     candidate = _PROBE_RESULTS.get(key, _MISSING)
@@ -1325,13 +1415,15 @@ def qwen4_qsa_indexed_attention(
                         scale=scale,
                         threads=attempted[0],
                         splits=attempted[1],
+                        hpt=attempted[2],
                     )
                     return _combine_sdpa_partials(
                         *partials, output_dtype=q.dtype
                     )
 
                 candidate, combined, counter, timings = _measure_candidates(
-                    _candidate_ladder(requested, threads), dispatch
+                    _candidate_ladder(requested, gqa, requested_hpt),
+                    dispatch,
                 )
                 if candidate is None:
                     _PROBE_RESULTS[key] = False
@@ -1346,6 +1438,7 @@ def qwen4_qsa_indexed_attention(
                     length=int(q.shape[2]),
                     context=int(compact.physical_width),
                     splits=candidate[1],
+                    hpt=candidate[2],
                     candidate=candidate,
                     geometry_key=geometry_key,
                     candidate_timings_ms=timings,
@@ -1359,6 +1452,7 @@ def qwen4_qsa_indexed_attention(
         scale=scale,
         threads=candidate[0],
         splits=candidate[1],
+        hpt=candidate[2],
     )
     output, counter = _combine_sdpa_partials(
         m, l, o, counter, output_dtype=q.dtype
@@ -1369,6 +1463,7 @@ def qwen4_qsa_indexed_attention(
         length=int(q.shape[2]),
         context=int(compact.physical_width),
         splits=candidate[1],
+        hpt=candidate[2],
         candidate=candidate,
         geometry_key=geometry_key,
         candidate_timings_ms=_PROBE_TIMINGS[key],
@@ -1386,6 +1481,7 @@ def qwen4_qsa_indexed_quantized_attention(
     key_bits: int,
     value_bits: int,
     splits: int | None = None,
+    hpt: int | None = None,
 ):
     """Read affine int8/int4 K/V inside the indexed SDPA kernel."""
 
@@ -1443,7 +1539,11 @@ def qwen4_qsa_indexed_quantized_attention(
     gqa = int(q.shape[1]) // nkh
     if gqa != 12:
         raise QSAIndexedProbeDeclined("indexed QSA exact mode requires GQA=12")
-    threads = gqa * 32
+    requested_hpt = (
+        None
+        if hpt is None and _HPT_OVERRIDE == 0
+        else indexed_hpt_for(gqa) if hpt is None else validate_hpt(hpt, gqa)
+    )
     sdpa_blocks = os.environ.get("MLX_SDPA_BLOCKS")
     if sdpa_blocks not in (None, "", str(_SDPA_BLOCKS)):
         raise QSAIndexedProbeDeclined(
@@ -1487,6 +1587,7 @@ def qwen4_qsa_indexed_quantized_attention(
         int(q.shape[2]),
         int(compact.causal_mask is not None),
         requested,
+        requested_hpt,
         group_size,
         key_bits,
         value_bits,
@@ -1514,6 +1615,7 @@ def qwen4_qsa_indexed_quantized_attention(
                         scale=scale,
                         threads=attempted[0],
                         splits=attempted[1],
+                        hpt=attempted[2],
                         group_size=group_size,
                         key_bits=key_bits,
                         value_bits=value_bits,
@@ -1523,7 +1625,8 @@ def qwen4_qsa_indexed_quantized_attention(
                     )
 
                 candidate, combined, counter, timings = _measure_candidates(
-                    _candidate_ladder(requested, threads), dispatch
+                    _candidate_ladder(requested, gqa, requested_hpt),
+                    dispatch,
                 )
                 if candidate is None:
                     _QUANTIZED_PROBE_RESULTS[key] = False
@@ -1539,6 +1642,7 @@ def qwen4_qsa_indexed_quantized_attention(
                     context=int(compact.physical_width),
                     reason="engaged_quantized",
                     splits=candidate[1],
+                    hpt=candidate[2],
                     candidate=candidate,
                     geometry_key=geometry_key,
                     candidate_timings_ms=timings,
@@ -1552,6 +1656,7 @@ def qwen4_qsa_indexed_quantized_attention(
         scale=scale,
         threads=candidate[0],
         splits=candidate[1],
+        hpt=candidate[2],
         group_size=group_size,
         key_bits=key_bits,
         value_bits=value_bits,
@@ -1566,6 +1671,7 @@ def qwen4_qsa_indexed_quantized_attention(
         context=int(compact.physical_width),
         reason="engaged_quantized",
         splits=candidate[1],
+        hpt=candidate[2],
         candidate=candidate,
         geometry_key=geometry_key,
         candidate_timings_ms=_PROBE_TIMINGS[key],
@@ -1579,6 +1685,7 @@ __all__ = [
     "indexed_chunk_ranges",
     "indexed_kernel_available",
     "indexed_split_chunk_ranges",
+    "indexed_hpt_for",
     "indexed_splits_for",
     "qsa_indexed_status",
     "qsa_indexed_enabled",
@@ -1588,5 +1695,6 @@ __all__ = [
     "qwen4_qsa_indexed_quantized_reference",
     "qwen4_qsa_indexed_reference",
     "record_qsa_indexed_receipt",
+    "validate_hpt",
     "set_qwen4_qsa_indexed",
 ]
