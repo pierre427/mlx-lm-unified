@@ -27,9 +27,9 @@ DEFAULT_OUTPUT = Path(
 CONTEXTS = (16_384, 32_768, 65_536, 131_072)
 MODEL_CONTEXTS = CONTEXTS[:3]
 SPLITS = (1, 2, 4, 8)
-SWAP_LIMIT_MIB = 512.0
-MODEL_LOAD_FREE_FLOOR = 45
-RUN_FREE_FLOOR = 25
+DEFAULT_SWAP_LIMIT_MIB = 512.0
+DEFAULT_MODEL_LOAD_FREE_FLOOR = 45
+DEFAULT_RUN_FREE_FLOOR = 25
 
 
 class GateFailure(RuntimeError):
@@ -53,8 +53,8 @@ def gpu_lock():
         raise SystemExit(f"GPU busy: {GPU_LOCK} exists ({owner})") from error
     owner_path = GPU_LOCK / "owner.json"
     owner = {
-        "agent": "codex-k-indexed-v2",
-        "label": "qwen4-qsa-indexed-gate-v2",
+        "agent": "codex-l-phase45",
+        "label": "qwen4-qsa-indexed-gate-v2-phase45",
         "pid": os.getpid(),
         "purpose": "fixed-chunk indexed split-K QSA Metal gate",
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -81,7 +81,7 @@ def _run_text(command):
     ).stdout.strip()
 
 
-def safety_snapshot():
+def safety_snapshot(label=None):
     memory = _run_text(["/usr/bin/memory_pressure", "-Q"])
     match = re.search(r"free percentage:\s*(\d+)%", memory)
     if match is None:
@@ -95,17 +95,27 @@ def safety_snapshot():
         used *= 1024.0
     thermal = _run_text(["/usr/bin/pmset", "-g", "therm"])
     return {
+        "label": label,
         "at": datetime.now(timezone.utc).isoformat(),
         "free_percent": int(match.group(1)),
         "swap_used_mib": used,
+        "memory_pressure_tail": memory.splitlines()[-1],
+        "swapusage": swap,
         "thermal": thermal.splitlines(),
     }
 
 
 def check_safety(
-    snapshot, *, swap_baseline=None, before_load=False, phase=5
+    snapshot,
+    *,
+    swap_baseline=None,
+    before_load=False,
+    phase=5,
+    model_load_free_floor=DEFAULT_MODEL_LOAD_FREE_FLOOR,
+    run_free_floor=DEFAULT_RUN_FREE_FLOOR,
+    swap_growth_abort_mib=DEFAULT_SWAP_LIMIT_MIB,
 ):
-    floor = MODEL_LOAD_FREE_FLOOR if before_load else RUN_FREE_FLOOR
+    floor = model_load_free_floor if before_load else run_free_floor
     if snapshot["free_percent"] < floor:
         raise GateFailure(
             int(phase),
@@ -113,7 +123,8 @@ def check_safety(
         )
     if (
         swap_baseline is not None
-        and snapshot["swap_used_mib"] - swap_baseline > SWAP_LIMIT_MIB
+        and swap_growth_abort_mib > 0
+        and snapshot["swap_used_mib"] - swap_baseline > swap_growth_abort_mib
     ):
         growth = snapshot["swap_used_mib"] - swap_baseline
         raise GateFailure(int(phase), f"swap grew {growth:.2f} MiB")
@@ -389,30 +400,53 @@ def phase3_gather(mx):
 
 
 def corpus_tokens(tokenizer, context):
-    text = (
-        "Direct indexed attention keeps selected KV rows in place. "
-        "The verify gate checks rollback, token authority, and receipts. "
-    )
+    text = """
+Incident review transcript. The operator first confirms that the service is
+quiescent, records memory and thermal state, and preserves the exact prompt
+cache boundary. The implementation keeps selected key/value rows in place;
+the comparison arm gathers the same rows before attention. Both arms start
+from clones of one evaluated cache. During review, the team checks every
+rollback record, generated token, chosen log probability, kernel candidate,
+and fallback receipt. A digest mismatch triggers a first-divergence analysis
+with top candidates, prefix numeric noise, and fresh one-row versus three-row
+forward controls. Timing begins only after equivalence passes.
+
+The following change request is realistic rather than synthetic: investigate
+a slow long-context inference request, explain the evidence, propose the
+smallest default-off optimization, write a targeted regression test, and
+report measured latency without claiming deployment. Logs show repeated
+cache hits, twelve sparse-attention layers, a width-three verification call,
+and no server traffic during the offline gate. The acceptance bar is strict:
+the target model remains token-authoritative and any unexplained flip closes
+the experiment.
+
+Example code under review:
+```python
+def choose_route(context, query_width, enabled):
+    if not enabled or context < 16384:
+        return "dense"
+    return "indexed" if 1 <= query_width <= 8 else "gather"
+```
+"""
     seed = tokenizer.encode(text)
     if not seed:
         raise ValueError("tokenizer produced an empty gate prompt")
     return (seed * (context // len(seed) + 1))[:context]
 
 
-def top_two(mx, logprobs):
-    indices = mx.argpartition(logprobs, kth=-2)[-2:]
+def top_candidates(mx, logprobs, count=8):
+    indices = mx.argpartition(logprobs, kth=-count)[-count:]
     mx.eval(indices)
     pairs = [(int(index), float(logprobs[int(index)].item())) for index in indices]
     pairs.sort(key=lambda item: item[1], reverse=True)
     return pairs
 
 
-def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
-    from mlx_lm.hybrid_speculative import HybridStats, self_mtp_generate_step
+@contextmanager
+def qsa_mode(mode):
     from mlx_lm.models import qwen4_exp
     from mlx_lm.models.qwen4_qsa_indexed import (
         qsa_indexed_enabled,
-        qsa_indexed_status,
         set_qwen4_qsa_indexed,
     )
 
@@ -434,11 +468,23 @@ def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
         qwen4_exp._QSA_GATHER_MIN_CONTEXT = 0
         qwen4_exp._QSA_GATHER_MAX_CONTEXT = 0
         qwen4_exp._QSA_NAX_DECODE = False
+        yield
+    finally:
+        set_qwen4_qsa_indexed(previous_indexed)
+        for name, value in previous.items():
+            setattr(qwen4_exp, name, value)
+
+
+def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
+    from mlx_lm.hybrid_speculative import HybridStats, self_mtp_generate_step
+    from mlx_lm.models.qwen4_qsa_indexed import qsa_indexed_status
+
+    with qsa_mode(mode):
         qsa_indexed_status(reset=True)
         stats = HybridStats()
         tokens = []
         chosen_logprobs = []
-        top2 = []
+        top8 = []
         started = time.perf_counter()
         for output_token, logprobs, _ in self_mtp_generate_step(
             mx.array([token], dtype=mx.uint32),
@@ -452,7 +498,7 @@ def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
             output_token = int(output_token)
             tokens.append(output_token)
             chosen_logprobs.append(float(logprobs[output_token].item()))
-            top2.append(top_two(mx, logprobs))
+            top8.append(top_candidates(mx, logprobs))
         elapsed = time.perf_counter() - started
         digest = hashlib.sha256(
             b"".join(int(item).to_bytes(4, "little") for item in tokens)
@@ -461,19 +507,72 @@ def run_model_arm(mx, model, token, cache, *, mode, max_tokens):
             "tokens": tokens,
             "digest": digest,
             "chosen_logprobs": chosen_logprobs,
-            "top2": top2,
+            "top8": top8,
             "stats": stats.__dict__,
             "indexed_status": qsa_indexed_status(),
             "elapsed_seconds": elapsed,
             "tokens_per_second": len(tokens) / elapsed,
         }
-    finally:
-        set_qwen4_qsa_indexed(previous_indexed)
-        for name, value in previous.items():
-            setattr(qwen4_exp, name, value)
 
 
-def first_divergence(gather, indexed):
+def candidate_delta(left, right):
+    left_map = dict(left)
+    right_map = dict(right)
+    shared = set(left_map) & set(right_map)
+    return {
+        "max_shared_delta": max(
+            (abs(left_map[token] - right_map[token]) for token in shared),
+            default=None,
+        ),
+        "complete_union": set(left_map) == set(right_map),
+        "left_only": sorted(set(left_map) - set(right_map)),
+        "right_only": sorted(set(right_map) - set(left_map)),
+    }
+
+
+def percentile95(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[max(0, int(np.ceil(0.95 * len(ordered))) - 1)]
+
+
+def run_forward_control(mx, model, token, base, shared, *, mode, width):
+    cache = clone_cache(base)
+    sequence = [token] + list(shared)
+    leading = 0 if width == 1 else len(sequence) % width
+    chunks = []
+    if leading:
+        chunks.append(sequence[:leading])
+        sequence = sequence[leading:]
+    chunks.extend(
+        sequence[index : index + width]
+        for index in range(0, len(sequence), width)
+    )
+    logits = None
+    with qsa_mode(mode):
+        for chunk in chunks:
+            logits = model(mx.array([chunk], dtype=mx.uint32), cache=cache)[0, -1]
+            mx.eval(logits, [layer.state for layer in cache])
+    logprobs = logits.astype(mx.float32) - mx.logsumexp(
+        logits.astype(mx.float32), axis=-1
+    )
+    candidates = top_candidates(mx, logprobs)
+    result = {
+        "mode": mode,
+        "chunk_width": width,
+        "leading_width": leading,
+        "forward_widths": [len(chunk) for chunk in chunks],
+        "decisive_width": len(chunks[-1]),
+        "argmax": candidates[0][0],
+        "top8": candidates,
+    }
+    del cache
+    mx.clear_cache()
+    return result
+
+
+def first_divergence(mx, model, token, base, gather, indexed):
     width = min(len(gather["tokens"]), len(indexed["tokens"]))
     at = next(
         (
@@ -487,22 +586,72 @@ def first_divergence(gather, indexed):
         return None
     if at >= width:
         return {"index": at, "classification": "STATE_FAULT", "reason": "length"}
-    left = gather["top2"][at]
-    right = indexed["top2"][at]
+    left = gather["top8"][at]
+    right = indexed["top8"][at]
     left_gap = left[0][1] - left[1][1]
     right_gap = right[0][1] - right[1][1]
     same_pair = {left[0][0], left[1][0]} == {right[0][0], right[1][0]}
-    near = same_pair and max(left_gap, right_gap) <= 0.002
+    near = (
+        same_pair
+        and left[1][0] == indexed["tokens"][at]
+        and right[1][0] == gather["tokens"][at]
+        and max(left_gap, right_gap) <= 0.002
+    )
+    deltas = [
+        candidate_delta(gather["top8"][index], indexed["top8"][index])
+        for index in range(at + 1)
+    ]
+    prefix = [
+        row["max_shared_delta"]
+        for row in deltas[:at]
+        if row["max_shared_delta"] is not None
+    ]
+    delta_at = deltas[at]["max_shared_delta"]
+    prefix_p95 = percentile95(prefix)
+    prefix_max = max(prefix, default=0.0)
+    in_band = delta_at is not None and delta_at <= max(0.002, prefix_max)
+    shared = gather["tokens"][:at]
+    controls = {
+        f"{mode}_t{width}": run_forward_control(
+            mx, model, token, base, shared, mode=mode, width=width
+        )
+        for mode in ("gather", "indexed")
+        for width in (1, 3)
+    }
+    kernel_shape = (
+        controls["gather_t1"]["argmax"] == controls["indexed_t1"]["argmax"]
+        and controls["gather_t3"]["argmax"] == gather["tokens"][at]
+        and controls["indexed_t3"]["argmax"] == indexed["tokens"][at]
+        and controls["gather_t3"]["argmax"] != controls["indexed_t3"]["argmax"]
+    )
+    if near and in_band:
+        classification = "NEAR_TIE"
+    elif kernel_shape:
+        classification = "KERNEL_SHAPE"
+    else:
+        classification = "STATE_FAULT"
     return {
         "index": at,
         "gather_token": gather["tokens"][at],
         "indexed_token": indexed["tokens"][at],
-        "gather_top2": left,
-        "indexed_top2": right,
+        "gather_top2": left[:2],
+        "indexed_top2": right[:2],
         "gather_gap": left_gap,
         "indexed_gap": right_gap,
         "same_candidate_pair": same_pair,
-        "classification": "NEAR_TIE" if near else "STATE_FAULT",
+        "prefix_delta_band": {
+            "definition": "max absolute logprob delta over shared top-8 ids",
+            "median": statistics.median(prefix) if prefix else 0.0,
+            "p95": prefix_p95,
+            "max": prefix_max,
+            "at_divergence": delta_at,
+            "at_divergence_in_band": in_band,
+            "incomplete_prefix_rows": sum(
+                not row["complete_union"] for row in deltas[:at]
+            ),
+        },
+        "controls": controls,
+        "classification": classification,
     }
 
 
@@ -514,13 +663,38 @@ def prefill_base(mx, model, prompt, make_prompt_cache):
     return base, int(prompt[-1])
 
 
-def phase4_model(mx, model, tokenizer, max_tokens, swap_baseline):
+def model_qsa_layer_count(model):
+    layers = model.language_model.model.layers
+    return sum(not layer.is_linear for layer in layers)
+
+
+def phase4_model(
+    mx,
+    model,
+    tokenizer,
+    max_tokens,
+    swap_baseline,
+    safety_rows,
+    *,
+    model_load_free_floor,
+    run_free_floor,
+    swap_growth_abort_mib,
+    wall_deadline,
+):
     from mlx_lm.models.cache import make_prompt_cache
 
     rows = []
+    qsa_layers = model_qsa_layer_count(model)
     for context in MODEL_CONTEXTS:
-        checkpoint = safety_snapshot()
-        check_safety(checkpoint, swap_baseline=swap_baseline, phase=4)
+        checkpoint = safety_snapshot(f"before_phase4_{context}")
+        check_safety(
+            checkpoint,
+            swap_baseline=swap_baseline,
+            phase=4,
+            model_load_free_floor=model_load_free_floor,
+            run_free_floor=run_free_floor,
+            swap_growth_abort_mib=swap_growth_abort_mib,
+        )
         prompt = corpus_tokens(tokenizer, context)
         base, token = prefill_base(mx, model, prompt, make_prompt_cache)
         gather = run_model_arm(
@@ -529,7 +703,7 @@ def phase4_model(mx, model, tokenizer, max_tokens, swap_baseline):
         indexed = run_model_arm(
             mx, model, token, clone_cache(base), mode="indexed", max_tokens=max_tokens
         )
-        divergence = first_divergence(gather, indexed)
+        divergence = first_divergence(mx, model, token, base, gather, indexed)
         max_logprob_delta = max(
             (
                 abs(left - right)
@@ -541,10 +715,24 @@ def phase4_model(mx, model, tokenizer, max_tokens, swap_baseline):
         )
         status = indexed["indexed_status"]
         reached = status["query_width_counts"].get("2-8", {}).get("engaged", 0)
+        cycles = indexed["stats"].get("cycles", 0)
+        expected_verify_calls = qsa_layers * cycles
+        receipt = {
+            "qsa_layers": qsa_layers,
+            "self_mtp_rounds": cycles,
+            "engaged_verify_calls": reached,
+            "expected_engaged_verify_calls": expected_verify_calls,
+            "engaged_calls_per_qsa_layer_per_round": (
+                reached / expected_verify_calls if expected_verify_calls else 0.0
+            ),
+            "candidate": status["candidate"],
+            "fallbacks": status["fallbacks"],
+        }
         passed = (
             max_logprob_delta <= 0.002
             and not status["fallbacks"]
-            and bool(reached)
+            and status["candidate"] is not None
+            and reached == expected_verify_calls
             and (divergence is None or divergence["classification"] == "NEAR_TIE")
         )
         row = {
@@ -557,19 +745,48 @@ def phase4_model(mx, model, tokenizer, max_tokens, swap_baseline):
             "gather_stats": gather["stats"],
             "indexed_stats": indexed["stats"],
             "indexed_status": status,
+            "receipt_contract": receipt,
             "cache_boundary": "both arms clone one cache prefilled through prompt[-2]",
             "draft_contract": "self-MTP k=2 uses width-3 rollback-recording verify",
             "safety": checkpoint,
         }
         rows.append(row)
-        if not passed:
-            raise GateFailure(4, json.dumps(row, sort_keys=True))
         del base, gather, indexed
         mx.clear_cache()
+        gc.collect()
+        after = safety_snapshot(f"after_phase4_{context}")
+        safety_rows.append(after)
+        check_safety(
+            after,
+            swap_baseline=swap_baseline,
+            phase=4,
+            model_load_free_floor=model_load_free_floor,
+            run_free_floor=run_free_floor,
+            swap_growth_abort_mib=swap_growth_abort_mib,
+        )
+        row["safety_after"] = after
+        if not passed:
+            raise GateFailure(4, json.dumps(row, sort_keys=True))
+        if wall_deadline is not None and time.monotonic() >= wall_deadline:
+            return {
+                "phase": 4,
+                "status": "PARTIAL_TIME_BOUND",
+                "rows": rows,
+                "stopped_after_context": context,
+            }
     return {"phase": 4, "status": "PASS", "rows": rows}
 
 
-def isolated_timing(mx, swap_baseline):
+def isolated_timing(
+    mx,
+    swap_baseline,
+    safety_rows,
+    *,
+    model_load_free_floor,
+    run_free_floor,
+    swap_growth_abort_mib,
+    wall_deadline,
+):
     from mlx_lm.models.qwen4_exp import QSACompactBlocks, _gather_qsa_attention
     from mlx_lm.models.qwen4_qsa_indexed import qwen4_qsa_indexed_attention
 
@@ -589,7 +806,7 @@ def isolated_timing(mx, swap_baseline):
                 "gather": lambda: _gather_qsa_attention(
                     q, k, v, compact, scale=256**-0.5, tile_rows=1
                 ),
-                "dense": lambda: mx.fast.scaled_dot_product_attention(
+                "dense_masked": lambda: mx.fast.scaled_dot_product_attention(
                     q, k, v, scale=256**-0.5, mask=mask
                 ),
             }
@@ -604,25 +821,55 @@ def isolated_timing(mx, swap_baseline):
                     settlements.append(settle_thermal())
                     samples[name].append(timed(mx, arms[name]))
                     check_safety(
-                        safety_snapshot(), swap_baseline=swap_baseline
+                        safety_snapshot(),
+                        swap_baseline=swap_baseline,
+                        model_load_free_floor=model_load_free_floor,
+                        run_free_floor=run_free_floor,
+                        swap_growth_abort_mib=swap_growth_abort_mib,
                     )
-            rows.append(
-                {
+            row = {
                     "context": context,
                     "length": length,
+                    "query_contract": "M=3 verify" if length == 3 else "M=1 datum",
+                    "indexed_min_query": 1,
                     "median_ms": {
                         name: statistics.median(values) * 1000.0
                         for name, values in samples.items()
                     },
                     "settlements": settlements,
                 }
-            )
+            rows.append(row)
             del q, k, v
             mx.clear_cache()
+            after = safety_snapshot(f"after_phase5_isolated_{context}_m{length}")
+            safety_rows.append(after)
+            check_safety(
+                after,
+                swap_baseline=swap_baseline,
+                model_load_free_floor=model_load_free_floor,
+                run_free_floor=run_free_floor,
+                swap_growth_abort_mib=swap_growth_abort_mib,
+            )
+            row["safety_after"] = after
+            if wall_deadline is not None and time.monotonic() >= wall_deadline:
+                row["time_bound_reached"] = True
+                return rows
     return rows
 
 
-def model_timing(mx, model, tokenizer, timing_tokens, swap_baseline):
+def model_timing(
+    mx,
+    model,
+    tokenizer,
+    timing_tokens,
+    swap_baseline,
+    safety_rows,
+    *,
+    model_load_free_floor,
+    run_free_floor,
+    swap_growth_abort_mib,
+    wall_deadline,
+):
     from mlx_lm.models.cache import make_prompt_cache
 
     rows = []
@@ -640,28 +887,91 @@ def model_timing(mx, model, tokenizer, timing_tokens, swap_baseline):
                 mode=mode,
                 max_tokens=timing_tokens,
             )
-            check_safety(safety_snapshot(), swap_baseline=swap_baseline)
-            arms[mode] = {
+            check_safety(
+                safety_snapshot(),
+                swap_baseline=swap_baseline,
+                model_load_free_floor=model_load_free_floor,
+                run_free_floor=run_free_floor,
+                swap_growth_abort_mib=swap_growth_abort_mib,
+            )
+            label = "plain_dense" if mode == "dense" else mode
+            arms[label] = {
                 "tokens_per_second": result["tokens_per_second"],
                 "elapsed_seconds": result["elapsed_seconds"],
                 "digest": result["digest"],
                 "settlement": settlement,
                 "indexed_status": result["indexed_status"],
             }
-        rows.append({"context": context, "arms": arms})
+        row = {"context": context, "arms": arms}
+        rows.append(row)
         del base
         mx.clear_cache()
+        after = safety_snapshot(f"after_phase5_end_to_end_{context}")
+        safety_rows.append(after)
+        check_safety(
+            after,
+            swap_baseline=swap_baseline,
+            model_load_free_floor=model_load_free_floor,
+            run_free_floor=run_free_floor,
+            swap_growth_abort_mib=swap_growth_abort_mib,
+        )
+        row["safety_after"] = after
+        if wall_deadline is not None and time.monotonic() >= wall_deadline:
+            row["time_bound_reached"] = True
+            return rows
     return rows
 
 
-def phase5_timing(mx, model, tokenizer, timing_tokens, swap_baseline):
+def phase5_timing(
+    mx,
+    model,
+    tokenizer,
+    timing_tokens,
+    swap_baseline,
+    safety_rows,
+    *,
+    model_load_free_floor,
+    run_free_floor,
+    swap_growth_abort_mib,
+    wall_deadline,
+):
+    isolated = isolated_timing(
+        mx,
+        swap_baseline,
+        safety_rows,
+        model_load_free_floor=model_load_free_floor,
+        run_free_floor=run_free_floor,
+        swap_growth_abort_mib=swap_growth_abort_mib,
+        wall_deadline=wall_deadline,
+    )
+    if isolated and isolated[-1].get("time_bound_reached"):
+        return {
+            "phase": 5,
+            "status": "PARTIAL_TIME_BOUND",
+            "isolated": isolated,
+            "end_to_end": [],
+        }
+    end_to_end = model_timing(
+        mx,
+        model,
+        tokenizer,
+        timing_tokens,
+        swap_baseline,
+        safety_rows,
+        model_load_free_floor=model_load_free_floor,
+        run_free_floor=run_free_floor,
+        swap_growth_abort_mib=swap_growth_abort_mib,
+        wall_deadline=wall_deadline,
+    )
     return {
         "phase": 5,
-        "status": "PASS",
-        "isolated": isolated_timing(mx, swap_baseline),
-        "end_to_end": model_timing(
-            mx, model, tokenizer, timing_tokens, swap_baseline
+        "status": (
+            "PARTIAL_TIME_BOUND"
+            if end_to_end and end_to_end[-1].get("time_bound_reached")
+            else "PASS"
         ),
+        "isolated": isolated,
+        "end_to_end": end_to_end,
     }
 
 
@@ -687,6 +997,24 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timing-tokens", type=int, default=64)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--start-phase", type=int, choices=(1, 4), default=1)
+    parser.add_argument(
+        "--swap-growth-abort-mib",
+        type=float,
+        default=DEFAULT_SWAP_LIMIT_MIB,
+        help="Set to 0 to record swap growth without aborting.",
+    )
+    parser.add_argument(
+        "--model-load-free-floor-percent",
+        type=int,
+        default=DEFAULT_MODEL_LOAD_FREE_FLOOR,
+    )
+    parser.add_argument(
+        "--run-free-floor-percent",
+        type=int,
+        default=DEFAULT_RUN_FREE_FLOOR,
+    )
+    parser.add_argument("--gpu-wall-limit-minutes", type=float, default=0.0)
     parser.add_argument("--execute-metal", action="store_true")
     args = parser.parse_args()
     if not args.execute_metal:
@@ -700,9 +1028,26 @@ def main():
             "type": "manifest",
             "schema": "mlx-uag.qwen4-qsa-indexed-gate.v2",
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "agent": "codex-k-indexed-v2",
+            "agent": "codex-l-phase45",
             "model": str(args.model),
             "outcome": "RUNNING",
+            "start_phase": args.start_phase,
+            "policy": {
+                "swap_growth_abort_mib": args.swap_growth_abort_mib,
+                "model_load_free_floor_percent": args.model_load_free_floor_percent,
+                "run_free_floor_percent": args.run_free_floor_percent,
+                "gpu_wall_limit_minutes": args.gpu_wall_limit_minutes,
+            },
+            "prior_phases_1_3": {
+                "commit": "82f2422aee277f0c630cf52c5973a70e8e379b74",
+                "json_sha256": (
+                    "739e5b23e035f05b72c3e74e1810f5b44715f822c55cfac64ae8ed0cfed7d64f"
+                ),
+                "jsonl_sha256": (
+                    "10971bc6a8ebe765eea492d87f133193b692f81c381709649072b76059083f23"
+                ),
+                "status": "PASS",
+            },
         },
         "phases": [],
         "safety": [],
@@ -714,42 +1059,85 @@ def main():
         from mlx_lm.utils import load
 
         mx.set_default_device(mx.gpu)
-        baseline = safety_snapshot()
+        wall_started = time.monotonic()
+        wall_deadline = (
+            wall_started + args.gpu_wall_limit_minutes * 60.0
+            if args.gpu_wall_limit_minutes > 0
+            else None
+        )
+        baseline = safety_snapshot("before_load")
         report["safety"].append(baseline)
         swap_baseline = baseline["swap_used_mib"]
-        current_phase = 1
+        current_phase = args.start_phase
+        model = None
+        tokenizer = None
         try:
-            report["phases"].append(phase1_candidate(mx))
-            current_phase = 2
-            report["phases"].append(phase2_exactness(mx))
-            current_phase = 3
-            report["phases"].append(phase3_gather(mx))
+            if args.start_phase == 1:
+                report["phases"].append(phase1_candidate(mx))
+                current_phase = 2
+                report["phases"].append(phase2_exactness(mx))
+                current_phase = 3
+                report["phases"].append(phase3_gather(mx))
             current_phase = 4
             mx.clear_cache()
             gc.collect()
-            before_load = safety_snapshot()
-            report["safety"].append(before_load)
             check_safety(
-                before_load,
+                baseline,
                 swap_baseline=swap_baseline,
                 before_load=True,
                 phase=4,
+                model_load_free_floor=args.model_load_free_floor_percent,
+                run_free_floor=args.run_free_floor_percent,
+                swap_growth_abort_mib=args.swap_growth_abort_mib,
             )
             model, tokenizer = load(str(args.model))
             model.eval()
             mx.eval(model.parameters())
-            report["phases"].append(
-                phase4_model(
-                    mx, model, tokenizer, args.max_tokens, swap_baseline
-                )
+            after_load = safety_snapshot("after_load")
+            report["safety"].append(after_load)
+            check_safety(
+                after_load,
+                swap_baseline=swap_baseline,
+                phase=4,
+                model_load_free_floor=args.model_load_free_floor_percent,
+                run_free_floor=args.run_free_floor_percent,
+                swap_growth_abort_mib=args.swap_growth_abort_mib,
             )
-            current_phase = 5
-            report["phases"].append(
-                phase5_timing(
-                    mx, model, tokenizer, args.timing_tokens, swap_baseline
-                )
+            phase4 = phase4_model(
+                mx,
+                model,
+                tokenizer,
+                args.max_tokens,
+                swap_baseline,
+                report["safety"],
+                model_load_free_floor=args.model_load_free_floor_percent,
+                run_free_floor=args.run_free_floor_percent,
+                swap_growth_abort_mib=args.swap_growth_abort_mib,
+                wall_deadline=wall_deadline,
             )
-            report["manifest"]["outcome"] = "PASS"
+            report["phases"].append(phase4)
+            if phase4["status"] == "PASS":
+                current_phase = 5
+                phase5 = phase5_timing(
+                    mx,
+                    model,
+                    tokenizer,
+                    args.timing_tokens,
+                    swap_baseline,
+                    report["safety"],
+                    model_load_free_floor=args.model_load_free_floor_percent,
+                    run_free_floor=args.run_free_floor_percent,
+                    swap_growth_abort_mib=args.swap_growth_abort_mib,
+                    wall_deadline=wall_deadline,
+                )
+                report["phases"].append(phase5)
+                report["manifest"]["outcome"] = (
+                    "PASS"
+                    if phase5["status"] == "PASS"
+                    else "PARTIAL_TIME_BOUND"
+                )
+            else:
+                report["manifest"]["outcome"] = "PARTIAL_TIME_BOUND"
         except GateFailure as error:
             report["manifest"]["outcome"] = f"FAIL_PHASE_{error.phase}"
             report["failure"] = {"phase": error.phase, "message": str(error)}
@@ -763,8 +1151,13 @@ def main():
             }
             exit_code = 1
         finally:
-            final = safety_snapshot()
+            model = None
+            tokenizer = None
+            mx.clear_cache()
+            gc.collect()
+            final = safety_snapshot("after_unload")
             report["safety"].append(final)
+            report["manifest"]["gpu_wall_seconds"] = time.monotonic() - wall_started
             report["manifest"]["finished_at"] = datetime.now(
                 timezone.utc
             ).isoformat()
