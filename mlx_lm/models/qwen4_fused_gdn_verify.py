@@ -50,6 +50,8 @@ from .qwen4_fused_gdn import (
     FusedGdnAdmission,
     _dtype,
     _shape,
+    _slab_width,
+    admit_rollback_span,
     fused_gdn_runtime_supported,
     probe_qwen4_fused_gdn_decode,
 )
@@ -120,20 +122,14 @@ def admit_qwen4_fused_gdn_verify(
         return FusedGdnAdmission(False, "distributed sharding")
     if not speculating:
         return FusedGdnAdmission(False, "not a speculative verify")
-    # ``spans`` is the cache's host-side rollback geometry for this forward
-    # (``ArraysCache.rollback_spans``). The kernel is mask-free, so only a
-    # slab whose single row advances every position is exact: ``()`` (no
-    # length metadata, no mask) or a one-row span equal to the width, which
-    # is how a ragged engine describes a fully valid lane; its mask, derived
-    # from that same metadata, is then all ones. A shorter span is right
-    # padding and ``None`` is geometry the cache cannot describe.
-    if spans is None:
-        return FusedGdnAdmission(False, "rollback geometry not describable")
-    if spans == ():
-        if mask is not None:
-            return FusedGdnAdmission(False, "masked verify")
-    elif len(spans) != 1 or int(spans[0]) != int(qkv.shape[1]):
-        return FusedGdnAdmission(False, "padded rollback geometry")
+    # One predicate for both kernels: the decode admission runs the same test
+    # at width one, because the ragged engine stamps ``lengths`` on a plain
+    # decode slab exactly as it does on a verify slab.
+    refusal = admit_rollback_span(
+        spans, mask, _slab_width(qkv), masked_reason="masked verify"
+    )
+    if refusal is not None:
+        return refusal
     if gate_activation != "sigmoid":
         return FusedGdnAdmission(False, f"output gate {gate_activation!r}")
 
