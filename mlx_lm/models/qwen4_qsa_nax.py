@@ -50,8 +50,10 @@ SOURCE = r"""
 
     threadgroup float sS[NSG * 32 * 16];
 
-    const device T* kb = k + (size_t)(b * NKVH + hkv) * TOT * D;
-    const device T* vb = v + (size_t)(b * NKVH + hkv) * TOT * D;
+    const size_t k_head =
+        (size_t)b * k_strides[0] + (size_t)hkv * k_strides[1];
+    const size_t v_head =
+        (size_t)b * v_strides[0] + (size_t)hkv * v_strides[1];
 
     const int  lpad      = left_pad[b];
     const uint tile_base = (b * L + tok) * U;
@@ -99,13 +101,13 @@ SOURCE = r"""
 
     for (uint u0 = 0; u0 < cnt; u0 += 8) {
 
-        size_t koff[4];
+        uint physical_rows[4];
         for (short qq = 0; qq < 4; qq++) {
             int n = fm0 + qq * 8;
             uint u = u0 + (uint)(n >> 2);
             int bid = (u < cnt) ? (int)ids[tile_base + u] : 0;
             int phys = lpad + bid * BS + (n & 3);
-            koff[qq] = (size_t)metal::clamp(phys, 0, (int)TOT - 1) * D;
+            physical_rows[qq] = (uint)metal::clamp(phys, 0, (int)TOT - 1);
         }
 
         {
@@ -120,8 +122,16 @@ SOURCE = r"""
                 for (short i = 0; i < 8; i++) ca[i] = qf[ks][i];
                 for (short i = 0; i < 8; i++) {
                     int c = sg * DS + ks * 16 + fn0 + (i % 4);
-                    cb[i]     = kb[koff[(i >> 2)] + c];
-                    cb[8 + i] = kb[koff[2 + (i >> 2)] + c];
+                    const uint physical = physical_rows[(i >> 2)];
+                    const uint physical_2 = physical_rows[2 + (i >> 2)];
+                    cb[i] = k[
+                        k_head + (size_t)physical * k_strides[2]
+                        + (size_t)c * k_strides[3]
+                    ];
+                    cb[8 + i] = k[
+                        k_head + (size_t)physical_2 * k_strides[2]
+                        + (size_t)c * k_strides[3]
+                    ];
                 }
                 op.run(ca, cb, cc);
             }
@@ -210,10 +220,16 @@ SOURCE = r"""
             for (short ks = 0; ks < 2; ks++) {
                 for (short i = 0; i < 8; i++) ca[i] = (T)p[ks * 8 + i];
                 for (short i = 0; i < 8; i++) {
-                    size_t ko = koff[ks * 2 + (i >> 2)];
+                    uint physical = physical_rows[ks * 2 + (i >> 2)];
                     int co = nbase + fn0 + (i % 4);
-                    cb[i]     = vb[ko + co];
-                    cb[8 + i] = vb[ko + co + 16];
+                    cb[i] = v[
+                        v_head + (size_t)physical * v_strides[2]
+                        + (size_t)co * v_strides[3]
+                    ];
+                    cb[8 + i] = v[
+                        v_head + (size_t)physical * v_strides[2]
+                        + (size_t)(co + 16) * v_strides[3]
+                    ];
                 }
                 op.run(ca, cb, cc);
             }
@@ -243,6 +259,7 @@ _KERNEL = mx.fast.metal_kernel(
     output_names=["out"],
     header=HEADER,
     source=SOURCE,
+    ensure_row_contiguous=False,
 )
 
 
@@ -426,7 +443,7 @@ def nax_qsa_attention(q, k, v, ids, counts, n_sel, q_pos, left_pad, *,
     assert gqa <= MTILE, "one token's heads must fit a 16-row NAX tile"
     (out,) = _KERNEL(
         inputs=[
-            mx.contiguous(q), mx.contiguous(k), mx.contiguous(v),
+            mx.contiguous(q), k, v,
             mx.contiguous(ids.astype(mx.uint32)),
             mx.contiguous(counts.astype(mx.uint32)),
             mx.contiguous(n_sel.astype(mx.uint32)),

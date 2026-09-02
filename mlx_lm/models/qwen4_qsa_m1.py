@@ -47,8 +47,10 @@ _SOURCE = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const device T* qh = q + (size_t)(b * NQH + h) * D;
-    const device T* kh = k + (size_t)(b * NKVH + hkv) * TOT * D;
-    const device T* vh = v + (size_t)(b * NKVH + hkv) * TOT * D;
+    const size_t k_head =
+        (size_t)b * k_strides[0] + (size_t)hkv * k_strides[1];
+    const size_t v_head =
+        (size_t)b * v_strides[0] + (size_t)hkv * v_strides[1];
 
     const uint ntokens = cnt * BS;
     for (uint token0 = 0; token0 < ntokens; token0 += 8u) {
@@ -62,8 +64,12 @@ _SOURCE = r"""
             && ((u < selected) || (logical >= complete));
 
         float dot = 0.0f;
-        for (uint d = lane; d < D; d += 32u)
-            dot += float(qh[d]) * float(kh[(size_t)phys * D + d]);
+        for (uint d = lane; d < D; d += 32u) {
+            const size_t k_index =
+                k_head + (size_t)phys * k_strides[2]
+                + (size_t)d * k_strides[3];
+            dot += float(qh[d]) * float(k[k_index]);
+        }
         dot = simd_sum(dot);
         if (lane == 0u) {
             scores[sg] = live ? dot * scale[0] : -INFINITY;
@@ -92,8 +98,12 @@ _SOURCE = r"""
 
         if (tid < D) {
             out *= shared_alpha;
-            for (uint j = 0; j < 8u; ++j)
-                out += probs[j] * float(vh[(size_t)physical[j] * D + tid]);
+            for (uint j = 0; j < 8u; ++j) {
+                const size_t v_index =
+                    v_head + (size_t)physical[j] * v_strides[2]
+                    + (size_t)tid * v_strides[3];
+                out += probs[j] * float(v[v_index]);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -116,7 +126,7 @@ def _kernel():
         output_names=["output"],
         header=_HEADER,
         source=_SOURCE,
-        ensure_row_contiguous=True,
+        ensure_row_contiguous=False,
     )
 
 
@@ -130,7 +140,7 @@ def qwen4_qsa_direct_m1(
     gqa = nqh // n_kv_heads
     (output,) = _kernel()(
         inputs=[
-            mx.contiguous(q), mx.contiguous(k), mx.contiguous(v),
+            mx.contiguous(q), k, v,
             mx.contiguous(ids.astype(mx.uint32)),
             mx.contiguous(counts.reshape(batch).astype(mx.uint32)),
             mx.contiguous(n_sel.reshape(batch).astype(mx.uint32)),
