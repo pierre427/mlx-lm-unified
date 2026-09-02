@@ -2936,7 +2936,12 @@ def _indexed_qsa_attention_or_gather(
     splits: int,
     tile_rows: int,
 ):
-    """Run indexed QSA or fall back with the same fetched cache tensors."""
+    """Run indexed QSA or fall back with the same fetched cache tensors.
+
+    Only synchronous Metal failures can fall back. A lazy failure after this
+    function returns is outside this try block, so the first probe evaluates
+    its result before caching a candidate.
+    """
 
     length = int(q.shape[2])
     context = int(compact.physical_width)
@@ -2944,16 +2949,20 @@ def _indexed_qsa_attention_or_gather(
         return qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=scale, splits=splits
         )
-    except QSAIndexedProbeDeclined as error:
-        reason = error.reason
-    except Exception:
-        reason = "dispatch_raised"
+    except (QSAIndexedProbeDeclined, RuntimeError) as error:
+        reason = (
+            error.reason
+            if isinstance(error, QSAIndexedProbeDeclined)
+            else "dispatch_raised"
+        )
+        exception_class = type(error).__name__
     record_qsa_indexed_receipt(
         engaged=False,
         reason=reason,
         length=length,
         context=context,
         splits=splits,
+        exception_class=exception_class,
     )
     return _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
@@ -3014,12 +3023,14 @@ def _capture_qsa_indexed_comparison(
         indexed_out = qwen4_qsa_indexed_attention(
             q, k, v, compact, scale=scale, splits=splits
         )
-    except QSAIndexedProbeDeclined as error:
+    except (QSAIndexedProbeDeclined, RuntimeError) as error:
         indexed_out = None
-        fallback_reason = error.reason
-    except Exception:
-        indexed_out = None
-        fallback_reason = "dispatch_raised"
+        fallback_reason = (
+            error.reason
+            if isinstance(error, QSAIndexedProbeDeclined)
+            else "dispatch_raised"
+        )
+        fallback_exception_class = type(error).__name__
     gather_out = _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
     )
@@ -3074,6 +3085,7 @@ def _capture_qsa_indexed_comparison(
             length=int(q.shape[2]),
             context=int(compact.physical_width),
             splits=splits,
+            exception_class=fallback_exception_class,
         )
 
     status = qsa_indexed_status()

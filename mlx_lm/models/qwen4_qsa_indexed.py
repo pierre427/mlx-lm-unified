@@ -217,6 +217,7 @@ def record_qsa_indexed_receipt(
     context: int,
     splits: int | None = None,
     candidate: tuple[int, int] | None = None,
+    exception_class: str | None = None,
 ) -> None:
     """Record bounded process evidence without evaluating device arrays."""
 
@@ -229,6 +230,7 @@ def record_qsa_indexed_receipt(
         "physical_kv": int(context),
         "splits": None if splits is None else int(splits),
         "candidate": None if candidate is None else list(candidate),
+        "exception_class": exception_class,
         "fully_masked_output": "zero",
     }
     with _STATUS_LOCK:
@@ -872,7 +874,7 @@ def qwen4_qsa_indexed_attention(
                         candidate = attempted
                         _PROBE_RESULTS[key] = attempted
                         break
-                    except (RuntimeError, ValueError):
+                    except RuntimeError:
                         continue
                 if candidate is None:
                     _PROBE_RESULTS[key] = False

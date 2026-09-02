@@ -432,6 +432,57 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertEqual(
             indexed.qsa_indexed_status()["counts"]["dispatch_raised"], 1
         )
+        self.assertEqual(
+            indexed.qsa_indexed_status()["last_decision"]["exception_class"],
+            "RuntimeError",
+        )
+
+    def test_contract_value_error_does_not_fall_back(self):
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        with (
+            mock.patch.object(
+                qwen4_exp,
+                "qwen4_qsa_indexed_attention",
+                side_effect=ValueError("contract failure"),
+            ),
+            mock.patch.object(
+                qwen4_exp,
+                "_gather_qsa_attention",
+                side_effect=AssertionError("gather must not run"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "contract failure"):
+                qwen4_exp._indexed_qsa_attention_or_gather(
+                    q,
+                    k,
+                    v,
+                    compact,
+                    scale=8**-0.5,
+                    splits=4,
+                    tile_rows=1,
+                )
+
+    def test_probe_ladder_does_not_swallow_contract_value_error(self):
+        q, k, v, compact = _real_bf16_fixture()
+        indexed._PROBE_RESULTS.clear()
+        with (
+            mock.patch.object(indexed, "indexed_kernel_available", return_value=True),
+            mock.patch.object(
+                indexed.mx,
+                "device_info",
+                return_value={"architecture": "applegpu_g17s"},
+            ),
+            mock.patch.object(
+                indexed,
+                "_partition_dispatch",
+                side_effect=ValueError("contract failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "contract failure"):
+                indexed.qwen4_qsa_indexed_attention(
+                    q, k, v, compact, scale=256**-0.5, splits=8
+                )
 
     def test_capture_writes_mismatch_and_returns_gather(self):
         mx.random.seed(37)
