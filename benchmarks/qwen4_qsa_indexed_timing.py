@@ -343,8 +343,6 @@ def run_isolated_cell(output):
         report["safety"].append(baseline_safety)
         check_cell_start(baseline_safety, 5)
         report["cpu_load_gate"] = wait_for_cpu_load()
-        baseline = thermal_baseline()
-        report["thermal_baseline"] = baseline
         for context in CONTEXTS:
             for length in (3, 1):
                 before = gate.safety_snapshot(
@@ -371,6 +369,7 @@ def run_isolated_cell(output):
                     )
                 for function in arms.values():
                     gate.timed(mx, function)
+                cell_settlement = gate.settle_thermal(timeout=30.0)
                 names = list(arms)
                 samples = {name: [] for name in names}
                 controls = []
@@ -382,7 +381,7 @@ def run_isolated_cell(output):
                             {
                                 "repeat": repeat,
                                 "arm": name,
-                                "settle": settle_to_baseline(baseline),
+                                "order": list(order),
                             }
                         )
                         samples[name].append(gate.timed(mx, arms[name]) * 1000.0)
@@ -403,7 +402,8 @@ def run_isolated_cell(output):
                         "query_contract": "M=3" if length == 3 else "M=1",
                         "median_ms": medians,
                         "samples_ms": samples,
-                        "arm_order_and_settle": controls,
+                        "arm_order": controls,
+                        "cell_thermal_settle": cell_settlement,
                         "indexed_speedup_vs_dense": (
                             medians["dense_masked"] / medians["indexed"]
                         ),
