@@ -1,4 +1,4 @@
-"""Default-off indexed split-K QSA attention for short verify widths."""
+"""Auto-default indexed split-K QSA attention for short verify widths."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 def _env_mode(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
-        return False
+        return None
     value = raw.strip().lower()
     if value == "auto":
         return None

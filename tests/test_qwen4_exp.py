@@ -2989,7 +2989,7 @@ class TestQSASelectionObject(unittest.TestCase):
             finally:
                 qwen4_exp_module._gather_qsa_attention = original
 
-    def test_z_indexed_env_unset_preserves_real_gather_route(self):
+    def test_z_indexed_explicit_zero_preserves_real_gather_route_byte_exactly(self):
         from mlx_lm.models import qwen4_qsa_indexed
 
         model = self._model()
@@ -3003,13 +3003,19 @@ class TestQSASelectionObject(unittest.TestCase):
             mx.eval(output)
             return output
 
+        with mock.patch.dict(
+            environ, {"MLX_QWEN4_QSA_INDEXED": "0"}, clear=False
+        ):
+            hard_off = qwen4_qsa_indexed._env_mode("MLX_QWEN4_QSA_INDEXED")
+        self.assertFalse(hard_off)
+
         with (
             lever_flag("_QSA_GATHER_KV"),
             lever_flag("_QSA_GATHER_TILE_ROWS", 2),
             lever_flag("_QSA_GATHER_MIN_CONTEXT", 0),
             lever_flag("_QSA_GATHER_MAX_CONTEXT", 0),
             lever_flag("_QSA_GATHER_MIN_QUERY", 1),
-            mock.patch.object(qwen4_qsa_indexed, "_QSA_INDEXED_ENABLED", False),
+            mock.patch.object(qwen4_qsa_indexed, "_QSA_INDEXED_ENABLED", hard_off),
         ):
             expected = run(model.make_cache())
             original = qwen4_exp_module._gather_qsa_attention

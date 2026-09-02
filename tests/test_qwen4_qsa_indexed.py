@@ -638,8 +638,17 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
         self.assertEqual(status["query_width_counts"][">8"]["declined"], 1)
 
-    def test_env_unset_keeps_dispatch_decisions_identical(self):
-        with mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", False):
+    def test_env_unset_selects_guarded_auto(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(indexed._env_mode("MLX_QWEN4_QSA_INDEXED"))
+
+    def test_explicit_zero_keeps_dispatch_decisions_byte_identical(self):
+        with mock.patch.dict(
+            os.environ, {"MLX_QWEN4_QSA_INDEXED": "0"}, clear=False
+        ):
+            hard_off = indexed._env_mode("MLX_QWEN4_QSA_INDEXED")
+        self.assertFalse(hard_off)
+        with mock.patch.object(indexed, "_QSA_INDEXED_ENABLED", hard_off):
             for use_nax in (False, True):
                 for gather_enabled in (False, True):
                     engage, reason = self.decide()
