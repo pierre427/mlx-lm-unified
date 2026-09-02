@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import itertools
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
@@ -2419,6 +2420,220 @@ class TestQwen4GdnRoundingBoundaries(unittest.TestCase):
         ).astype(mx.bfloat16)
         mx.eval(actual, expected)
         self.assertTrue(mx.array_equal(actual, expected).item())
+
+
+class TestPLEDeviceChainCompile(unittest.TestCase):
+    """``mx.compile`` over the device half of the PLE forward.
+
+    The PLE scope study (``wiki/docs/plans/qwen4-ple-device-fusion.md`` 3.3)
+    measured the chain from ``key_proj`` through ``gated + conv`` as 49-57
+    dispatches once per verify round, and compiling it as BIT-IDENTICAL --
+    max abs diff 0.0 at widths 3 and 16.  Bit-identical is therefore the bar
+    these tests hold, not a tolerance: the lever may only change cost.
+    """
+
+    PLE_LAYER = 1  # ple_layer_ids=[2] is layer_idx + 1
+    CONV, HISTORY = 2, 3
+
+    def setUp(self):
+        self._saved = qwen4_exp_module._PLE_COMPILE
+        qwen4_exp_module.qwen4_ple_compile_status(reset=True)
+
+    def tearDown(self):
+        qwen4_exp_module._PLE_COMPILE = self._saved
+        qwen4_exp_module.qwen4_ple_compile_status(reset=True)
+
+    def _layer(self, dtype=mx.bfloat16):
+        args = tiny_args(ple_layer_ids=[2])
+        mx.random.seed(5)
+        layer = PLELayer(args, self.PLE_LAYER, 0)
+        layer.set_dtype(dtype)
+        return layer, args
+
+    def _inputs(self, args, width, batch=2, dtype=mx.bfloat16):
+        mx.random.seed(11 + width)
+        hidden = mx.random.normal(
+            (batch, width, args.hidden_size * args.hc_count)
+        ).astype(dtype)
+        ids = mx.array(
+            [[1 + row * 7 + i for i in range(width)] for row in range(batch)],
+            dtype=mx.int32,
+        )
+        return hidden, ids
+
+    def _run(self, layer, hidden, ids, mask, compiled):
+        qwen4_exp_module._PLE_COMPILE = compiled
+        cache = Qwen4ArraysCache(4)
+        out = layer(hidden, ids, cache, mask)
+        mx.eval(out, cache[self.CONV])
+        return out, cache[self.CONV]
+
+    def test_compiled_is_bit_identical_to_eager(self):
+        for dtype in (mx.bfloat16, mx.float16):
+            layer, args = self._layer(dtype)
+            for width, masked in itertools.product((1, 3, 16, 17), (False, True)):
+                with self.subTest(dtype=str(dtype), width=width, masked=masked):
+                    hidden, ids = self._inputs(args, width, dtype=dtype)
+                    mask = None
+                    if masked:
+                        lengths = [width, max(1, width - 1)]
+                        mask = (
+                            mx.arange(width)[None, :] < mx.array(lengths)[:, None]
+                        )
+                    eager_out, eager_state = self._run(
+                        layer, hidden, ids, mask, False
+                    )
+                    comp_out, comp_state = self._run(layer, hidden, ids, mask, True)
+                    self.assertTrue(
+                        mx.array_equal(eager_out, comp_out).item(),
+                        f"width {width} masked={masked}: output differs, "
+                        f"max abs diff "
+                        f"{mx.max(mx.abs(eager_out - comp_out)).item()}",
+                    )
+                    self.assertTrue(
+                        mx.array_equal(eager_state, comp_state).item(),
+                        f"width {width} masked={masked}: conv state differs",
+                    )
+                    # Non-vacuous: the arms must not be secretly the same run.
+                    self.assertGreater(
+                        qwen4_exp_module.qwen4_ple_compile_status()["counts"][
+                            "builds"
+                        ],
+                        0,
+                        "no graph was traced -- the compiled arm never ran",
+                    )
+
+    def test_float32_activations_run_eager_with_a_receipt(self):
+        """fp32 has no ``astype`` boundary to absorb the fused FMA.
+
+        The compiled chain then differs from eager at ~1 ULP -- measured
+        2.2e-8 to 6.0e-8 at widths 3/16/17 -- so fp32 is refused rather than
+        served "nearly" exactly.
+        """
+        layer, args = self._layer(mx.float32)
+        hidden, ids = self._inputs(args, 3, dtype=mx.float32)
+        eager_out, eager_state = self._run(layer, hidden, ids, None, False)
+        comp_out, comp_state = self._run(layer, hidden, ids, None, True)
+        self.assertTrue(mx.array_equal(eager_out, comp_out).item())
+        self.assertTrue(mx.array_equal(eager_state, comp_state).item())
+        status = qwen4_exp_module.qwen4_ple_compile_status()
+        self.assertEqual(status["counts"]["builds"], 0)
+        self.assertGreater(status["counts"]["skips"], 0)
+        self.assertEqual(status["last_receipt"]["reason"], "float32_activations")
+
+    def test_the_lever_is_promoted_and_an_explicit_zero_reverts_it(self):
+        """Unset means ON; ``=0`` is how an operator turns a promotion off."""
+        read = qwen4_exp_module._env_flag
+        with mock.patch.dict(environ, {}, clear=False):
+            environ.pop("MLX_QWEN4_PLE_COMPILE", None)
+            self.assertTrue(read("MLX_QWEN4_PLE_COMPILE", default=True))
+        for value in ("0", "off", "false", "no"):
+            with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": value}):
+                self.assertFalse(
+                    read("MLX_QWEN4_PLE_COMPILE", default=True), f"{value!r}"
+                )
+
+    def test_env_explicit_zero_traces_nothing_and_answers_eagerly(self):
+        layer, args = self._layer()
+        hidden, ids = self._inputs(args, 3)
+        with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": "0"}):
+            qwen4_exp_module._PLE_COMPILE = qwen4_exp_module._env_flag(
+                "MLX_QWEN4_PLE_COMPILE", default=True
+            )
+        self.assertFalse(qwen4_exp_module._PLE_COMPILE)
+        cache = Qwen4ArraysCache(4)
+        mx.eval(layer(hidden, ids, cache))
+        status = qwen4_exp_module.qwen4_ple_compile_status()
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["counts"]["builds"], 0)
+        self.assertEqual(status["counts"]["hits"], 0)
+        self.assertEqual(getattr(layer, "_ple_compile_cache", {}), {})
+
+    def test_a_non_metal_device_runs_eager_with_a_receipt(self):
+        """Bit-identity was measured on Metal, and does not hold off it.
+
+        On the CPU device fp16 activations drift from eager by up to 4.9e-4
+        at widths 1/3/16/17 -- the CPU backend fuses a different span than the
+        Metal one.  The lever may change cost only, so an unmeasured device
+        runs eager instead.
+        """
+        layer, args = self._layer(mx.float16)
+        hidden, ids = self._inputs(args, 3, dtype=mx.float16)
+        with mx.stream(mx.cpu):
+            eager_out, eager_state = self._run(layer, hidden, ids, None, False)
+            comp_out, comp_state = self._run(layer, hidden, ids, None, True)
+        self.assertTrue(mx.array_equal(eager_out, comp_out).item())
+        self.assertTrue(mx.array_equal(eager_state, comp_state).item())
+        status = qwen4_exp_module.qwen4_ple_compile_status()
+        self.assertEqual(status["counts"]["builds"], 0)
+        self.assertGreater(status["counts"]["skips"], 0)
+        self.assertEqual(status["last_receipt"]["reason"], "non_metal_device")
+
+    def test_a_compile_failure_falls_back_with_a_receipt(self):
+        layer, args = self._layer()
+        hidden, ids = self._inputs(args, 3)
+        eager_out, eager_state = self._run(layer, hidden, ids, None, False)
+
+        def boom(fn):
+            raise RuntimeError("synthetic trace failure")
+
+        qwen4_exp_module._PLE_COMPILE = True
+        original = qwen4_exp_module.mx.compile
+        qwen4_exp_module.mx.compile = boom
+        try:
+            cache = Qwen4ArraysCache(4)
+            out = layer(hidden, ids, cache)
+            mx.eval(out, cache[self.CONV])
+        finally:
+            qwen4_exp_module.mx.compile = original
+        self.assertTrue(mx.array_equal(eager_out, out).item())
+        self.assertTrue(mx.array_equal(eager_state, cache[self.CONV]).item())
+        status = qwen4_exp_module.qwen4_ple_compile_status()
+        self.assertEqual(status["counts"]["fallbacks"], 1)
+        self.assertEqual(status["last_receipt"]["event"], "fallbacks")
+        self.assertIn("synthetic trace failure", status["last_receipt"]["error"])
+        # Demoted, not retried: a second call adds no second failure.
+        cache2 = Qwen4ArraysCache(4)
+        mx.eval(layer(hidden, ids, cache2))
+        self.assertEqual(
+            qwen4_exp_module.qwen4_ple_compile_status()["counts"]["fallbacks"], 1
+        )
+
+    def test_a_weight_change_retraces_instead_of_serving_a_stale_graph(self):
+        """``mx.compile`` bakes a captured weight in as a constant.
+
+        Measured: without the identity guard the cached graph kept answering
+        with the OLD gain after ``norm_key.weight`` was rebound, and disagreed
+        with eager.  Frozen inference never rebinds, but ``set_dtype``,
+        quantization and a LoRA merge all do.
+        """
+        layer, args = self._layer()
+        hidden, ids = self._inputs(args, 3)
+        qwen4_exp_module._PLE_COMPILE = True
+        cache = Qwen4ArraysCache(4)
+        mx.eval(layer(hidden, ids, cache))
+
+        layer.norm_key.weight = layer.norm_key.weight * 2.0
+        stale, stale_state = self._run(layer, hidden, ids, None, True)
+        fresh, fresh_state = self._run(layer, hidden, ids, None, False)
+        self.assertTrue(mx.array_equal(stale, fresh).item())
+        self.assertTrue(mx.array_equal(stale_state, fresh_state).item())
+        self.assertGreater(
+            qwen4_exp_module.qwen4_ple_compile_status()["counts"]["retraces"], 0
+        )
+
+    def test_the_signature_cache_is_bounded(self):
+        layer, args = self._layer()
+        qwen4_exp_module._PLE_COMPILE = True
+        limit = qwen4_exp_module._PLE_COMPILE_CACHE_MAX
+        for width in range(1, limit + 4):
+            hidden, ids = self._inputs(args, width)
+            cache = Qwen4ArraysCache(4)
+            mx.eval(layer(hidden, ids, cache))
+        self.assertLessEqual(len(layer._ple_compile_cache), limit)
+        self.assertGreater(
+            qwen4_exp_module.qwen4_ple_compile_status()["counts"]["overflow"], 0
+        )
 
 
 if __name__ == "__main__":

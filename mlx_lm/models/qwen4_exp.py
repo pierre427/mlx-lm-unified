@@ -91,6 +91,70 @@ from ..verify_sync import record_verify_sync
 # Opt-in micro-levers, each read once at import.  Off keeps the stock path,
 # EXCEPT where a lever has been promoted (``default=True``) -- see below.
 _RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
+
+# ``mx.compile`` over the device half of the PLE forward -- the two
+# projections, three ``GroupRMSNorm``s, the gate arithmetic, the pad ``where``s,
+# the dilated short conv and the residual add.  Scoped in
+# ``wiki/docs/plans/qwen4-ple-device-fusion.md``: 49-57 dispatches once per
+# verify round, and compiling them is BIT-IDENTICAL (max abs diff 0.0) while
+# buying 0.057 ms at width 3 and 0.164 ms at width 16 in isolation.  Same
+# mechanism ``nn.silu`` and ``qwen3_next._precise_swiglu`` already use.
+#
+# PROMOTED (2026-09-02) on the end-to-end serving gate: B1 self-MTP k=2 gave an
+# identical 256-token digest at 16K and 64K, decode +0.2% at 64K with a positive
+# sign at both contexts, and 431 replays over 16 generations with 0 fallbacks,
+# 0 overflows and 0 retraces.  Unset means ON; ``MLX_QWEN4_PLE_COMPILE=0``
+# reverts to the eager chain, which is the same arithmetic.
+_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE", default=True)
+# One traced graph per (batch, width, mask, state-write, dtype) signature.  A
+# single run legitimately holds several: the prefill chunk width and its short
+# tail, the decode width, the verify slab width, and each of those again with
+# and without a pad mask -- so the bound is set well above that rather than at
+# it.  Past the bound we stop caching and run eager rather than grow without
+# limit; ``overflow`` in the receipts says it happened.
+_PLE_COMPILE_CACHE_MAX = max(1, int(os.environ.get("MLX_QWEN4_PLE_COMPILE_CACHE", "32")))
+_PLE_COMPILE_STATS_LOCK = threading.Lock()
+_PLE_COMPILE_STATS = {
+    "builds": 0,
+    "hits": 0,
+    "fallbacks": 0,
+    "overflow": 0,
+    "skips": 0,
+    "retraces": 0,
+}
+_PLE_COMPILE_LAST_RECEIPT: Optional[dict] = None
+
+
+def _record_ple_compile(event: str, **fields) -> None:
+    global _PLE_COMPILE_LAST_RECEIPT
+    with _PLE_COMPILE_STATS_LOCK:
+        _PLE_COMPILE_STATS[event] = _PLE_COMPILE_STATS.get(event, 0) + 1
+        if event != "hits":
+            _PLE_COMPILE_LAST_RECEIPT = {"event": event, **fields}
+
+
+def qwen4_ple_compile_status(*, reset: bool = False) -> dict:
+    """Bounded receipts for the compiled PLE device chain.
+
+    ``fallbacks`` MUST be 0 on a healthy run: every one is a signature that
+    raised while tracing or replaying and was demoted to the eager chain.
+    """
+
+    global _PLE_COMPILE_LAST_RECEIPT
+    with _PLE_COMPILE_STATS_LOCK:
+        report = {
+            "enabled": bool(_PLE_COMPILE),
+            "cache_max": _PLE_COMPILE_CACHE_MAX,
+            "counts": dict(_PLE_COMPILE_STATS),
+            "last_receipt": _PLE_COMPILE_LAST_RECEIPT,
+        }
+        if reset:
+            for key in _PLE_COMPILE_STATS:
+                _PLE_COMPILE_STATS[key] = 0
+            _PLE_COMPILE_LAST_RECEIPT = None
+    return report
+
+
 _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
 _QSA_APC_SUMMARIES = _env_flag("MLX_QWEN4_QSA_APC_SUMMARIES")
 _QSA_SUMMARY_FORMAT_VERSION = 1
@@ -1838,34 +1902,49 @@ class PLELayer(nn.Module):
             bias=False,
         )
 
+    def _conv_state_tail(self, conv_input, mask):
+        """The persistent conv state cut at each row's own last valid position.
+
+        The conv is causal, so the branch OUTPUT at a valid position is
+        already pad-free; the persistent tail is not.  Cutting at the padded
+        width instead makes a short row carry pads in its conv state forever.
+        """
+        return mx.contiguous(
+            conv_input[:, -self.short_conv_state_len :, :]
+            if mask is None
+            else _row_tail(
+                conv_input, _valid_span_end(mask), self.short_conv_state_len
+            )
+        )
+
     def _short_conv(self, x: mx.array, cache: Optional[ArraysCache], mask=None):
+        """Eager short conv WITH the cache write, for direct-state callers.
+
+        ``__call__`` goes through ``_device_chain`` instead, which returns the
+        new state rather than assigning it -- a cache mutation is exactly the
+        side effect ``mx.compile`` cannot trace.  Both share
+        ``_conv_state_tail`` so the tail has one definition.
+        """
         state = cache[2] if cache is not None else None
         if state is None:
-            state = mx.zeros((x.shape[0], self.short_conv_state_len, x.shape[-1]), x.dtype)
+            state = mx.zeros(
+                (x.shape[0], self.short_conv_state_len, x.shape[-1]), x.dtype
+            )
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            # The conv is causal, so the branch OUTPUT at a valid position is
-            # already pad-free; the persistent tail is not.  Cut each row's
-            # window at its own last valid position instead of at the padded
-            # width, or the row carries pads in its conv state forever.
-            cache[2] = mx.contiguous(
-                conv_input[:, -self.short_conv_state_len :, :]
-                if mask is None
-                else _row_tail(
-                    conv_input, _valid_span_end(mask), self.short_conv_state_len
-                )
-            )
+            cache[2] = self._conv_state_tail(conv_input, mask)
         return nn.silu(self.conv1d(conv_input))[:, -x.shape[1] :, :]
 
-    def __call__(self, hidden: mx.array, input_ids: mx.array, cache=None, mask=None):
-        if mask is None and isinstance(cache, ArraysCache):
-            # A model with no linear layer builds no ssm mask, so read the
-            # padding geometry off the cache rather than trust the caller.
-            if cache.lengths is not None or cache.left_padding is not None:
-                mask = cache.make_mask(input_ids.shape[1])
-        previous_conv = cache[2] if cache is not None else None
-        previous_tokens = cache[3] if cache is not None else None
-        embeddings = self.ple_embedding(input_ids, cache, mask)
+    def _device_chain(self, hidden, embeddings, mask, state, write_state: bool):
+        """The device half of the PLE forward, as ONE pure array function.
+
+        Everything from ``key_proj`` through the residual ``gated + conv``,
+        with no host round trip, no cache mutation and no Python-level state:
+        the gather has already happened and its rows arrive as ``embeddings``.
+        That purity is the whole point -- it is what lets ``mx.compile`` trace
+        the chain, and the ONLY thing the compiled path changes.  Returns
+        ``[out, normed]``, plus the new conv state when ``write_state``.
+        """
         key = self.norm_key(self.key_proj(embeddings)).reshape(
             *hidden.shape[:-1], self.hc_count, self.hidden_size
         )
@@ -1880,7 +1959,176 @@ class PLELayer(nn.Module):
         if mask is not None:
             gated = mx.where(mask[..., None], gated, 0)
             normed = mx.where(mask[..., None], normed, 0)
-        conv = self._short_conv(normed, cache, mask)
+        if state is None:
+            state = mx.zeros(
+                (normed.shape[0], self.short_conv_state_len, normed.shape[-1]),
+                normed.dtype,
+            )
+        conv_input = mx.concatenate([state, normed], axis=1)
+        conv = nn.silu(self.conv1d(conv_input))[:, -normed.shape[1] :, :]
+        out = gated + conv
+        if not write_state:
+            return [out, normed]
+        return [out, normed, self._conv_state_tail(conv_input, mask)]
+
+    def _chain_params(self):
+        """Strong references to every weight the traced chain closes over.
+
+        ``mx.compile`` bakes a captured array into the graph as a CONSTANT and
+        does not notice when the attribute is later rebound -- measured: after
+        ``norm_key.weight *= 2`` the cached graph still answered with the old
+        gain, and disagreed with eager.  Frozen inference never does that, but
+        ``set_dtype``, quantization, a LoRA merge and training all do, so the
+        entry is keyed on the identity of these objects rather than trusted.
+        Holding them keeps the ids from being recycled under us; the graph
+        holds them anyway, so this costs no memory.
+        """
+        params = []
+        for module in (
+            self.key_proj,
+            self.value_proj,
+            self.conv1d,
+            self.norm_key,
+            self.norm_query,
+            self.norm_conv,
+        ):
+            for name in ("weight", "scales", "biases"):
+                value = getattr(module, name, None)
+                if value is not None:
+                    params.append(value)
+        return tuple(params)
+
+    def _compiled_chain(
+        self, signature, has_mask: bool, has_state: bool, write_state: bool
+    ):
+        """Return the traced chain for ``signature``, or ``None`` for eager.
+
+        ``None`` is the fail-closed answer and is cached as such, so a
+        signature that raised once is never retried -- the eager chain is
+        always a correct substitute, and a compile failure must cost one
+        receipt, not one exception per round.
+        """
+        cache = getattr(self, "_ple_compile_cache", None)
+        if cache is None:
+            cache = {}
+            self._ple_compile_cache = cache
+        params = self._chain_params()
+        entry = cache.get(signature)
+        if entry is not None:
+            cached_params, compiled = entry
+            if len(cached_params) == len(params) and all(
+                a is b for a, b in zip(cached_params, params)
+            ):
+                _record_ple_compile("hits")
+                return compiled
+            # A weight moved under a traced graph: drop it and retrace.
+            _record_ple_compile("retraces", signature=repr(signature))
+            del cache[signature]
+        if len(cache) >= _PLE_COMPILE_CACHE_MAX:
+            _record_ple_compile("overflow", signature=repr(signature))
+            return None
+        try:
+            # Every optional argument is baked in at build time rather than
+            # passed as ``None``: ``mx.compile`` flattens its argument tree, so
+            # a signature must have a fixed arity of real arrays.
+            if has_mask and has_state:
+
+                def chain(hidden, embeddings, mask, state, _ws=write_state):
+                    return self._device_chain(hidden, embeddings, mask, state, _ws)
+
+            elif has_mask:
+
+                def chain(hidden, embeddings, mask, _ws=write_state):
+                    return self._device_chain(hidden, embeddings, mask, None, _ws)
+
+            elif has_state:
+
+                def chain(hidden, embeddings, state, _ws=write_state):
+                    return self._device_chain(hidden, embeddings, None, state, _ws)
+
+            else:
+
+                def chain(hidden, embeddings, _ws=write_state):
+                    return self._device_chain(hidden, embeddings, None, None, _ws)
+
+            compiled = mx.compile(chain)
+        except Exception as exc:  # pragma: no cover - defensive
+            compiled = None
+            _record_ple_compile(
+                "fallbacks", signature=repr(signature), error=repr(exc)
+            )
+        else:
+            _record_ple_compile("builds", signature=repr(signature))
+        cache[signature] = (params, compiled)
+        return compiled
+
+    def _run_device_chain(self, hidden, embeddings, mask, state, write_state: bool):
+        if not _PLE_COMPILE:
+            return self._device_chain(hidden, embeddings, mask, state, write_state)
+        if mx.default_device() != mx.gpu:
+            # Bit-identity was measured on Metal only, and it does NOT hold off
+            # it: on the CPU device fp16 activations drift from eager by up to
+            # 4.9e-4 at widths 1/3/16/17, masked and unmasked, because the CPU
+            # backend fuses a different span than the Metal one.  The lever's
+            # contract is that it may change COST ONLY, so a device whose
+            # exactness was never measured runs eager.
+            _record_ple_compile("skips", reason="non_metal_device")
+            return self._device_chain(hidden, embeddings, mask, state, write_state)
+        if mx.float32 in (hidden.dtype, embeddings.dtype):
+            # MEASURED, not assumed: with bf16 or fp16 activations the compiled
+            # chain is bit-identical at widths 1/3/16/17 masked and unmasked,
+            # because every fusible span ends at an ``astype`` back to the
+            # activation dtype that absorbs the difference.  With fp32
+            # activations that boundary is gone and the fused kernel's FMA
+            # contraction shows through at ~1 ULP (2.2e-8 to 6.0e-8).  The
+            # lever's contract is that it may change COST ONLY, so fp32 runs
+            # eager rather than "nearly" exact.
+            _record_ple_compile("skips", reason="float32_activations")
+            return self._device_chain(hidden, embeddings, mask, state, write_state)
+        has_mask = mask is not None
+        has_state = state is not None
+        signature = (
+            tuple(hidden.shape),
+            tuple(embeddings.shape),
+            tuple(state.shape) if has_state else None,
+            has_mask,
+            bool(write_state),
+            str(hidden.dtype),
+            str(embeddings.dtype),
+        )
+        compiled = self._compiled_chain(signature, has_mask, has_state, write_state)
+        if compiled is None:
+            return self._device_chain(hidden, embeddings, mask, state, write_state)
+        args = tuple(
+            a for a in (hidden, embeddings, mask, state) if a is not None
+        )
+        try:
+            return compiled(*args)
+        except Exception as exc:
+            # Fail closed: demote this signature for the rest of the process
+            # and answer from the eager chain, which is the same arithmetic.
+            self._ple_compile_cache[signature] = (self._chain_params(), None)
+            _record_ple_compile(
+                "fallbacks", signature=repr(signature), error=repr(exc)
+            )
+            return self._device_chain(hidden, embeddings, mask, state, write_state)
+
+    def __call__(self, hidden: mx.array, input_ids: mx.array, cache=None, mask=None):
+        if mask is None and isinstance(cache, ArraysCache):
+            # A model with no linear layer builds no ssm mask, so read the
+            # padding geometry off the cache rather than trust the caller.
+            if cache.lengths is not None or cache.left_padding is not None:
+                mask = cache.make_mask(input_ids.shape[1])
+        previous_conv = cache[2] if cache is not None else None
+        previous_tokens = cache[3] if cache is not None else None
+        embeddings = self.ple_embedding(input_ids, cache, mask)
+        write_state = cache is not None
+        outputs = self._run_device_chain(
+            hidden, embeddings, mask, previous_conv, write_state
+        )
+        out, normed = outputs[0], outputs[1]
+        if write_state:
+            cache[2] = outputs[2]
         spans = (
             cache.rollback_spans(input_ids.shape[1], mask)
             if isinstance(cache, Qwen4ArraysCache) and cache.speculating
@@ -1946,7 +2194,7 @@ class PLELayer(nn.Module):
                 [previous_conv, previous_tokens],
                 per_row_fn=_ple_rollback_rows,
             )
-        return gated + conv
+        return out
 
 
 _ROPE_POSITION_FREQS: Dict[tuple, mx.array] = {}
