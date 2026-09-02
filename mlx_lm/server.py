@@ -878,13 +878,42 @@ def plan_soft_reload(cli_args, config: Any) -> List[Tuple[str, MutableKey, Any, 
     return plan
 
 
+def _invalidate_compiled_traces(changed_modules) -> None:
+    """Retire compiled traces that could have baked in a lever we just wrote.
+
+    ``mx.compile`` resolves an ``if _FLAG:`` inside a traced region at TRACE
+    time, so a model module's compile caches must be keyed on the lever or
+    dropped when it moves -- otherwise a soft reload reports the new value
+    while already-traced shapes keep running the old branch (MEASURED
+    2026-09-02 on ``qwen4_rmsnorm_fast``: 2 stale traces per flip).  The keying
+    lives in the model modules; this is the call that tells them a write
+    happened.  Every trace-holding model module is invalidated, not just the
+    one that owns the attribute, because a lever in one module is read from a
+    region traced in another.
+    """
+    for module_name in changed_modules:
+        module = sys.modules.get(module_name)
+        hook = getattr(module, "invalidate_compiled_traces", None)
+        if hook is not None:
+            hook()
+
+
 def apply_soft_reload(cli_args, plan) -> Dict[str, Dict[str, Any]]:
     """Write a validated plan and report old -> new per key."""
     changes = {}
+    moved_module = False
     for name, spec, old, new in plan:
         target = cli_args if spec.kind == "cli_args" else _soft_reload_target(spec)
         setattr(target, spec.attr, new)
+        # Only a lever that actually MOVED costs a retrace. A reload that
+        # rewrites a constant with the value it already had must not throw
+        # away warm traces -- operators re-post whole config blocks.
+        moved_module = moved_module or (spec.kind == "module" and old != new)
         changes[name] = {"old": old, "new": new}
+    if moved_module:
+        _invalidate_compiled_traces(
+            {s.module for s in SOFT_RELOAD_KEYS.values() if s.kind == "module"}
+        )
     return changes
 
 

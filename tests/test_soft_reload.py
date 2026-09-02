@@ -738,7 +738,8 @@ class TestAdminRoutesOverHTTP(unittest.TestCase):
         self.assertIsInstance(ple_status.json()["enabled"], bool)
         self.assertEqual(
             set(ple_status.json()["counts"]),
-            {"builds", "hits", "fallbacks", "overflow", "skips", "retraces"},
+            {"builds", "hits", "fallbacks", "overflow", "skips", "retraces",
+             "invalidations"},
         )
         self.assertEqual(requests.get(self.base + "/v1/nope").status_code, 404)
 

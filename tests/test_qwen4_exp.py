@@ -2625,6 +2625,62 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
             qwen4_exp_module.qwen4_ple_compile_status()["counts"]["retraces"], 0
         )
 
+    def test_a_lever_flip_retraces_instead_of_replaying_the_old_branch(self):
+        """``mx.compile`` bakes an ``if _FLAG:`` in at TRACE time.
+
+        The chain calls three ``GroupRMSNorm``s, whose branch is chosen by the
+        module-tier ``_RMSNORM_FAST``.  With the cache keyed on shape and
+        dtype alone, flipping that lever -- through the ``qwen4_rmsnorm_fast``
+        soft-reload key or in an A/B -- left every already-traced signature
+        replaying the OLD branch while the server reported the new value.
+        MEASURED 2026-09-02: 2 stale traces per flip.
+
+        The probe is behavioural, not just structural: a trace REPLAY never
+        re-runs the Python body, so counting ``mx.fast.rms_norm`` calls
+        separates "retraced and took the fast branch" from "replayed".
+        """
+        layer, args = self._layer()
+        hidden, ids = self._inputs(args, 3)
+        qwen4_exp_module._PLE_COMPILE = True
+        saved = qwen4_exp_module._RMSNORM_FAST
+        real_rms_norm = mx.fast.rms_norm
+        calls = []
+
+        def counted(*a, **k):
+            calls.append(1)
+            return real_rms_norm(*a, **k)
+
+        try:
+            qwen4_exp_module._RMSNORM_FAST = False
+            mx.eval(layer(hidden, ids, Qwen4ArraysCache(4)))
+            built = qwen4_exp_module.qwen4_ple_compile_status()["counts"]["builds"]
+            self.assertEqual(built, 1)
+
+            mx.fast.rms_norm = counted
+            qwen4_exp_module._RMSNORM_FAST = True
+            mx.eval(layer(hidden, ids, Qwen4ArraysCache(4)))
+            counts = qwen4_exp_module.qwen4_ple_compile_status()["counts"]
+            # It retraced...
+            self.assertEqual(counts["builds"], built + 1)
+            self.assertEqual(counts["invalidations"], 1)
+            # ...and the retrace ran the FAST branch, once per GroupRMSNorm.
+            self.assertEqual(len(calls), 3)
+            # The stale generation is dropped, not merely out-keyed, so a
+            # flip cannot walk the cache bound to ``overflow``.
+            self.assertEqual(len(layer._ple_compile_cache), 1)
+
+            # A steady lever must still hit the cache: the fix may not turn
+            # compilation off by retracing on every call.
+            calls.clear()
+            mx.eval(layer(hidden, ids, Qwen4ArraysCache(4)))
+            counts = qwen4_exp_module.qwen4_ple_compile_status()["counts"]
+            self.assertEqual(counts["builds"], built + 1)
+            self.assertEqual(counts["hits"], 1)
+            self.assertEqual(calls, [])
+        finally:
+            mx.fast.rms_norm = real_rms_norm
+            qwen4_exp_module._RMSNORM_FAST = saved
+
     def test_the_signature_cache_is_bounded(self):
         layer, args = self._layer()
         qwen4_exp_module._PLE_COMPILE = True
@@ -2687,6 +2743,7 @@ class TestPLECompileServer(unittest.TestCase):
                 "overflow": 0,
                 "skips": 0,
                 "retraces": 0,
+                "invalidations": 0,
             },
         )
         self.assertEqual(body["last_receipt"]["event"], "fallbacks")
