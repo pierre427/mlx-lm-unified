@@ -167,6 +167,59 @@ def _tiny_deepseek_v32():
     )
 
 
+def _tiny_deepseek_v3():
+    from mlx_lm.models import deepseek_v3
+
+    return deepseek_v3.Model(
+        deepseek_v3.ModelArgs(
+            model_type="deepseek_v3",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=64,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            kv_lora_rank=64,
+            q_lora_rank=None,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            n_routed_experts=None,
+            first_k_dense_replace=99,
+            max_position_embeddings=2048,
+        )
+    )
+
+
+def _tiny_glm4_moe_lite():
+    from mlx_lm.models import glm4_moe_lite
+
+    return glm4_moe_lite.Model(
+        glm4_moe_lite.ModelArgs(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=64,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_group=1,
+            topk_group=1,
+            kv_lora_rank=64,
+            q_lora_rank=None,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            first_k_dense_replace=1,
+            num_nextn_predict_layers=0,
+        )
+    )
+
+
 BUILDERS = {
     "bailing_moe_v3": _tiny_bailing_moe_v3,
     "deepseek_v32": _tiny_deepseek_v32,
@@ -188,19 +241,36 @@ BF16_DIGESTS = {
 # Relative (max-abs / max-abs) tolerance between a quantized and a bf16 run.
 # Measured on these tiny configs: 8-bit is <= 0.006 everywhere and 4-bit <= 0.09,
 # except on deepseek_v32.  Its DSA indexer picks the sparse key set by top-k over
-# scores read from the (also quantized) index cache, and that discrete choice can
-# land on a different set at 4 bits, moving the output far more than the
-# arithmetic error.  That is a property of DSA under quantization, not of the
-# dequant boundary under test -- which test_quantized_branches_agree_with_each_other
-# pins directly.
+# index scores, and that choice is discrete: an arbitrarily small perturbation
+# anywhere upstream of it can land on a different set, moving the output far more
+# than the arithmetic error does.  Quantizing the index cache is not the only way
+# in -- leaving that cache in bf16 and quantizing only the MLA latent still
+# diverges (rel. err 0.28 at 8 bits vs 0.17 at 4, non-monotonic in bits, which is
+# the signature of a flip rather than of accumulated error), because layer 0's
+# quantized attention output is layer 1's indexer input.  That is a property of
+# DSA under any quantization, not of the dequant boundary under test -- which
+# test_quantized_branches_agree_with_each_other pins directly.
 _DEFAULT_TOLERANCE = {8: 0.02, 4: 0.10}
 TOLERANCES = {name: _DEFAULT_TOLERANCE for name in BUILDERS}
 TOLERANCES["deepseek_v32"] = {8: 0.02, 4: 0.40}
 
 
+# `deepseek_v3` and `glm4_moe_lite` already carried the quantized-MLA shape
+# these twins were given, but not `deepseek_v2`'s asymmetric-bits refusal: with
+# distinct key/value bits `QuantizedKVCache.bits` is None and both the rope
+# matmul and the latent dequantize would fail on a bare TypeError instead. They
+# take part in the refusal test only.
+REFUSAL_ONLY_BUILDERS = {
+    "deepseek_v3": _tiny_deepseek_v3,
+    "glm4_moe_lite": _tiny_glm4_moe_lite,
+}
+
+ALL_BUILDERS = {**BUILDERS, **REFUSAL_ONLY_BUILDERS}
+
+
 def _build(name):
     mx.random.seed(0)
-    model = BUILDERS[name]()
+    model = ALL_BUILDERS[name]()
     model.eval()
     return model
 
@@ -311,9 +381,11 @@ class TestQuantizedKVCacheOnMLATwins(unittest.TestCase):
                 model = _build(name)
                 if name == "deepseek_v32":
                     # Over this horizon the DSA indexer picks a different
-                    # sparse key set on 2 of its 10 calls when it reads an
-                    # 8-bit index cache, so a quantized run cannot track a
-                    # bf16 one.  Pin what this fix owns instead: on the *same*
+                    # sparse key set on 2 of its 10 calls at 8 bits, so a
+                    # quantized run cannot track a bf16 one (see the TOLERANCES
+                    # note: the flip survives leaving the index cache in bf16,
+                    # so it is not the index cache's quantization that causes
+                    # it).  Pin what this fix owns instead: on the *same*
                     # quantized cache both MLA branches see the same selection
                     # and must agree.
                     mla.set_absorbed_max_query_override(mla.ABSORBED_UNBOUNDED)
@@ -334,7 +406,7 @@ class TestQuantizedKVCacheOnMLATwins(unittest.TestCase):
                 )
 
     def test_asymmetric_kv_bits_are_refused(self):
-        for name in BUILDERS:
+        for name in ALL_BUILDERS:
             with self.subTest(model=name):
                 model = _build(name)
                 cache = make_prompt_cache(model)
