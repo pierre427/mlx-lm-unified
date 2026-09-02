@@ -309,6 +309,7 @@ def test_resident_verify_switch_is_independent_of_decode():
     stats = qwen4_exp.qwen4_fused_gdn_stats(layer)
     assert stats["verify_calls"] == 0 and stats["verify_fallbacks"] == 0
     assert stats["verify_last_fallbacks"] == {}
+    assert stats["verify_fallback_reasons"] == {}
 
 
 def test_decode_hook_routes_speculating_multi_token_forwards_to_verify():
@@ -513,3 +514,120 @@ def test_ragged_engine_one_lane_geometry_is_admitted_and_recorded():
     assert layer.fused_gdn_verify_calls == 1
     assert layer.fused_gdn_verify_fallbacks == 0
     assert cache.events == [("record", 3), ("set", 0), ("set", 1), ("advance", 3)]
+
+
+def _hook_args(values):
+    return (values["qkv"], values["z"], values["b"], values["a"], None)
+
+
+def _admitted_verify(layer, values, cache):
+    """Run one admitted verify through the hook with the kernel patched out."""
+    patches = _admitted_patches(
+        dict(
+            return_value=(
+                FakeArray((1, 3, 6144), mx.bfloat16),
+                object(),
+                object(),
+                mx.zeros((1, 2, 2, 2, 2)),
+                mx.zeros((1, 2, 3, 4)),
+            )
+        )
+    )
+    with patches[0], patches[1], patches[2], patches[3]:
+        return layer._try_fused_verify(
+            values["qkv"], values["z"], values["b"], values["a"], None, cache
+        )
+
+
+def test_verify_decline_histogram_survives_a_later_admitted_call():
+    """``last_fallback`` is cleared by the next success; the histogram is not.
+
+    A production run that declines a wide PLD verify and then admits a narrow
+    MTP one used to receipt ``{}`` for the reason, which is how 288 real
+    declines went unexplained in the 2026-09-02 receipts run.
+    """
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    layer.set_fused_gdn_verify_mode("fused")
+    layer.out_proj = Identity()
+    values = production_values(steps=3)
+
+    with patch.object(qwen4_exp, "fused_gdn_runtime_supported") as runtime:
+        assert layer._try_fused_verify(*_hook_args(values), FakeCache()) is None
+        assert layer._try_fused_verify(*_hook_args(values), FakeCache()) is None
+        not_speculating = FakeCache(
+            values["conv_state"], values["recurrent_state"], speculating=False
+        )
+        assert layer._try_fused_verify(*_hook_args(values), not_speculating) is None
+    runtime.assert_not_called()
+    assert layer.fused_gdn_verify_fallback_reasons == {
+        "uninitialized cache": 2,
+        "not a speculative verify": 1,
+    }
+
+    cache = FakeCache(values["conv_state"], values["recurrent_state"])
+    assert _admitted_verify(layer, values, cache) is not None
+    assert layer.fused_gdn_verify_calls == 1
+    # The point-in-time field is cleared by the success, the histogram is not.
+    assert layer.fused_gdn_verify_last_fallback is None
+    assert layer.fused_gdn_verify_fallback_reasons == {
+        "uninitialized cache": 2,
+        "not a speculative verify": 1,
+    }
+
+    stats = qwen4_exp.qwen4_fused_gdn_stats(layer)
+    assert stats["verify_calls"] == 1 and stats["verify_fallbacks"] == 3
+    assert stats["verify_last_fallbacks"] == {}
+    assert stats["verify_fallback_reasons"] == {
+        "uninitialized cache": 2,
+        "not a speculative verify": 1,
+    }
+
+
+def test_verify_decline_histogram_is_reset_only_by_the_stats_reset():
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    layer.set_fused_gdn_verify_mode("fused")
+    values = production_values(steps=3)
+    with patch.object(qwen4_exp, "fused_gdn_runtime_supported"):
+        assert layer._try_fused_verify(*_hook_args(values), FakeCache()) is None
+
+    # A plain read leaves the counters alone; only ``reset`` clears them.
+    assert qwen4_exp.qwen4_fused_gdn_stats(layer)["verify_fallback_reasons"] == {
+        "uninitialized cache": 1
+    }
+    stats = qwen4_exp.qwen4_fused_gdn_stats(layer, reset=True)
+    assert stats["verify_fallback_reasons"] == {"uninitialized cache": 1}
+    assert layer.fused_gdn_verify_fallback_reasons == {}
+    assert layer.fused_gdn_verify_fallbacks == 0
+    assert layer.fused_gdn_verify_last_fallback is None
+    after = qwen4_exp.qwen4_fused_gdn_stats(layer)
+    assert after["verify_fallback_reasons"] == {} and after["verify_fallbacks"] == 0
+
+
+def test_verify_decline_histogram_key_set_is_bounded():
+    """Reason text carries widths and shapes, so the tail folds into one key."""
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    with patch.object(qwen4_exp, "_VERIFY_FALLBACK_REASON_LIMIT", 2):
+        for reason in ("verify width 9 above 8", "verify width 17 above 8"):
+            layer._fused_gdn_verify_fallback(reason)
+        for reason in ("verify width 33 above 8", "verify width 65 above 8"):
+            layer._fused_gdn_verify_fallback(reason)
+        # A key already present still counts under itself past the limit.
+        layer._fused_gdn_verify_fallback("verify width 9 above 8")
+    assert layer.fused_gdn_verify_fallback_reasons == {
+        "verify width 9 above 8": 2,
+        "verify width 17 above 8": 1,
+        "other": 2,
+    }
+    assert layer.fused_gdn_verify_fallbacks == 5
+    assert layer.fused_gdn_verify_last_fallback == "verify width 9 above 8"
+
+
+def test_verify_fallback_histogram_is_not_a_module_parameter():
+    """The dict must not enter the parameter tree or the model state."""
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer._fused_gdn_verify_fallback("uninitialized cache")
+    assert "fused_gdn_verify_fallback_reasons" not in layer
+    assert "fused_gdn_verify_fallback_reasons" not in layer.parameters()
+    assert layer.fused_gdn_verify_fallback_reasons == {"uninitialized cache": 1}

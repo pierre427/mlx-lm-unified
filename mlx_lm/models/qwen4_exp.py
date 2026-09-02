@@ -301,6 +301,10 @@ _FUSED_GDN_DECODE_MODES = ("stock", "fused", "fused_outproj")
 # selected independently of the decode mode.
 _FUSED_GDN_VERIFY = _env_flag("MLX_QWEN4_FUSED_GDN_VERIFY")
 _FUSED_GDN_VERIFY_MODES = ("stock", "fused")
+# Distinct decline reasons a layer's durable verify histogram will key on
+# before folding the tail into ``other``; admission reasons embed widths and
+# shapes, so the bound is what keeps a long-lived server's counter finite.
+_VERIFY_FALLBACK_REASON_LIMIT = 32
 _SHAPE_STABLE_SHORT_FORWARD = _env_flag(
     "MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD"
 )
@@ -949,6 +953,11 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         self.fused_gdn_verify_calls = 0
         self.fused_gdn_verify_fallbacks = 0
         self.fused_gdn_verify_last_fallback = None
+        # Durable decline histogram: ``last_fallback`` is cleared by the next
+        # admitted call, so it cannot receipt a run that declines then succeeds.
+        # Set through ``object`` and mutated in place so this dict stays out of
+        # the parameter tree (``nn.Module.__setattr__`` registers dicts).
+        object.__setattr__(self, "fused_gdn_verify_fallback_reasons", {})
         # Per-layer device rendezvous for the 12-block one-dispatch output
         # epilogue.  Length 64 keeps it a device buffer, not a Metal constant.
         object.__setattr__(
@@ -1003,6 +1012,12 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
     def _fused_gdn_verify_fallback(self, reason: str):
         self.fused_gdn_verify_fallbacks += 1
         self.fused_gdn_verify_last_fallback = reason
+        reasons = self.fused_gdn_verify_fallback_reasons
+        # Admission reasons carry widths and shapes, so the key set is capped
+        # and the tail folds into one bucket rather than growing unbounded.
+        if reason not in reasons and len(reasons) >= _VERIFY_FALLBACK_REASON_LIMIT:
+            reason = "other"
+        reasons[reason] = reasons.get(reason, 0) + 1
         return None
 
     def _try_fused_verify(self, qkv, z, b, a, mask, cache):
@@ -1267,11 +1282,20 @@ def qwen4_fused_gdn_verify_mode_counts(model: nn.Module) -> dict[str, int]:
     return counts
 
 
-def qwen4_fused_gdn_stats(model: nn.Module) -> dict[str, Any]:
+def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str, Any]:
     """Return graph-selection and fallback counters without host synchronization.
 
     ``fused_calls``/``fallbacks``/``last_fallbacks`` describe the single-token
     decode path; the ``verify_*`` keys describe the speculative-verify path.
+
+    ``verify_last_fallbacks`` is a snapshot of each layer's *most recent*
+    decline, which the next admitted call clears; ``verify_fallback_reasons``
+    is the durable per-reason histogram of every decline since the layer was
+    built (or since the last ``reset``), so a run that declines and then
+    succeeds still receipts why it declined.
+
+    ``reset`` zeroes every counter this function reports, on the model's
+    layers, after reading them.
     """
     stats = {
         "fused_calls": 0,
@@ -1281,6 +1305,7 @@ def qwen4_fused_gdn_stats(model: nn.Module) -> dict[str, Any]:
         "verify_calls": 0,
         "verify_fallbacks": 0,
         "verify_last_fallbacks": {},
+        "verify_fallback_reasons": {},
     }
     for _, module in model.named_modules():
         if not isinstance(module, GatedDeltaNet):
@@ -1300,6 +1325,18 @@ def qwen4_fused_gdn_stats(model: nn.Module) -> dict[str, Any]:
             stats["verify_last_fallbacks"][reason] = (
                 stats["verify_last_fallbacks"].get(reason, 0) + 1
             )
+        durable = stats["verify_fallback_reasons"]
+        for reason, count in module.fused_gdn_verify_fallback_reasons.items():
+            durable[reason] = durable.get(reason, 0) + count
+        if reset:
+            module.fused_gdn_decode_calls = 0
+            module.fused_gdn_outproj_calls = 0
+            module.fused_gdn_decode_fallbacks = 0
+            module.fused_gdn_decode_last_fallback = None
+            module.fused_gdn_verify_calls = 0
+            module.fused_gdn_verify_fallbacks = 0
+            module.fused_gdn_verify_last_fallback = None
+            module.fused_gdn_verify_fallback_reasons.clear()
     return stats
 
 
