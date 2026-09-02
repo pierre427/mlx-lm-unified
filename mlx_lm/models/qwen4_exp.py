@@ -2149,27 +2149,43 @@ def _qsa_join_ledger_width(index_keys, cursor: int, who: str) -> int:
 
 
 def _qsa_merge_summaries(caches, logical_lengths):
+    """Pooled rows for a join, and the identity that describes them.
+
+    Coverage and provenance are two quantities, not one.  A join that can
+    carry no pooled BLOCK still knows exactly who produced the rows it
+    joined, and that is the zero-coverage state the rest of this file keeps
+    everywhere else: identity retained, ``complete_blocks`` 0.  So ``(None,
+    identity@0)`` means "nothing reusable, provenance intact" and ``(None,
+    None)`` is reserved for a real provenance loss -- the joined rows
+    disagree about who made them, or none of them ever had an identity.
+    """
     if not _QSA_APC_SUMMARIES or not caches:
         return None, None
     identity = getattr(caches[0], "_qsa_summary_identity", None)
-    ratio = getattr(caches[0], "_qsa_pooled_ratio", None)
-    if identity is None or not ratio:
+    if identity is None:
         return None, None
+    for cache in caches[1:]:
+        if not _qsa_summary_identity_matches(
+            getattr(cache, "_qsa_summary_identity", None), identity
+        ):
+            return None, None
+    zero = _qsa_summary_with_coverage(identity, 0)
+    ratio = getattr(caches[0], "_qsa_pooled_ratio", None)
+    if not ratio:
+        return None, zero
     complete = min(int(length) // ratio for length in logical_lengths)
+    if complete == 0:
+        return None, zero
     rows = []
     for cache in caches:
         pooled = getattr(cache, "_qsa_pooled_keys", None)
-        other_identity = getattr(cache, "_qsa_summary_identity", None)
         if (
             pooled is None
             or pooled.shape[1] < complete
             or getattr(cache, "_qsa_pooled_ratio", None) != ratio
-            or not _qsa_summary_identity_matches(other_identity, identity)
         ):
-            return None, None
+            return None, zero
         rows.append(mx.contiguous(pooled[:, :complete]))
-    if complete == 0:
-        return None, _qsa_summary_with_coverage(identity, 0)
     return (
         mx.concatenate(rows, axis=0),
         _qsa_summary_with_coverage(identity, complete),
@@ -2562,6 +2578,11 @@ class BatchQSAKVCache(BatchKVCache):
         width = max(lengths)
         padding = [width - length for length in lengths]
         batch = cls(padding)
+        # Provenance is settled before the empty-join early exit: a join of
+        # empty lanes carries no block but still has a producer.
+        pooled, identity = _qsa_merge_summaries(caches, lengths)
+        if identity is not None:
+            batch._qsa_summary_identity = identity
         if width == 0:
             return batch
 
@@ -2597,7 +2618,6 @@ class BatchQSAKVCache(BatchKVCache):
                     )
                 )
             batch.index_keys = mx.concatenate(rows)
-        pooled, identity = _qsa_merge_summaries(caches, lengths)
         if pooled is not None:
             batch._qsa_pooled_keys = pooled
             batch._qsa_pooled_ratio = identity["compress_ratio"]
@@ -2751,7 +2771,11 @@ class QSAQuantizedKVCache(QSAKVCache):
         value_bits: Optional[int] = None,
         rotate: bool = False,
         normalize: bool = False,
+        summary_identity=None,
     ):
+        # This reaches QuantizedKVCache directly, so QSAKVCache.__init__ --
+        # and with it the summary-state init -- does not run. Do it here or
+        # the packed twin is the only cache that cannot be given a producer.
         QuantizedKVCache.__init__(
             self,
             group_size=group_size,
@@ -2761,6 +2785,7 @@ class QSAQuantizedKVCache(QSAKVCache):
             rotate=rotate,
             normalize=normalize,
         )
+        _init_qsa_summary_state(self, summary_identity)
 
     @classmethod
     def from_unquantized(
@@ -2905,7 +2930,10 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
         key_bits: Optional[int] = None,
         value_bits: Optional[int] = None,
         rotate: bool = False,
+        summary_identity=None,
     ):
+        # BatchQSAKVCache.__init__ is bypassed here for the same reason as in
+        # the single-sequence twin; carry the identity explicitly.
         BatchQuantizedKVCache.__init__(
             self,
             left_padding,
@@ -2915,6 +2943,7 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
             value_bits=value_bits,
             rotate=rotate,
         )
+        _init_qsa_summary_state(self, summary_identity)
         # This subclass inherits BatchKVCache.bucketed_attention. Quantized
         # attention uses the dense packed path, so keep that optional backend
         # explicitly disabled while still satisfying its attribute contract.
@@ -3072,6 +3101,7 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
             key_bits=self.key_bits,
             value_bits=self.value_bits,
             rotate=self.rotate,
+            summary_identity=self._qsa_summary_identity,
         )
         if self.keys is None:
             return cache
@@ -3148,10 +3178,11 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
                 )
             batch.index_keys = mx.concatenate(rows)
         pooled, identity = _qsa_merge_summaries(caches, lengths)
+        if identity is not None:
+            batch._qsa_summary_identity = identity
         if pooled is not None:
             batch._qsa_pooled_keys = pooled
             batch._qsa_pooled_ratio = identity["compress_ratio"]
-            batch._qsa_summary_identity = identity
         return batch
 
     def to_quantized(

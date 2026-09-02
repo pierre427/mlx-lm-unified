@@ -3390,5 +3390,207 @@ class TestQSASelectionObject(unittest.TestCase):
                     QSASelection(**{**base, field: value})
 
 
+class TestQSASummaryIdentityAcrossTwins(unittest.TestCase):
+    """Provenance is a four-twin contract, not a float-cache one.
+
+    ``QSAQuantizedKVCache.__init__`` reaches ``QuantizedKVCache.__init__``
+    directly, so ``QSAKVCache.__init__`` -- the only place the summary state
+    was seeded from a caller -- never ran on the packed twins.  A zero-coverage
+    ``extract`` off a packed batch therefore handed back a cache with NO
+    producer while the float twin handed back the producer with coverage 0,
+    and the two are not the same claim: one says "recompute from nothing", the
+    other says "these blocks are mine, I just hold none of them yet".  Every
+    assertion below runs over all four twins so a path can only be fixed on
+    one of them by failing here.
+    """
+
+    GROUP = 32
+    DIM = 64
+    RATIO = 4
+    WIDTH = 8
+
+    def _identity(self, complete_blocks=0, layer_id="3"):
+        return {
+            "format_version": 1,
+            "model_config_hash": "twin-identity-test",
+            "block_size": self.RATIO,
+            "compress_ratio": self.RATIO,
+            "producer_version": "qwen4-pooled-key-v1",
+            "layer_id": layer_id,
+            "complete_blocks": complete_blocks,
+        }
+
+    def _pooled(self, rows, blocks=2):
+        return (
+            mx.arange(rows * blocks * self.DIM)
+            .reshape(rows, blocks, self.DIM)
+            .astype(mx.bfloat16)
+        )
+
+    def _float(self, cls, rows=1, pooled=True, identity=None):
+        """A populated float twin, optionally carrying pooled summaries."""
+        identity = self._identity() if identity is None else identity
+        if cls is QSAKVCache:
+            cache = QSAKVCache(identity)
+        else:
+            cache = BatchQSAKVCache([0] * rows, summary_identity=identity)
+        mx.random.seed(5)
+        shape = (rows, 2, self.WIDTH, self.DIM)
+        keys = mx.random.normal(shape).astype(mx.bfloat16)
+        values = mx.random.normal(shape).astype(mx.bfloat16)
+        cache.update_and_fetch(keys, values)
+        cache.update_index_keys(
+            mx.random.normal((rows, self.WIDTH, self.DIM)).astype(mx.bfloat16)
+        )
+        if pooled:
+            cache._qsa_pooled_keys = self._pooled(rows)
+            cache._qsa_pooled_ratio = self.RATIO
+            cache._qsa_summary_identity = self._identity(complete_blocks=2)
+        return cache
+
+    def _twin(self, cls, rows=1, pooled=True):
+        """The same populated cache in each of the four classes."""
+        if cls in (QSAKVCache, BatchQSAKVCache):
+            return self._float(cls, rows=rows, pooled=pooled)
+        source = self._float(
+            QSAKVCache if cls is QSAQuantizedKVCache else BatchQSAKVCache,
+            rows=rows,
+            pooled=pooled,
+        )
+        return source.to_quantized(self.GROUP, 4)
+
+    ALL_TWINS = (
+        QSAKVCache,
+        BatchQSAKVCache,
+        QSAQuantizedKVCache,
+        BatchQSAQuantizedKVCache,
+    )
+
+    def test_every_twin_seeds_the_identity_from_its_constructor(self):
+        identity = self._identity(complete_blocks=7)
+        for cls in self.ALL_TWINS:
+            with self.subTest(cache=cls.__name__):
+                if cls in (QSAKVCache, QSAQuantizedKVCache):
+                    cache = cls(summary_identity=identity)
+                else:
+                    cache = cls([0, 0], summary_identity=identity)
+                stored = cache._qsa_summary_identity
+                self.assertIsNotNone(stored)
+                self.assertTrue(
+                    qwen4_exp_module._qsa_summary_identity_matches(
+                        stored, identity
+                    )
+                )
+                # A fresh cache holds no block, whatever the seed claimed.
+                self.assertEqual(stored["complete_blocks"], 0)
+                self.assertIsNone(cache._qsa_pooled_keys)
+                self.assertFalse(cache._qsa_summary_restored)
+
+    def test_zero_coverage_extract_keeps_the_producer(self):
+        expected_single = {
+            BatchQSAKVCache: QSAKVCache,
+            BatchQSAQuantizedKVCache: QSAQuantizedKVCache,
+        }
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            for cls, single in expected_single.items():
+                with self.subTest(cache=cls.__name__):
+                    batch = self._twin(cls, rows=2, pooled=False)
+                    self.assertIsNone(batch._qsa_pooled_keys)
+                    row = batch.extract(1)
+                    self.assertIsInstance(row, single)
+                    self.assertIsNone(row._qsa_pooled_keys)
+                    identity = row._qsa_summary_identity
+                    self.assertIsNotNone(
+                        identity,
+                        f"{cls.__name__}.extract dropped the producer",
+                    )
+                    self.assertTrue(
+                        qwen4_exp_module._qsa_summary_identity_matches(
+                            identity, self._identity()
+                        )
+                    )
+                    self.assertEqual(identity["complete_blocks"], 0)
+
+    def test_quantize_then_extract_keeps_identity_and_coverage(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            source = self._float(BatchQSAKVCache, rows=2)
+            packed = source.to_quantized(self.GROUP, 4)
+            self.assertIsInstance(packed, BatchQSAQuantizedKVCache)
+            self.assertEqual(
+                packed._qsa_summary_identity["complete_blocks"], 2
+            )
+            row = packed.extract(1)
+            self.assertIsInstance(row, QSAQuantizedKVCache)
+            self.assertEqual(row._qsa_summary_identity["complete_blocks"], 2)
+            self.assertTrue(
+                mx.array_equal(
+                    row._qsa_pooled_keys, source._qsa_pooled_keys[1:2]
+                ).item()
+            )
+            # And the single twin survives the same conversion.
+            single = self._float(QSAKVCache)
+            single_packed = single.to_quantized(self.GROUP, 4)
+            self.assertIsInstance(single_packed, QSAQuantizedKVCache)
+            self.assertEqual(
+                single_packed._qsa_summary_identity["complete_blocks"], 2
+            )
+
+    def test_state_round_trip_keeps_identity_on_every_twin(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            for cls in self.ALL_TWINS:
+                with self.subTest(cache=cls.__name__):
+                    rows = 1 if cls in (QSAKVCache, QSAQuantizedKVCache) else 2
+                    cache = self._twin(cls, rows=rows)
+                    restored = cls.from_state(cache.state, cache.meta_state)
+                    self.assertTrue(restored._qsa_summary_restored)
+                    self.assertEqual(
+                        restored._qsa_summary_identity,
+                        cache._qsa_summary_identity,
+                    )
+                    self.assertTrue(
+                        mx.array_equal(
+                            restored._qsa_pooled_keys, cache._qsa_pooled_keys
+                        ).item()
+                    )
+
+    def test_trim_keeps_the_producer_and_narrows_coverage(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            for cls in self.ALL_TWINS:
+                with self.subTest(cache=cls.__name__):
+                    rows = 1 if cls in (QSAKVCache, QSAQuantizedKVCache) else 2
+                    cache = self._twin(cls, rows=rows)
+                    cache.trim(self.RATIO)
+                    identity = cache._qsa_summary_identity
+                    self.assertIsNotNone(identity)
+                    self.assertEqual(identity["complete_blocks"], 1)
+                    self.assertEqual(cache._qsa_pooled_keys.shape[1], 1)
+
+    def test_merge_keeps_the_producer_when_it_can_carry_no_block(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            for cls, batch_cls in (
+                (QSAKVCache, BatchQSAKVCache),
+                (QSAQuantizedKVCache, BatchQSAQuantizedKVCache),
+            ):
+                with self.subTest(cache=cls.__name__):
+                    rows = [self._twin(cls, pooled=False) for _ in range(2)]
+                    batch = batch_cls.merge(rows)
+                    identity = batch._qsa_summary_identity
+                    self.assertIsNotNone(
+                        identity, f"{batch_cls.__name__}.merge lost provenance"
+                    )
+                    self.assertEqual(identity["complete_blocks"], 0)
+                    self.assertIsNone(batch._qsa_pooled_keys)
+
+    def test_merge_of_disagreeing_producers_drops_the_identity(self):
+        """The zero-coverage rule must not paper over a real mismatch."""
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            left = self._float(QSAKVCache, pooled=False)
+            right = self._float(
+                QSAKVCache, pooled=False, identity=self._identity(layer_id="9")
+            )
+            batch = BatchQSAKVCache.merge([left, right])
+            self.assertIsNone(batch._qsa_summary_identity)
+
+
 if __name__ == "__main__":
     unittest.main()
