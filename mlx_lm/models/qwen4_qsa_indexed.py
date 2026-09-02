@@ -13,6 +13,12 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from .qwen4_qsa_indexed_merge import (
+    combine_indexed_partials,
+    fused_merge_enabled,
+    fused_merge_status,
+    mlx_sequential_merge,
+)
 from .qwen4_qsa_nax import (
     compact_blocks_to_kernel_inputs,
     compact_token_validity,
@@ -403,6 +409,7 @@ def qsa_indexed_status(*, reset: bool = False) -> dict[str, Any]:
                 "mismatches": _STATUS_DEVICE_MISMATCHES,
                 "pending": _STATUS_DEVICE_PENDING_EXPECTED,
             },
+            "fused_merge": fused_merge_status(reset=reset),
             "fully_masked_output": "zero",
             "last_decision": _STATUS_LAST,
         }
@@ -526,21 +533,7 @@ def _reference_partials(q, k, v, compact, *, scale: float, splits: int):
 
 
 def _combine_reference_sdpa_partials(m, l, o, *, output_dtype):
-    live = mx.isfinite(m)
-    state_m = mx.max(m, axis=-1)
-    safe_m = mx.where(mx.isfinite(state_m), state_m, mx.zeros_like(state_m))
-    factors = mx.where(
-        live,
-        mx.exp(m - safe_m[..., None]),
-        mx.zeros_like(m),
-    )
-    denom = mx.sum(l * factors, axis=-1)
-    numer = mx.sum(o.astype(mx.float32) * factors[..., None], axis=-2)
-    return mx.where(
-        (denom > 0)[..., None],
-        numer / mx.maximum(denom[..., None], mx.array(1.0e-30, mx.float32)),
-        mx.zeros_like(numer),
-    ).astype(output_dtype)
+    return mlx_sequential_merge(m, l, o, output_dtype=output_dtype)
 
 
 def qwen4_qsa_indexed_reference(
@@ -902,6 +895,15 @@ def _combine_sdpa_partials(m, l, o, engaged, *, output_dtype):
     dim = int(o.shape[-1])
     if blocks != _SDPA_BLOCKS or dim % 32:
         raise ValueError("indexed QSA pass 2 has unsupported partial geometry")
+    if fused_merge_enabled():
+        output = combine_indexed_partials(
+            m,
+            l,
+            o,
+            output_dtype=output_dtype,
+            on_fallback=_record_merge_fallback,
+        )
+        return output, engaged
     output = _combine_kernel()(
         inputs=[m, l, o, mx.array([length], dtype=mx.int32)],
         template=[
@@ -915,6 +917,15 @@ def _combine_sdpa_partials(m, l, o, engaged, *, output_dtype):
         output_dtypes=[output_dtype],
     )[0]
     return output, engaged
+
+
+def _record_merge_fallback() -> None:
+    """Record an indexed-QSA receipt for a fused merge fallback."""
+
+    global _STATUS_FALLBACKS
+    with _STATUS_LOCK:
+        _STATUS_COUNTS["merge_fallback"] += 1
+        _STATUS_FALLBACKS += 1
 
 
 def qwen4_qsa_indexed_attention(
