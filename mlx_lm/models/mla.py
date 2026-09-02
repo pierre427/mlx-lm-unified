@@ -124,6 +124,24 @@ def absorbed_query_limit(geometric_limit: int) -> int:
     return geometric_limit if override is None else override
 
 
+def refuse_asymmetric_mla_kv_bits(cache, model_name: str) -> None:
+    """Fail closed on a quantized KV cache with distinct key/value bits.
+
+    The absorbed path caches the latent once and uses it as both key and value,
+    so a separate ``value_bits`` is undefined and ``QuantizedKVCache.bits`` --
+    the width the rope-score matmul and the latent dequantize both need -- is
+    ``None``.  Mirrors the refusal ``deepseek_v2`` already carries.
+    """
+    if getattr(cache, "key_bits", None) != getattr(cache, "value_bits", None):
+        raise NotImplementedError(
+            "Asymmetric key/value KV-cache bits are not supported on the "
+            f"{model_name} absorbed-MLA path: the compressed latent is cached "
+            "once and serves as both the attention key and value, so a "
+            "value_bits distinct from key_bits is undefined. Use a single "
+            "symmetric --kv-bits for absorbed-MLA models."
+        )
+
+
 def use_absorbed_path(query_len: int, cache_len: int, geometry) -> bool:
     """Whether an (L, S)-shaped MLA attention should take the absorbed branch.
 
