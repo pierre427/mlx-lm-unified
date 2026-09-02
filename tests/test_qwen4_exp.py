@@ -2528,10 +2528,30 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
         cache = Qwen4ArraysCache(4)
         mx.eval(layer(hidden, ids, cache))
         status = qwen4_exp_module.qwen4_ple_compile_status()
-        self.assertFalse(status["enabled"] and False)
+        self.assertFalse(status["enabled"])
         self.assertEqual(status["counts"]["builds"], 0)
         self.assertEqual(status["counts"]["hits"], 0)
         self.assertEqual(getattr(layer, "_ple_compile_cache", {}), {})
+
+    def test_a_non_metal_device_runs_eager_with_a_receipt(self):
+        """Bit-identity was measured on Metal, and does not hold off it.
+
+        On the CPU device fp16 activations drift from eager by up to 4.9e-4
+        at widths 1/3/16/17 -- the CPU backend fuses a different span than the
+        Metal one.  The lever may change cost only, so an unmeasured device
+        runs eager instead.
+        """
+        layer, args = self._layer(mx.float16)
+        hidden, ids = self._inputs(args, 3, dtype=mx.float16)
+        with mx.stream(mx.cpu):
+            eager_out, eager_state = self._run(layer, hidden, ids, None, False)
+            comp_out, comp_state = self._run(layer, hidden, ids, None, True)
+        self.assertTrue(mx.array_equal(eager_out, comp_out).item())
+        self.assertTrue(mx.array_equal(eager_state, comp_state).item())
+        status = qwen4_exp_module.qwen4_ple_compile_status()
+        self.assertEqual(status["counts"]["builds"], 0)
+        self.assertGreater(status["counts"]["skips"], 0)
+        self.assertEqual(status["last_receipt"]["reason"], "non_metal_device")
 
     def test_a_compile_failure_falls_back_with_a_receipt(self):
         layer, args = self._layer()

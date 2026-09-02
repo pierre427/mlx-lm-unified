@@ -2062,6 +2062,15 @@ class PLELayer(nn.Module):
     def _run_device_chain(self, hidden, embeddings, mask, state, write_state: bool):
         if not _PLE_COMPILE:
             return self._device_chain(hidden, embeddings, mask, state, write_state)
+        if mx.default_device() != mx.gpu:
+            # Bit-identity was measured on Metal only, and it does NOT hold off
+            # it: on the CPU device fp16 activations drift from eager by up to
+            # 4.9e-4 at widths 1/3/16/17, masked and unmasked, because the CPU
+            # backend fuses a different span than the Metal one.  The lever's
+            # contract is that it may change COST ONLY, so a device whose
+            # exactness was never measured runs eager.
+            _record_ple_compile("skips", reason="non_metal_device")
+            return self._device_chain(hidden, embeddings, mask, state, write_state)
         if mx.float32 in (hidden.dtype, embeddings.dtype):
             # MEASURED, not assumed: with bf16 or fp16 activations the compiled
             # chain is bit-identical at widths 1/3/16/17 masked and unmasked,
