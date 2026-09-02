@@ -305,16 +305,34 @@ class TestQSAPooledKeyCache(unittest.TestCase):
         trim_prompt_cache(cache, 2)
         for token in range(3):
             step([10 + token])
-        return outputs
+        return outputs, cache
 
     def test_full_model_logits_bitwise_identical_with_rollback(self):
         args = tiny_args(ple_layer_ids=[2])
         model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
-        stock = self._run_model_sequence(model)
+        stock, _ = self._run_model_sequence(model)
         with lever(qwen4_exp, "_QSA_POOLED_KEY_CACHE"):
-            fast = self._run_model_sequence(model)
+            fast, _ = self._run_model_sequence(model)
         for step, (expected, actual) in enumerate(zip(stock, fast)):
             np.testing.assert_array_equal(actual, expected, f"step {step}")
+
+    def test_apc_summaries_are_bitwise_and_invalidate_on_rollback(self):
+        args = tiny_args(ple_layer_ids=[2])
+        model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+        stock, _ = self._run_model_sequence(model)
+        with lever(qwen4_exp, "_QSA_APC_SUMMARIES"):
+            qwen4_exp.qsa_apc_summary_status(reset=True)
+            fast, cache = self._run_model_sequence(model)
+            status = qwen4_exp.qsa_apc_summary_status()
+        for step, (expected, actual) in enumerate(zip(stock, fast)):
+            np.testing.assert_array_equal(actual, expected, f"step {step}")
+        self.assertGreater(status["counts"]["invalidations"], 0)
+        for layer_cache in cache:
+            if isinstance(layer_cache, QSAKVCache):
+                self.assertEqual(
+                    layer_cache._qsa_summary_identity["complete_blocks"],
+                    layer_cache.offset // args.indexer_compress_ratio,
+                )
 
     def _run_batch_sequence(self, model):
         cache = _merge_caches([model.make_cache()])

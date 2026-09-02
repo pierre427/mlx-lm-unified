@@ -1146,6 +1146,82 @@ class TestModelLocalCacheClasses(unittest.TestCase):
         self.assertEqual(qsa.offset, 11)
         self.assertEqual(keys.shape[2], 11)
 
+    def test_qsa_summary_and_provenance_round_trip(self):
+        from mlx_lm.models import qwen4_exp
+        from mlx_lm.models.qwen4_exp import QSAKVCache
+
+        previous = qwen4_exp._QSA_APC_SUMMARIES
+        qwen4_exp._QSA_APC_SUMMARIES = True
+        try:
+            qsa = QSAKVCache()
+            values = mx.zeros((1, 1, 8, 4))
+            qsa.update_and_fetch(values, values)
+            qsa.update_index_keys(mx.zeros((1, 8, 16)))
+            qsa._qsa_pooled_keys = mx.arange(32).reshape(1, 2, 16)
+            qsa._qsa_pooled_ratio = 4
+            qsa._qsa_summary_identity = {
+                "format_version": 1,
+                "model_config_hash": "tiny-model-config",
+                "block_size": 4,
+                "compress_ratio": 4,
+                "producer_version": "qwen4-pooled-key-v1",
+                "layer_id": "3",
+                "complete_blocks": 2,
+            }
+            path = os.path.join(self.test_dir, "qsa_summary.safetensors")
+            save_prompt_cache(path, [qsa], {"user": "metadata"})
+            loaded, user_metadata = load_prompt_cache(
+                path, return_metadata=True
+            )
+            self.assertEqual(user_metadata, {"user": "metadata"})
+            self.assertTrue(
+                mx.array_equal(
+                    loaded[0]._qsa_pooled_keys, qsa._qsa_pooled_keys
+                ).item()
+            )
+            _, raw_metadata = mx.load(path, return_metadata=True)
+            values = list(raw_metadata.values())
+            self.assertIn("qsa_summary_v1", values)
+            self.assertTrue(
+                any('"format": "qsa_apc_summaries"' in v for v in values)
+            )
+
+            nested_path = os.path.join(
+                self.test_dir, "qsa_summary_cache_list.safetensors"
+            )
+            save_prompt_cache(nested_path, [CacheList(qsa)])
+            _, nested_metadata = mx.load(nested_path, return_metadata=True)
+            self.assertTrue(
+                any(
+                    '"cache_path": [0, 0]' in value
+                    for value in nested_metadata.values()
+                )
+            )
+        finally:
+            qwen4_exp._QSA_APC_SUMMARIES = previous
+
+    def test_qsa_summary_env_unset_keeps_legacy_state(self):
+        import subprocess
+        import sys
+
+        env = os.environ.copy()
+        env.pop("MLX_QWEN4_QSA_APC_SUMMARIES", None)
+        script = (
+            "from mlx_lm.models import qwen4_exp\n"
+            "from mlx_lm.models.qwen4_exp import QSAKVCache\n"
+            "assert qwen4_exp._QSA_APC_SUMMARIES is False\n"
+            "assert len(QSAKVCache().state) == 3\n"
+            "status = qwen4_exp.qsa_apc_summary_status()\n"
+            "assert status['enabled'] is False\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_cache_list_with_model_local_members(self):
         # CacheList serializes its members' classes itself; model-local
         # members must survive that path too.

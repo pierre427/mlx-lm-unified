@@ -331,6 +331,33 @@ class TestWhitelist(unittest.TestCase):
         finally:
             qwen4_qsa_indexed._QSA_INDEXED_ENABLED = original
 
+    def test_qwen4_apc_summary_lever_is_independent(self):
+        from mlx_lm.models import qwen4_exp
+
+        cli_args = make_cli_args()
+        original = qwen4_exp._QSA_APC_SUMMARIES
+        try:
+            qwen4_exp._QSA_APC_SUMMARIES = False
+            plan = plan_soft_reload(
+                cli_args, {"qwen4_qsa_apc_summaries": True}
+            )
+            changes = apply_soft_reload(cli_args, plan)
+            self.assertEqual(
+                changes,
+                {
+                    "qwen4_qsa_apc_summaries": {
+                        "old": False,
+                        "new": True,
+                    }
+                },
+            )
+            self.assertTrue(qwen4_exp._QSA_APC_SUMMARIES)
+            status = qwen4_exp.qsa_stage1_status()
+            self.assertTrue(status["apc_summaries"]["enabled"])
+            self.assertIn("recomputes", status["apc_summaries"]["counts"])
+        finally:
+            qwen4_exp._QSA_APC_SUMMARIES = original
+
 
 class TestHardTierRefusal(unittest.TestCase):
     def test_model_path_is_refused_with_a_restart_message(self):

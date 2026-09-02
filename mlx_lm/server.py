@@ -700,6 +700,9 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
     "qwen4_qsa_pooled_key_cache": MutableKey(
         "module", "_QSA_POOLED_KEY_CACHE", _reload_flag, "mlx_lm.models.qwen4_exp"
     ),
+    "qwen4_qsa_apc_summaries": MutableKey(
+        "module", "_QSA_APC_SUMMARIES", _reload_flag, "mlx_lm.models.qwen4_exp"
+    ),
     "qwen4_qsa_scatter_chosen": MutableKey(
         "module", "_QSA_SCATTER_CHOSEN", _reload_flag, "mlx_lm.models.qwen4_exp"
     ),

@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import threading
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -90,6 +91,103 @@ from .rope_utils import initialize_rope
 # EXCEPT where a lever has been promoted (``default=True``) -- see below.
 _RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
 _QSA_POOLED_KEY_CACHE = _env_flag("MLX_QWEN4_QSA_POOLED_KEY_CACHE")
+_QSA_APC_SUMMARIES = _env_flag("MLX_QWEN4_QSA_APC_SUMMARIES")
+_QSA_SUMMARY_FORMAT_VERSION = 1
+_QSA_SUMMARY_PRODUCER_VERSION = "qwen4-pooled-key-v1"
+_QSA_SUMMARY_META_MARKER = "qsa_summary_v1"
+_QSA_SUMMARY_IDENTITY_FIELDS = (
+    "format_version",
+    "model_config_hash",
+    "block_size",
+    "compress_ratio",
+    "producer_version",
+    "layer_id",
+)
+_QSA_SUMMARY_STATS_LOCK = threading.Lock()
+_QSA_SUMMARY_STATS = Counter(
+    {"hits": 0, "misses": 0, "recomputes": 0, "invalidations": 0}
+)
+_QSA_SUMMARY_BLOCKS = Counter(
+    {"reused": 0, "recomputed": 0, "invalidated": 0}
+)
+_QSA_SUMMARY_REASONS = Counter()
+_QSA_SUMMARY_LAST_RECEIPT = None
+
+
+def _qsa_summary_config_hash(args) -> str:
+    payload = json.dumps(
+        asdict(args), sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _qsa_summary_identity(args, layer_id) -> dict[str, Any]:
+    ratio = int(args.indexer_compress_ratio)
+    return {
+        "format_version": _QSA_SUMMARY_FORMAT_VERSION,
+        "model_config_hash": _qsa_summary_config_hash(args),
+        "block_size": ratio,
+        "compress_ratio": ratio,
+        "producer_version": _QSA_SUMMARY_PRODUCER_VERSION,
+        "layer_id": str(layer_id),
+        "complete_blocks": 0,
+    }
+
+
+def _qsa_summary_identity_matches(stored, expected) -> bool:
+    return bool(stored) and all(
+        stored.get(name) == expected.get(name)
+        for name in _QSA_SUMMARY_IDENTITY_FIELDS
+    )
+
+
+def _qsa_summary_with_coverage(identity, complete_blocks: int):
+    if identity is None:
+        return None
+    updated = dict(identity)
+    updated["complete_blocks"] = int(complete_blocks)
+    return updated
+
+
+def _record_qsa_summary(event: str, reason: str, *, blocks: int = 0) -> None:
+    global _QSA_SUMMARY_LAST_RECEIPT
+    if not _QSA_APC_SUMMARIES:
+        return
+    receipt = {"event": event, "reason": reason, "blocks": int(blocks)}
+    with _QSA_SUMMARY_STATS_LOCK:
+        _QSA_SUMMARY_STATS[event] += 1
+        if event == "hits":
+            _QSA_SUMMARY_BLOCKS["reused"] += int(blocks)
+        elif event == "recomputes":
+            _QSA_SUMMARY_BLOCKS["recomputed"] += int(blocks)
+        elif event == "invalidations":
+            _QSA_SUMMARY_BLOCKS["invalidated"] += int(blocks)
+        _QSA_SUMMARY_REASONS[reason] += 1
+        _QSA_SUMMARY_LAST_RECEIPT = receipt
+
+
+def qsa_apc_summary_status(*, reset: bool = False) -> dict[str, Any]:
+    """Return bounded APC-summary receipts for the QSA status endpoint."""
+
+    global _QSA_SUMMARY_LAST_RECEIPT
+    with _QSA_SUMMARY_STATS_LOCK:
+        report = {
+            "enabled": bool(_QSA_APC_SUMMARIES),
+            "format_version": _QSA_SUMMARY_FORMAT_VERSION,
+            "producer_version": _QSA_SUMMARY_PRODUCER_VERSION,
+            "counts": dict(_QSA_SUMMARY_STATS),
+            "blocks": dict(_QSA_SUMMARY_BLOCKS),
+            "reasons": dict(_QSA_SUMMARY_REASONS),
+            "last_receipt": _QSA_SUMMARY_LAST_RECEIPT,
+        }
+        if reset:
+            for key in _QSA_SUMMARY_STATS:
+                _QSA_SUMMARY_STATS[key] = 0
+            for key in _QSA_SUMMARY_BLOCKS:
+                _QSA_SUMMARY_BLOCKS[key] = 0
+            _QSA_SUMMARY_REASONS.clear()
+            _QSA_SUMMARY_LAST_RECEIPT = None
+    return report
 
 # PROMOTED to default-on 2026-08-28; set MLX_QWEN4_QSA_SCATTER_CHOSEN=0 to
 # revert (the server also exposes it live as ``qwen4_qsa_scatter_chosen``).
@@ -489,6 +587,7 @@ def qsa_stage1_status(*, reset: bool = False) -> dict[str, Any]:
                 "current": cache.currsize,
                 "maximum": cache.maxsize,
             },
+            "apc_summaries": qsa_apc_summary_status(reset=reset),
         }
         if reset:
             _QSA_STAGE1_STATS.clear()
@@ -1838,6 +1937,174 @@ _QSA_CYCLE_STATE = (
 )
 
 
+def _qsa_summary_persistable(cache) -> bool:
+    pooled = getattr(cache, "_qsa_pooled_keys", None)
+    identity = getattr(cache, "_qsa_summary_identity", None)
+    return bool(
+        _QSA_APC_SUMMARIES
+        and pooled is not None
+        and identity is not None
+        and pooled.ndim == 3
+        and pooled.shape[1] > 0
+        and int(identity.get("complete_blocks", -1)) == pooled.shape[1]
+    )
+
+
+def _qsa_summary_state(cache, base):
+    return (*base, cache._qsa_pooled_keys) if _qsa_summary_persistable(cache) else base
+
+
+def _qsa_summary_restore_state(cache, value, base_length: int):
+    if len(value) == base_length:
+        cache._qsa_pending_pooled = None
+        return value
+    if len(value) == base_length + 1:
+        cache._qsa_pending_pooled = value[-1]
+        return value[:-1]
+    raise ValueError(
+        f"Invalid {type(cache).__name__} state: expected {base_length} legacy "
+        f"fields or {base_length + 1} fields with a QSA summary."
+    )
+
+
+def _qsa_summary_meta(cache, base):
+    if not _qsa_summary_persistable(cache):
+        return tuple(base)
+    identity = cache._qsa_summary_identity
+    return tuple(base) + (
+        _QSA_SUMMARY_META_MARKER,
+        str(identity["format_version"]),
+        identity["model_config_hash"],
+        str(identity["block_size"]),
+        str(identity["compress_ratio"]),
+        identity["producer_version"],
+        identity["layer_id"],
+        str(identity["complete_blocks"]),
+    )
+
+
+def _qsa_summary_split_meta(value):
+    value = tuple(value)
+    if _QSA_SUMMARY_META_MARKER not in value:
+        return value, None, None
+    marker = value.index(_QSA_SUMMARY_META_MARKER)
+    base, summary = value[:marker], value[marker:]
+    if len(summary) != 8:
+        return base, None, "summary_identity_mismatch"
+    try:
+        version = int(summary[1])
+        identity = {
+            "format_version": version,
+            "model_config_hash": summary[2],
+            "block_size": int(summary[3]),
+            "compress_ratio": int(summary[4]),
+            "producer_version": summary[5],
+            "layer_id": summary[6],
+            "complete_blocks": int(summary[7]),
+        }
+    except (TypeError, ValueError):
+        return base, None, "summary_identity_mismatch"
+    if version != _QSA_SUMMARY_FORMAT_VERSION:
+        return base, None, "summary_identity_mismatch"
+    return base, identity, None
+
+
+def _qsa_summary_finish_restore(cache, identity, reason=None):
+    pooled = getattr(cache, "_qsa_pending_pooled", None)
+    cache._qsa_pending_pooled = None
+    cache._qsa_pooled_keys = None
+    cache._qsa_pooled_ratio = None
+    cache._qsa_summary_restored = False
+    geometry_limit = None
+    if identity is not None and identity.get("compress_ratio", 0) > 0:
+        ratio = identity["compress_ratio"]
+        if hasattr(cache, "_idx") and hasattr(cache, "max_left_padding"):
+            geometry_limit = max(
+                0, int(cache._idx) - int(cache.max_left_padding())
+            ) // ratio
+        elif isinstance(getattr(cache, "offset", None), int):
+            geometry_limit = max(0, int(cache.offset)) // ratio
+    valid = bool(
+        _QSA_APC_SUMMARIES
+        and reason is None
+        and identity is not None
+        and pooled is not None
+        and pooled.ndim == 3
+        and identity["complete_blocks"] == pooled.shape[1]
+        and identity["block_size"] == identity["compress_ratio"]
+        and (
+            geometry_limit is None
+            or identity["complete_blocks"] <= geometry_limit
+        )
+    )
+    if valid:
+        cache._qsa_pooled_keys = pooled
+        cache._qsa_pooled_ratio = identity["compress_ratio"]
+        cache._qsa_summary_identity = identity
+        cache._qsa_summary_restored = True
+        return
+    dropped = 0 if pooled is None or pooled.ndim < 2 else int(pooled.shape[1])
+    cache._qsa_summary_identity = None
+    if pooled is not None and _QSA_APC_SUMMARIES:
+        _record_qsa_summary(
+            "invalidations", reason or "summary_identity_mismatch", blocks=dropped
+        )
+
+
+def _qsa_summary_rebound(cache, keep: int, reason: str) -> None:
+    pooled = getattr(cache, "_qsa_pooled_keys", None)
+    if pooled is None:
+        return
+    old = int(pooled.shape[1])
+    keep = max(0, min(int(keep), old))
+    if keep == 0:
+        cache._qsa_pooled_keys = None
+        cache._qsa_pooled_ratio = None
+    elif keep < old:
+        cache._qsa_pooled_keys = mx.contiguous(pooled[:, :keep])
+    cache._qsa_summary_identity = _qsa_summary_with_coverage(
+        getattr(cache, "_qsa_summary_identity", None), keep
+    )
+    if old > keep:
+        _record_qsa_summary("invalidations", reason, blocks=old - keep)
+
+
+def _init_qsa_summary_state(cache, identity=None) -> None:
+    cache._qsa_summary_identity = (
+        None if identity is None else _qsa_summary_with_coverage(identity, 0)
+    )
+    cache._qsa_summary_restored = False
+    cache._qsa_pending_pooled = None
+
+
+def _qsa_merge_summaries(caches, logical_lengths):
+    if not _QSA_APC_SUMMARIES or not caches:
+        return None, None
+    identity = getattr(caches[0], "_qsa_summary_identity", None)
+    ratio = getattr(caches[0], "_qsa_pooled_ratio", None)
+    if identity is None or not ratio:
+        return None, None
+    complete = min(int(length) // ratio for length in logical_lengths)
+    rows = []
+    for cache in caches:
+        pooled = getattr(cache, "_qsa_pooled_keys", None)
+        other_identity = getattr(cache, "_qsa_summary_identity", None)
+        if (
+            pooled is None
+            or pooled.shape[1] < complete
+            or getattr(cache, "_qsa_pooled_ratio", None) != ratio
+            or not _qsa_summary_identity_matches(other_identity, identity)
+        ):
+            return None, None
+        rows.append(mx.contiguous(pooled[:, :complete]))
+    if complete == 0:
+        return None, _qsa_summary_with_coverage(identity, 0)
+    return (
+        mx.concatenate(rows, axis=0),
+        _qsa_summary_with_coverage(identity, complete),
+    )
+
+
 def _qsa_to_quantized(
     self,
     group_size: int = 64,
@@ -1899,11 +2166,15 @@ class BatchQSAKVCache(BatchKVCache):
         instance._max_left_pad = None
         for name, blank in cls._QSA_CYCLE_FIELDS:
             setattr(instance, name, blank)
+        _init_qsa_summary_state(instance)
         return instance
 
-    def __init__(self, left_padding: List[int], attention_backend=None):
+    def __init__(
+        self, left_padding: List[int], attention_backend=None, summary_identity=None
+    ):
         # __new__ owns the QSA fields; it runs on both construction paths.
         super().__init__(left_padding, attention_backend=attention_backend)
+        _init_qsa_summary_state(self, summary_identity)
 
     def max_left_padding(self) -> int:
         """Host copy of ``left_padding.max()``, keyed by array identity.
@@ -1982,6 +2253,23 @@ class BatchQSAKVCache(BatchKVCache):
                     else mx.contiguous(pooled[:, :keep])
                 )
                 self._qsa_pooled_ratio = ratio
+                self._qsa_summary_identity = _qsa_summary_with_coverage(
+                    self._qsa_summary_identity,
+                    self._qsa_pooled_keys.shape[1],
+                )
+                if keep < pooled.shape[1]:
+                    _record_qsa_summary(
+                        "invalidations",
+                        who,
+                        blocks=pooled.shape[1] - keep,
+                    )
+            elif pooled.shape[1]:
+                self._qsa_summary_identity = _qsa_summary_with_coverage(
+                    self._qsa_summary_identity, 0
+                )
+                _record_qsa_summary(
+                    "invalidations", who, blocks=pooled.shape[1]
+                )
         if cursor_final:
             self._reconcile_index_ledger(who)
 
@@ -2057,10 +2345,12 @@ class BatchQSAKVCache(BatchKVCache):
 
     @property
     def state(self):
-        return (*BatchKVCache.state.fget(self), self.index_keys)
+        base = (*BatchKVCache.state.fget(self), self.index_keys)
+        return _qsa_summary_state(self, base)
 
     @state.setter
     def state(self, value):
+        value = _qsa_summary_restore_state(self, value, 5)
         BatchKVCache.state.fset(self, value[:4])
         self.index_keys = value[4]
         self._max_left_pad = None
@@ -2073,11 +2363,13 @@ class BatchQSAKVCache(BatchKVCache):
 
     @property
     def meta_state(self):
-        return BatchKVCache.meta_state.fget(self)
+        return _qsa_summary_meta(self, BatchKVCache.meta_state.fget(self))
 
     @meta_state.setter
     def meta_state(self, value):
-        BatchKVCache.meta_state.fset(self, value)
+        base, identity, reason = _qsa_summary_split_meta(value)
+        BatchKVCache.meta_state.fset(self, base)
+        _qsa_summary_finish_restore(self, identity, reason)
         if value:
             # ``_idx`` is only now the real cursor, so this is where a restored
             # ledger can be checked against it at all.
@@ -2085,8 +2377,11 @@ class BatchQSAKVCache(BatchKVCache):
 
     @property
     def nbytes(self):
-        return super().nbytes + (
-            0 if self.index_keys is None else self.index_keys.nbytes
+        summary = 0 if self._qsa_pooled_keys is None else self._qsa_pooled_keys.nbytes
+        return (
+            super().nbytes
+            + (0 if self.index_keys is None else self.index_keys.nbytes)
+            + summary
         )
 
     def _finalize(self, *, keep_shared=False):
@@ -2152,7 +2447,7 @@ class BatchQSAKVCache(BatchKVCache):
     def extract(self, idx):
         # A row leaves as a standalone sequence, so its ledger must be whole.
         self._reconcile_index_ledger("BatchQSAKVCache.extract")
-        cache = QSAKVCache()
+        cache = QSAKVCache(self._qsa_summary_identity)
         padding = self.left_padding[idx].item()
         end = self._idx
         if self._right_padding is not None:
@@ -2165,6 +2460,19 @@ class BatchQSAKVCache(BatchKVCache):
             cache.index_keys = mx.contiguous(
                 self.index_keys[idx : idx + 1, padding:end]
             )
+        if self._qsa_pooled_keys is not None and self._qsa_pooled_ratio:
+            complete = min(
+                cache.offset // self._qsa_pooled_ratio,
+                self._qsa_pooled_keys.shape[1],
+            )
+            if complete:
+                cache._qsa_pooled_keys = mx.contiguous(
+                    self._qsa_pooled_keys[idx : idx + 1, :complete]
+                )
+                cache._qsa_pooled_ratio = self._qsa_pooled_ratio
+                cache._qsa_summary_identity = _qsa_summary_with_coverage(
+                    self._qsa_summary_identity, complete
+                )
         return cache
 
     @classmethod
@@ -2198,6 +2506,11 @@ class BatchQSAKVCache(BatchKVCache):
                     values = values[:, :length]
                 rows.append(mx.pad(values, [(0, 0), (left, 0), (0, 0)]))
             batch.index_keys = mx.concatenate(rows)
+        pooled, identity = _qsa_merge_summaries(caches, lengths)
+        if pooled is not None:
+            batch._qsa_pooled_keys = pooled
+            batch._qsa_pooled_ratio = identity["compress_ratio"]
+            batch._qsa_summary_identity = identity
         return batch
 
 
@@ -2216,11 +2529,13 @@ class QSAKVCache(KVCache):
         instance.index_keys = None
         for name, blank in cls._QSA_CYCLE_FIELDS:
             setattr(instance, name, blank)
+        _init_qsa_summary_state(instance)
         return instance
 
-    def __init__(self):
+    def __init__(self, summary_identity=None):
         # __new__ owns the QSA fields; it runs on both construction paths.
         super().__init__()
+        _init_qsa_summary_state(self, summary_identity)
 
     def update_index_keys(self, keys: mx.array):
         self.index_keys = keys if self.index_keys is None else mx.concatenate([self.index_keys[:, : self.offset], keys], axis=1)
@@ -2252,13 +2567,7 @@ class QSAKVCache(KVCache):
                 )
         if self._qsa_pooled_keys is not None:
             keep = 0 if not keep_pooled else self.offset // self._qsa_pooled_ratio
-            if keep == 0:
-                self._qsa_pooled_keys = None
-                self._qsa_pooled_ratio = None
-            elif keep < self._qsa_pooled_keys.shape[1]:
-                self._qsa_pooled_keys = mx.contiguous(
-                    self._qsa_pooled_keys[:, :keep]
-                )
+            _qsa_summary_rebound(self, keep, who)
 
     def trim(self, n):
         n = super().trim(n)
@@ -2271,20 +2580,40 @@ class QSAKVCache(KVCache):
 
     @property
     def state(self):
-        return self.keys, self.values, self.index_keys
+        return _qsa_summary_state(
+            self, (self.keys, self.values, self.index_keys)
+        )
 
     @state.setter
     def state(self, value):
+        value = _qsa_summary_restore_state(self, value, 3)
         self.keys, self.values, self.index_keys = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
         self._mtp_share_topk = False
         self._mtp_shared_topk = None
         self._qsa_pooled_keys = None
         self._qsa_pooled_ratio = None
+        self._qsa_summary_identity = None
+        self._qsa_summary_restored = False
+
+    @property
+    def meta_state(self):
+        return _qsa_summary_meta(self, KVCache.meta_state.fget(self))
+
+    @meta_state.setter
+    def meta_state(self, value):
+        base, identity, reason = _qsa_summary_split_meta(value)
+        KVCache.meta_state.fset(self, base)
+        _qsa_summary_finish_restore(self, identity, reason)
 
     @property
     def nbytes(self):
-        return super().nbytes + (0 if self.index_keys is None else self.index_keys.nbytes)
+        summary = 0 if self._qsa_pooled_keys is None else self._qsa_pooled_keys.nbytes
+        return (
+            super().nbytes
+            + (0 if self.index_keys is None else self.index_keys.nbytes)
+            + summary
+        )
 
 
 def _copy_qsa_auxiliary_state(source, destination):
@@ -2292,6 +2621,13 @@ def _copy_qsa_auxiliary_state(source, destination):
     destination.index_keys = source.index_keys
     for name, blank in _QSA_CYCLE_STATE:
         setattr(destination, name, getattr(source, name, blank))
+    destination._qsa_summary_identity = getattr(
+        source, "_qsa_summary_identity", None
+    )
+    destination._qsa_summary_restored = getattr(
+        source, "_qsa_summary_restored", False
+    )
+    destination._qsa_pending_pooled = None
     if hasattr(destination, "_max_left_pad"):
         destination._max_left_pad = None
 
@@ -2424,33 +2760,44 @@ class QSAQuantizedKVCache(QSAKVCache):
 
     @property
     def state(self):
-        return QuantizedKVCache.state.fget(self), self.index_keys
+        base = (QuantizedKVCache.state.fget(self), self.index_keys)
+        return _qsa_summary_state(self, base)
 
     @state.setter
     def state(self, value):
+        value = _qsa_summary_restore_state(self, value, 2)
         QuantizedKVCache.state.fset(self, value[0])
         self.index_keys = value[1]
         self.offset = 0
         for name, blank in _QSA_CYCLE_STATE:
             setattr(self, name, blank)
+        self._qsa_summary_identity = None
+        self._qsa_summary_restored = False
 
     @property
     def meta_state(self):
-        return QuantizedKVCache.meta_state.fget(self)
+        return _qsa_summary_meta(self, QuantizedKVCache.meta_state.fget(self))
 
     @meta_state.setter
     def meta_state(self, value):
-        QuantizedKVCache.meta_state.fset(self, value)
+        base, identity, reason = _qsa_summary_split_meta(value)
+        QuantizedKVCache.meta_state.fset(self, base)
         self.release_qsa_cycle(
             "QSAQuantizedKVCache.meta_state", keep_pooled=False
         )
+        _qsa_summary_finish_restore(self, identity, reason)
 
     @property
     def nbytes(self):
         packed = 0
         if self.keys is not None:
             packed = sum(x.nbytes for x in (*self.keys, *self.values))
-        return packed + (0 if self.index_keys is None else self.index_keys.nbytes)
+        summary = 0 if self._qsa_pooled_keys is None else self._qsa_pooled_keys.nbytes
+        return (
+            packed
+            + (0 if self.index_keys is None else self.index_keys.nbytes)
+            + summary
+        )
 
 
 class BatchQSAQuantizedKVCache(BatchQSAKVCache):
@@ -2643,6 +2990,19 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
             cache.index_keys = mx.contiguous(
                 self.index_keys[idx : idx + 1, padding:end]
             )
+        if self._qsa_pooled_keys is not None and self._qsa_pooled_ratio:
+            complete = min(
+                cache.offset // self._qsa_pooled_ratio,
+                self._qsa_pooled_keys.shape[1],
+            )
+            if complete:
+                cache._qsa_pooled_keys = mx.contiguous(
+                    self._qsa_pooled_keys[idx : idx + 1, :complete]
+                )
+                cache._qsa_pooled_ratio = self._qsa_pooled_ratio
+                cache._qsa_summary_identity = _qsa_summary_with_coverage(
+                    self._qsa_summary_identity, complete
+                )
         return cache
 
     @classmethod
@@ -2681,6 +3041,11 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
                     mx.pad(values, [(0, 0), (width - length, 0), (0, 0)])
                 )
             batch.index_keys = mx.concatenate(rows)
+        pooled, identity = _qsa_merge_summaries(caches, lengths)
+        if pooled is not None:
+            batch._qsa_pooled_keys = pooled
+            batch._qsa_pooled_ratio = identity["compress_ratio"]
+            batch._qsa_summary_identity = identity
         return batch
 
     def to_quantized(
@@ -2705,25 +3070,33 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
 
     @property
     def state(self):
-        return BatchQuantizedKVCache.state.fget(self), self.index_keys
+        base = (BatchQuantizedKVCache.state.fget(self), self.index_keys)
+        return _qsa_summary_state(self, base)
 
     @state.setter
     def state(self, value):
+        value = _qsa_summary_restore_state(self, value, 2)
         BatchQuantizedKVCache.state.fset(self, value[0])
         self.index_keys = value[1]
         self._max_left_pad = None
         for name, blank in _QSA_CYCLE_STATE:
             setattr(self, name, blank)
+        self._qsa_summary_identity = None
+        self._qsa_summary_restored = False
         BatchKVCache._configure_attention_backend(self, "sdpa")
 
     @property
     def meta_state(self):
-        return BatchQuantizedKVCache.meta_state.fget(self)
+        return _qsa_summary_meta(
+            self, BatchQuantizedKVCache.meta_state.fget(self)
+        )
 
     @meta_state.setter
     def meta_state(self, value):
-        BatchQuantizedKVCache.meta_state.fset(self, value)
+        base, identity, reason = _qsa_summary_split_meta(value)
+        BatchQuantizedKVCache.meta_state.fset(self, base)
         BatchKVCache._configure_attention_backend(self, "sdpa")
+        _qsa_summary_finish_restore(self, identity, reason)
         self._reconcile_index_ledger("BatchQSAQuantizedKVCache.meta_state")
 
     @property
@@ -2731,7 +3104,12 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
         packed = 0
         if self.keys is not None:
             packed = sum(x.nbytes for x in (*self.keys, *self.values))
-        return packed + (0 if self.index_keys is None else self.index_keys.nbytes)
+        summary = 0 if self._qsa_pooled_keys is None else self._qsa_pooled_keys.nbytes
+        return (
+            packed
+            + (0 if self.index_keys is None else self.index_keys.nbytes)
+            + summary
+        )
 
 
 @dataclass(frozen=True)
@@ -3429,7 +3807,7 @@ def _dispatch_qsa_indexed_with_optional_capture(
 
 
 class QSAIndexer(nn.Module):
-    def __init__(self, args: TextModelArgs):
+    def __init__(self, args: TextModelArgs, layer_id=0):
         super().__init__()
         self.n_heads = args.indexer_n_heads
         self.head_dim = args.indexer_head_dim
@@ -3437,6 +3815,7 @@ class QSAIndexer(nn.Module):
         self.block_topk = args.indexer_budget // args.indexer_compress_ratio
         self.rotary_dim = int(args.head_dim * args.partial_rotary_factor)
         self.rope_theta = args.rope_theta
+        self.summary_identity = _qsa_summary_identity(args, layer_id)
         self.index_qk_proj = nn.Linear(
             args.hidden_size,
             (args.indexer_n_heads + args.indexer_kv_heads) * args.indexer_head_dim,
@@ -3522,7 +3901,7 @@ class QSAIndexer(nn.Module):
             )
 
         if not (
-            _QSA_POOLED_KEY_CACHE
+            (_QSA_POOLED_KEY_CACHE or _QSA_APC_SUMMARIES)
             and type(cache)
             in (
                 QSAKVCache,
@@ -3551,11 +3930,57 @@ class QSAIndexer(nn.Module):
             closed = (all_raw.shape[1] - cache.max_left_padding()) // ratio
         cached = cache._qsa_pooled_keys
         count = 0 if cached is None else cached.shape[1]
+        if _QSA_APC_SUMMARIES:
+            expected = self.summary_identity
+            stored = getattr(cache, "_qsa_summary_identity", None)
+            shape_ok = bool(
+                cached is None
+                or (
+                    cached.ndim == 3
+                    and cached.shape[0] == all_raw.shape[0]
+                    and cached.shape[2] == self.head_dim
+                    and cached.dtype == all_raw.dtype
+                )
+            )
+            coverage_ok = bool(
+                cached is None
+                or (
+                    stored is not None
+                    and int(stored.get("complete_blocks", -1)) == count
+                )
+            )
+            identity_ok = cached is None or _qsa_summary_identity_matches(
+                stored, expected
+            )
+            if cached is not None and not (
+                shape_ok and coverage_ok and identity_ok
+            ):
+                _qsa_summary_rebound(
+                    cache, 0, "summary_identity_mismatch"
+                )
+                cached, count = None, 0
+                _record_qsa_summary(
+                    "misses", "summary_identity_mismatch", blocks=0
+                )
+            elif cached is None:
+                _record_qsa_summary("misses", "summary_absent", blocks=0)
+            elif count and cache._qsa_summary_restored:
+                _record_qsa_summary(
+                    "hits",
+                    "persisted_summary",
+                    blocks=min(count, n_blocks),
+                )
+            cache._qsa_summary_identity = _qsa_summary_with_coverage(
+                expected, count
+            )
+            cache._qsa_summary_restored = False
         if cached is not None and (
             count > closed
             or cache._qsa_pooled_ratio != ratio
             or cached.shape[0] != all_raw.shape[0]
         ):
+            if _QSA_APC_SUMMARIES:
+                _qsa_summary_rebound(cache, 0, "summary_identity_mismatch")
             cached, count = None, 0
         if count == n_blocks:
             pooled = cached
@@ -3564,10 +3989,21 @@ class QSAIndexer(nn.Module):
             # closed since the previous call need computing.
             new = pool(count, n_blocks)
             pooled = new if cached is None else mx.concatenate([cached, new], axis=1)
+            if _QSA_APC_SUMMARIES and closed > count:
+                _record_qsa_summary(
+                    "recomputes", "new_complete_blocks", blocks=closed - count
+                )
         cache._qsa_pooled_keys = (
             pooled if closed >= n_blocks else mx.contiguous(pooled[:, :closed])
         )
         cache._qsa_pooled_ratio = ratio
+        if _QSA_APC_SUMMARIES:
+            cache._qsa_summary_identity = _qsa_summary_with_coverage(
+                self.summary_identity,
+                0
+                if cache._qsa_pooled_keys is None
+                else cache._qsa_pooled_keys.shape[1],
+            )
         return pooled
 
     def __call__(
@@ -3792,7 +4228,12 @@ class QSAIndexer(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextModelArgs, layer_idx: int = -1):
+    def __init__(
+        self,
+        args: TextModelArgs,
+        layer_idx: int = -1,
+        summary_layer_id=None,
+    ):
         super().__init__()
         self.layer_idx = int(layer_idx)
         self._qsa_indexed_capture_calls = 0
@@ -3806,7 +4247,10 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, args.hidden_size, bias=args.attention_bias)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.indexer = QSAIndexer(args)
+        self.indexer = QSAIndexer(
+            args,
+            layer_idx if summary_layer_id is None else summary_layer_id,
+        )
         self.rope = initialize_rope(
             int(args.head_dim * args.partial_rotary_factor),
             base=args.rope_theta,
@@ -4073,11 +4517,17 @@ class Attention(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, args: TextModelArgs, layer_idx: int):
+    def __init__(
+        self, args: TextModelArgs, layer_idx: int, summary_layer_id=None
+    ):
         super().__init__()
         self.is_linear = args.layer_types[layer_idx] == "linear_attention"
         self.linear_attn = GatedDeltaNet(args) if self.is_linear else None
-        self.self_attn = None if self.is_linear else Attention(args, layer_idx)
+        self.self_attn = (
+            None
+            if self.is_linear
+            else Attention(args, layer_idx, summary_layer_id)
+        )
         self.mlp = SparseMoeBlock(args)
         ple_index = args.ple_layer_ids.index(layer_idx + 1) if layer_idx + 1 in args.ple_layer_ids else None
         self.ple = PLELayer(args, layer_idx, ple_index) if ple_index is not None else None
@@ -4171,7 +4621,9 @@ class TextModel(nn.Module):
                 cache_type = Qwen4ArraysCache if layer.ple is not None else ArraysCache
                 caches.append(cache_type(size=4 if layer.ple is not None else 2))
             else:
-                caches.append(QSAKVCache())
+                caches.append(
+                    QSAKVCache(layer.self_attn.indexer.summary_identity)
+                )
         return caches
 
     def sanitize(self, weights):
@@ -4299,7 +4751,7 @@ class Qwen4ExpMTP(nn.Module):
             layer_types=["full_attention"],
             ple_layer_ids=[],
         )
-        self.layers = [DecoderLayer(mtp_args, 0)]
+        self.layers = [DecoderLayer(mtp_args, 0, summary_layer_id="mtp:0")]
         self.hyper_connection_mixer = GatedResidual(mtp_args, use_combine=False)
 
     def fuse(self, embeddings: mx.array, hidden: mx.array) -> mx.array:
@@ -4388,7 +4840,10 @@ class Model(nn.Module):
 
     def make_mtp_cache(self, window_size: Optional[int] = None, sink_size: int = 4):
         if window_size is None:
-            return [QSAKVCache() for _ in self.mtp.layers]
+            return [
+                QSAKVCache(layer.self_attn.indexer.summary_identity)
+                for layer in self.mtp.layers
+            ]
         return [SinkWindowKVCache(window_size, sink_size) for _ in self.mtp.layers]
 
     def mtp_end_cycle(self, mtp_cache):

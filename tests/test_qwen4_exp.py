@@ -1086,6 +1086,22 @@ class TestQSACacheFromState(unittest.TestCase):
         )
         return cache
 
+    def _summarized(self, seed=1, length=13, layer_id=3):
+        args = tiny_args()
+        indexer = QSAIndexer(args, layer_id)
+        cache = QSAKVCache(indexer.summary_identity)
+        hidden = mx.random.normal(
+            (1, length, args.hidden_size), key=mx.random.key(seed)
+        )
+        causal = (
+            mx.arange(length)[:, None] >= mx.arange(length)[None, :]
+        )[None, None]
+        indexer(hidden, causal, cache)
+        values = mx.zeros((1, 1, length, 2))
+        cache.update_and_fetch(values, values)
+        mx.eval(cache._qsa_pooled_keys)
+        return args, indexer, cache
+
     def test_new_sets_every_attribute_the_load_path_reads(self):
         for cls in (BatchQSAKVCache, QSAKVCache):
             with self.subTest(cache=cls.__name__):
@@ -1125,6 +1141,120 @@ class TestQSACacheFromState(unittest.TestCase):
         state[4] = state[4][:, :-1]
         with self.assertRaisesRegex(RuntimeError, "un-ledgered KV"):
             BatchQSAKVCache.from_state(tuple(state), cache.meta_state)
+
+    def test_summary_identity_round_trip_and_trim_invalidation(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            _, _, cache = self._summarized()
+            self.assertEqual(len(cache.state), 4)
+            self.assertIn("qsa_summary_v1", cache.meta_state)
+            restored = QSAKVCache.from_state(cache.state, cache.meta_state)
+            self.assertTrue(restored._qsa_summary_restored)
+            self.assertTrue(
+                mx.array_equal(
+                    restored._qsa_pooled_keys, cache._qsa_pooled_keys
+                ).item()
+            )
+            self.assertEqual(
+                restored._qsa_summary_identity["complete_blocks"], 3
+            )
+            restored.trim(5)
+            self.assertEqual(restored.offset, 8)
+            self.assertEqual(restored._qsa_pooled_keys.shape[1], 2)
+            self.assertEqual(
+                restored._qsa_summary_identity["complete_blocks"], 2
+            )
+
+    def test_legacy_state_restores_without_a_summary(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            _, _, cache = self._summarized()
+            legacy = QSAKVCache.from_state(cache.state[:3], (str(cache.offset),))
+            self.assertIsNone(legacy._qsa_pooled_keys)
+            self.assertIsNone(legacy._qsa_summary_identity)
+            self.assertEqual(legacy.offset, cache.offset)
+
+    def test_incremental_extension_equals_cold_recompute(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            args, indexer, cache = self._summarized()
+            warm = QSAKVCache.from_state(cache.state, cache.meta_state)
+            cold = QSAKVCache.from_state(cache.state[:3], (str(cache.offset),))
+            suffix = mx.random.normal(
+                (1, 7, args.hidden_size), key=mx.random.key(22)
+            )
+            q_pos = mx.arange(13, 20)
+            causal = (mx.arange(20)[None, :] <= q_pos[:, None])[None, None]
+
+            with mock.patch.object(
+                indexer, "_pool_blocks", wraps=indexer._pool_blocks
+            ) as warm_pool:
+                warm_selection = indexer(suffix, causal, warm)
+            with mock.patch.object(
+                indexer, "_pool_blocks", wraps=indexer._pool_blocks
+            ) as cold_pool:
+                cold_selection = indexer(suffix, causal, cold)
+            mx.eval(
+                warm._qsa_pooled_keys,
+                cold._qsa_pooled_keys,
+                warm_selection.raw_block_ids,
+                cold_selection.raw_block_ids,
+            )
+            self.assertEqual(warm_pool.call_count, 1)
+            self.assertEqual(cold_pool.call_count, 1)
+            self.assertEqual(
+                warm_pool.call_args.args[1].tolist(), [12, 16]
+            )
+            self.assertEqual(
+                cold_pool.call_args.args[1].tolist(), [0, 4, 8, 12, 16]
+            )
+            self.assertTrue(
+                mx.array_equal(
+                    warm._qsa_pooled_keys, cold._qsa_pooled_keys
+                ).item()
+            )
+            self.assertTrue(
+                mx.array_equal(
+                    warm_selection.raw_block_ids,
+                    cold_selection.raw_block_ids,
+                ).item()
+            )
+
+    def test_summary_identity_mismatch_fails_closed_on_consumption(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            args, indexer, cache = self._summarized()
+            meta = list(cache.meta_state)
+            marker = meta.index("qsa_summary_v1")
+            meta[marker + 5] = "different-producer"
+            restored = QSAKVCache.from_state(cache.state, tuple(meta))
+            qwen4_exp_module.qsa_apc_summary_status(reset=True)
+            suffix = mx.random.normal(
+                (1, 1, args.hidden_size), key=mx.random.key(23)
+            )
+            indexer(suffix, None, restored)
+            status = qwen4_exp_module.qsa_apc_summary_status()
+            self.assertGreaterEqual(
+                status["reasons"]["summary_identity_mismatch"], 1
+            )
+            self.assertEqual(status["counts"]["invalidations"], 1)
+
+    def test_ram_batch_merge_and_extract_preserve_summaries(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            _, _, left = self._summarized(seed=31)
+            _, _, right = self._summarized(seed=32)
+            batch = BatchQSAKVCache.merge([left, right])
+            expected = mx.concatenate(
+                [left._qsa_pooled_keys, right._qsa_pooled_keys]
+            )
+            self.assertTrue(
+                mx.array_equal(batch._qsa_pooled_keys, expected).item()
+            )
+            extracted = batch.extract(1)
+            self.assertTrue(
+                mx.array_equal(
+                    extracted._qsa_pooled_keys, right._qsa_pooled_keys
+                ).item()
+            )
+            self.assertEqual(
+                extracted._qsa_summary_identity["complete_blocks"], 3
+            )
 
 
 class TestPaddedSpeculativeStaging(unittest.TestCase):
@@ -2290,6 +2420,40 @@ class TestQSAKVQuantization(unittest.TestCase):
         self.assertTrue(
             mx.array_equal(restored_batch.index_keys, batch.index_keys)
         )
+
+    def test_quantized_state_round_trip_keeps_apc_summaries(self):
+        with lever_flag("_QSA_APC_SUMMARIES"):
+            source, _ = self._single()
+            source._qsa_pooled_keys = mx.arange(2 * self.DIM).reshape(
+                1, 2, self.DIM
+            ).astype(mx.bfloat16)
+            source._qsa_pooled_ratio = 4
+            source._qsa_summary_identity = {
+                "format_version": 1,
+                "model_config_hash": "quantized-test",
+                "block_size": 4,
+                "compress_ratio": 4,
+                "producer_version": "qwen4-pooled-key-v1",
+                "layer_id": "3",
+                "complete_blocks": 2,
+            }
+            packed = source.to_quantized(self.GROUP, 4)
+            restored = QSAQuantizedKVCache.from_state(
+                packed.state, packed.meta_state
+            )
+            self.assertTrue(
+                mx.array_equal(
+                    restored._qsa_pooled_keys, source._qsa_pooled_keys
+                ).item()
+            )
+            batch = BatchQSAQuantizedKVCache.merge([packed, restored])
+            round_trip = BatchQSAQuantizedKVCache.from_state(
+                batch.state, batch.meta_state
+            )
+            self.assertEqual(round_trip._qsa_pooled_keys.shape, (2, 2, self.DIM))
+            self.assertEqual(
+                round_trip._qsa_summary_identity["complete_blocks"], 2
+            )
 
     def test_cachelist_recursion_converts_the_real_qsa_leaf(self):
         leaf, ledger = self._single()
