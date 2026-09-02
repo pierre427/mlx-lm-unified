@@ -14,6 +14,23 @@ path for every geometry or layout outside the narrow admission contract.
 The ``scalar`` variant is the conservative baseline. ``tile4`` reuses each
 hidden word across four output rows and splits the ten experts over five SIMD
 groups, then reduces router-weighted values in the original slot order.
+
+Token width is an explicit qualification, not a side effect of some other
+gate: ``QUALIFIED_TOKEN_WIDTHS`` lists the flattened widths whose fused result
+has been checked against the stock ``gather_qmm`` path on the production
+checkpoint, and admission refuses every other width by name. The routing
+tensors reach the kernel as whatever view the router produced -- the top-k
+slice of a ``[M, 512]`` gate matrix has row stride 512, not 10 -- so both
+kernels resolve ``indices``, ``scores`` and the ``hidden`` row base through
+their real strides, in-kernel and with 32-bit ``elem_to_loc``: no graph node
+and no copy at any width. (Before 2026-09-02 they assumed a packed ``[M, 10]``
+layout, which is only true at M=1 where a single row has no row stride; at
+M=3 every token past the first read another token's experts and the result
+was ~115% of the block's own peak away from the answer. The alternative fix,
+``mx.contiguous`` on the three activation inputs, is exact too but costs
+three graph nodes per block per token, +1.0% on M=1 decode; and the 64-bit
+``elem_to_loc`` overload costs a chain of 64-bit divisions per slot, +24% on
+the M=3 round for ``scalar``. Both measured 2026-09-02.)
 """
 
 from __future__ import annotations
@@ -34,6 +51,36 @@ _SIMD_WIDTH = 32
 _TILE4_SIMDGROUPS = 5
 _TILE4_THREADS = _SIMD_WIDTH * _TILE4_SIMDGROUPS
 _VARIANTS = ("scalar", "tile4")
+
+# Flattened token widths the fused path is QUALIFIED for. Both kernels index
+# by (token, slot) and dispatch one grid slice per token, so structurally any
+# small M runs; a width is listed here only once its output has been checked
+# against the stock path on real weights and real routing. Refusing by width
+# is a decision the admission makes, not something the sort threshold in
+# switch_layers happens to enforce. M=1 (decode): tile4, 0.36% of block peak
+# from an fp32 reference where the stock path sits 0.86% (2026-09-02, all 49
+# blocks, real routing), and 30.70 ms/token against 30.81 for the pre-fix
+# dense-read kernel at 16K (the strided addressing is free at M=1).
+# M=3 (MTP verify at k=2): exact after the strided fix -- 0.38-0.41% from
+# fp32 per token, stock 0.92-0.97% -- and tile4 measures 41.85 ms per round
+# against 42.40 for the unsorted stock path and 42.61 for the shipped sorted
+# one (engine-direct self-MTP k=2 at 16K, n=6 per arm). It is still NOT
+# listed: it changes the verify token stream (not bit-identical to stock,
+# same as M=1's tile4 was), and switch_layers sorts M=3 at the shipped
+# threshold anyway, so enabling it is a two-line product decision -- add 3
+# here and raise _GATHER_SORT_MIN_ASSIGNMENTS to 40 -- worth about -1.8%
+# of round time, to be taken with a digest sign-off, not by accident.
+# Before the fix the same width was 0/48 blocks bit-equal, median 115% of
+# peak (results/qwen4-kernel-bw-20260902-moe3arm.json); the whole record is
+# results/qwen4-fused-down-m3-20260902*.json.
+QUALIFIED_TOKEN_WIDTHS: tuple[int, ...] = (1,)
+
+# The ``auto`` policy's variant per width. tile4 won the real-weight M=1
+# qualification and is the faster variant at M=3 as well (scalar: 42.09 ms
+# per round with dense reads, and a quarter slower with 64-bit in-kernel
+# addressing; see the module docstring). scalar and tile4 produce
+# bit-identical output at every width.
+AUTO_VARIANT_BY_WIDTH: dict[int, str] = {1: "tile4", 3: "tile4"}
 
 _INDEX_DTYPES = (mx.int32, mx.uint32)
 
@@ -84,8 +131,14 @@ def admit_qwen4_fused_down(
     tokens = 1
     for extent in hidden_shape[:-2]:
         tokens *= extent
-    if tokens not in (1, 3):
-        return FusedMoeAdmission(False, "only flattened token widths M=1 or M=3")
+    if tokens not in QUALIFIED_TOKEN_WIDTHS:
+        qualified = ", ".join(f"M={w}" for w in QUALIFIED_TOKEN_WIDTHS)
+        return FusedMoeAdmission(
+            False,
+            f"flattened token width M={tokens} is not qualified for the "
+            f"fused down kernel (qualified: {qualified})",
+            tokens,
+        )
 
     routed_shape = hidden_shape[:-2] + (TOP_K,)
     if _shape(indices) != routed_shape or _shape(scores) != routed_shape:
@@ -144,6 +197,17 @@ def admit_qwen4_fused_down(
     return FusedMoeAdmission(True, "eligible", tokens)
 
 
+def auto_variant(tokens: int) -> str:
+    """Variant the ``auto`` policy dispatches at an admitted token width."""
+    try:
+        return AUTO_VARIANT_BY_WIDTH[tokens]
+    except KeyError:
+        raise ValueError(
+            f"no auto variant for flattened token width M={tokens}; "
+            f"qualified widths are {QUALIFIED_TOKEN_WIDTHS}"
+        ) from None
+
+
 _DOWN_REDUCE_SOURCE = r"""
     constexpr uint H = 2560;
     constexpr uint EH = 640;
@@ -159,12 +223,20 @@ _DOWN_REDUCE_SOURCE = r"""
     float routed = 0.0f;
 #pragma unroll
     for (uint slot = 0; slot < TOPK; ++slot) {
-        uint expert = uint(indices[token * TOPK + slot]);
+        // indices/scores/hidden are addressed through their real strides:
+        // the router hands over a strided top-k view, not a packed [M, 10].
+        // hidden's innermost (640) axis is unit-stride by contract.
+        // 32-bit elem_to_loc: these views are tiny (M x 10 x 640 at most),
+        // and the 64-bit overload costs a chain of 64-bit divisions.
+        uint elem = token * TOPK + slot;
+        uint expert = uint(indices[elem_to_loc(
+            elem, indices_shape, indices_strides, indices_ndim)]);
         size_t wrow = size_t(expert) * H + row;
         const device uint32_t* dw = packed + wrow * DOWN_WORDS;
         const device W* ds = down_scales + wrow * DOWN_GROUPS;
         const device W* db = down_biases + wrow * DOWN_GROUPS;
-        const device T* hrow = hidden + (size_t(token) * TOPK + slot) * EH;
+        const device T* hrow = hidden + elem_to_loc(
+            elem * EH, hidden_shape, hidden_strides, hidden_ndim);
 
         float value = 0.0f;
         for (uint word = lane; word < DOWN_WORDS; word += 32) {
@@ -188,7 +260,8 @@ _DOWN_REDUCE_SOURCE = r"""
             // Match the two T-valued boundaries in the stock graph.
             T expert_value = static_cast<T>(value);
             T weighted_value = static_cast<T>(
-                float(expert_value) * float(scores[token * TOPK + slot]));
+                float(expert_value) * float(scores[elem_to_loc(
+                    elem, scores_shape, scores_strides, scores_ndim)]));
             routed += float(weighted_value);
         }
     }
@@ -222,8 +295,12 @@ _DOWN_REDUCE_TILE4_SOURCE = r"""
 #pragma unroll
     for (uint local_slot = 0; local_slot < 2; ++local_slot) {
         uint slot = slot_base + local_slot;
-        uint expert = uint(indices[token * TOPK + slot]);
-        const device T* hrow = hidden + (size_t(token) * TOPK + slot) * EH;
+        // Strided routing views, as in the scalar kernel.
+        uint elem = token * TOPK + slot;
+        uint expert = uint(indices[elem_to_loc(
+            elem, indices_shape, indices_strides, indices_ndim)]);
+        const device T* hrow = hidden + elem_to_loc(
+            elem * EH, hidden_shape, hidden_strides, hidden_ndim);
 
         for (uint word = lane; word < DOWN_WORDS; word += 32) {
             size_t hbase = size_t(word) * 8;
@@ -265,7 +342,9 @@ _DOWN_REDUCE_TILE4_SOURCE = r"""
 #pragma unroll
         for (uint local_slot = 0; local_slot < 2; ++local_slot) {
             uint slot = slot_base + local_slot;
-            float score = float(scores[token * TOPK + slot]);
+            float score = float(scores[elem_to_loc(
+                token * TOPK + slot, scores_shape, scores_strides,
+                scores_ndim)]);
 #pragma unroll
             for (uint local_row = 0; local_row < 4; ++local_row) {
                 T expert_value = static_cast<T>(
@@ -353,8 +432,10 @@ def qwen4_fused_down(
     Raise when the exact production geometry is not present. The integration
     layer must catch the rejected admission before this call and use the stock
     ``gather_qmm`` path instead. Indices must come from the model's trusted
-    top-k router, and every input must use its standard row-contiguous layout.
-    ``variant`` is selected per call, so serving can tune it without reload.
+    top-k router. The weight tables must be row-contiguous (they are never
+    copied); ``indices``, ``scores`` and ``hidden`` may be strided views, and
+    only ``hidden``'s innermost axis must be unit-stride. ``variant`` is
+    selected per call, so serving can tune it without reload.
     """
 
     if variant not in _VARIANTS:
@@ -403,7 +484,10 @@ def qwen4_fused_down(
 
 
 __all__ = [
+    "AUTO_VARIANT_BY_WIDTH",
     "FusedMoeAdmission",
+    "QUALIFIED_TOKEN_WIDTHS",
     "admit_qwen4_fused_down",
+    "auto_variant",
     "qwen4_fused_down",
 ]

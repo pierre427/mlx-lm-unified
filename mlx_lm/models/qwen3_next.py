@@ -484,11 +484,7 @@ class FusedGateUpSwitchGLU(nn.Module):
         )
         outcome = None
         if fused is not None:
-            outcome = (
-                "tile4"
-                if variant == "auto" and idx.size // idx.shape[-1] == 1
-                else ("scalar" if variant == "auto" else variant)
-            )
+            outcome = _fused_outcome(variant, idx)
         object.__setattr__(self, "_last_fused_variant", outcome)
         if fused is not None:
             return fused
@@ -528,11 +524,7 @@ class FusedDownSwitchGLU(SwitchGLU):
         )
         outcome = None
         if fused is not None:
-            outcome = (
-                "tile4"
-                if variant == "auto" and idx.size // idx.shape[-1] == 1
-                else ("scalar" if variant == "auto" else variant)
-            )
+            outcome = _fused_outcome(variant, idx)
         object.__setattr__(self, "_last_fused_variant", outcome)
         if fused is not None:
             return fused
@@ -543,6 +535,15 @@ class FusedDownSwitchGLU(SwitchGLU):
         if scores is not None:
             return (x * scores[..., None]).sum(axis=-2)
         return x
+
+
+def _fused_outcome(variant: str, indices) -> str:
+    """Name the variant a successful fused dispatch ran, for the receipts."""
+    if variant != "auto":
+        return variant
+    from .qwen4_fused_moe import auto_variant
+
+    return auto_variant(indices.size // indices.shape[-1])
 
 
 def _try_qwen4_fused_down(
@@ -558,7 +559,11 @@ def _try_qwen4_fused_down(
     ):
         return None
 
-    from .qwen4_fused_moe import admit_qwen4_fused_down, qwen4_fused_down
+    from .qwen4_fused_moe import (
+        admit_qwen4_fused_down,
+        auto_variant,
+        qwen4_fused_down,
+    )
 
     # SwitchLinear preserves its singleton matrix row as [..., top_k, 1, K].
     # The custom GEMV consumes the equivalent compact [..., top_k, K] view.
@@ -581,9 +586,9 @@ def _try_qwen4_fused_down(
     if not admission.accepted:
         return None
     if variant == "auto":
-        # The real-weight qualification selected tile4 at M=1 and scalar at
-        # M=3. Admission guarantees that no other token width reaches here.
-        variant = "tile4" if admission.tokens == 1 else "scalar"
+        # One table (AUTO_VARIANT_BY_WIDTH) decides the variant per qualified
+        # width; admission guarantees no other width reaches here.
+        variant = auto_variant(admission.tokens)
     return qwen4_fused_down(
         compact_hidden,
         indices,
