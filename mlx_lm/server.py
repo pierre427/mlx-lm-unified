@@ -4456,6 +4456,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_qwen4_qsa_stage1_status()
         elif self.path == "/v1/status/qwen4-qsa-indexed":
             self.handle_qwen4_qsa_indexed_status()
+        elif self.path == "/v1/status/qwen4-ple-compile":
+            self.handle_qwen4_ple_compile_status()
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -4489,6 +4491,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(200)
         self.end_headers()
         self.wfile.write(json.dumps(qsa_indexed_status()).encode())
+        self.wfile.flush()
+
+    def handle_qwen4_ple_compile_status(self):
+        """Expose bounded compiled-PLE-chain receipts.
+
+        The lever is default-on for every Flash-Next request, so ``fallbacks``
+        being 0 is a production invariant; this is the only way to read it
+        from outside the process.  Read-only: it never resets the counters.
+        """
+
+        from mlx_lm.models.qwen4_exp import qwen4_ple_compile_status
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(qwen4_ple_compile_status()).encode())
         self.wfile.flush()
 
     def handle_health_check(self):

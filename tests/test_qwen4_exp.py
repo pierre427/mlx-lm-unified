@@ -1,6 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
+import io
 import itertools
+import json
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
@@ -39,6 +41,7 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
 )
 from mlx_lm.models import qwen4_exp as qwen4_exp_module
+from mlx_lm.server import APIHandler
 from mlx_lm.models.qwen4_exp import (
     BatchQSAKVCache,
     BatchQSAQuantizedKVCache,
@@ -2638,6 +2641,67 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPLECompileServer(unittest.TestCase):
+    """``/v1/status/qwen4-ple-compile`` mirrors the three QSA lever routes."""
+
+    ROUTE = "/v1/status/qwen4-ple-compile"
+
+    def setUp(self):
+        qwen4_exp_module.qwen4_ple_compile_status(reset=True)
+
+    def tearDown(self):
+        qwen4_exp_module.qwen4_ple_compile_status(reset=True)
+
+    def _get(self, path):
+        handler = APIHandler.__new__(APIHandler)
+        handler.path = path
+        handler.wfile = io.BytesIO()
+        handler._set_completion_headers = lambda code=200: setattr(
+            handler, "status", code
+        )
+        handler.end_headers = lambda: None
+        handler.do_GET()
+        raw = handler.wfile.getvalue()
+        return handler.status, (json.loads(raw) if handler.status == 200 else raw)
+
+    def test_status_endpoint_serves_the_receipts_read_only(self):
+        qwen4_exp_module._record_ple_compile("builds", signature="B1-W3")
+        qwen4_exp_module._record_ple_compile("hits")
+        qwen4_exp_module._record_ple_compile(
+            "fallbacks", signature="B1-W16", exception_class="RuntimeError"
+        )
+
+        status, body = self._get(self.ROUTE)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, qwen4_exp_module.qwen4_ple_compile_status())
+        self.assertEqual(body["enabled"], bool(qwen4_exp_module._PLE_COMPILE))
+        self.assertEqual(body["cache_max"], qwen4_exp_module._PLE_COMPILE_CACHE_MAX)
+        self.assertEqual(
+            body["counts"],
+            {
+                "builds": 1,
+                "hits": 1,
+                "fallbacks": 1,
+                "overflow": 0,
+                "skips": 0,
+                "retraces": 0,
+            },
+        )
+        self.assertEqual(body["last_receipt"]["event"], "fallbacks")
+        self.assertEqual(body["last_receipt"]["exception_class"], "RuntimeError")
+
+        # A GET is a read, never a reset: the second read must match the first.
+        again_status, again = self._get(self.ROUTE)
+        self.assertEqual(again_status, 200)
+        self.assertEqual(again, body)
+
+    def test_neighbouring_paths_still_404(self):
+        for path in (self.ROUTE + "/", self.ROUTE + "?reset=1", "/v1/status/qwen4-ple"):
+            with self.subTest(path=path):
+                status, _ = self._get(path)
+                self.assertEqual(status, 404)
 
 
 class TestQSAKVQuantization(unittest.TestCase):

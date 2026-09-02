@@ -733,6 +733,13 @@ class TestAdminRoutesOverHTTP(unittest.TestCase):
         self.assertEqual(nax_status.status_code, 200)
         self.assertIn(nax_status.json()["mode"], {"auto", "on", "off"})
         self.assertEqual(nax_status.json()["auto_min_physical_kv"], 16_384)
+        ple_status = requests.get(self.base + "/v1/status/qwen4-ple-compile")
+        self.assertEqual(ple_status.status_code, 200)
+        self.assertIsInstance(ple_status.json()["enabled"], bool)
+        self.assertEqual(
+            set(ple_status.json()["counts"]),
+            {"builds", "hits", "fallbacks", "overflow", "skips", "retraces"},
+        )
         self.assertEqual(requests.get(self.base + "/v1/nope").status_code, 404)
 
 
