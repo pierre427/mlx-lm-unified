@@ -113,16 +113,18 @@ def sha256_file(path: Path) -> str:
 
 
 def array_receipt(array) -> dict[str, Any]:
+    import mlx.core as mx
     import numpy as np
 
-    value = np.asarray(array)
+    dtype = str(array.dtype)
+    value = np.asarray(array.astype(mx.float32) if array.dtype == mx.bfloat16 else array)
     digest = hashlib.sha256()
-    digest.update(str(value.dtype).encode())
+    digest.update(dtype.encode())
     digest.update(json.dumps(list(value.shape)).encode())
     digest.update(value.tobytes())
     return {
         "shape": list(value.shape),
-        "dtype": str(value.dtype),
+        "dtype": dtype,
         "sha256": digest.hexdigest(),
     }
 
