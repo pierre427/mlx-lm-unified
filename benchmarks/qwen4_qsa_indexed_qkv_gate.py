@@ -344,7 +344,7 @@ def phase_model(mx, model_path, max_tokens):
     ]
     status = indexed["indexed_status"]
     qsa_layers = model_qsa_layer_count(model)
-    rounds = indexed["stats"].get("cycles", 0)
+    rounds = indexed["stats"].get("draft_cycles", 0)
     engaged = status["query_width_counts"].get("2-8", {}).get("engaged", 0)
     result = {
         "phase": "model_16k_int8",
