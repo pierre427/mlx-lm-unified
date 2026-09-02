@@ -1,3 +1,10 @@
+<!-- LAB SCOPE NOTE (mlx-uag, 2026-09-02): the rules below are ml-explore's
+contributor policy for the upstream mlx-lm repository. In this fork (branch
+`unified`, remote `forgejo`), agents DO commit and push to forgejo on the
+lab's instruction; the "do not push" rule applies only to ml-explore remotes
+and the pierre427 GitHub fork, which are never pushed from here. See
+mlx-uag/AGENTS.md. -->
+
 # Instructions for mlx-lm
 
 ## Agent rules
