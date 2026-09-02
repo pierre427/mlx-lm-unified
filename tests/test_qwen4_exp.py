@@ -492,7 +492,8 @@ class TestQwen4Exp(unittest.TestCase):
         # message, not load.
         with self.assertRaisesRegex(
             ValueError,
-            r"norm convention mismatch(?s:.*)raw \(\+1 offset\)"
+            r"norm convention check failed(?s:.*)raw \(\+1 offset applied\)"
+            r"(?s:.*)wrong number of times"
             r"(?s:.*)q_norm(?s:.*)MLX_QWEN4_NORM_CONVENTION",
         ):
             model.sanitize(
@@ -504,7 +505,10 @@ class TestQwen4Exp(unittest.TestCase):
 
         # Zero-centered gains in a converted-layout checkpoint (the offset
         # would be skipped, gains stay ~0) must also refuse.
-        with self.assertRaisesRegex(ValueError, "norm convention mismatch"):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"norm convention check failed(?s:.*)decisively zero-centered",
+        ):
             model.sanitize(
                 {
                     "model.layers.0.linear_attn.conv1d.weight": converted_conv,
@@ -529,7 +533,97 @@ class TestQwen4Exp(unittest.TestCase):
             gains = output["model.layers.3.self_attn.q_norm.weight"]
             self.assertAlmostEqual(gains.mean().item(), 1.6, places=1)
 
-    def test_norm_convention_override_forces_and_skips_check(self):
+    def test_norm_convention_refuses_ambiguous_evidence(self):
+        # The whole point of the audit: a norm-sparse artifact (a standalone
+        # MTP head has nine gains and no conv1d keys at all) separates the
+        # two hypotheses by only ~0.15, and the earlier comparative guard
+        # returned silently there. Ambiguity must fail closed.
+        args = tiny_args()
+        model = TextModel(args)
+        # Means at 0.5 are exactly equidistant from 0 and 1; nudge to make
+        # the one-centered side better by 0.15, still inside the 0.25 margin.
+        ambiguous = {
+            "model.mtp.pre_fc_norm_embedding.weight": mx.full((16,), 0.575),
+            "model.mtp.pre_fc_norm_hidden.weight": mx.full((16,), 0.575),
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            r"norm convention check failed(?s:.*)do not decisively favour"
+            r"(?s:.*)MLX_QWEN4_NORM_CONVENTION_UNCHECKED",
+        ) as caught:
+            model.sanitize(dict(ambiguous))
+        message = str(caught.exception)
+        self.assertIn("A_one 0.425", message)
+        self.assertIn("A_zero 0.575", message)
+
+        # And the documented escape hatch suppresses it.
+        environ["MLX_QWEN4_NORM_CONVENTION_UNCHECKED"] = "1"
+        try:
+            output = model.sanitize(dict(ambiguous))
+        finally:
+            del environ["MLX_QWEN4_NORM_CONVENTION_UNCHECKED"]
+        self.assertAlmostEqual(
+            output["model.mtp.pre_fc_norm_hidden.weight"].mean().item(),
+            0.575,
+            places=3,
+        )
+
+    def test_norm_convention_refuses_missing_fold_without_conv1d_keys(self):
+        # The audit's MISSING-PLUS-ONE route: zero-centered gains presented
+        # with no conv1d key at all, so the layout proxy is vacuously False
+        # and no fold runs. The gains alone must convict.
+        args = tiny_args()
+        model = TextModel(args)
+        zero_centered = self._norm_gain_weights(0.0)
+        with self.assertRaisesRegex(
+            ValueError,
+            r"converted \(no offset applied\)(?s:.*)decisively zero-centered",
+        ):
+            model.sanitize(dict(zero_centered))
+
+        environ["MLX_QWEN4_NORM_CONVENTION_UNCHECKED"] = "1"
+        try:
+            model.sanitize(dict(zero_centered))
+        finally:
+            del environ["MLX_QWEN4_NORM_CONVENTION_UNCHECKED"]
+
+    def test_norm_convention_override_selects_fold_but_still_checks(self):
+        # MLX_QWEN4_NORM_CONVENTION chooses the fold; it no longer skips the
+        # check, so a forced convention still has to survive its evidence.
+        args = tiny_args()
+        model = TextModel(args)
+        converted_conv = mx.zeros((8, 3, 1))
+        zero_centered = self._norm_gain_weights(0.0)
+        environ["MLX_QWEN4_NORM_CONVENTION"] = "raw"
+        try:
+            # Forcing raw on a converted-layout checkpoint folds the +1 and
+            # the result is consistent, so the check passes.
+            output = model.sanitize(
+                {
+                    "model.layers.0.linear_attn.conv1d.weight": converted_conv,
+                    **zero_centered,
+                }
+            )
+            self.assertAlmostEqual(
+                output["model.layers.3.self_attn.q_norm.weight"].mean().item(),
+                1.6,
+                places=1,
+            )
+            # Forcing raw on gains that are already one-centered lands them
+            # near 2 and must still be refused under the override.
+            with self.assertRaisesRegex(
+                ValueError, "norm convention check failed"
+            ):
+                model.sanitize(
+                    {
+                        "model.layers.0.linear_attn.conv1d.weight": converted_conv,
+                        **self._norm_gain_weights(1.0),
+                    }
+                )
+        finally:
+            del environ["MLX_QWEN4_NORM_CONVENTION"]
+
+    def test_norm_convention_override_forces_fold(self):
         args = tiny_args()
         model = TextModel(args)
         raw_conv = mx.zeros((8, 1, 3))
@@ -537,8 +631,9 @@ class TestQwen4Exp(unittest.TestCase):
 
         environ["MLX_QWEN4_NORM_CONVENTION"] = "converted"
         try:
-            # The proxy says raw; the override forces converted (no +1)
-            # and skips the refusal.
+            # The proxy says raw; the override forces converted (no +1).
+            # The gains are already one-centered, so the check still runs
+            # and passes.
             output = model.sanitize(
                 {
                     "model.layers.0.linear_attn.conv1d.weight": raw_conv,
