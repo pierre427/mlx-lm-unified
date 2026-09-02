@@ -346,7 +346,7 @@ class TestQSAIndexedReference(unittest.TestCase):
         agree at every width in the widened admission window, with ragged
         per-row block counts, non-zero left padding and a dense causal mask.
         """
-        for length in (9, 12, 15, 16):
+        for length in (9, 12, 15, 16, 17):
             for splits in (1, 4, 8):
                 with self.subTest(length=length, splits=splits):
                     mx.random.seed(1300 + length)
@@ -371,7 +371,7 @@ class TestQSAIndexedReference(unittest.TestCase):
                     )
 
     def test_pld_verify_widths_are_split_invariant_without_a_mask(self):
-        for length in (9, 12, 15, 16):
+        for length in (9, 12, 15, 16, 17):
             with self.subTest(length=length):
                 mx.random.seed(2300 + length)
                 compact = _wide_compact(length=length)
@@ -982,7 +982,10 @@ class TestQSAIndexedAdmission(unittest.TestCase):
                 (12, 16_384, True, "engaged"),
                 (15, 16_384, True, "engaged"),
                 (16, 16_384, True, "engaged"),
-                (17, 65_536, False, "width_out_of_range"),
+                # A PLD verify forward is the bonus token plus the proposal,
+                # so its width is max_span + 1 = 17. This is the common one.
+                (17, 16_384, True, "engaged"),
+                (18, 65_536, False, "width_out_of_range"),
             ]
             for length, context, engage, reason in cases:
                 with self.subTest(length=length, context=context):
@@ -1058,7 +1061,7 @@ class TestQSAIndexedAdmission(unittest.TestCase):
             ("nax_engaged", 1),
             ("probe_declined", 3),
             ("dispatch_raised", 12),
-            ("width_out_of_range", 24),
+            ("width_out_of_range", 32),
         ):
             indexed.record_qsa_indexed_receipt(
                 engaged=False,
@@ -1088,8 +1091,8 @@ class TestQSAIndexedAdmission(unittest.TestCase):
         self.assertEqual(status["fallbacks"], 2)
         self.assertEqual(status["query_width_counts"]["1"]["declined"], 1)
         self.assertEqual(status["query_width_counts"]["2-8"]["declined"], 1)
-        self.assertEqual(status["query_width_counts"]["9-16"]["declined"], 1)
-        self.assertEqual(status["query_width_counts"][">16"]["declined"], 1)
+        self.assertEqual(status["query_width_counts"]["9-17"]["declined"], 1)
+        self.assertEqual(status["query_width_counts"][">17"]["declined"], 1)
         self.assertEqual(status["split_candidates"], [128, 64, 32, 16, 8])
         geometry = status["geometry_candidates"]["B1-L3-T32768-U520-mask1"]
         self.assertEqual(geometry["candidate"], [384, 32])

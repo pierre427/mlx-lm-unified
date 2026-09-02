@@ -523,7 +523,7 @@ _QSA_GATHER_MIN_QUERY = max(
 # indexed dispatch drops into, and it tiles over query rows, so the two
 # admission windows must agree or ``gather_would_admit`` receipts lie.
 _QSA_GATHER_MAX_QUERY = max(
-    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_QUERY", "16"))
+    1, int(os.environ.get("MLX_QWEN4_QSA_GATHER_MAX_QUERY", "17"))
 )
 
 

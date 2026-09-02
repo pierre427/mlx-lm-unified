@@ -76,9 +76,15 @@ _MIN_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_QUERY", 2, minimum=1)
 # The kernel flattens (batch, query row) into the dispatch grid and runs the
 # native ``sdpa_vector_2pass`` arithmetic at ``q_len == 1`` per row, so a
 # wider verify block is the same work per row and nothing in the source or
-# the threadgroup geometry depends on this bound. It is admission policy,
-# and it is set to the widest span adaptive prompt lookup proposes (16).
-_MAX_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_QUERY", 16, minimum=1)
+# the threadgroup geometry depends on this bound. It is admission policy.
+#
+# It is set to the widest block adaptive prompt lookup actually presents, which
+# is ``max_span + 1``, not ``max_span``: a PLD verify forward is the pending
+# bonus token followed by the proposal (``verify_rows = len(pending) + n_prop``
+# in ``hybrid_speculative``). At the serving profile's ``max_span=16`` the
+# measured distribution is 17 x 14, 15 x 1, 1 x 3 per 256-token generation, so
+# a bound of 16 admits one speculative forward in fifteen.
+_MAX_QUERY = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_QUERY", 17, minimum=1)
 _MIN_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MIN_CONTEXT", 16384)
 _MAX_CONTEXT = _env_int("MLX_QWEN4_QSA_INDEXED_MAX_CONTEXT", 0)
 _AUTO_MIN_CONTEXT_M3 = _env_int(
@@ -240,8 +246,8 @@ _STATUS_COUNTS = Counter()
 _STATUS_WIDTHS = {
     "1": Counter(),
     "2-8": Counter(),
-    "9-16": Counter(),
-    ">16": Counter(),
+    "9-17": Counter(),
+    ">17": Counter(),
 }
 _STATUS_LAST = None
 _STATUS_CANDIDATE = None
@@ -261,9 +267,9 @@ def _width_bucket(width: int) -> str:
         return "1"
     if width <= 8:
         return "2-8"
-    if width <= 16:
-        return "9-16"
-    return ">16"
+    if width <= 17:
+        return "9-17"
+    return ">17"
 
 
 def record_qsa_indexed_receipt(

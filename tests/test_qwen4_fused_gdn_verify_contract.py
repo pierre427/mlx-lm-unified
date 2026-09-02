@@ -125,8 +125,9 @@ def test_production_verify_widths_are_admitted():
         assert result.accepted, (steps, result.reason)
     # Adaptive prompt lookup proposes spans up to 16 wide; those are the
     # widths that were declining before the bound was raised.
-    assert qwen4_fused_gdn_verify.MAX_VERIFY_STEPS >= 16
-    for steps in (9, 15, 16):
+    # 17 is the width adaptive PLD actually presents (bonus + max_span).
+    assert qwen4_fused_gdn_verify.MAX_VERIFY_STEPS >= 17
+    for steps in (9, 15, 16, 17):
         assert admission(steps).accepted
 
 
@@ -143,7 +144,7 @@ def test_verify_kernel_source_is_pinned_across_the_width_bound():
     )
 
 
-@pytest.mark.parametrize("steps", [2, 8, 9, 15, 16])
+@pytest.mark.parametrize("steps", [2, 8, 9, 15, 16, 17])
 def test_wide_dispatch_shapes_scale_only_the_token_axis(steps):
     """Geometry is width independent; only the snapshot extents move."""
     calls = []

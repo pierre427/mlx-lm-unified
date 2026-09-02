@@ -57,8 +57,12 @@ from .qwen4_fused_gdn import (
 logger = logging.getLogger(__name__)
 
 # Production self-MTP verifies ``k + 1`` tokens (k = 2 on Flash-Next); adaptive
-# prompt lookup proposes spans up to 16 wide, and the bound is what decides
-# whether those reach this kernel at all.
+# prompt lookup presents much wider blocks, and the bound is what decides
+# whether those reach this kernel at all. A PLD verify forward is the pending
+# bonus token followed by the proposal, so its width is ``max_span + 1``: at
+# the serving profile's ``max_span=16`` the measured distribution is 17 x 14,
+# 15 x 1, 1 x 3 per 256-token generation. The bound is therefore 17, not 16 --
+# a bound of 16 admits one speculative forward in fifteen.
 #
 # Nothing in the kernel's geometry depends on ``S``: the threadgroup is
 # ``(32, TY, 1)`` over one value head, the register tile is ``st[DV/TY][DK/32]``
@@ -70,7 +74,7 @@ logger = logging.getLogger(__name__)
 # extra step per linear layer -- but it does not change the arithmetic of any
 # width that was already admitted. The kernel source is pinned by hash in
 # ``tests/test_qwen4_fused_gdn_verify_contract.py`` to keep that true.
-MAX_VERIFY_STEPS = 16
+MAX_VERIFY_STEPS = 17
 
 
 def admit_qwen4_fused_gdn_verify(

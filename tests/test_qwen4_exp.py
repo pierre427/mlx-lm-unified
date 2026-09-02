@@ -3139,8 +3139,8 @@ class TestQSASelectionObject(unittest.TestCase):
 
     def test_shipped_gather_window_admits_every_pld_verify_width(self):
         """The default window mirrors the indexed one so PLD spans reach it."""
-        self.assertEqual(qwen4_exp_module._QSA_GATHER_MAX_QUERY, 16)
-        for width, expected in ((12, 4), (16, 4), (17, 0)):
+        self.assertEqual(qwen4_exp_module._QSA_GATHER_MAX_QUERY, 17)
+        for width, expected in ((12, 4), (16, 4), (17, 4), (18, 0)):
             with self.subTest(width=width):
                 model = self._model()
                 model.eval()
