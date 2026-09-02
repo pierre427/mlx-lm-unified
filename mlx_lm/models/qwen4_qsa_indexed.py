@@ -34,6 +34,8 @@ _EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
 _SDPA_VECTOR_HEADER_SHA256 = (
     "2100a4d1eaa8a524c5147c82c771cad75197495c72daffa03e7ea4c259aebf10"
 )
+_QUANTIZED_BITS = frozenset({4, 8})
+_QUANTIZED_GROUP_SIZES = frozenset({32, 64, 128})
 
 
 def _env_flag(name: str) -> bool:
@@ -162,8 +164,24 @@ def _selection_topk_width(selection) -> int:
     return int(ids.shape[-1])
 
 
+def qsa_indexed_quantized_cache_config(cache):
+    if cache is None or not hasattr(cache, "group_size"):
+        return None
+    key_bits = getattr(cache, "key_bits", getattr(cache, "bits", None))
+    value_bits = getattr(cache, "value_bits", getattr(cache, "bits", None))
+    if key_bits is None or value_bits is None:
+        return None
+    return {
+        "group_size": int(cache.group_size),
+        "key_bits": int(key_bits),
+        "value_bits": int(value_bits),
+        "rotate": bool(getattr(cache, "rotate", False)),
+        "normalize": bool(getattr(cache, "normalize", False)),
+    }
+
+
 def decide_qsa_indexed_admission(
-    selection, *, length: int, training: bool, layout_ok: bool
+    selection, *, length: int, training: bool, layout_ok: bool, cache=None
 ) -> tuple[bool, str]:
     """Resolve the indexed route without evaluating arrays or changing state."""
 
@@ -196,6 +214,17 @@ def decide_qsa_indexed_admission(
             return False, "context_out_of_range"
     if not layout_ok:
         return False, "unsupported_layout"
+    quantized = qsa_indexed_quantized_cache_config(cache)
+    if quantized is not None:
+        if quantized["group_size"] not in _QUANTIZED_GROUP_SIZES:
+            return False, "quantized_group_size_unsupported"
+        if (
+            quantized["key_bits"] not in _QUANTIZED_BITS
+            or quantized["value_bits"] not in _QUANTIZED_BITS
+        ):
+            return False, "quantized_bits_unsupported"
+        if quantized["rotate"] or quantized["normalize"]:
+            return False, "quantized_transform_unsupported"
     if not indexed_kernel_available():
         return False, "kernel_unavailable"
     return True, "engaged"
@@ -271,6 +300,8 @@ def record_qsa_indexed_receipt(
             "mlx_build_unverified",
             "probe_declined",
             "dispatch_raised",
+            "quantized_probe_declined",
+            "quantized_dispatch_raised",
         }:
             _STATUS_FALLBACKS += 1
         if candidate is not None:
@@ -293,6 +324,7 @@ def _device_attest_output(
     candidate: tuple[int, int],
     geometry_key: str,
     candidate_timings_ms: dict[int, float],
+    reason: str = "engaged",
 ):
     """Attach one device counter and defer host credit until status readback."""
 
@@ -304,7 +336,7 @@ def _device_attest_output(
     }
     receipt = {
         "engaged": True,
-        "reason": "engaged",
+        "reason": str(reason),
         "query_width": int(length),
         "physical_kv": int(context),
         "splits": int(splits),
@@ -348,7 +380,7 @@ def _reconcile_device_receipts_locked() -> None:
     receipt["device_counter_observed"] = observed
     receipt["device_counter_expected"] = expected
     if observed == expected:
-        _STATUS_COUNTS["engaged"] += observed
+        _STATUS_COUNTS[receipt["reason"]] += observed
         for bucket, count in _STATUS_DEVICE_PENDING_WIDTHS.items():
             _STATUS_WIDTHS[bucket]["engaged"] += count
     else:
@@ -547,6 +579,51 @@ def qwen4_qsa_indexed_reference(
     return _combine_reference_sdpa_partials(m, l, o, output_dtype=q.dtype)
 
 
+def dequantize_qsa_quantized_kv(
+    q_keys,
+    q_values,
+    *,
+    group_size: int,
+    key_bits: int,
+    value_bits: int,
+):
+    """Match the full-cache affine dequantization boundary used by MLX."""
+
+    keys = mx.dequantize(
+        *q_keys, group_size=int(group_size), bits=int(key_bits)
+    )
+    values = mx.dequantize(
+        *q_values, group_size=int(group_size), bits=int(value_bits)
+    )
+    return keys, values
+
+
+def qwen4_qsa_indexed_quantized_reference(
+    q,
+    q_keys,
+    q_values,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+    group_size: int,
+    key_bits: int,
+    value_bits: int,
+):
+    """Dequantize with MLX, then run the unchanged bf16 mirror."""
+
+    keys, values = dequantize_qsa_quantized_kv(
+        q_keys,
+        q_values,
+        group_size=group_size,
+        key_bits=key_bits,
+        value_bits=value_bits,
+    )
+    return qwen4_qsa_indexed_reference(
+        q, keys, values, compact, scale=scale, splits=splits
+    )
+
+
 _HEADER = r"""
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -668,6 +745,114 @@ _SOURCE = r"""
 """
 
 
+_QUANTIZED_SOURCE = r"""
+    // Keep the bf16 SDPA order while dequantizing only selected K/V values.
+    const uint lane = thread_index_in_simdgroup;
+    const uint head = simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint unit = threadgroup_position_in_grid.z;
+    const uint split = unit % S;
+    const uint bkv = unit / S;
+    const uint b = bkv / NKVH;
+    const uint hkv = bkv % NKVH;
+
+    const int L = dims[0];
+    const int TOT = dims[1];
+    const int U = dims[2];
+    const uint count = counts[b * L + row];
+    const uint selected = n_sel[b * L + row];
+    const int qp = qpos[b * L + row];
+    const int complete = ((qp + 1) / BS) * BS;
+    const int lpad = left_pad[b];
+    const uint base = BLOCKS / S;
+    const uint remainder = BLOCKS % S;
+    const uint block_begin = split * base + metal::min(split, remainder);
+    const uint block_count = base + (split < remainder ? 1u : 0u);
+    const uint token_width = uint(U) * BS;
+    const uint qh = hkv * GQA + head;
+    const uint elements = D / 32;
+    const uint groups = D / GROUP_SIZE;
+    const uint k_packed = D * KBITS / 32;
+    const uint v_packed = D * VBITS / 32;
+    const uint k_mask = (1u << KBITS) - 1u;
+    const uint v_mask = (1u << VBITS) - 1u;
+
+    float q_values[D / 32];
+    for (uint part = 0; part < elements; ++part) {
+        const uint d = lane * elements + part;
+        q_values[part] = float(scale[0]) * float(
+            q[((size_t)(b * NQH + qh) * L + row) * D + d]
+        );
+    }
+
+    const uint slot_base = (b * L + row) * uint(U);
+    for (uint local_block = 0; local_block < block_count; ++local_block) {
+        const uint block_idx = block_begin + local_block;
+        float out_values[D / 32] = {0};
+        float maximum = -3.402823466e+38F;
+        float sum = 0.0f;
+
+        for (uint token = block_idx; token < token_width; token += BLOCKS) {
+            const uint slot = token / BS;
+            const uint tail = token % BS;
+            int logical = 0;
+            int physical = 0;
+            bool live = slot < count;
+            if (live) {
+                const int block = int(ids[slot_base + slot]);
+                logical = block * BS + int(tail);
+                physical = lpad + logical;
+                live = physical >= 0 && physical < TOT && logical <= qp;
+                live = live && (slot < selected || logical >= complete);
+                if (HAS_MASK && live)
+                    live = mask[(size_t)(b * L + row) * TOT + physical];
+            }
+            if (!live) continue;
+
+            const size_t quant_row = ((size_t)b * NKVH + hkv) * TOT + physical;
+            float score = 0.0f;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                const uint word = k_w[quant_row * k_packed + d * KBITS / 32];
+                const uint code = (word >> ((d * KBITS) & 31)) & k_mask;
+                const size_t affine = quant_row * groups + d / GROUP_SIZE;
+                const T value = k_s[affine] * code + k_b[affine];
+                score += q_values[part] * float(value);
+            }
+            score = simd_sum(score);
+            const float new_max = metal::max(maximum, score);
+            const float factor = fast::exp(maximum - new_max);
+            const float probability = fast::exp(score - new_max);
+            maximum = new_max;
+            sum = sum * factor + probability;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                const uint word = v_w[quant_row * v_packed + d * VBITS / 32];
+                const uint code = (word >> ((d * VBITS) & 31)) & v_mask;
+                const size_t affine = quant_row * groups + d / GROUP_SIZE;
+                const T value = v_s[affine] * code + v_b[affine];
+                out_values[part] = out_values[part] * factor
+                    + probability * float(value);
+            }
+        }
+
+        const size_t state = (
+            ((size_t)(b * NQH + qh) * L + row) * BLOCKS + block_idx
+        );
+        if (lane == 0) {
+            part_m[state] = maximum;
+            part_l[state] = sum;
+        }
+        for (uint part = 0; part < elements; ++part) {
+            const uint d = lane * elements + part;
+            part_o[state * D + d] = T(out_values[part]);
+        }
+    }
+    if (unit == 0 && row == 0 && head == 0 && lane == 0)
+        engaged[0] = 1;
+"""
+
+
 _COMBINE_SOURCE = r"""
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -744,6 +929,34 @@ def _partition_kernel():
 
 
 @lru_cache(maxsize=None)
+def _quantized_partition_kernel():
+    return mx.fast.metal_kernel(
+        name="qwen4_qsa_indexed_quantized_sdpa_pass1_v1",
+        input_names=[
+            "q",
+            "k_w",
+            "k_s",
+            "k_b",
+            "v_w",
+            "v_s",
+            "v_b",
+            "ids",
+            "counts",
+            "n_sel",
+            "qpos",
+            "left_pad",
+            "mask",
+            "scale",
+            "dims",
+        ],
+        output_names=["part_m", "part_l", "part_o", "engaged"],
+        header=_HEADER,
+        source=_QUANTIZED_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
+@lru_cache(maxsize=None)
 def _combine_kernel():
     return mx.fast.metal_kernel(
         name="qwen4_qsa_indexed_sdpa_pass2_v3",
@@ -766,6 +979,7 @@ class QSAIndexedProbeDeclined(RuntimeError):
 _PROBE_LOCK = threading.Lock()
 _PROBE_RESULTS = {}
 _PROBE_TIMINGS = {}
+_QUANTIZED_PROBE_RESULTS = {}
 _MISSING = object()
 
 
@@ -877,6 +1091,93 @@ def _partition_dispatch(
             ("S", int(splits)),
             ("BLOCKS", _SDPA_BLOCKS),
             ("HAS_MASK", int(has_mask)),
+        ],
+        grid=(threads, length, batch * nkh * splits),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS, dim),
+            (1,),
+        ],
+        output_dtypes=[mx.float32, mx.float32, q.dtype, mx.uint32],
+    )
+
+
+def _quantized_partition_dispatch(
+    q,
+    q_keys,
+    q_values,
+    compact,
+    *,
+    scale: float,
+    threads: int,
+    splits: int,
+    group_size: int,
+    key_bits: int,
+    value_bits: int,
+):
+    batch, nqh, length, dim = map(int, q.shape)
+    nkh = int(q_keys[0].shape[1])
+    gqa = nqh // nkh
+    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
+        compact_blocks_to_kernel_inputs(compact)
+    )
+    required_threads = gqa * 32
+    if threads != required_threads:
+        raise ValueError("indexed QSA pass 1 requires one SIMD group per GQA head")
+    if compact.causal_mask is None:
+        mask = mx.ones((1,), dtype=mx.bool_)
+        has_mask = False
+    else:
+        mask = compact.causal_mask
+        if (
+            mask.ndim != 4
+            or int(mask.shape[1]) != 1
+            or int(mask.shape[2]) != length
+            or int(mask.shape[3]) != total
+            or mask.dtype != mx.bool_
+        ):
+            raise QSAIndexedProbeDeclined(
+                "indexed QSA requires a rank-4 [B|1, 1, L, T] bool cache mask",
+                reason="unsupported_mask_layout",
+            )
+        if int(mask.shape[0]) not in (1, batch):
+            raise QSAIndexedProbeDeclined(
+                "indexed QSA cache mask batch must be 1 or B",
+                reason="unsupported_mask_layout",
+            )
+        if int(mask.shape[0]) == 1 and batch > 1:
+            mask = mx.broadcast_to(mask, (batch, 1, length, total))
+        mask = mask[:, 0]
+        has_mask = True
+    return _quantized_partition_kernel()(
+        inputs=[
+            mx.contiguous(q),
+            *(mx.contiguous(x) for x in q_keys),
+            *(mx.contiguous(x) for x in q_values),
+            mx.contiguous(ids.astype(mx.uint32)),
+            mx.contiguous(counts.astype(mx.uint32)),
+            mx.contiguous(n_sel.astype(mx.uint32)),
+            mx.contiguous(q_pos.astype(mx.int32)),
+            mx.contiguous(left_pad.astype(mx.int32)),
+            mx.contiguous(mask),
+            mx.array([scale], dtype=mx.float32),
+            mx.array([length, total, u_width], dtype=mx.int32),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("D", dim),
+            ("NQH", nqh),
+            ("NKVH", nkh),
+            ("GQA", gqa),
+            ("BS", int(compact.block_size)),
+            ("S", int(splits)),
+            ("BLOCKS", _SDPA_BLOCKS),
+            ("HAS_MASK", int(has_mask)),
+            ("GROUP_SIZE", int(group_size)),
+            ("KBITS", int(key_bits)),
+            ("VBITS", int(value_bits)),
         ],
         grid=(threads, length, batch * nkh * splits),
         threadgroup=(threads, 1, 1),
@@ -1074,16 +1375,217 @@ def qwen4_qsa_indexed_attention(
     )
 
 
+def qwen4_qsa_indexed_quantized_attention(
+    q,
+    q_keys,
+    q_values,
+    compact,
+    *,
+    scale: float,
+    group_size: int,
+    key_bits: int,
+    value_bits: int,
+    splits: int | None = None,
+):
+    """Read affine int8/int4 K/V inside the indexed SDPA kernel."""
+
+    mlx_version = str(getattr(mx, "__version__", "unknown"))
+    allow_unverified = (
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX") == "1"
+    )
+    if mlx_version not in _EXACT_MLX_BUILDS and not allow_unverified:
+        raise QSAIndexedProbeDeclined(
+            f"indexed QSA exactness is unproven on mlx {mlx_version}",
+            reason="mlx_build_unverified",
+        )
+    if not indexed_kernel_available():
+        raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
+    if q.ndim != 4 or len(q_keys) != 3 or len(q_values) != 3:
+        raise ValueError("quantized indexed QSA wants packed K/V triples")
+    if q_keys[0].ndim != 4 or q_values[0].ndim != 4:
+        raise ValueError("quantized indexed QSA wants rank-4 packed K/V")
+    if q_keys[0].shape[:3] != q_values[0].shape[:3]:
+        raise ValueError("quantized indexed QSA K/V geometry must match")
+    if q.shape[0] != q_keys[0].shape[0] or q.shape[1] % q_keys[0].shape[1]:
+        raise ValueError("indexed QSA requires matching batch and integral GQA")
+    if int(q_keys[0].shape[2]) != int(compact.physical_width):
+        raise ValueError("indexed QSA tensors do not match compact selection")
+    if q_keys[0].dtype != mx.uint32 or q_values[0].dtype != mx.uint32:
+        raise ValueError("quantized indexed QSA packed weights must be uint32")
+    if any(x.dtype != q.dtype for x in (*q_keys[1:], *q_values[1:])):
+        raise QSAIndexedProbeDeclined(
+            "quantized indexed QSA requires query and affine parameter dtype match"
+        )
+    group_size = int(group_size)
+    key_bits = int(key_bits)
+    value_bits = int(value_bits)
+    if group_size not in _QUANTIZED_GROUP_SIZES:
+        raise QSAIndexedProbeDeclined(
+            "quantized indexed QSA group size is unsupported"
+        )
+    if key_bits not in _QUANTIZED_BITS or value_bits not in _QUANTIZED_BITS:
+        raise QSAIndexedProbeDeclined("quantized indexed QSA bits are unsupported")
+    if int(compact.block_size) != _BLOCK_SIZE:
+        raise ValueError("indexed QSA requires block size 4")
+    dim = int(q.shape[-1])
+    if dim != 256:
+        raise QSAIndexedProbeDeclined("indexed QSA exact mode requires D=256")
+    groups = dim // group_size
+    expected_k_packed = dim * key_bits // 32
+    expected_v_packed = dim * value_bits // 32
+    if int(q_keys[0].shape[-1]) != expected_k_packed:
+        raise ValueError("quantized indexed QSA key packing does not match metadata")
+    if int(q_values[0].shape[-1]) != expected_v_packed:
+        raise ValueError("quantized indexed QSA value packing does not match metadata")
+    if any(int(x.shape[-1]) != groups for x in (*q_keys[1:], *q_values[1:])):
+        raise ValueError("quantized indexed QSA affine groups do not match metadata")
+    nkh = int(q_keys[0].shape[1])
+    gqa = int(q.shape[1]) // nkh
+    if gqa != 12:
+        raise QSAIndexedProbeDeclined("indexed QSA exact mode requires GQA=12")
+    threads = gqa * 32
+    sdpa_blocks = os.environ.get("MLX_SDPA_BLOCKS")
+    if sdpa_blocks not in (None, "", str(_SDPA_BLOCKS)):
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA requires MLX_SDPA_BLOCKS=128"
+        )
+
+    _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+    token_width = u_width * _BLOCK_SIZE
+    if token_width <= 1024 or token_width > 8192:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA requires the MLX two-pass SDPA geometry"
+        )
+    architecture = str(mx.device_info().get("architecture", ""))
+    if architecture[-1:] not in {"s", "d"}:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA exact mode requires a 128-block MLX SDPA device"
+        )
+    requested = (
+        None
+        if splits is None and _SPLITS_OVERRIDE == 0
+        else indexed_splits_for(u_width) if splits is None else int(splits)
+    )
+    if requested is not None and requested not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    geometry_key = (
+        f"quantized-B{int(q.shape[0])}-L{int(q.shape[2])}"
+        f"-U{int(u_width)}-dtype{q.dtype}"
+        f"-mask{int(compact.causal_mask is not None)}"
+        f"-g{group_size}-k{key_bits}-v{value_bits}"
+    )
+    key = (
+        mlx_version,
+        str(q.dtype),
+        dim,
+        int(q.shape[1]),
+        nkh,
+        int(compact.block_size),
+        int(u_width),
+        int(q.shape[0]),
+        int(q.shape[2]),
+        int(compact.causal_mask is not None),
+        requested,
+        group_size,
+        key_bits,
+        value_bits,
+    )
+
+    candidate = _QUANTIZED_PROBE_RESULTS.get(key, _MISSING)
+    if candidate is False:
+        raise QSAIndexedProbeDeclined(
+            "quantized indexed QSA candidate ladder was declined"
+        )
+    if candidate is _MISSING:
+        with _PROBE_LOCK:
+            candidate = _QUANTIZED_PROBE_RESULTS.get(key, _MISSING)
+            if candidate is False:
+                raise QSAIndexedProbeDeclined(
+                    "quantized indexed QSA candidate ladder was declined"
+                )
+            if candidate is _MISSING:
+                def dispatch(attempted):
+                    partials = _quantized_partition_dispatch(
+                        q,
+                        q_keys,
+                        q_values,
+                        compact,
+                        scale=scale,
+                        threads=attempted[0],
+                        splits=attempted[1],
+                        group_size=group_size,
+                        key_bits=key_bits,
+                        value_bits=value_bits,
+                    )
+                    return _combine_sdpa_partials(
+                        *partials, output_dtype=q.dtype
+                    )
+
+                candidate, combined, counter, timings = _measure_candidates(
+                    _candidate_ladder(requested, threads), dispatch
+                )
+                if candidate is None:
+                    _QUANTIZED_PROBE_RESULTS[key] = False
+                    raise QSAIndexedProbeDeclined(
+                        "quantized indexed QSA candidate ladder was declined"
+                    )
+                _QUANTIZED_PROBE_RESULTS[key] = candidate
+                _PROBE_TIMINGS[key] = timings
+                return _device_attest_output(
+                    combined,
+                    counter,
+                    length=int(q.shape[2]),
+                    context=int(compact.physical_width),
+                    reason="engaged_quantized",
+                    splits=candidate[1],
+                    candidate=candidate,
+                    geometry_key=geometry_key,
+                    candidate_timings_ms=timings,
+                )
+
+    m, l, o, counter = _quantized_partition_dispatch(
+        q,
+        q_keys,
+        q_values,
+        compact,
+        scale=scale,
+        threads=candidate[0],
+        splits=candidate[1],
+        group_size=group_size,
+        key_bits=key_bits,
+        value_bits=value_bits,
+    )
+    output, counter = _combine_sdpa_partials(
+        m, l, o, counter, output_dtype=q.dtype
+    )
+    return _device_attest_output(
+        output,
+        counter,
+        length=int(q.shape[2]),
+        context=int(compact.physical_width),
+        reason="engaged_quantized",
+        splits=candidate[1],
+        candidate=candidate,
+        geometry_key=geometry_key,
+        candidate_timings_ms=_PROBE_TIMINGS[key],
+    )
+
+
 __all__ = [
     "QSAIndexedProbeDeclined",
     "decide_qsa_indexed_admission",
+    "dequantize_qsa_quantized_kv",
     "indexed_chunk_ranges",
     "indexed_kernel_available",
     "indexed_split_chunk_ranges",
     "indexed_splits_for",
     "qsa_indexed_status",
     "qsa_indexed_enabled",
+    "qsa_indexed_quantized_cache_config",
     "qwen4_qsa_indexed_attention",
+    "qwen4_qsa_indexed_quantized_attention",
+    "qwen4_qsa_indexed_quantized_reference",
     "qwen4_qsa_indexed_reference",
     "record_qsa_indexed_receipt",
     "set_qwen4_qsa_indexed",
