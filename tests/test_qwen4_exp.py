@@ -2521,10 +2521,26 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
         self.assertGreater(status["counts"]["skips"], 0)
         self.assertEqual(status["last_receipt"]["reason"], "float32_activations")
 
-    def test_env_off_traces_nothing_and_answers_eagerly(self):
+    def test_the_lever_is_promoted_and_an_explicit_zero_reverts_it(self):
+        """Unset means ON; ``=0`` is how an operator turns a promotion off."""
+        read = qwen4_exp_module._env_flag
+        with mock.patch.dict(environ, {}, clear=False):
+            environ.pop("MLX_QWEN4_PLE_COMPILE", None)
+            self.assertTrue(read("MLX_QWEN4_PLE_COMPILE", default=True))
+        for value in ("0", "off", "false", "no"):
+            with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": value}):
+                self.assertFalse(
+                    read("MLX_QWEN4_PLE_COMPILE", default=True), f"{value!r}"
+                )
+
+    def test_env_explicit_zero_traces_nothing_and_answers_eagerly(self):
         layer, args = self._layer()
         hidden, ids = self._inputs(args, 3)
-        qwen4_exp_module._PLE_COMPILE = False
+        with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": "0"}):
+            qwen4_exp_module._PLE_COMPILE = qwen4_exp_module._env_flag(
+                "MLX_QWEN4_PLE_COMPILE", default=True
+            )
+        self.assertFalse(qwen4_exp_module._PLE_COMPILE)
         cache = Qwen4ArraysCache(4)
         mx.eval(layer(hidden, ids, cache))
         status = qwen4_exp_module.qwen4_ple_compile_status()

@@ -100,9 +100,12 @@ _RMSNORM_FAST = _env_flag("MLX_QWEN4_RMSNORM_FAST")
 # buying 0.057 ms at width 3 and 0.164 ms at width 16 in isolation.  Same
 # mechanism ``nn.silu`` and ``qwen3_next._precise_swiglu`` already use.
 #
-# Ships DEFAULT OFF pending the end-to-end serving gate; set
-# ``MLX_QWEN4_PLE_COMPILE=1`` to arm it.
-_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE")
+# PROMOTED (2026-09-02) on the end-to-end serving gate: B1 self-MTP k=2 gave an
+# identical 256-token digest at 16K and 64K, decode +0.2% at 64K with a positive
+# sign at both contexts, and 431 replays over 16 generations with 0 fallbacks,
+# 0 overflows and 0 retraces.  Unset means ON; ``MLX_QWEN4_PLE_COMPILE=0``
+# reverts to the eager chain, which is the same arithmetic.
+_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE", default=True)
 # One traced graph per (batch, width, mask, state-write, dtype) signature.  A
 # single run legitimately holds several: the prefill chunk width and its short
 # tail, the decode width, the verify slab width, and each of those again with
