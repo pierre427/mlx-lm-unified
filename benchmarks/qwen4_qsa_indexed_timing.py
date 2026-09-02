@@ -8,6 +8,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -145,6 +146,34 @@ def check_abort_floor(snapshot, phase):
             phase,
             f"free memory {snapshot['free_percent']}% is below the 10% abort floor",
         )
+
+
+def wait_for_cpu_load(limit=10.0, timeout=600.0):
+    started = time.monotonic()
+    samples = []
+    while True:
+        output = subprocess.run(
+            ["/usr/bin/uptime"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        match = re.search(r"load averages?:\s*([0-9.]+)", output)
+        if match is None:
+            raise gate.GateFailure(5, f"could not parse uptime: {output!r}")
+        load = float(match.group(1))
+        samples.append(
+            {"at": utc_now(), "one_minute_load": load, "uptime": output}
+        )
+        if load < limit:
+            return {
+                "limit": limit,
+                "wait_seconds": time.monotonic() - started,
+                "samples": samples,
+            }
+        if time.monotonic() - started >= timeout:
+            raise gate.GateFailure(5, "one-minute CPU load did not fall below 10")
+        time.sleep(5.0)
 
 
 def thermal_baseline():
@@ -313,6 +342,7 @@ def run_isolated_cell(output):
         baseline_safety = gate.safety_snapshot("before_isolated")
         report["safety"].append(baseline_safety)
         check_cell_start(baseline_safety, 5)
+        report["cpu_load_gate"] = wait_for_cpu_load()
         baseline = thermal_baseline()
         report["thermal_baseline"] = baseline
         for context in CONTEXTS:
@@ -462,6 +492,7 @@ def run_end_to_end_cell(model_path, context, output):
                     abort_event=guard.event,
                     abort_phase=5,
                 )
+            report["cpu_load_gate"] = wait_for_cpu_load()
             before_timing = gate.safety_snapshot(
                 f"before_end_to_end_{context}"
             )
