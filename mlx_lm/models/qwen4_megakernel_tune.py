@@ -588,8 +588,11 @@ def ensure_tuned(*, probe: Optional[MD.DeviceProbe] = None,
 
     need_primitives = entry is None or not (entry.get("primitives") or {}).get(
         "ok")
+    # A sweep that RAN and produced no winner is an answer, not a gap: the
+    # entry keeps its `sweep` record and later loads stop re-measuring it.
     need_sweep = mode == "force" or (
-        mode == "auto" and (entry is None or "threads" not in entry))
+        mode == "auto" and (entry is None or ("threads" not in entry
+                                              and "sweep" not in entry)))
     if mode == "force" or need_primitives or need_sweep:
         try:
             entry = calibrate(probe=probe, sweep=(mode != "off") and (
