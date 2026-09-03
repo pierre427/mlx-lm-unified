@@ -3411,6 +3411,28 @@ class TestModels(unittest.TestCase):
                     "full_attention",
                 ],
             },
+            {
+                "model_type": "k2_horizon_mova",
+                "vocab_size": 1000,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 64,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "num_shared_experts": 1,
+                "mova_num_experts": 4,
+                "mova_num_experts_per_tok": 2,
+                "mlp_only_layers": [0],
+                "rms_norm_eps": 1e-6,
+                "router_scaling_factor": 2.5,
+                "layernorm_num_groups": 2,
+                "rope_parameters": {"rope_theta": 1e7, "rope_type": "default"},
+                "attention_gate_func": "softplus",
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
