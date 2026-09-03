@@ -414,7 +414,20 @@ def load_model(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    if (model_file := config.get("model_file")) is not None:
+    model_file = config.get("model_file")
+    native_classes = None
+    if model_file is not None and not trust_remote_code:
+        # A checkpoint may vendor its own model_file while this tree ships a
+        # native port of the same model_type. Without trust_remote_code prefer
+        # the native module; the error below stays for unknown types.
+        try:
+            native_classes = get_model_classes(config=config)
+        except ValueError:
+            native_classes = None
+
+    if native_classes is not None:
+        model_class, model_args_class = native_classes
+    elif model_file is not None:
         if not trust_remote_code:
             raise ValueError(
                 f"The model at {model_path} requires importing and running a "
