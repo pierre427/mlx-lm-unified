@@ -165,7 +165,18 @@ ACTL_M = {
 ACTL_M_STRIDE = 16       # keep the per-query block 16-word aligned
 # The widest verify slab the kernel is built for.  k=2 self-MTP is a 3-wide
 # verify, which is what production routes; wider costs scratch linearly.
-MAX_QUERY_WIDTH = 3
+#
+# It is a BUILD width, not a runtime one.  `MAXMW` sizes the kernel's register
+# arrays (`float acc[RMAXN * MAXMW]`) and its threadgroup arena, and one Metal
+# dispatch has ONE register allocation, so a body built for three queries pays
+# that footprint on every launch INCLUDING an M=1 decode token -- the same
+# occupancy tax the spec's "one kernel, not two" decision already pays across
+# phases, now paid across widths.  The knob exists so a deployed ladder can
+# build the narrow body for the decode half and the wide one for the verify
+# half, and so the tax is measurable rather than inferred.  `_env_int` is
+# defined further down the module, so the read is inline.
+MAX_QUERY_WIDTH = max(1, min(3, int(
+    os.environ.get("MLX_QWEN4_MEGAKERNEL_MAX_WIDTH") or 3)))
 ACTL_HEADER = 32                                   # shared header words
 ACTL_M0 = ACTL_HEADER                              # per-query blocks start
 ACTL_IDS = ACTL_M0 + ACTL_M_STRIDE * MAX_QUERY_WIDTH   # the ids start here
