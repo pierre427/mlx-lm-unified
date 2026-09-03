@@ -381,8 +381,9 @@ class TestCache(_EnvMixin, unittest.TestCase):
         calls = []
 
         def fake(*, probe=None, sweep=True, budget_s=None, path=None,
-                 write=True):
-            calls.append({"signature": probe.signature, "sweep": sweep})
+                 write=True, respect_lease=True):
+            calls.append({"signature": probe.signature, "sweep": sweep,
+                          "respect_lease": respect_lease})
             stored = dict(entry, signature=probe.signature)
             MT.write_entry(probe.signature, stored, path)
             return stored
@@ -452,6 +453,47 @@ class TestCache(_EnvMixin, unittest.TestCase):
         entry, state = MT.ensure_tuned(probe=probe_from())
         self.assertIsNone(entry)
         self.assertIn("no Metal device", state["error"])
+
+    def test_the_sweep_yields_to_whoever_holds_the_gpu_lease(self):
+        """A timing sweep taken under load is not a measurement of geometry.
+
+        Proven the hard way on 2026-09-03: the same machine answered 256x160
+        while a perplexity gate was running and 512x80 under the lock.
+        """
+        lease = os.path.join(self.dir.name, "gpu.lock")
+        os.makedirs(lease)
+        os.environ["MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH"] = lease
+        self.ENV = self.ENV + ("MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH",)
+        self._env.setdefault("MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH", None)
+        self.assertEqual(MT.gpu_is_busy(), lease)
+
+        probe = probe_from()
+        entry = MT.calibrate(probe=probe, sweep=True)
+        self.assertTrue(entry["primitives"]["ok"])
+        self.assertFalse(entry["sweep"]["ok"])
+        self.assertIn("deferred", entry["sweep"])
+        self.assertNotIn("threads", entry)
+        # A deferred sweep is NOT an answer: the next load tries again.
+        MT.forget()
+        calls = self._stub_calibrate({"primitives": {"ok": True}})
+        MT.ensure_tuned(probe=probe)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["respect_lease"])
+
+        # ...and the resolution falls back to the probe rule meanwhile.
+        MT.forget()
+        MC.invalidate()
+        os.environ["MLX_QWEN4_MEGAKERNEL_TUNE"] = "skip"
+        resolved = MC.resolve(probe=probe)
+        self.assertEqual(resolved["values"]["threads"], 512)
+        self.assertEqual(resolved["sources"]["threads"], "probe")
+
+    def test_force_ignores_the_lease(self):
+        os.environ["MLX_QWEN4_MEGAKERNEL_TUNE"] = "force"
+        calls = self._stub_calibrate({"threads": 512,
+                                      "primitives": {"ok": True}})
+        MT.ensure_tuned(probe=probe_from())
+        self.assertEqual([c["respect_lease"] for c in calls], [False])
 
     def test_an_unknown_tune_mode_is_refused(self):
         os.environ["MLX_QWEN4_MEGAKERNEL_TUNE"] = "sideways"

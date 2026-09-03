@@ -54,13 +54,18 @@ before the GPU is touched.
 ``MLX_QWEN4_MEGAKERNEL_GPU_CORES``
     Core count for a machine whose IORegistry cannot be read.
 ``MLX_QWEN4_MEGAKERNEL_TUNE``
-    ``auto`` (default) calibrates once per signature; ``off`` skips the sweep
-    but still runs the primitive tests; ``force`` re-runs both.
+    ``auto`` (default) calibrates once per signature and yields the timing
+    sweep to whoever holds the GPU lease; ``off`` skips the sweep but still
+    runs the primitive tests; ``skip`` touches nothing at all; ``force``
+    re-runs both and ignores the lease.
 ``MLX_QWEN4_MEGAKERNEL_TUNE_CACHE``
     Path of the tuning cache JSON.  Default
     ``~/.cache/mlxuag/megakernel-tune.json``.
 ``MLX_QWEN4_MEGAKERNEL_TUNE_BUDGET_S``
     Wall-clock budget for a calibration sweep.  Default 120 s.
+``MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH``
+    A lease path that DEFERS the timing sweep while it exists.  Default is
+    the lab GPU lease directory; empty disables the check.
 ``MLX_QWEN4_MEGAKERNEL_REQUIRE_PRIMITIVES``
     ``1`` (default) refuses the kernel on a signature whose grid-barrier and
     device-scope fence tests have not passed here.  ``0`` is an escape hatch

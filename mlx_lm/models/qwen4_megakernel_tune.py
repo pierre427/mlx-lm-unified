@@ -14,12 +14,26 @@ the kernel -- ``qwen4_megakernel_config.portability_refusal`` turns a missing
 or failed primitive result into a named refusal.
 
 **The sweep answers "which geometry is fastest here".**  It is deliberately
-small: a bandwidth-bound 4-bit matvec chain separated by grid barriers, which
-is the dominant per-token cost class, run at a bounded set of (threads,
+small: a chain of barrier-separated phases run at a bounded set of (threads,
 threadgroups) and then at a bounded set of rows-per-simdgroup at the winner.
-It is a starting point for an unknown part, not a replacement for the tuning
-round that produced the shipped numbers -- and the receipt says ``cache`` so
-nobody mistakes one for the other.
+
+Its shape is NOT arbitrary, and the first version of it got the answer wrong.
+A pure 4-bit matvec chain -- the dominant cost class -- preferred 1024 threads
+per core at every threadgroup width on this machine (0.390 ms at T=512/G=80
+against 0.492 at the shipped T=512/G=40), while the per-token measurement that
+chose the shipped geometry says G=80 is 13% SLOWER.  The proxy was missing the
+two things that decided it: a phase whose parallelism is capped (the GDN core
+has 48 value heads, so a grid wider than 48 pays the barrier for idle
+threadgroups) and, above all, that phase's PER-THREAD REGISTER FOOTPRINT --
+Metal allocates registers for the whole kernel, so one phase holding 64 floats
+a thread costs occupancy in every other phase.  The workload therefore carries
+a fourth phase that does both.  A proxy without it recommends a geometry that
+makes this machine slower, which is the whole failure mode this layer exists
+to avoid.
+
+It is still a starting point for an unknown part, not a replacement for the
+tuning round that produced the shipped numbers -- and the receipt says
+``cache`` so nobody mistakes one for the other.
 
 Both results go into a JSON cache keyed by the device signature.  A later load
 reads the cache and launches nothing.  The cache is advisory in exactly one
@@ -42,6 +56,13 @@ from . import qwen4_megakernel_device as MD
 ENV_CACHE = "MLX_QWEN4_MEGAKERNEL_TUNE_CACHE"
 ENV_MODE = "MLX_QWEN4_MEGAKERNEL_TUNE"
 ENV_BUDGET = "MLX_QWEN4_MEGAKERNEL_TUNE_BUDGET_S"
+ENV_BUSY = "MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH"
+# A sweep is a TIMING measurement, and a timing measurement taken while another
+# job owns the GPU is not a measurement of the geometry.  Proven on 2026-09-03:
+# the same machine, the same workload, half an hour apart -- 256x160 while a
+# perplexity gate was running, 512x80 under the lock.  The default is the lab's
+# GPU lease directory; set the variable empty to disable the check.
+DEFAULT_BUSY_PATH = "/Users/Shared/mlxuag/gpu.lock"
 CACHE_VERSION = 1
 DEFAULT_CACHE = "~/.cache/mlxuag/megakernel-tune.json"
 DEFAULT_BUDGET_S = 120.0
@@ -62,6 +83,19 @@ def tune_mode() -> str:
         raise ValueError(
             f"{ENV_MODE} must be one of {MODES}; got {mode!r}")
     return mode
+
+
+def gpu_is_busy() -> Optional[str]:
+    """The lease path another job holds, or ``None``.
+
+    Deliberately a PATH and not a probe: a lease is a claim somebody made, and
+    a claim is checkable without measuring anything.
+    """
+    raw = os.environ.get(ENV_BUSY)
+    path = DEFAULT_BUSY_PATH if raw is None else raw.strip()
+    if not path:
+        return None
+    return path if os.path.exists(path) else None
 
 
 def tune_budget_s() -> float:
@@ -227,11 +261,16 @@ _PROBE_SRC = r"""
   }
 """
 
-# The sweep workload: a persistent chain of 4-bit matvec phases separated by
-# grid barriers.  Nothing here is Qwen-specific and nothing is loaded from
-# disk -- the shapes are chosen so one phase streams 8 MiB, which is the cost
-# class the real phases live in, and the activation is staged in threadgroup
-# memory exactly as the real bodies stage theirs.
+# The sweep workload: a persistent chain of barrier-separated phases.  Nothing
+# here is Qwen-specific and nothing is loaded from disk.  Three phases in four
+# are a 4-bit matvec streaming 8 MiB, the cost class the real phases live in,
+# with the activation staged in threadgroup memory as the real bodies stage
+# theirs.  The fourth is the RECURRENT phase, and it is what makes the answer
+# right: only HV units of work exist, so a grid wider than HV idles and still
+# pays the barrier, and it holds STV floats a thread in registers, which Metal
+# allocates for the WHOLE kernel and therefore charges to every other phase.
+# Without it the sweep recommends 1024 threads per core, which the per-token
+# measurement says is 13% slower.
 _SWEEP_SRC = r"""
   uint tid = thread_position_in_threadgroup.x;
   const uint nt = NT;
@@ -252,6 +291,24 @@ _SWEEP_SRC = r"""
   for (uint p = 0u; p < NPHASE; ++p) {
     for (uint i = tid; i < KDIM; i += nt) xs[i] = float(xin[i]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (p % 4u == 3u) {
+      // The recurrent phase: HV heads, a per-thread state in registers.
+      float st[STV];
+      for (uint r = 0u; r < STV; ++r) st[r] = xs[r];
+      for (uint h = tg; h < HV; h += ntg) {
+        for (uint k = tid; k < SLEN; k += nt) {
+          float v = float(qw[h * SLEN + k] & 0xFFFFu) * 1.5258789e-05f;
+          for (uint r = 0u; r < STV; ++r) st[r] = st[r] * 0.999f + v;
+        }
+      }
+      float acc = 0.0f;
+      for (uint r = 0u; r < STV; ++r) acc += st[r];
+      float s = simd_sum(acc);
+      if (lane == 0u && tg < RDIM) out[tg] = s;
+      if (!gbar(ctr, ab, ntg, tid, phase, CAP)) break;
+      continue;
+    }
 
     const uint blocks = KDIM / 8u;
     for (uint base = (tg * nsg + sg) * ROWS; base < RDIM;
@@ -309,7 +366,10 @@ def _sweep_kernel(threads: int, rows: int, rdim: int, kdim: int):
     key = (threads, rows, rdim, kdim)
     if key not in _SWEEP_CACHE:
         header = _GBAR + (f"\n#define ROWS {rows}u\n#define NT {threads}u\n"
-                          f"#define RDIM {rdim}u\n#define KDIM {kdim}u\n")
+                          f"#define RDIM {rdim}u\n#define KDIM {kdim}u\n"
+                          f"#define HV {SWEEP_HEADS}u\n"
+                          f"#define STV {SWEEP_STATE_REGS}u\n"
+                          f"#define SLEN {SWEEP_STATE_LEN}u\n")
         _SWEEP_CACHE[key] = mx.fast.metal_kernel(
             name=f"qwen4_mk_sweep_t{threads}_r{rows}",
             input_names=["xin", "qw", "ctrl", "params"],
@@ -381,6 +441,12 @@ SWEEP_ROWS = (1, 2, 4)
 SWEEP_RDIM = 8192
 SWEEP_KDIM = 2048
 SWEEP_PHASES = 16
+# The recurrent phase, in the shapes that matter for a geometry decision:
+# 48 value heads cap the parallelism, and 64 floats a thread is the GDN core's
+# register footprint, which the whole kernel is allocated for.
+SWEEP_HEADS = 48
+SWEEP_STATE_REGS = 64
+SWEEP_STATE_LEN = 4096
 
 
 def _time_config(*, threads: int, groups: int, rows: int, xin, qw,
@@ -486,9 +552,11 @@ def run_sweep(*, probe: MD.DeviceProbe, budget_s: float = DEFAULT_BUDGET_S,
         "configs": results,
         "truncated": truncated,
         "workload": {
-            "kind": "4-bit matvec chain with grid barriers",
+            "kind": "4-bit matvec chain plus a register-heavy recurrent "
+                    "phase, grid-barrier separated",
             "rows": SWEEP_RDIM, "cols": SWEEP_KDIM,
-            "phases": SWEEP_PHASES,
+            "phases": SWEEP_PHASES, "heads": SWEEP_HEADS,
+            "state_regs": SWEEP_STATE_REGS,
             "bytes_per_phase": SWEEP_RDIM * SWEEP_KDIM // 2,
         },
         "seconds": round(time.perf_counter() - started, 3),
@@ -499,7 +567,8 @@ def run_sweep(*, probe: MD.DeviceProbe, budget_s: float = DEFAULT_BUDGET_S,
 def calibrate(*, probe: Optional[MD.DeviceProbe] = None, sweep: bool = True,
               budget_s: Optional[float] = None,
               path: Optional[str] = None,
-              write: bool = True) -> dict[str, Any]:
+              write: bool = True,
+              respect_lease: bool = True) -> dict[str, Any]:
     """Primitive tests, then (optionally) the sweep; write the cache entry.
 
     The entry is written after the primitive tests and again after the sweep,
@@ -522,6 +591,16 @@ def calibrate(*, probe: Optional[MD.DeviceProbe] = None, sweep: bool = True,
     if write:
         write_entry(probe.signature, entry, path)
     if not entry["primitives"]["ok"] or not sweep:
+        return entry
+
+    busy = gpu_is_busy() if respect_lease else None
+    if busy:
+        # Deferred, not answered: the entry keeps its permission, resolution
+        # falls back to the probe-derived geometry, and the next load that
+        # finds the GPU free measures.
+        entry["sweep"] = {"ok": False, "deferred": f"{busy} is held"}
+        if write:
+            write_entry(probe.signature, entry, path)
         return entry
 
     result = run_sweep(probe=probe, budget_s=budget_s)
@@ -590,13 +669,20 @@ def ensure_tuned(*, probe: Optional[MD.DeviceProbe] = None,
         "ok")
     # A sweep that RAN and produced no winner is an answer, not a gap: the
     # entry keeps its `sweep` record and later loads stop re-measuring it.
+    deferred = bool((entry or {}).get("sweep", {}).get("deferred"))
     need_sweep = mode == "force" or (
-        mode == "auto" and (entry is None or ("threads" not in entry
-                                              and "sweep" not in entry)))
+        mode == "auto" and (entry is None or deferred
+                            or ("threads" not in entry
+                                and "sweep" not in entry)))
     if mode == "force" or need_primitives or need_sweep:
         try:
-            entry = calibrate(probe=probe, sweep=(mode != "off") and (
-                need_sweep or mode == "force"), path=path)
+            entry = calibrate(
+                probe=probe,
+                sweep=(mode != "off") and (need_sweep or mode == "force"),
+                path=path,
+                # `force` is an operator who is holding the machine on
+                # purpose; every other mode yields to whoever holds the lease.
+                respect_lease=(mode != "force"))
             state["calibrated"] = True
         except Exception as exc:  # pragma: no cover - no Metal device
             state["error"] = f"{type(exc).__name__}: {exc}"

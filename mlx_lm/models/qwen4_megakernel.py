@@ -699,8 +699,12 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
         report = {
             "enabled": _megakernel_enabled(),
             "device_supported": _device_supported(),
-            "threadgroups": _THREADGROUPS,
-            "threads": _THREADS,
+            # The geometry a launch would ACTUALLY use, which is the
+            # resolved one -- reporting the module constants here while
+            # admission runs on a cached or probe-derived geometry would put
+            # two different answers on one receipt.
+            "threadgroups": _resolved_geometry()[1],
+            "threads": _resolved_geometry()[0],
             "spin_cap": _SPIN_CAP,
             "scratch_floats": SCRATCH_FLOATS,
             "scratch_bytes": SCRATCH_FLOATS * 4,
@@ -1205,3 +1209,10 @@ def _portability_refusal(settings: dict, *, threads: int, groups: int,
         )
     except Exception as exc:  # pragma: no cover - no Metal device
         return f"portability check failed: {type(exc).__name__}"
+
+
+def _resolved_geometry() -> tuple[int, int]:
+    """Threads and threadgroups after the portability resolution."""
+    values = _portable_config().get("values", {})
+    return (int(values.get("threads", _THREADS)),
+            int(values.get("groups", _THREADGROUPS)))
