@@ -105,7 +105,7 @@ _TG_BLOCKS = (
     ("PART", RMAX * MAX_SIMDGROUPS),   # split-K partials
     ("GSC", HC_COUNT),           # the four GroupRMSNorm scales
     ("SHR", 8),                  # GDN core's shared scalars
-    ("TOPW", TOPK),
+    ("TOPW", MAX_QUERY_WIDTH * TOPK),   # per-query routing weights
 )
 
 TG: dict[str, int] = {}
@@ -117,7 +117,7 @@ TG_FLOATS = _off
 del _off, _name, _size
 
 # + the top-k expert ids, which are uint and live in their own array
-THREADGROUP_BYTES = TG_FLOATS * 4 + TOPK * 4
+THREADGROUP_BYTES = TG_FLOATS * 4 + MAX_QUERY_WIDTH * TOPK * 4
 
 
 # ---------------------------------------------------------------- MSL: helpers
@@ -143,10 +143,19 @@ BODY_HELPERS = r"""
 // in bf16: row r's scales start at r*2*ng and its biases ng elements later.
 // (The split layout puts all scales before all biases; the pack keeps it
 // selectable, and `sb_stride_rows` is the one line that differs.)
-template <uint R, typename F4>
+// M is the QUERY WIDTH.  The weight is read ONCE and used for all M queries:
+// `w2[woff[r] + bl]` is outside the m loop, and only the source words and the
+// accumulators multiply.  That is the whole economics of a verify slab --
+// weight traffic is what a decode matvec is made of, and it does not grow
+// with the width.  `xs4` is the distance in float4s between one query's
+// source vector and the next, so the same body serves a staged source (M
+// vectors packed cols apart) and an unstaged one (M scratch planes SCSTRIDE
+// apart).  At M = 1 every m loop is one iteration and the emitted code is
+// what shipped.
+template <uint R, uint M, typename F4>
 inline void qmv4(const device uint* W, uint w_off, uint sb_off, uint cols,
                  uint ng, uint row0, uint rows, uint estride,
-                 F4 x4, uint lane, thread float* acc) {
+                 F4 x4, uint xs4, uint lane, thread float* acc) {
   const device uint2* w2 =
       reinterpret_cast<const device uint2*>(W + w_off);
   const device BFT* sb = reinterpret_cast<const device BFT*>(W + sb_off);
@@ -157,27 +166,36 @@ inline void qmv4(const device uint* W, uint w_off, uint sb_off, uint cols,
     uint rr = (row0 + r < rows) ? (row0 + r) : (rows - 1u);
     woff[r] = (estride + rr) * n2;         // in uint2 blocks
     soff[r] = (estride + rr) * 2u * ng;
-    acc[r] = 0.0f;
+    for (uint m = 0; m < M; ++m) acc[r * M + m] = 0.0f;
   }
   for (uint bl = lane; bl < n2; bl += 32u) {
-    float4 a0 = x4[bl * 4u + 0u], a1 = x4[bl * 4u + 1u];
-    float4 a2 = x4[bl * 4u + 2u], a3 = x4[bl * 4u + 3u];
-    float xs = hsum4(a0) + hsum4(a1) + hsum4(a2) + hsum4(a3);
+    float4 a[M * 4];
+    float xs[M];
+    for (uint m = 0; m < M; ++m) {
+      const uint b = m * xs4 + bl * 4u;
+      a[m*4+0] = x4[b + 0u]; a[m*4+1] = x4[b + 1u];
+      a[m*4+2] = x4[b + 2u]; a[m*4+3] = x4[b + 3u];
+      xs[m] = hsum4(a[m*4+0]) + hsum4(a[m*4+1])
+            + hsum4(a[m*4+2]) + hsum4(a[m*4+3]);
+    }
     uint g = bl >> 2u;
     for (uint r = 0; r < R; ++r) {
       uint2 p = w2[woff[r] + bl];
-      float part = dot8(p.x, a0, a1) + dot8(p.y, a2, a3);
-      acc[r] += float(sb[soff[r] + g]) * part
-              + float(sb[soff[r] + ng + g]) * xs;
+      float s0 = float(sb[soff[r] + g]), s1 = float(sb[soff[r] + ng + g]);
+      for (uint m = 0; m < M; ++m) {
+        float part = dot8(p.x, a[m*4+0], a[m*4+1])
+                   + dot8(p.y, a[m*4+2], a[m*4+3]);
+        acc[r * M + m] += s0 * part + s1 * xs[m];
+      }
     }
   }
-  for (uint r = 0; r < R; ++r) acc[r] = simd_sum(acc[r]);
+  for (uint r = 0; r < R * M; ++r) acc[r] = simd_sum(acc[r]);
 }
 
-template <uint R, typename F4>
+template <uint R, uint M, typename F4>
 inline void qmv8(const device uint* W, uint w_off, uint sb_off, uint cols,
                  uint ng, uint row0, uint rows, uint estride,
-                 F4 x4, uint lane, thread float* acc) {
+                 F4 x4, uint xs4, uint lane, thread float* acc) {
   const device uint2* w2 =
       reinterpret_cast<const device uint2*>(W + w_off);
   const device BFT* sb = reinterpret_cast<const device BFT*>(W + sb_off);
@@ -188,20 +206,27 @@ inline void qmv8(const device uint* W, uint w_off, uint sb_off, uint cols,
     uint rr = (row0 + r < rows) ? (row0 + r) : (rows - 1u);
     woff[r] = (estride + rr) * n2;
     soff[r] = (estride + rr) * 2u * ng;
-    acc[r] = 0.0f;
+    for (uint m = 0; m < M; ++m) acc[r * M + m] = 0.0f;
   }
   for (uint bl = lane; bl < n2; bl += 32u) {
-    float4 a0 = x4[bl * 2u + 0u], a1 = x4[bl * 2u + 1u];
-    float xs = hsum4(a0) + hsum4(a1);
+    float4 a[M * 2];
+    float xs[M];
+    for (uint m = 0; m < M; ++m) {
+      const uint b = m * xs4 + bl * 2u;
+      a[m*2+0] = x4[b + 0u]; a[m*2+1] = x4[b + 1u];
+      xs[m] = hsum4(a[m*2+0]) + hsum4(a[m*2+1]);
+    }
     uint g = bl >> 3u;
     for (uint r = 0; r < R; ++r) {
       uint2 p = w2[woff[r] + bl];
-      float part = dot4x8(p.x, a0) + dot4x8(p.y, a1);
-      acc[r] += float(sb[soff[r] + g]) * part
-              + float(sb[soff[r] + ng + g]) * xs;
+      float s0 = float(sb[soff[r] + g]), s1 = float(sb[soff[r] + ng + g]);
+      for (uint m = 0; m < M; ++m) {
+        float part = dot4x8(p.x, a[m*2+0]) + dot4x8(p.y, a[m*2+1]);
+        acc[r * M + m] += s0 * part + s1 * xs[m];
+      }
     }
   }
-  for (uint r = 0; r < R; ++r) acc[r] = simd_sum(acc[r]);
+  for (uint r = 0; r < R * M; ++r) acc[r] = simd_sum(acc[r]);
 }
 
 // The same, but K is split ACROSS THE SIMDGROUPS of one threadgroup and the
@@ -209,10 +234,10 @@ inline void qmv8(const device uint* W, uint w_off, uint sb_off, uint cols,
 // split-K: it costs no grid barrier.  It lost on the MoE down projection and
 // wins 1.37x on the hyper down-mix -- the difference is row count, not the
 // technique.  324 rows over 640 simdgroups leaves 87% of them idle otherwise.
-template <uint R, typename F4>
+template <uint R, uint M, typename F4>
 inline void qmv4_ksplit(const device uint* W, uint w_off, uint sb_off,
                         uint cols, uint ng, uint row0, uint rows,
-                        F4 x4, uint lane, uint sg, uint nsg,
+                        F4 x4, uint xs4, uint lane, uint sg, uint nsg,
                         thread float* acc) {
   const device uint2* w2 =
       reinterpret_cast<const device uint2*>(W + w_off);
@@ -223,21 +248,30 @@ inline void qmv4_ksplit(const device uint* W, uint w_off, uint sb_off,
     uint rr = (row0 + r < rows) ? (row0 + r) : (rows - 1u);
     woff[r] = rr * n2;
     soff[r] = rr * 2u * ng;
-    acc[r] = 0.0f;
+    for (uint m = 0; m < M; ++m) acc[r * M + m] = 0.0f;
   }
   for (uint bl = sg * 32u + lane; bl < n2; bl += nsg * 32u) {
-    float4 a0 = x4[bl * 4u + 0u], a1 = x4[bl * 4u + 1u];
-    float4 a2 = x4[bl * 4u + 2u], a3 = x4[bl * 4u + 3u];
-    float xs = hsum4(a0) + hsum4(a1) + hsum4(a2) + hsum4(a3);
+    float4 a[M * 4];
+    float xs[M];
+    for (uint m = 0; m < M; ++m) {
+      const uint b = m * xs4 + bl * 4u;
+      a[m*4+0] = x4[b + 0u]; a[m*4+1] = x4[b + 1u];
+      a[m*4+2] = x4[b + 2u]; a[m*4+3] = x4[b + 3u];
+      xs[m] = hsum4(a[m*4+0]) + hsum4(a[m*4+1])
+            + hsum4(a[m*4+2]) + hsum4(a[m*4+3]);
+    }
     uint g = bl >> 2u;
     for (uint r = 0; r < R; ++r) {
       uint2 p = w2[woff[r] + bl];
-      float part = dot8(p.x, a0, a1) + dot8(p.y, a2, a3);
-      acc[r] += float(sb[soff[r] + g]) * part
-              + float(sb[soff[r] + ng + g]) * xs;
+      float s0 = float(sb[soff[r] + g]), s1 = float(sb[soff[r] + ng + g]);
+      for (uint m = 0; m < M; ++m) {
+        float part = dot8(p.x, a[m*4+0], a[m*4+1])
+                   + dot8(p.y, a[m*4+2], a[m*4+3]);
+        acc[r * M + m] += s0 * part + s1 * xs[m];
+      }
     }
   }
-  for (uint r = 0; r < R; ++r) acc[r] = simd_sum(acc[r]);
+  for (uint r = 0; r < R * M; ++r) acc[r] = simd_sum(acc[r]);
 }
 
 // Which opcodes rerun per query, and which take the slab inside their own
@@ -250,6 +284,65 @@ inline void qmv4_ksplit(const device uint* W, uint w_off, uint sb_off,
 //
 // A bitmask rather than a switch: `op` is uniform across the threadgroup, so
 // this is a scalar test in front of a loop, not a per-thread branch.
+// One place where R and the bit width are resolved, templated on the query
+// width.  Written once so every call site -- the generic matvec, the hyper
+// mixers, the MoE -- widens by passing a different M rather than by growing
+// its own if-chain.
+template <uint M, typename F4>
+inline void qmv_any(bool bits4, uint R, const device uint* W, uint w_off,
+                    uint sb_off, uint cols, uint ng, uint row0, uint rows,
+                    uint estride, F4 x4, uint xs4, uint lane,
+                    thread float* acc) {
+  if (bits4) {
+    if (R == 4u)      qmv4<4, M>(W, w_off, sb_off, cols, ng, row0, rows,
+                                 estride, x4, xs4, lane, acc);
+    else if (R == 2u) qmv4<2, M>(W, w_off, sb_off, cols, ng, row0, rows,
+                                 estride, x4, xs4, lane, acc);
+    else              qmv4<1, M>(W, w_off, sb_off, cols, ng, row0, rows,
+                                 estride, x4, xs4, lane, acc);
+  } else {
+    if (R == 4u)      qmv8<4, M>(W, w_off, sb_off, cols, ng, row0, rows,
+                                 estride, x4, xs4, lane, acc);
+    else if (R == 2u) qmv8<2, M>(W, w_off, sb_off, cols, ng, row0, rows,
+                                 estride, x4, xs4, lane, acc);
+    else              qmv8<1, M>(W, w_off, sb_off, cols, ng, row0, rows,
+                                 estride, x4, xs4, lane, acc);
+  }
+}
+
+// Build the union of the M queries' top-k expert lists, in a deterministic
+// order: query 0's choices in its own order first, then whatever query 1 adds,
+// and so on.  At M = 1 the union IS query 0's list in query 0's order, which
+// is what makes the width-1 MoE path bit-identical to what shipped.
+//
+// `uslot[u]` packs, in a byte per query, that query's own slot for union
+// expert `u` plus one; 0 means the query did not choose it.  The slot, not the
+// union position, is what indexes the query's E1 output and its routing
+// weight.
+//
+// One thread does it.  At M = 3 and k = 10 that is at most 30 insertions
+// against a list of at most 30, i.e. ~450 comparisons once per phase, against
+// the megabytes of expert weight the phase is about to read.
+inline void build_expert_union(const threadgroup uint* topi, uint MWq,
+                               uint tid, threadgroup uint* uni,
+                               threadgroup uint* uslot,
+                               threadgroup uint* unin) {
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    uint n = 0u;
+    for (uint m = 0; m < MWq; ++m) {
+      for (uint t = 0; t < TOPKN; ++t) {
+        const uint e = topi[m * TOPKN + t];
+        uint at = n;
+        for (uint u = 0; u < n; ++u) if (uni[u] == e) { at = u; break; }
+        if (at == n) { uni[n] = e; uslot[n] = 0u; n += 1u; }
+        uslot[at] |= (t + 1u) << (8u * m);
+      }
+    }
+    unin[0] = n;
+  }
+}
+
 inline bool per_query_op(uint op) {
   return ((PERQMASK >> op) & 1u) != 0u;
 }
@@ -321,7 +414,10 @@ BODY_SRC = r"""
   const uint ids_from_scratch = actl[7];
 
   threadgroup float A[TGF];
-  threadgroup uint  topi[TOPKN];
+  // Routing is PER QUERY -- the M tokens of a slab pick their own top-10 --
+  // so both arrays carry a query plane.  30 uints and 30 floats is 160 B of
+  // the arena's 320 B of headroom.
+  threadgroup uint  topi[MAXMW * TOPKN];
   threadgroup float* tgx  = A + TG_TGX;
   threadgroup float* tlog = A + TG_TLOG;
   threadgroup float* sq   = A + TG_SQ;
@@ -334,6 +430,14 @@ BODY_SRC = r"""
   threadgroup float* gsc  = A + TG_GSC;
   threadgroup float* shr  = A + TG_SHR;
   threadgroup float* topw = A + TG_TOPW;
+  // The routed-expert UNION, aliased over the GDN core's staging blocks.
+  // `SQ`/`SK` are live only inside OP_GDN_CORE, which is a different layer
+  // branch and never runs beside the MoE, so 128 floats there are free here
+  // -- the same alias trade `tlog` and the combine's transpose already make.
+  threadgroup uint* uni =
+      reinterpret_cast<threadgroup uint*>(A + TG_SQ);          // MAXMW*TOPKN
+  threadgroup uint* uslot = uni + MAXMW * TOPKN;               // packed slots
+  threadgroup uint* unin = uslot + MAXMW * TOPKN;              // union size
   const threadgroup float4* tgx4 =
       reinterpret_cast<const threadgroup float4*>(A + TG_TGX);
   const threadgroup float4* tlr4 =
@@ -400,49 +504,69 @@ BODY_SRC = r"""
         const uint bits = T[TBL_BITS];
         const uint woff = T[TBL_WOFF], sboff = T[TBL_SBOFF];
         const uint R = (a0 == 0u) ? 1u : a0;
+        // ------------------------------------------- E2: where M sources come from
         // Stage the source when it fits: G threadgroups x NSG simdgroups all
-        // stream the same vector, and a HIDDEN-wide one is 10 KiB.
-        bool staged = cols <= HID;
+        // stream the same vector, and a HIDDEN-wide one is 10 KiB.  A width-M
+        // slab wants M of them, and `TGX` is 10 KiB of a 16,064 B arena whose
+        // hard cap is 16 KiB, so at M = 3 only sources of at most HID / 3
+        // columns still fit.  Everything wider reads its M sources straight
+        // from device scratch, one plane apart -- option (b) of the E2 fork,
+        // measured against a K-tiled staging in
+        // results/qwen4-megakernel-width3-20260903-qmv.py.  The unstaged path
+        // already existed (`cols > HID` selected it) and the L2 absorbs the
+        // re-read, since every threadgroup wants the same words.
+        //
+        // At M = 1 the predicate is `cols <= HID`, exactly as it shipped.
+        const bool staged = (MW * cols) <= HID;
         if (staged) {
-          for (uint i = tid; i < cols; i += NT) tgx[i] = sc[src + i];
+          for (uint i = tid; i < MW * cols; i += NT) {
+            const uint m = i / cols, c = i - m * cols;
+            tgx[i] = scratch[(size_t)m * SCSTRIDE + src + c];
+          }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        // Distance in float4s between one query's source and the next: the
+        // staged copies are packed `cols` apart, the unstaged ones are a whole
+        // scratch plane apart.
+        const uint sxs4 = cols / 4u;
+        const uint dxs4 = SCSTRIDE / 4u;
         const device float4* dx4 =
-            reinterpret_cast<const device float4*>(sc + src);
+            reinterpret_cast<const device float4*>(scratch + src);
         for (uint r0 = grow * R; r0 < rows; r0 += nrow * R) {
-          float acc[RMAXN];
-          if (bits == 4u) {
-            if (staged) {
-              if (R == 4u)      qmv4<4>(W, woff, sboff, cols, ng, r0, rows, 0u, tgx4, lane, acc);
-              else if (R == 2u) qmv4<2>(W, woff, sboff, cols, ng, r0, rows, 0u, tgx4, lane, acc);
-              else              qmv4<1>(W, woff, sboff, cols, ng, r0, rows, 0u, tgx4, lane, acc);
-            } else {
-              if (R == 4u)      qmv4<4>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
-              else if (R == 2u) qmv4<2>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
-              else              qmv4<1>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
-            }
+          float acc[RMAXN * MAXMW];
+          if (MW == 1u) {
+            if (staged) qmv_any<1>(bits == 4u, R, W, woff, sboff, cols, ng,
+                                   r0, rows, 0u, tgx4, sxs4, lane, acc);
+            else        qmv_any<1>(bits == 4u, R, W, woff, sboff, cols, ng,
+                                   r0, rows, 0u, dx4, dxs4, lane, acc);
+          } else if (MW == 2u) {
+            if (staged) qmv_any<2>(bits == 4u, R, W, woff, sboff, cols, ng,
+                                   r0, rows, 0u, tgx4, sxs4, lane, acc);
+            else        qmv_any<2>(bits == 4u, R, W, woff, sboff, cols, ng,
+                                   r0, rows, 0u, dx4, dxs4, lane, acc);
           } else {
-            if (staged) {
-              if (R == 4u)      qmv8<4>(W, woff, sboff, cols, ng, r0, rows, 0u, tgx4, lane, acc);
-              else if (R == 2u) qmv8<2>(W, woff, sboff, cols, ng, r0, rows, 0u, tgx4, lane, acc);
-              else              qmv8<1>(W, woff, sboff, cols, ng, r0, rows, 0u, tgx4, lane, acc);
-            } else {
-              if (R == 4u)      qmv8<4>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
-              else if (R == 2u) qmv8<2>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
-              else              qmv8<1>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
-            }
+            if (staged) qmv_any<MAXMW>(bits == 4u, R, W, woff, sboff, cols, ng,
+                                       r0, rows, 0u, tgx4, sxs4, lane, acc);
+            else        qmv_any<MAXMW>(bits == 4u, R, W, woff, sboff, cols, ng,
+                                       r0, rows, 0u, dx4, dxs4, lane, acc);
           }
           if (lane == 0u) {
             // arg2 == 1 is DST_OUT: 248,320 vocabulary rows do not fit the
-            // 512 KiB scratch, so lm_head writes its own output buffer.
+            // scratch, so lm_head writes its own output buffer -- one row per
+            // query, so a verify slab returns M logit vectors.
             if (a2 == 1u) {
               for (uint r = 0; r < R; ++r)
                 if (r0 + r < rows)
-                  logits[(size_t)rep * rows + r0 + r] =
-                      static_cast<BFT>(apply_act(acc[r], a1));
+                  for (uint m = 0; m < MW; ++m)
+                    logits[((size_t)rep * MW + m) * rows + r0 + r] =
+                        static_cast<BFT>(
+                            apply_act(acc[r * MW + m], a1));
             } else {
               for (uint r = 0; r < R; ++r)
-                if (r0 + r < rows) sc[dst + r0 + r] = apply_act(acc[r], a1);
+                if (r0 + r < rows)
+                  for (uint m = 0; m < MW; ++m)
+                    scratch[(size_t)m * SCSTRIDE + dst + r0 + r] =
+                        apply_act(acc[r * MW + m], a1);
             }
           }
         }
@@ -487,8 +611,12 @@ BODY_SRC = r"""
         const uint ng = cols / T[TBL_GSIZE];
         const device uint* TI = (a0 == NO_ENTRY) ? T : (tbl + a0 * TSTRIDE);
         const uint irows = (a0 == NO_ENTRY) ? 0u : TI[TBL_ROWS];
+        // The M sources are whole scratch planes apart, and the hyper
+        // down-mix is 10,240 wide -- three of those is 120 KiB, so staging is
+        // not on the table here at any width.
         const device float4* x4 =
-            reinterpret_cast<const device float4*>(sc + src);
+            reinterpret_cast<const device float4*>(scratch + src);
+        const uint dxs4 = SCSTRIDE / 4u;
         for (uint r0 = tg * RDOWN; r0 < rows + irows; r0 += ntg * RDOWN) {
           bool inj = r0 >= rows;
           uint rr = inj ? (r0 - rows) : r0;
@@ -499,20 +627,37 @@ BODY_SRC = r"""
           uint so = inj ? TI[TBL_SBOFF] : T[TBL_SBOFF];
           uint nn = inj ? (TI[TBL_COLS] / TI[TBL_GSIZE]) : ng;
           uint nc = inj ? TI[TBL_COLS] : cols;
-          float acc[RMAXN];
-          qmv4_ksplit<RDOWN>(WW, wo, so, nc, nn, rr, cap, x4,
-                             lane, sg, NSG, acc);
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (lane == 0u)
-            for (uint r = 0; r < RDOWN; ++r) part[r * NSG + sg] = acc[r];
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (tid == 0u) {
-            for (uint r = 0; r < RDOWN; ++r) {
-              if (rr + r >= cap) break;
-              float total = 0.0f;
-              for (uint j = 0; j < NSG; ++j) total += part[r * NSG + j];
-              if (inj) sc[a1 + rr + r] = apply_act(total, 4u);
-              else     sc[dst + rr + r] = apply_act(total, 3u);
+          float acc[RMAXN * MAXMW];
+          // The weight is read ONCE for all M queries; only the split-K
+          // partials are per query.  `PART` is RMAX x 16 floats and the
+          // threadgroup arena has 320 B free, so it cannot be widened by M --
+          // instead the M queries take turns through the SAME buffer, one
+          // threadgroup barrier apiece.  Barriers are the cheap resource
+          // here: the expensive one, the quantized weight read, is shared.
+          if (MW == 1u)
+            qmv4_ksplit<RDOWN, 1>(WW, wo, so, nc, nn, rr, cap, x4, dxs4,
+                                  lane, sg, NSG, acc);
+          else if (MW == 2u)
+            qmv4_ksplit<RDOWN, 2>(WW, wo, so, nc, nn, rr, cap, x4, dxs4,
+                                  lane, sg, NSG, acc);
+          else
+            qmv4_ksplit<RDOWN, MAXMW>(WW, wo, so, nc, nn, rr, cap, x4, dxs4,
+                                      lane, sg, NSG, acc);
+          for (uint m = 0; m < MW; ++m) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0u)
+              for (uint r = 0; r < RDOWN; ++r)
+                part[r * NSG + sg] = acc[r * MW + m];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+              device float* scm = scratch + (size_t)m * SCSTRIDE;
+              for (uint r = 0; r < RDOWN; ++r) {
+                if (rr + r >= cap) break;
+                float total = 0.0f;
+                for (uint j = 0; j < NSG; ++j) total += part[r * NSG + j];
+                if (inj) scm[a1 + rr + r] = apply_act(total, 4u);
+                else     scm[dst + rr + r] = apply_act(total, 3u);
+              }
             }
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -528,36 +673,63 @@ BODY_SRC = r"""
         const uint cols = T[TBL_COLS];
         const uint ng = cols / T[TBL_GSIZE];
         const uint hcn = a1, width = a2;
-        for (uint i = tid; i < cols; i += NT) tlr[i] = sc[src + i];
+        // `TLR` is HC_LOWRANK floats and cannot be tripled -- the arena has
+        // 320 B free -- so a slab stages query 0 and reads the rest from
+        // their planes.  Every threadgroup wants the same 320 floats, so the
+        // re-read is L2-resident; the weight, which is the expensive read,
+        // is shared across all M either way.
+        for (uint i = tid; i < cols; i += NT) tlr[i] = scratch[src + i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint pstride4 = SCSTRIDE / 4u;
+        const device float4* dlr4 =
+            reinterpret_cast<const device float4*>(scratch + src);
         for (uint d = grow; d < width; d += nrow) {
-          float acc[RMAXN];
+          float acc[RMAXN * MAXMW];
           // rows h*width + d, h = 0..hcn-1: one simdgroup, four rows
           const device uint2* w2 =
               reinterpret_cast<const device uint2*>(W + T[TBL_WOFF]);
           const device BFT* sb =
               reinterpret_cast<const device BFT*>(W + T[TBL_SBOFF]);
           const uint n2 = (cols >> 3u) >> 1u;
-          for (uint h = 0; h < hcn; ++h) acc[h] = 0.0f;
+          for (uint i = 0; i < hcn * MW; ++i) acc[i] = 0.0f;
           for (uint bl = lane; bl < n2; bl += 32u) {
-            float4 a0v = tlr4[bl * 4u + 0u], a1v = tlr4[bl * 4u + 1u];
-            float4 a2v = tlr4[bl * 4u + 2u], a3v = tlr4[bl * 4u + 3u];
-            float xs = hsum4(a0v) + hsum4(a1v) + hsum4(a2v) + hsum4(a3v);
+            float4 a[MAXMW * 4];
+            float xs[MAXMW];
+            for (uint m = 0; m < MW; ++m) {
+              if (m == 0u) {
+                a[0] = tlr4[bl * 4u + 0u]; a[1] = tlr4[bl * 4u + 1u];
+                a[2] = tlr4[bl * 4u + 2u]; a[3] = tlr4[bl * 4u + 3u];
+              } else {
+                const device float4* p4 = dlr4 + (size_t)m * pstride4;
+                a[m*4+0] = p4[bl * 4u + 0u]; a[m*4+1] = p4[bl * 4u + 1u];
+                a[m*4+2] = p4[bl * 4u + 2u]; a[m*4+3] = p4[bl * 4u + 3u];
+              }
+              xs[m] = hsum4(a[m*4+0]) + hsum4(a[m*4+1])
+                    + hsum4(a[m*4+2]) + hsum4(a[m*4+3]);
+            }
             uint g = bl >> 2u;
             for (uint h = 0; h < hcn; ++h) {
               uint row = h * width + d;
               uint2 p = w2[row * n2 + bl];
-              float pr = dot8(p.x, a0v, a1v) + dot8(p.y, a2v, a3v);
-              acc[h] += float(sb[row * 2u * ng + g]) * pr
-                      + float(sb[row * 2u * ng + ng + g]) * xs;
+              float s0 = float(sb[row * 2u * ng + g]);
+              float s1 = float(sb[row * 2u * ng + ng + g]);
+              for (uint m = 0; m < MW; ++m) {
+                float pr = dot8(p.x, a[m*4+0], a[m*4+1])
+                         + dot8(p.y, a[m*4+2], a[m*4+3]);
+                acc[h * MW + m] += s0 * pr + s1 * xs[m];
+              }
             }
           }
-          for (uint h = 0; h < hcn; ++h) acc[h] = simd_sum(acc[h]);
+          for (uint i = 0; i < hcn * MW; ++i) acc[i] = simd_sum(acc[i]);
           if (lane == 0u) {
-            float total = 0.0f;
-            for (uint h = 0; h < hcn; ++h)
-              total += sigmoid_f(acc[h]) * sc[a0 + h * width + d];
-            sc[dst + d] = total / float(hcn);
+            for (uint m = 0; m < MW; ++m) {
+              device float* scm = scratch + (size_t)m * SCSTRIDE;
+              float total = 0.0f;
+              for (uint h = 0; h < hcn; ++h)
+                total += sigmoid_f(acc[h * MW + m])
+                       * scm[a0 + h * width + d];
+              scm[dst + d] = total / float(hcn);
+            }
           }
         }
       }
@@ -591,9 +763,7 @@ BODY_SRC = r"""
         device const float* rec_i =
             rec_in + (size_t)gdn_slot * HV * DV * DK;
         device float* rec_o = rec_out + (size_t)gdn_slot * HV * DV * DK;
-        device float* s_qkv = sc + SC_GDN_QKV;
-        device float* s_z   = sc + SC_GDN_Z;
-        device float* s_ba  = sc + SC_GDN_BA;
+        // Per-query views come from the plane inside the query loop below.
 
         // HV=48 value heads is this phase's WHOLE parallelism.  The strided
         // form is mandatory: the shipped G=40 is below 48, and the spike's
@@ -612,24 +782,74 @@ BODY_SRC = r"""
             for (uint i = 0; i < NDK; ++i)
               st[j][i] = si[(size_t)dv * DK + NDK * lane + i];
           }
-          for (uint idx = tid; idx < 2u * DK + DV; idx += NT) {
-            uint p = idx / DK;
-            uint d = idx - p * DK;
-            uint c = p == 0u ? hk * DK + d
-                   : (p == 1u ? KD + hk * DK + d : 2u * KD + hv * DV + d);
-            const device BFT* wc = convw + (size_t)c * CK;
+          // ------------------------------------------- the slab, in order
+          // The delta rule is SEQUENTIAL over the queries: query m updates
+          // the state query m-1 left.  The state stays in registers across
+          // the whole slab, so the 3.1 MB/layer recurrent state is read once
+          // and written once no matter how wide the slab is -- which is why
+          // this phase costs ~1.5x rather than M x.
+          //
+          // ONE state is written: the one after the LAST query.  Widening
+          // `rec_out` to carry a restore point per query costs no binding but
+          // +227 MB of write traffic per token (`rec_out` alone is
+          // 36 x 48 x 128 x 128 x 4 = 113 MB, ~0.45 ms at 500 GB/s), which is
+          // a third of the whole token budget spent on a rollback that mostly
+          // does not happen.  The contract the unified fused GDN verify
+          // kernel already settled is the other one: `cs_in`/`rec_in` are a
+          // separate buffer from `cs_out`/`rec_out`, so the PRE-SLAB state
+          // survives the launch untouched, and a partial accept re-launches a
+          // narrower slab from it.  Re-launch on rejection, not restore
+          // points.
+          //
+          // The conv window rolls with the slab.  `2*DK + DV` = 384 channels
+          // and NT = 512 threads, so one thread owns at most one channel and
+          // its CK-1 taps live in registers across the queries; only the
+          // final window reaches `cs_o`.
+          // Channels per thread.  384 channels over NT threads; at the
+          // shipped NT = 512 that is one apiece, and the general form keeps
+          // the narrow geometries the coverage tests build.
+          const uint NCH = 2u * DK + DV;
+          const uint CPT = (NCH + NT - 1u) / NT;
+          uint cp[CPT], cd_[CPT], cc[CPT];
+          float win[CPT][CK - 1u];
+          for (uint q = 0; q < CPT; ++q) {
+            const uint cidx = tid + q * NT;
+            if (cidx >= NCH) { cp[q] = 3u; continue; }   // 3 = no channel
+            cp[q] = cidx / DK; cd_[q] = cidx - cp[q] * DK;
+            cc[q] = cp[q] == 0u ? hk * DK + cd_[q]
+                  : (cp[q] == 1u ? KD + hk * DK + cd_[q]
+                                 : 2u * KD + hv * DV + cd_[q]);
+            for (uint tap = 0; tap + 1u < CK; ++tap)
+              win[q][tap] = float(cs_i[(size_t)tap * CD + cc[q]]);
+          }
+
+          for (uint mq2 = 0; mq2 < MW; ++mq2) {
+          device float* scm  = scratch + (size_t)mq2 * SCSTRIDE;
+          device float* s_qkv = scm + SC_GDN_QKV;
+          device float* s_z   = scm + SC_GDN_Z;
+          device float* s_ba  = scm + SC_GDN_BA;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint q = 0; q < CPT; ++q) {
+            if (cp[q] == 3u) continue;
+            const device BFT* wc = convw + (size_t)cc[q] * CK;
+            const float xin_c = s_qkv[cc[q]];
             float a = 0.0f;
             for (uint tap = 0; tap + 1u < CK; ++tap)
-              a += float(cs_i[(size_t)tap * CD + c]) * float(wc[tap]);
-            a += s_qkv[c] * float(wc[CK - 1u]);
+              a += win[q][tap] * float(wc[tap]);
+            a += xin_c * float(wc[CK - 1u]);
             float sl = silu_f(a);
-            if (p == 0u) sq[d] = sl; else if (p == 1u) sk[d] = sl; else sv[d] = sl;
-            if (p == 2u || (hv % RATIO) == 0u) {
-              for (uint tap = 0; tap + 2u < CK; ++tap)
-                cs_o[(size_t)tap * CD + c] = cs_i[(size_t)(tap + 1u) * CD + c];
-              cs_o[(size_t)(CK - 2u) * CD + c] = static_cast<BFT>(s_qkv[c]);
-            }
+            if (cp[q] == 0u) sq[cd_[q]] = sl;
+            else if (cp[q] == 1u) sk[cd_[q]] = sl;
+            else sv[cd_[q]] = sl;
+            // Roll the window: the taps a bf16 ledger would have held.  The
+            // round trip through bf16 is kept so the slab's later queries see
+            // exactly what a sequence of single-token launches would have
+            // left them.
+            for (uint tap = 0; tap + 2u < CK; ++tap)
+              win[q][tap] = win[q][tap + 1u];
+            win[q][CK - 2u] = float(static_cast<BFT>(xin_c));
           }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
           if (tid == 0u) {
             float av = s_ba[HV + hv] + float(dtb[hv]);
             shr[2] = metal::precise::exp(
@@ -674,8 +894,11 @@ BODY_SRC = r"""
             }
             o = simd_sum(o);
             if (lane == 0u) sy[dv] = o;
-            for (uint i = 0; i < NDK; ++i)
-              so[(size_t)dv * DK + NDK * lane + i] = st[j][i];
+            // The state stays in registers; only the state after the LAST
+            // query reaches `rec_out`.  See the restore-point note above.
+            if (mq2 + 1u == MW)
+              for (uint i = 0; i < NDK; ++i)
+                so[(size_t)dv * DK + NDK * lane + i] = st[j][i];
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if (sg == 0u) {
@@ -690,9 +913,20 @@ BODY_SRC = r"""
           for (uint d = tid; d < DV; d += NT) {
             float n = sy[d] * shr[0] * float(gnw[d]);
             float zz = s_z[hv * DV + d];
-            sc[dst + hv * DV + d] = n / (1.0f + metal::precise::exp(-zz));
+            scm[dst + hv * DV + d] = n / (1.0f + metal::precise::exp(-zz));
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
+          }   // the slab, in order
+
+          // The conv window AFTER the last query, written once.  The guard is
+          // the original one: q/k channels are shared across the RATIO value
+          // heads that map to one key head, so only the first writes them.
+          for (uint q = 0; q < CPT; ++q) {
+            if (cp[q] == 3u) continue;
+            if (!(cp[q] == 2u || (hv % RATIO) == 0u)) continue;
+            for (uint tap = 0; tap + 1u < CK; ++tap)
+              cs_o[(size_t)tap * CD + cc[q]] = static_cast<BFT>(win[q][tap]);
+          }
         }
         gdn_slot += 1u;
       }
@@ -729,7 +963,8 @@ BODY_SRC = r"""
               ex[t] = metal::precise::exp(bestv[t] - m); ssum += ex[t];
             }
             for (uint t = 0; t < kk; ++t) {
-              topi[t] = besti[t]; topw[t] = ex[t] / ssum;
+              topi[mq * TOPKN + t] = besti[t];
+              topw[mq * TOPKN + t] = ex[t] / ssum;
             }
           }
         }
@@ -739,8 +974,8 @@ BODY_SRC = r"""
         // barrier and every threadgroup writes the same values.
         if (tg == 0u && tid == 0u)
           for (uint t = 0; t < kk; ++t) {
-            sc[dst + t] = float(topi[t]);
-            sc[SC_MOE_TOPW + t] = topw[t];
+            sc[dst + t] = float(topi[mq * TOPKN + t]);
+            sc[SC_MOE_TOPW + t] = topw[mq * TOPKN + t];
           }
       }
 
@@ -754,19 +989,75 @@ BODY_SRC = r"""
         const uint cols = T[TBL_COLS], rows = T[TBL_ROWS];
         const uint ng = cols / T[TBL_GSIZE];
         const uint width = a1;
-        for (uint i = tid; i < cols; i += NT) tgx[i] = sc[src + i];
+
+        // ------------------------------------------------ the expert UNION
+        // THE one term that does not amortise.  Every other phase's weight
+        // traffic is width-invariant; here the M queries choose their own
+        // top-10, so the read is the size of the UNION of their choices --
+        // 10 if they route identically, 30 if disjoint.  Loop the union ONCE
+        // and mask per query: one straight-line loop, no per-query branch to
+        // serialise the simdgroup, and the expert weight is read once no
+        // matter how many queries want it.
+        //
+        // `uslot[u]` packs, in a byte per query, that query's own slot for
+        // union expert `u`, plus one -- 0 means "this query did not choose
+        // it".  The slot matters because the E1 output and the E2 activation
+        // are indexed by the query's OWN slot, not by the union position.
+        build_expert_union(topi, MW, tid, uni, uslot, unin);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint r0 = grow * RGU; r0 < TOPKN * width; r0 += nrow * RGU) {
-          uint e = r0 / width, j = r0 - e * width;
-          uint eid = topi[e];
-          float g_[RGU], u_[RGU];
-          qmv4<RGU>(W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng, j, rows,
-                    eid * rows, tgx4, lane, g_);
-          qmv4<RGU>(W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng, width + j, rows,
-                    eid * rows, tgx4, lane, u_);
-          if (lane == 0u)
-            for (uint r = 0; r < RGU; ++r)
-              if (j + r < width) sc[dst + r0 + r] = silu_f(g_[r]) * u_[r];
+        const uint nu = unin[0];
+
+        const bool staged = (MW * cols) <= HID;
+        if (staged) {
+          for (uint i = tid; i < MW * cols; i += NT) {
+            const uint m = i / cols, c = i - m * cols;
+            tgx[i] = scratch[(size_t)m * SCSTRIDE + src + c];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const uint sxs4 = cols / 4u, dxs4 = SCSTRIDE / 4u;
+        const device float4* dx4 =
+            reinterpret_cast<const device float4*>(scratch + src);
+
+        for (uint r0 = grow * RGU; r0 < nu * width; r0 += nrow * RGU) {
+          uint u = r0 / width, j = r0 - u * width;
+          uint eid = uni[u], packed = uslot[u];
+          float g_[RGU * MAXMW], u_[RGU * MAXMW];
+          if (MW == 1u) {
+            if (staged) {
+              qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         j, rows, eid * rows, tgx4, sxs4, lane, g_);
+              qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         width + j, rows, eid * rows, tgx4, sxs4, lane, u_);
+            } else {
+              qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         j, rows, eid * rows, dx4, dxs4, lane, g_);
+              qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         width + j, rows, eid * rows, dx4, dxs4, lane, u_);
+            }
+          } else if (staged) {
+            qmv_any<MAXMW>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                           j, rows, eid * rows, tgx4, sxs4, lane, g_);
+            qmv_any<MAXMW>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                           width + j, rows, eid * rows, tgx4, sxs4, lane, u_);
+          } else {
+            qmv_any<MAXMW>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                           j, rows, eid * rows, dx4, dxs4, lane, g_);
+            qmv_any<MAXMW>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                           width + j, rows, eid * rows, dx4, dxs4, lane, u_);
+          }
+          if (lane == 0u) {
+            for (uint m = 0; m < MW; ++m) {
+              const uint slot1 = (packed >> (8u * m)) & 255u;
+              if (slot1 == 0u) continue;          // query m skipped this one
+              device float* scm = scratch + (size_t)m * SCSTRIDE;
+              const uint base = (slot1 - 1u) * width + j;
+              for (uint r = 0; r < RGU; ++r)
+                if (j + r < width)
+                  scm[dst + base + r] =
+                      silu_f(g_[r * MW + m]) * u_[r * MW + m];
+            }
+          }
         }
       }
 
@@ -785,31 +1076,50 @@ BODY_SRC = r"""
         const device BFT* sb =
             reinterpret_cast<const device BFT*>(W + T[TBL_SBOFF]);
         const device float4* act4 =
-            reinterpret_cast<const device float4*>(sc + src);
+            reinterpret_cast<const device float4*>(scratch + src);
+        const uint pstride4 = SCSTRIDE / 4u;
+        // The union again, and the same shape: the K fold now runs over the
+        // UNION's experts and each query contributes only through the ones it
+        // selected.  At M = 1 the union IS query 0's top-10 in its own order,
+        // so both the loop bounds and the accumulation order are what shipped.
+        build_expert_union(topi, MW, tid, uni, uslot, unin);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint nu = unin[0];
         for (uint r0 = grow * RDN; r0 < rows; r0 += nrow * RDN) {
-          float acc[RDN];
-          for (uint r = 0; r < RDN; ++r) acc[r] = 0.0f;
-          for (uint gb = lane; gb < TOPKN * n2; gb += 32u) {
-            uint e = gb / n2, bl = gb - e * n2;
-            uint eid = topi[e]; float wg = topw[e];
-            uint ab_ = e * (cols / 4u) + bl * 4u;
-            float4 a0v = act4[ab_ + 0u], a1v = act4[ab_ + 1u];
-            float4 a2v = act4[ab_ + 2u], a3v = act4[ab_ + 3u];
-            float xs = hsum4(a0v) + hsum4(a1v) + hsum4(a2v) + hsum4(a3v);
+          float acc[RDN * MAXMW];
+          for (uint i = 0; i < RDN * MW; ++i) acc[i] = 0.0f;
+          for (uint gb = lane; gb < nu * n2; gb += 32u) {
+            uint u = gb / n2, bl = gb - u * n2;
+            uint eid = uni[u], packed = uslot[u];
             uint g = bl >> 2u;
+            // The weight read is OUTSIDE the query loop: one expert row read
+            // serves every query in the union that chose it.
             for (uint r = 0; r < RDN; ++r) {
               if (r0 + r >= rows) break;
               uint row = eid * rows + r0 + r;
               uint2 p = w2[row * n2 + bl];
-              float pr = dot8(p.x, a0v, a1v) + dot8(p.y, a2v, a3v);
-              acc[r] += wg * (float(sb[row * 2u * ng + g]) * pr
-                            + float(sb[row * 2u * ng + ng + g]) * xs);
+              float s0 = float(sb[row * 2u * ng + g]);
+              float s1 = float(sb[row * 2u * ng + ng + g]);
+              for (uint m = 0; m < MW; ++m) {
+                const uint slot1 = (packed >> (8u * m)) & 255u;
+                if (slot1 == 0u) continue;
+                const device float4* am4 = act4 + (size_t)m * pstride4;
+                uint ab_ = (slot1 - 1u) * (cols / 4u) + bl * 4u;
+                float4 a0v = am4[ab_ + 0u], a1v = am4[ab_ + 1u];
+                float4 a2v = am4[ab_ + 2u], a3v = am4[ab_ + 3u];
+                float xs = hsum4(a0v) + hsum4(a1v) + hsum4(a2v) + hsum4(a3v);
+                float pr = dot8(p.x, a0v, a1v) + dot8(p.y, a2v, a3v);
+                acc[r * MW + m] +=
+                    topw[m * TOPKN + (slot1 - 1u)] * (s0 * pr + s1 * xs);
+              }
             }
           }
-          for (uint r = 0; r < RDN; ++r) {
-            float v = simd_sum(acc[r]);
-            if (lane == 0u && r0 + r < rows) sc[dst + r0 + r] = v;
-          }
+          for (uint r = 0; r < RDN; ++r)
+            for (uint m = 0; m < MW; ++m) {
+              float v = simd_sum(acc[r * MW + m]);
+              if (lane == 0u && r0 + r < rows)
+                scratch[(size_t)m * SCSTRIDE + dst + r0 + r] = v;
+            }
         }
       }
 
@@ -1305,18 +1615,25 @@ BODY_SRC = r"""
         const device BFT* w = reinterpret_cast<const device BFT*>(
             WB[T[TBL_GROUP]] + T[TBL_WOFF]);
         device BFT* st = const_cast<device BFT*>(pconv);
+        // The dilated window rolls M steps.  One thread owns a channel for
+        // the whole slab, so the queries simply run in order inside it: no
+        // cross-thread hazard, and the state is read and written once even
+        // though it advances M times.
         for (uint c = tg * NT + tid; c < HCH; c += ntg * NT) {
-          const float xnew = sc[src + c];
-          float acc = 0.0f;
-          for (uint kk = 0; kk + 1u < PLEK; ++kk)
-            acc += float(w[c * PLEK + kk])
-                 * float(st[(size_t)(kk * PLEN) * HCH + c]);
-          acc += float(w[c * PLEK + (PLEK - 1u)]) * xnew;
-          sc[dst + c] = sc[dst + c] + sc[a0 + c] + silu_f(acc);
-          // roll: state row r <- row r+1, last row <- the new vector
-          for (uint r = 0; r + 1u < PLES; ++r)
-            st[(size_t)r * HCH + c] = st[(size_t)(r + 1u) * HCH + c];
-          st[(size_t)(PLES - 1u) * HCH + c] = static_cast<BFT>(xnew);
+          for (uint m = 0; m < MW; ++m) {
+            device float* scm = scratch + (size_t)m * SCSTRIDE;
+            const float xnew = scm[src + c];
+            float acc = 0.0f;
+            for (uint kk = 0; kk + 1u < PLEK; ++kk)
+              acc += float(w[c * PLEK + kk])
+                   * float(st[(size_t)(kk * PLEN) * HCH + c]);
+            acc += float(w[c * PLEK + (PLEK - 1u)]) * xnew;
+            scm[dst + c] = scm[dst + c] + scm[a0 + c] + silu_f(acc);
+            // roll: state row r <- row r+1, last row <- the new vector
+            for (uint r = 0; r + 1u < PLES; ++r)
+              st[(size_t)r * HCH + c] = st[(size_t)(r + 1u) * HCH + c];
+            st[(size_t)(PLES - 1u) * HCH + c] = static_cast<BFT>(xnew);
+          }
         }
       }
 
@@ -1364,7 +1681,9 @@ BODY_SRC = r"""
     }
     if (!live) break;
     for (uint i = tg * NT + tid; i < HID; i += ntg * NT)
-      out[(size_t)rep * HID + i] = static_cast<BFT>(sc[SC_MIXED + i]);
+      for (uint m = 0; m < MW; ++m)
+        out[((size_t)rep * MW + m) * HID + i] =
+            static_cast<BFT>(scratch[(size_t)m * SCSTRIDE + SC_MIXED + i]);
     live = gbar(ctr, ab, ntg, tid, phase, SPINCAP);
   }
 
@@ -1568,12 +1887,12 @@ class MegakernelBody:
             grid=(self.groups * self.threads, 1, 1),
             threadgroup=(self.threads, 1, 1),
             output_shapes=[
-                (scratch_floats(mwidth),), (reps, HIDDEN),
+                (scratch_floats(mwidth),), (reps * mwidth, HIDDEN),
                 (self.gdn_layers, CONV_KERNEL - 1, CONV_DIM),
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
                 (mwidth * 2 * N_Q_HEADS * SDPA_BLOCKS,),
                 (mwidth * N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM,),
-                (reps, self.vocab),
+                (reps * mwidth, self.vocab),
                 (4,),
             ],
             output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16,
