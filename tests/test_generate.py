@@ -11,6 +11,7 @@ import mlx.core as mx
 from mlx_lm.batch_admission import LinearStateCost, StateBudget
 from mlx_lm.generate import (
     DEFAULT_PREFILL_STEP_SIZE,
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     GenerationResponse,
     StopSequenceMatcher,
@@ -1899,6 +1900,12 @@ class TestGenerate(unittest.TestCase):
                     max_tokens=3,
                     kv_bits=8,
                     kv_group_size=32,
+                    # BatchGenerator only supports immediate (from token 0)
+                    # quantization; match that explicitly rather than
+                    # relying on stream_generate's default, which now
+                    # resolves to DEFAULT_QUANTIZED_KV_START (5000) instead
+                    # of 0 when omitted.
+                    quantized_kv_start=0,
                 )
             )
             self.assertEqual(len(responses[uid]), len(single))
@@ -1915,6 +1922,146 @@ class TestGenerate(unittest.TestCase):
                 # this fixed fixture the three-step envelope is ~0.289 while
                 # every delivered token remains identical.
                 self.assertLessEqual(float(delta.item()), 0.5)
+
+    def test_generate_step_quantized_kv_start_defaults_to_shared_constant(self):
+        """A library caller that passes kv_bits and omits quantized_kv_start
+        must quantize on the same schedule the CLI/server default to
+        (DEFAULT_QUANTIZED_KV_START), not from token 0."""
+        prompt = mx.array(self.tokenizer.encode("hi"))
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
+            next(
+                generate_step(
+                    prompt, self.model, max_tokens=1, kv_bits=8, kv_group_size=32
+                )
+            )
+        self.assertGreaterEqual(mock_quantize.call_count, 1)
+        for call in mock_quantize.call_args_list:
+            self.assertEqual(
+                call.kwargs["quantized_kv_start"], DEFAULT_QUANTIZED_KV_START
+            )
+
+    def test_generate_step_quantized_kv_start_explicit_zero_is_immediate(self):
+        """Passing 0 explicitly must still mean 'from token 0', not the
+        shared default -- None and 0 are different requests."""
+        prompt = mx.array(self.tokenizer.encode("hi"))
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
+            next(
+                generate_step(
+                    prompt,
+                    self.model,
+                    max_tokens=1,
+                    kv_bits=8,
+                    kv_group_size=32,
+                    quantized_kv_start=0,
+                )
+            )
+        self.assertGreaterEqual(mock_quantize.call_count, 1)
+        for call in mock_quantize.call_args_list:
+            self.assertEqual(call.kwargs["quantized_kv_start"], 0)
+
+    def test_generate_step_quantized_kv_start_explicit_value_is_honored(self):
+        prompt = mx.array(self.tokenizer.encode("hi"))
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
+            next(
+                generate_step(
+                    prompt,
+                    self.model,
+                    max_tokens=1,
+                    kv_bits=8,
+                    kv_group_size=32,
+                    quantized_kv_start=123,
+                )
+            )
+        self.assertGreaterEqual(mock_quantize.call_count, 1)
+        for call in mock_quantize.call_args_list:
+            self.assertEqual(call.kwargs["quantized_kv_start"], 123)
+
+    def test_quantized_kv_start_constant_has_one_definition(self):
+        """generate.py and cache_prompt.py must import the same constant --
+        it must not be redefined (and able to drift) in a second place."""
+        from mlx_lm import cache_prompt
+
+        self.assertIs(
+            cache_prompt.DEFAULT_QUANTIZED_KV_START, DEFAULT_QUANTIZED_KV_START
+        )
+        self.assertEqual(DEFAULT_QUANTIZED_KV_START, 5000)
+
+    def test_stream_generate_reports_effective_quantized_kv_start(self):
+        """The resolved schedule is a receipt on the response, so a harness
+        that reads kv_bits off its own request can't silently report a
+        different schedule than what actually ran."""
+        prompt = "hi"
+
+        default_responses = list(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                max_tokens=1,
+                kv_bits=8,
+                kv_group_size=32,
+            )
+        )
+        self.assertEqual(
+            default_responses[-1].effective_quantized_kv_start,
+            DEFAULT_QUANTIZED_KV_START,
+        )
+
+        immediate_responses = list(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                max_tokens=1,
+                kv_bits=8,
+                kv_group_size=32,
+                quantized_kv_start=0,
+            )
+        )
+        self.assertEqual(immediate_responses[-1].effective_quantized_kv_start, 0)
+
+        unquantized_responses = list(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                max_tokens=1,
+            )
+        )
+        self.assertIsNone(unquantized_responses[-1].effective_quantized_kv_start)
+
+    def test_batch_generator_stats_report_effective_quantized_kv_start(self):
+        """BatchGenerator only supports immediate (from-token-0) quantized
+        KV, so its receipt is always 0 when kv_bits is set -- distinct from
+        the delayed-start schedule the non-batched entry points default to."""
+        prompt = self.tokenizer.encode("hello there")
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        try:
+            with gen.stats() as stats:
+                gen.insert([prompt])
+                while gen.next_generated():
+                    pass
+        finally:
+            gen.close()
+        self.assertEqual(stats.effective_quantized_kv_start, 0)
+
+        gen_plain = BatchGenerator(
+            self.model, stop_tokens=self.tokenizer.eos_token_ids, max_tokens=1
+        )
+        try:
+            with gen_plain.stats() as plain_stats:
+                gen_plain.insert([prompt])
+                while gen_plain.next_generated():
+                    pass
+        finally:
+            gen_plain.close()
+        self.assertIsNone(plain_stats.effective_quantized_kv_start)
 
     def _continued_generation_test_helper(self, model):
         # Eight steps exercise repeated merge/filter/continuation cycles while
