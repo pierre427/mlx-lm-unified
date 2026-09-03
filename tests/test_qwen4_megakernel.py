@@ -481,3 +481,62 @@ def test_every_admitted_width_has_a_dispatch_branch():
     covered = {1, 2, mk.MAX_QUERY_WIDTH}
     for width in range(1, mk.MAX_QUERY_WIDTH + 1):
         assert width in covered, width
+
+
+def test_control_block_tails_advance_mid_slab():
+    """§5 of the plan, as arithmetic on positions.
+
+    A width-3 slab at position 3 covers positions 3, 4, 5, whose tail blocks
+    are 0, 1, 1 -- the tail ADVANCES inside the slab.  Query 0 is also the one
+    that closes block 0, so `pool_new_block` differs across the slab too.  One
+    shared tail would leave the later queries' newest positions in no scored
+    block, which is the 2026-09-03 defect with two more queries to hide in.
+    """
+    from mlx_lm.models.qwen4_megakernel_runtime import build_control_block
+    bs = mk.IDX_COMPRESS
+    m0, st = mk.ACTL_M0, mk.ACTL_M_STRIDE
+
+    def field(a, m, name):
+        return int(a[m0 + m * st + mk.ACTL_M[name]])
+
+    for start in range(0, 4 * bs + 1):
+        a = build_control_block(start, 3, total=4096, pooled_stride=1024,
+                                n_attn_layers=12, rope_theta=1e6)
+        for m in range(3):
+            pos = start + m
+            assert field(a, m, "q_pos") == pos
+            assert field(a, m, "rope_pos") == pos
+            assert field(a, m, "kv_slot") == pos
+            assert field(a, m, "logical_len") == pos + 1
+            assert field(a, m, "tail_block") == pos // bs
+            assert field(a, m, "n_blocks") == (pos + 1) // bs
+            assert field(a, m, "complete") == ((pos + 1) // bs) * bs
+            assert field(a, m, "pool_new_block") == int((pos + 1) % bs == 0)
+            # `count > n_sel` is the predicate that admits the tail slot.
+            has_tail = int((pos + 1) % bs != 0)
+            assert (field(a, m, "count") - field(a, m, "n_sel")) == has_tail
+        # exactly one query closes a block per slab of width < block size
+        assert sum(field(a, m, "pool_new_block") for m in range(3)) <= 1
+    # the named case
+    a = build_control_block(3, 3, total=4096, pooled_stride=1024,
+                            n_attn_layers=12, rope_theta=1e6)
+    assert [field(a, m, "tail_block") for m in range(3)] == [0, 1, 1]
+    assert [field(a, m, "pool_new_block") for m in range(3)] == [1, 0, 0]
+
+
+def test_width_one_control_block_matches_the_shipped_header():
+    """The width-1 header must be what the M=1 kernel shipped with.
+
+    Every un-widened phase body reads the shared header slots, and the M=1
+    regression guard is that the width-1 path is bit-identical -- so the
+    header has to carry query 0's values, not the slab's.
+    """
+    from mlx_lm.models.qwen4_megakernel_runtime import build_control_block
+    for pos in (0, 1, 3, 4, 17, 1023, 16384):
+        a = build_control_block(pos, 1, total=32768, pooled_stride=8192,
+                                n_attn_layers=12, rope_theta=1e6)
+        for name, off in mk.ACTL_M.items():
+            if name in mk.ACTL:
+                assert int(a[mk.ACTL[name]]) == int(a[mk.ACTL_M0 + off]), name
+        assert int(a[mk.ACTL["q_pos"]]) == pos
+        assert int(a[mk.ACTL["tail_block"]]) == pos // mk.IDX_COMPRESS

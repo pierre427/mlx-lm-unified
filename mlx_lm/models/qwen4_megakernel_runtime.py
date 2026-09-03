@@ -74,6 +74,79 @@ from .qwen4_megakernel import (
 OUT = {name: index for index, name in enumerate(OUT_NAMES)}
 
 
+def build_control_block(position: int, width: int, *, total: int,
+                        pooled_stride: int, n_attn_layers: int,
+                        rope_theta: float) -> np.ndarray:
+    """The per-slab attention control block, as plain numpy.
+
+    A shared header, then ONE per-query block for each of the `width`
+    queries, then room for each query's own selected-block list.
+
+    **What advances mid-slab.**  Verify query `m` sits at position `p + m`, so
+    its logical length, its closed-block count, its RoPE position, its
+    physical KV slot and its TAIL BLOCK are all its own.  The tail is
+    `(p + m) // block_size`, which crosses a block boundary for one slab in
+    `block_size` -- at p = 3 and width 3 the three queries' tails are blocks
+    0, 1, 1, and the first query is the one that CLOSES block 0.  Sharing any
+    of these across the slab reproduces the 2026-09-03 defect at M queries
+    instead of one: positions that are in no scored block and are simply not
+    attended.
+
+    Pure and model-free on purpose -- the trap it guards is arithmetic on
+    positions, so a test should be able to reach it without a checkpoint.
+    """
+    width = max(int(width), 1)
+    actl = np.zeros(actl_words(width), np.uint32)
+    actl[ACTL["total"]] = total
+    actl[ACTL["block_size"]] = IDX_COMPRESS
+    actl[ACTL["ids_from_scratch"]] = 1
+    actl[ACTL["scale_bits"]] = np.float32(HEAD_DIM ** -0.5).view(np.uint32)
+    actl[ACTL["rope_theta_bits"]] = np.float32(rope_theta).view(np.uint32)
+    actl[ACTL["pooled_stride"]] = pooled_stride
+    actl[ACTL["n_attn_layers"]] = n_attn_layers
+    actl[ACTL["m_width"]] = width
+    for m in range(width):
+        pos = position + m
+        length = pos + 1
+        n_blocks = length // IDX_COMPRESS
+        budget = min(BLOCK_TOPK, n_blocks)
+        # THE TAIL BLOCK.  `n_blocks` counts only CLOSED blocks, so when the
+        # length is not a multiple of the compression ratio the 1..3 newest
+        # positions -- the query's own included -- are in no scored block.
+        # Stock's sparse mask is `selected_tokens | tail` with
+        # `tail = (complete <= t <= q_pos)`, and the shipped indexed kernel
+        # appends that tail block at slot `n_sel` and counts it in `count`.
+        # This path did neither until 2026-09-03, so three tokens in four
+        # could not attend their own most recent context; the teacher-forced
+        # perplexity gate is what found it.
+        tail_block = pos // IDX_COMPRESS
+        has_tail = int(length % IDX_COMPRESS != 0)
+        count = budget + has_tail
+        b = ACTL_M0 + m * ACTL_M_STRIDE
+        actl[b + ACTL_M["u_width"]] = count
+        actl[b + ACTL_M["count"]] = count
+        actl[b + ACTL_M["n_sel"]] = budget
+        actl[b + ACTL_M["tail_block"]] = tail_block
+        actl[b + ACTL_M["q_pos"]] = pos
+        actl[b + ACTL_M["logical_len"]] = length
+        actl[b + ACTL_M["n_blocks"]] = n_blocks
+        # Every block the grid names is causally valid at this query: a block
+        # ends at 4b+3 and the deepest query is at `pos`, and
+        # n_blocks = length // 4 already excludes the open tail block.
+        actl[b + ACTL_M["n_valid"]] = n_blocks
+        actl[b + ACTL_M["rope_pos"]] = pos
+        actl[b + ACTL_M["kv_slot"]] = pos
+        actl[b + ACTL_M["pool_new_block"]] = int(length % IDX_COMPRESS == 0)
+        actl[b + ACTL_M["complete"]] = n_blocks * IDX_COMPRESS
+    # Query 0's block also lands in the shared header slots, so a phase body
+    # that has not been widened yet reads query 0 and a width-1 control block
+    # is byte-for-byte the one the M=1 kernel shipped with.
+    for name, off in ACTL_M.items():
+        if name in ACTL:
+            actl[ACTL[name]] = actl[ACTL_M0 + off]
+    return actl
+
+
 class MegakernelDecoder:
     """One packed model, one token schedule, and its ledgers."""
 
@@ -273,75 +346,12 @@ class MegakernelDecoder:
 
     # ----------------------------------------------------------- the token
     def control(self, position: int, width: int = 1) -> mx.array:
-        """The per-slab attention control block.
-
-        A shared header, then ONE per-query block for each of the `width`
-        queries, then each query's own selected-block list.
-
-        **What advances mid-slab.**  Verify query `m` sits at position
-        `p + m`, so its logical length, its closed-block count, its RoPE
-        position, its physical KV slot and its TAIL BLOCK are all its own.
-        The tail is `(p + m) // block_size`, which crosses a block boundary
-        for one slab in `block_size` -- at p = 3 and width 3 the three
-        queries' tails are blocks 0, 1, 1 and the second query is the one
-        that CLOSES block 0.  Sharing any of these across the slab
-        reproduces the 2026-09-03 defect at M queries instead of one:
-        positions that are in no scored block and are simply not attended.
-        """
-        width = max(int(width), 1)
-        actl = np.zeros(actl_words(width), np.uint32)
-        actl[ACTL["total"]] = self.total
-        actl[ACTL["block_size"]] = IDX_COMPRESS
-        actl[ACTL["ids_from_scratch"]] = 1
-        actl[ACTL["scale_bits"]] = np.float32(
-            HEAD_DIM ** -0.5).view(np.uint32)
-        actl[ACTL["rope_theta_bits"]] = np.float32(
-            self.rope_theta).view(np.uint32)
-        actl[ACTL["pooled_stride"]] = self.pooled_stride
-        actl[ACTL["n_attn_layers"]] = len(self.attn_layers)
-        actl[ACTL["m_width"]] = width
-        for m in range(width):
-            pos = position + m
-            length = pos + 1
-            n_blocks = length // IDX_COMPRESS
-            budget = min(BLOCK_TOPK, n_blocks)
-            # THE TAIL BLOCK.  ``n_blocks`` counts only CLOSED blocks, so when
-            # the length is not a multiple of the compression ratio the 1..3
-            # newest positions -- the query's own included -- are in no scored
-            # block.  Stock's sparse mask is ``selected_tokens | tail`` with
-            # ``tail = (complete <= t <= q_pos)``, and the shipped indexed
-            # kernel appends that tail block at slot ``n_sel`` and counts it in
-            # ``count``.  This path did neither until 2026-09-03, so three
-            # tokens in four could not attend their own most recent context;
-            # the teacher-forced perplexity gate is what found it.
-            tail_block = pos // IDX_COMPRESS
-            has_tail = int(length % IDX_COMPRESS != 0)
-            count = budget + has_tail
-            b = ACTL_M0 + m * ACTL_M_STRIDE
-            actl[b + ACTL_M["u_width"]] = count
-            actl[b + ACTL_M["count"]] = count
-            actl[b + ACTL_M["n_sel"]] = budget
-            actl[b + ACTL_M["tail_block"]] = tail_block
-            actl[b + ACTL_M["q_pos"]] = pos
-            actl[b + ACTL_M["logical_len"]] = length
-            actl[b + ACTL_M["n_blocks"]] = n_blocks
-            # Every block the grid names is causally valid at this query: a
-            # block ends at 4b+3 and the deepest query is at `pos`, and
-            # n_blocks = length // 4 already excludes the open tail block.
-            actl[b + ACTL_M["n_valid"]] = n_blocks
-            actl[b + ACTL_M["rope_pos"]] = pos
-            actl[b + ACTL_M["kv_slot"]] = pos
-            actl[b + ACTL_M["pool_new_block"]] = int(
-                length % IDX_COMPRESS == 0)
-            actl[b + ACTL_M["complete"]] = (length // IDX_COMPRESS) \
-                * IDX_COMPRESS
-        # Query 0's block also lands in the shared header slots, so a phase
-        # body that has not been widened yet reads query 0 and a width-1 slab
-        # is byte-for-byte the control block the M=1 kernel shipped with.
-        for name, off in ACTL_M.items():
-            if name in ACTL:
-                actl[ACTL[name]] = actl[ACTL_M0 + off]
-        return mx.array(actl)
+        """The per-slab attention control block for this decoder's ledgers."""
+        return mx.array(build_control_block(
+            position, width, total=self.total,
+            pooled_stride=self.pooled_stride,
+            n_attn_layers=len(self.attn_layers),
+            rope_theta=self.rope_theta))
 
     def step_slab(self, embeddings: mx.array, *, ple_embeddings=None,
                   position: Optional[int] = None, record: bool = True):
