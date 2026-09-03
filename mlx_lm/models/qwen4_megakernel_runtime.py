@@ -141,6 +141,8 @@ class MegakernelDecoder:
             vocab=VOCAB, threads=threads, groups=groups)
         self._allocate()
         self.position = 0
+        self._pending = None
+        self._pending_width = 1
 
     def restore_source_contiguity(self) -> int:
         """Give the STOCK path back CONTIGUOUS scales and biases.
@@ -382,6 +384,7 @@ class MegakernelDecoder:
             mwidth=width)
         logits = outs[OUT["logits"]]
         self._pending = outs
+        self._pending_width = width
         if record:
             record_megakernel_receipt(
                 engaged=True, reason="engaged", phases=len(self.schedule),
@@ -418,6 +421,7 @@ class MegakernelDecoder:
             pconv=self.pconv, actl=self.control(position))
         logits = outs[OUT["logits"]]
         self._pending = outs
+        self._pending_width = 1
         if record:
             record_megakernel_receipt(
                 engaged=True, reason="engaged", phases=len(self.schedule),
@@ -436,7 +440,29 @@ class MegakernelDecoder:
         outs = self._pending
         self.cs = outs[OUT["cs_out"]]
         self.rec = outs[OUT["rec_out"]]
-        self.position += 1
+        self.position += self._pending_width
+
+    def rollback(self) -> None:
+        """Discard a slab whose queries were not all accepted.
+
+        There is nothing to undo in the recurrent or conv state: `cs_in` and
+        `rec_in` are a SEPARATE buffer from `cs_out`/`rec_out`, so the
+        pre-slab state is still what `self.cs`/`self.rec` point at until
+        `commit` swaps them.  Declining to commit IS the rollback, and a
+        partial accept re-launches a narrower slab from the same position.
+        That is the contract the unified fused GDN verify kernel settled, and
+        the reason no restore point is written: one per query would cost
+        +227 MB of write traffic per token for a rollback that mostly does
+        not happen.
+
+        The KV and index ledgers are written IN PLACE, so a rejected slab
+        leaves stale columns past the accepted position.  They are harmless:
+        every read is bounded by the query's own `logical_len` and `n_valid`,
+        both of which come from the position, and the next launch overwrites
+        the same physical slots.
+        """
+        self._pending = None
+        self._pending_width = 0
 
     @property
     def device_barriers(self) -> int:
