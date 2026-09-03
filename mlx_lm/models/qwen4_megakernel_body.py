@@ -41,6 +41,9 @@ import mlx.core as mx
 from .qwen4_megakernel import (
     ACTL,
     ACTL_HEADER,
+    ACTL_IDS,
+    ACTL_M0,
+    ACTL_M_STRIDE,
     BLOCK_TOPK,
     PLE_CONV_KERNEL,
     PLE_NGRAM,
@@ -68,8 +71,11 @@ from .qwen4_megakernel import (
     SDPA_BLOCKS,
     NUM_EXPERTS,
     RMS_EPS,
+    MAX_QUERY_WIDTH,
     SCRATCH,
     SCRATCH_FLOATS,
+    SCRATCH_STRIDE,
+    scratch_floats,
     STEP_STRIDE,
     TOPK,
     VALUE_DIM,
@@ -259,19 +265,34 @@ BODY_SRC = r"""
   device atomic_uint* ctr =
       reinterpret_cast<device atomic_uint*>(const_cast<device uint*>(ctrl));
   device atomic_uint* ab = ctr + 1;
-  const uint nsteps = meta[0];
-  const uint reps   = meta[1];
-  // The barrier's generation base travels in `meta`, not its own binding: a
-  // one-word buffer is worth as much of the 31-binding budget as an 8 GiB
-  // weight group.
-  uint phase = meta[3];
+  const uint nsteps = actl[19];
+  const uint reps   = actl[20];
+  // The barrier's generation base travels in `actl`, not its own binding: a
+  // four-word buffer was worth as much of the 31-binding budget as an 8 GiB
+  // weight group, and width 3 needs the slot.
+  uint phase = actl[22];
+  // QUERY WIDTH.  1 is a draft token; k+1 is a verify slab, whose queries sit
+  // in M scratch planes SCSTRIDE floats apart and whose per-query control --
+  // position, block count, and above all the incomplete TAIL block, which
+  // ADVANCES mid-slab -- lives in the per-query blocks at ACTLM0.
+  const uint MW = actl[23] == 0u ? 1u : actl[23];
   // Host inputs per repetition.  The first HCH floats are the residual
   // streams; a surplus is the MTP head's embedding, which its `fuse` reads
   // from SC_BRANCH.  Anything the schedule reads must be WRITTEN here --
   // scratch is a fresh allocation every call, so a phase that reads an
   // uninitialised slot is grid-dependent garbage, which is exactly what the
   // G-sweep coverage test reports as "differs".
-  const uint xw = meta[2] == 0u ? HCH : meta[2];
+  const uint xw = actl[21] == 0u ? HCH : actl[21];
+
+  // The two merged ledgers, split back into the four names the phase bodies
+  // use.  Both offsets are products of control words the token already
+  // carries -- no new binding, no new field.
+  const device BFT* kbuf = kv;
+  const device BFT* vbuf =
+      kv + (size_t)actl[17] * NKVH * (size_t)actl[0] * HD;
+  const device BFT* rawk = idxl;
+  const device BFT* pooled =
+      idxl + (size_t)actl[17] * (size_t)actl[0] * IDXD;
 
   // Every packed group is a binding; the table's `group` field selects one.
   const device uint* WB[10] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9};
@@ -280,7 +301,7 @@ BODY_SRC = r"""
   // Block ids for the attention phase.  ``OP_INDEX_TOPB`` writes them into
   // scratch as floats (a block index is < 2^24, so the round trip is exact);
   // a standalone probe hands them in through ``actl`` instead.
-  const device uint* sel_ids = actl + ACTLH;
+  const device uint* sel_ids = actl + ACTLIDS;
   const uint ids_from_scratch = actl[7];
 
   threadgroup float A[TGF];
@@ -1210,15 +1231,25 @@ BODY_SRC = r"""
 # the 63 GiB of experts needs eight groups on its own because a group is
 # uint32-indexed and so caps at 2^31 words = 8 GiB.  Ten buffers + main +
 # lm_head + the table fits in 22 inputs, for 30 of 31.
+# Phase E bought back THREE binding slots, each a pure addressing change with
+# no new arithmetic, because width 3 needs slots and the kernel was AT the
+# ceiling (23 inputs + 8 outputs = 31 of Metal's 31, not the 30 the build log
+# recorded):
+#   * ``kbuf`` + ``vbuf`` -> ``kv``.  Same dtype, same shape, one constant
+#     offset apart; the attention phase already computed ``kvbase``.
+#   * ``pooled`` + ``rawk`` -> ``idxl``, the one index ledger.  Same argument.
+#   * ``meta`` -> folded into ``actl``.  A four-word uint32 control buffer was
+#     worth as much of the budget as an 8 GiB weight group.
+# 20 inputs + 8 outputs = 28 of 31, i.e. three free.
 IN_NAMES = [
     "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9",
-    "tbl", "sched", "meta", "cs_in", "rec_in", "kbuf", "vbuf", "pooled",
-    # The raw index-key ledger and the PLE conv state.  Both are LEDGERS the
-    # kernel appends to in place, like ``ctrl``, not values it returns: the
-    # decode token that writes them is the same launch that reads them back
-    # two phases later, so an output would put the host in the middle of the
-    # dispatch.  21 bindings of Metal's 31.
-    "rawk", "pconv",
+    "tbl", "sched", "cs_in", "rec_in",
+    # The KV ledger (keys then values) and the index ledger (raw keys then
+    # pooled block keys).  Both are LEDGERS the kernel appends to in place,
+    # like ``ctrl``, not values it returns: the decode token that writes them
+    # is the same launch that reads them back two phases later, so an output
+    # would put the host in the middle of the dispatch.
+    "kv", "idxl", "pconv",
     "actl", "ctrl",
 ]
 OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "logits",
@@ -1257,6 +1288,8 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         "IDXH": IDX_HEADS, "IDXD": IDX_HEAD_DIM,
         "INVIDXD": f"{IDX_HEAD_DIM ** -0.5:.17g}f",
         "ROTD": ROTARY_DIM, "ACTLH": ACTL_HEADER,
+        "ACTLIDS": ACTL_IDS, "ACTLM0": ACTL_M0, "ACTLMS": ACTL_M_STRIDE,
+        "SCSTRIDE": SCRATCH_STRIDE, "MAXMW": MAX_QUERY_WIDTH,
         "PLEK": PLE_CONV_KERNEL, "PLEN": PLE_NGRAM, "PLES": PLE_STATE_LEN,
         "PLEQS": f"{HIDDEN ** -0.5:.17g}f",
         "RDOWN": rdown, "RGU": rgu, "RDN": rdn, "RMAXN": RMAX,
@@ -1328,35 +1361,63 @@ class MegakernelBody:
     def __call__(self, xin, cs_in, rec_in, *, reps: int = 1,
                  steps: Optional[int] = None, kbuf=None, vbuf=None,
                  pooled=None, actl=None, total: int = 1, rawk=None,
-                 pconv=None):
+                 pconv=None, kv=None, idxl=None, mwidth: int = 1):
         """``steps`` truncates the schedule, for cumulative phase profiling.
 
         The barrier map lives in the schedule, so a prefix is a real, running
         kernel with exactly the barriers its own phases need -- not a kernel
         with the tail compiled out.
+
+        ``mwidth`` is the QUERY width of the slab: 1 for a draft token, k+1
+        for a verify slab.  The scratch is allocated as that many planes and
+        ``actl[23]`` carries it into the kernel.
+
+        The ledgers arrive merged (``kv``, ``idxl``).  The separate
+        ``kbuf``/``vbuf``/``rawk``/``pooled`` kwargs are still accepted, for
+        the standalone phase probes that build tiny ones, and are concatenated
+        here; the decode path allocates them merged and never pays that copy.
         """
         nsteps = len(self.schedule) if steps is None else int(steps)
         width = int(xin.shape[-1])
-        meta = mx.array([nsteps, reps, width, self.phase], mx.uint32)
-        if kbuf is None:
-            kbuf = mx.zeros((N_KV_HEADS, 1, HEAD_DIM), mx.bfloat16)
-            vbuf = kbuf
-        if pooled is None:
-            pooled = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
+        mwidth = max(int(mwidth), 1)
+        if mwidth > MAX_QUERY_WIDTH:
+            raise ValueError(
+                f"query width {mwidth} over the built maximum {MAX_QUERY_WIDTH}"
+            )
+        if kv is None:
+            if kbuf is None:
+                kbuf = mx.zeros((N_KV_HEADS, 1, HEAD_DIM), mx.bfloat16)
+                vbuf = kbuf
+            kv = mx.concatenate(
+                [kbuf.reshape(-1), vbuf.reshape(-1)]).reshape(-1, HEAD_DIM)
+        if idxl is None:
+            if rawk is None:
+                rawk = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
+            if pooled is None:
+                pooled = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
+            idxl = mx.concatenate(
+                [rawk.reshape(-1, IDX_HEAD_DIM),
+                 pooled.reshape(-1, IDX_HEAD_DIM)])
         if actl is None:
-            actl = mx.zeros((ACTL_HEADER + BLOCK_TOPK + 1,), mx.uint32)
-        if rawk is None:
-            rawk = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
+            actl = mx.zeros((ACTL_IDS + BLOCK_TOPK + 1,), mx.uint32)
         if pconv is None:
             pconv = mx.zeros((PLE_STATE_LEN, HC_HIDDEN), mx.bfloat16)
+        # `meta` used to be its own binding.  Its four words now ride in the
+        # `actl` header, which means they are per-LAUNCH host state written
+        # into an array the caller owns -- so patch a copy, never the caller's.
+        actl = mx.concatenate([
+            actl[:ACTL["nsteps"]],
+            mx.array([nsteps, reps, width, self.phase, mwidth], mx.uint32),
+            actl[ACTL["m_width"] + 1:],
+        ])
         outs = self.kernel(
-            inputs=[xin, *self.wbufs, self.table, self.sched, meta,
-                    cs_in, rec_in, kbuf, vbuf, pooled, rawk, pconv, actl,
+            inputs=[xin, *self.wbufs, self.table, self.sched,
+                    cs_in, rec_in, kv, idxl, pconv, actl,
                     self.ctrl],
             grid=(self.groups * self.threads, 1, 1),
             threadgroup=(self.threads, 1, 1),
             output_shapes=[
-                (SCRATCH_FLOATS,), (reps, HIDDEN),
+                (scratch_floats(mwidth),), (reps, HIDDEN),
                 (self.gdn_layers, CONV_KERNEL - 1, CONV_DIM),
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
                 (2 * N_Q_HEADS * SDPA_BLOCKS,),

@@ -44,6 +44,11 @@ from .qwen4_megakernel_body import MegakernelBody, OUT_NAMES
 from .qwen4_megakernel import (
     ACTL,
     ACTL_HEADER,
+    ACTL_IDS,
+    ACTL_M,
+    ACTL_M0,
+    ACTL_M_STRIDE,
+    actl_words,
     BLOCK_TOPK,
     CONV_DIM,
     CONV_KERNEL,
@@ -168,20 +173,40 @@ class MegakernelDecoder:
     def _allocate(self) -> None:
         n_attn = max(len(self.attn_layers), 1)
         n_gdn = max(len(self.gdn_layers), 1)
-        self.kbuf = mx.zeros(
-            (n_attn * N_KV_HEADS, self.total, HEAD_DIM), mx.bfloat16)
-        self.vbuf = mx.zeros(
-            (n_attn * N_KV_HEADS, self.total, HEAD_DIM), mx.bfloat16)
-        self.rawk = mx.zeros(
-            (n_attn * self.total, IDX_HEAD_DIM), mx.bfloat16)
-        self.pooled = mx.zeros(
-            (n_attn * self.pooled_stride, IDX_HEAD_DIM), mx.bfloat16)
+        # ONE binding each, not two.  `kv` is [keys | values] and `idxl` is
+        # [raw index keys | pooled block keys]; the kernel splits them by a
+        # constant offset it computes from control words it already has.  That
+        # bought two of the three binding slots phase E needed, at the cost of
+        # exactly nothing -- these were already allocated as one shape apiece.
+        self.kv = mx.zeros(
+            (2, n_attn * N_KV_HEADS, self.total, HEAD_DIM), mx.bfloat16)
+        self.idxl = mx.zeros(
+            (n_attn * (self.total + self.pooled_stride), IDX_HEAD_DIM),
+            mx.bfloat16)
+        self._raw_rows = n_attn * self.total
         self.cs = mx.zeros((n_gdn, CONV_KERNEL - 1, CONV_DIM), mx.bfloat16)
         self.rec = mx.zeros(
             (n_gdn, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM), mx.float32)
         self.pconv = mx.zeros((PLE_STATE_LEN, HC_HIDDEN), mx.bfloat16)
-        mx.eval(self.kbuf, self.vbuf, self.rawk, self.pooled,
-                self.cs, self.rec, self.pconv)
+        mx.eval(self.kv, self.idxl, self.cs, self.rec, self.pconv)
+
+    # Views onto the merged ledgers, so seeding and the tests keep their
+    # names.  These are slices of one buffer, not copies.
+    @property
+    def kbuf(self):
+        return self.kv[0]
+
+    @property
+    def vbuf(self):
+        return self.kv[1]
+
+    @property
+    def rawk(self):
+        return self.idxl[: self._raw_rows]
+
+    @property
+    def pooled(self):
+        return self.idxl[self._raw_rows:]
 
     def seed_from_caches(self, caches, *, indexer_of=None) -> dict[str, Any]:
         """Fill the ledgers from a stock prefill.
@@ -200,18 +225,19 @@ class MegakernelDecoder:
             assert length <= self.total, (
                 f"prefill {length} over the ledger's {self.total} columns")
             base = slot * N_KV_HEADS
-            self.kbuf[base: base + N_KV_HEADS, :length] = keys[0, :, :length]
-            self.vbuf[base: base + N_KV_HEADS, :length] = values[0, :, :length]
+            self.kv[0, base: base + N_KV_HEADS, :length] = keys[0, :, :length]
+            self.kv[1, base: base + N_KV_HEADS, :length] = values[0, :, :length]
             raw = cache.index_keys
             rbase = slot * self.total
-            self.rawk[rbase: rbase + length] = raw[0, :length]
+            self.idxl[rbase: rbase + length] = raw[0, :length]
             n_blocks = length // IDX_COMPRESS
             if n_blocks and indexer_of is not None:
                 starts = mx.arange(n_blocks) * IDX_COMPRESS
                 pooled = indexer_of(index)._pool_blocks(
                     raw[:, : n_blocks * IDX_COMPRESS], starts)[0]
                 pbase = slot * self.pooled_stride
-                self.pooled[pbase: pbase + n_blocks] = pooled.astype(
+                self.idxl[self._raw_rows + pbase:
+                          self._raw_rows + pbase + n_blocks] = pooled.astype(
                     mx.bfloat16)
                 report["pooled_blocks"] += n_blocks
             report["attention"] += 1
@@ -228,8 +254,7 @@ class MegakernelDecoder:
             if state is not None:
                 self.pconv[:] = state[0].astype(mx.bfloat16)
             report["ple"] += 1
-        mx.eval(self.kbuf, self.vbuf, self.rawk, self.pooled,
-                self.cs, self.rec, self.pconv)
+        mx.eval(self.kv, self.idxl, self.cs, self.rec, self.pconv)
         return report
 
     # ------------------------------------------------------------ admission
@@ -245,52 +270,75 @@ class MegakernelDecoder:
         )
 
     # ----------------------------------------------------------- the token
-    def control(self, position: int) -> mx.array:
-        """The per-token attention control block.
+    def control(self, position: int, width: int = 1) -> mx.array:
+        """The per-slab attention control block.
 
-        Everything in it except the per-layer ledger bases is shared by all
-        twelve attention layers, so the layer index lives in the schedule and
-        this stays one array per token.
+        A shared header, then ONE per-query block for each of the `width`
+        queries, then each query's own selected-block list.
+
+        **What advances mid-slab.**  Verify query `m` sits at position
+        `p + m`, so its logical length, its closed-block count, its RoPE
+        position, its physical KV slot and its TAIL BLOCK are all its own.
+        The tail is `(p + m) // block_size`, which crosses a block boundary
+        for one slab in `block_size` -- at p = 3 and width 3 the three
+        queries' tails are blocks 0, 1, 1 and the second query is the one
+        that CLOSES block 0.  Sharing any of these across the slab
+        reproduces the 2026-09-03 defect at M queries instead of one:
+        positions that are in no scored block and are simply not attended.
         """
-        length = position + 1
-        n_blocks = length // IDX_COMPRESS
-        budget = min(BLOCK_TOPK, n_blocks)
-        # THE TAIL BLOCK.  ``n_blocks`` counts only CLOSED blocks, so when the
-        # length is not a multiple of the compression ratio the 1..3 newest
-        # positions -- the query's own included -- are in no scored block.
-        # Stock's sparse mask is ``selected_tokens | tail`` with
-        # ``tail = (complete <= t <= q_pos)``, and the shipped indexed kernel
-        # appends that tail block at slot ``n_sel`` and counts it in ``count``.
-        # This path did neither until 2026-09-03, so three tokens in four
-        # could not attend their own most recent context; the teacher-forced
-        # perplexity gate is what found it.
-        tail_block = position // IDX_COMPRESS
-        has_tail = int(length % IDX_COMPRESS != 0)
-        count = budget + has_tail
-        actl = np.zeros(ACTL_HEADER + BLOCK_TOPK + 1, np.uint32)
+        width = max(int(width), 1)
+        actl = np.zeros(actl_words(width), np.uint32)
         actl[ACTL["total"]] = self.total
-        actl[ACTL["u_width"]] = count
-        actl[ACTL["count"]] = count
-        actl[ACTL["n_sel"]] = budget
-        actl[ACTL["tail_block"]] = tail_block
-        actl[ACTL["q_pos"]] = position
         actl[ACTL["block_size"]] = IDX_COMPRESS
         actl[ACTL["ids_from_scratch"]] = 1
         actl[ACTL["scale_bits"]] = np.float32(
             HEAD_DIM ** -0.5).view(np.uint32)
-        actl[ACTL["logical_len"]] = length
-        actl[ACTL["n_blocks"]] = n_blocks
-        # Every block the grid names is causally valid at this query: a block
-        # ends at 4b+3 and the deepest query is at `position` = length - 1,
-        # and n_blocks = length // 4 already excludes the open tail block.
-        actl[ACTL["n_valid"]] = n_blocks
-        actl[ACTL["rope_pos"]] = position
         actl[ACTL["rope_theta_bits"]] = np.float32(
             self.rope_theta).view(np.uint32)
-        actl[ACTL["kv_slot"]] = position
         actl[ACTL["pooled_stride"]] = self.pooled_stride
-        actl[ACTL["pool_new_block"]] = int(length % IDX_COMPRESS == 0)
         actl[ACTL["n_attn_layers"]] = len(self.attn_layers)
+        actl[ACTL["m_width"]] = width
+        for m in range(width):
+            pos = position + m
+            length = pos + 1
+            n_blocks = length // IDX_COMPRESS
+            budget = min(BLOCK_TOPK, n_blocks)
+            # THE TAIL BLOCK.  ``n_blocks`` counts only CLOSED blocks, so when
+            # the length is not a multiple of the compression ratio the 1..3
+            # newest positions -- the query's own included -- are in no scored
+            # block.  Stock's sparse mask is ``selected_tokens | tail`` with
+            # ``tail = (complete <= t <= q_pos)``, and the shipped indexed
+            # kernel appends that tail block at slot ``n_sel`` and counts it in
+            # ``count``.  This path did neither until 2026-09-03, so three
+            # tokens in four could not attend their own most recent context;
+            # the teacher-forced perplexity gate is what found it.
+            tail_block = pos // IDX_COMPRESS
+            has_tail = int(length % IDX_COMPRESS != 0)
+            count = budget + has_tail
+            b = ACTL_M0 + m * ACTL_M_STRIDE
+            actl[b + ACTL_M["u_width"]] = count
+            actl[b + ACTL_M["count"]] = count
+            actl[b + ACTL_M["n_sel"]] = budget
+            actl[b + ACTL_M["tail_block"]] = tail_block
+            actl[b + ACTL_M["q_pos"]] = pos
+            actl[b + ACTL_M["logical_len"]] = length
+            actl[b + ACTL_M["n_blocks"]] = n_blocks
+            # Every block the grid names is causally valid at this query: a
+            # block ends at 4b+3 and the deepest query is at `pos`, and
+            # n_blocks = length // 4 already excludes the open tail block.
+            actl[b + ACTL_M["n_valid"]] = n_blocks
+            actl[b + ACTL_M["rope_pos"]] = pos
+            actl[b + ACTL_M["kv_slot"]] = pos
+            actl[b + ACTL_M["pool_new_block"]] = int(
+                length % IDX_COMPRESS == 0)
+            actl[b + ACTL_M["complete"]] = (length // IDX_COMPRESS) \
+                * IDX_COMPRESS
+        # Query 0's block also lands in the shared header slots, so a phase
+        # body that has not been widened yet reads query 0 and a width-1 slab
+        # is byte-for-byte the control block the M=1 kernel shipped with.
+        for name, off in ACTL_M.items():
+            if name in ACTL:
+                actl[ACTL[name]] = actl[ACTL_M0 + off]
         return mx.array(actl)
 
     def step(self, embedding: mx.array, *, ple_embedding=None,
@@ -317,9 +365,8 @@ class MegakernelDecoder:
             parts.append(ple_embedding.reshape(-1).astype(mx.bfloat16))
         xin = mx.concatenate(parts)[None, :]
         outs = self.body(
-            xin, self.cs, self.rec, reps=1, kbuf=self.kbuf, vbuf=self.vbuf,
-            pooled=self.pooled, rawk=self.rawk, pconv=self.pconv,
-            actl=self.control(position))
+            xin, self.cs, self.rec, reps=1, kv=self.kv, idxl=self.idxl,
+            pconv=self.pconv, actl=self.control(position))
         logits = outs[OUT["logits"]]
         self._pending = outs
         if record:

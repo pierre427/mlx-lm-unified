@@ -132,8 +132,53 @@ ACTL = {
     # The incomplete tail block this query must attend even though the
     # indexer never scored it.  ``count > n_sel`` says a tail slot is live.
     "tail_block": 18,
+    # ---- phase E: what used to be the `meta` binding -------------------
+    # `meta` was a four-word uint32 buffer worth as much of Metal's 31
+    # bindings as an 8 GiB weight group.  Folding it into `actl`, which is
+    # already a small per-token uint32 control array, buys one slot back --
+    # one of the three the width-3 build has to spend.
+    "nsteps": 19,
+    "reps": 20,
+    "xw": 21,            # host-input floats per repetition
+    "phase_base": 22,    # the grid barrier's generation counter
+    "m_width": 23,       # QUERY WIDTH: 1 for a draft, k+1 for a verify slab
 }
-ACTL_HEADER = 32         # the ids start here; keep it a multiple of 16
+# Per-query control.  Every field here advances WITHIN a verify slab -- the
+# query's own position, the block count it may attend, and above all the
+# incomplete TAIL block, which is `(p + m) // block_size` and so crosses a
+# block boundary mid-slab for one slab in `block_size`.  Getting that wrong
+# is the 2026-09-03 defect, silently, at M tail blocks instead of one.
+ACTL_M = {
+    "u_width": 0,
+    "count": 1,
+    "q_pos": 2,
+    "logical_len": 3,
+    "n_blocks": 4,
+    "n_valid": 5,
+    "rope_pos": 6,
+    "kv_slot": 7,
+    "pool_new_block": 8,
+    "tail_block": 9,
+    "complete": 10,      # (q_pos + 1) // BS * BS, precomputed per query
+    "n_sel": 11,         # scored blocks selected; slot n_sel is the tail
+}
+ACTL_M_STRIDE = 16       # keep the per-query block 16-word aligned
+# The widest verify slab the kernel is built for.  k=2 self-MTP is a 3-wide
+# verify, which is what production routes; wider costs scratch linearly.
+MAX_QUERY_WIDTH = 3
+ACTL_HEADER = 32                                   # shared header words
+ACTL_M0 = ACTL_HEADER                              # per-query blocks start
+ACTL_IDS = ACTL_M0 + ACTL_M_STRIDE * MAX_QUERY_WIDTH   # the ids start here
+
+
+def actl_words(width: int = 1) -> int:
+    """Control words a slab of `width` queries needs, ids included.
+
+    Each query owns its OWN selected-block list: the indexer's q differs per
+    query, so the selections cannot be shared without changing the arithmetic
+    against stock.
+    """
+    return ACTL_IDS + (BLOCK_TOPK + 1) * MAX_QUERY_WIDTH
 
 
 # -------------------------------------------------------------------- opcodes
@@ -338,6 +383,18 @@ for _name, _size in _SCRATCH_BLOCKS:
 SCRATCH_FLOATS = _offset
 del _offset, _name, _size
 
+# ---------------------------------------------------------- M scratch planes
+# EVERY named block above is per-token: there is no shared block, so a width-M
+# slab is M identical planes and a phase body rebases `sc` by `m * STRIDE`.
+# The stride is padded to a float4 boundary so the `float4` reads the matvec
+# path makes off `sc` stay aligned in every plane, not just plane 0.
+SCRATCH_STRIDE = (SCRATCH_FLOATS + 15) & ~15
+
+
+def scratch_floats(width: int = 1) -> int:
+    """Device scratch a slab of `width` queries needs."""
+    return SCRATCH_STRIDE * max(int(width), 1)
+
 
 # ------------------------------------------------------------------ env/state
 def _env_flag(name: str) -> bool:
@@ -423,7 +480,13 @@ PHASE_ROWS = {
 MOE_DOWN_FOLD_EXPERTS = True
 # Hard caps the build must respect (spec Sec. 6).
 THREADGROUP_BYTES_CAP = 16 * 1024      # 25.6 KiB is what made DNSTAGE lose
-DEVICE_SCRATCH_BYTES_CAP = 512 * 1024
+# Phase E raised this from 512 KiB.  The cap was never a hardware limit -- the
+# scratch is an ordinary MLX device buffer and the device reports an 86.6 GB
+# max buffer length -- it was a cache-residency choice sized for ONE token.  A
+# width-3 slab is three planes of 129,088 floats plus nothing shared, i.e.
+# 1.478 MiB, so the cap is stated per query width and asserted at admission.
+DEVICE_SCRATCH_BYTES_CAP_PER_QUERY = 512 * 1024
+DEVICE_SCRATCH_BYTES_CAP = DEVICE_SCRATCH_BYTES_CAP_PER_QUERY * MAX_QUERY_WIDTH
 BINDING_CAP = 31
 # One kernel, not two.  The two-dispatch split is bit-identical and 21% faster
 # when its halves batch, but a layer cannot batch its halves, so it costs 2
@@ -439,6 +502,10 @@ _STATUS_ABORTS = 0
 _STATUS_LAUNCHES = 0
 _STATUS_PHASES = 0
 _STATUS_OPS: Counter = Counter()
+# Query widths that actually LAUNCHED.  "The megakernel served the verify half"
+# is a claim about a width, and a receipt that only says "engaged" cannot
+# support it -- an admission that silently fell back to M=1 looks identical.
+_STATUS_WIDTHS: Counter = Counter()
 
 
 @dataclass(frozen=True)
@@ -494,11 +561,18 @@ def admit_megakernel_decode(
         return MegakernelAdmission(False, "training")
     if sharded:
         return MegakernelAdmission(False, "distributed sharding")
-    if speculating:
+    if speculating and width == 1:
+        # A width-1 speculative step is a DRAFTER, whose rejection rolls the
+        # recurrent state back; the kernel has no restore point for that.  A
+        # width-M slab is the VERIFY half, which carries its own restore
+        # contract (phase E5), so it is admitted.
         return MegakernelAdmission(False, "speculative rollback")
     if batch != 1:
         return MegakernelAdmission(False, f"batch {batch}")
-    if width != 1:
+    # Phase E: a width is a PARAMETER, not a refusal.  Production routes k=2
+    # self-MTP, so the round is an M=1 draft and an M=3 verify; refusing the
+    # verify half left the megakernel serving the cheaper half of every round.
+    if width < 1 or width > MAX_QUERY_WIDTH:
         return MegakernelAdmission(False, f"query width {width}")
     if mask is not None:
         return MegakernelAdmission(False, "masked decode")
@@ -523,7 +597,7 @@ def admit_megakernel_decode(
         return MegakernelAdmission(False, "empty schedule")
     if not _device_supported():
         return MegakernelAdmission(False, "device unsupported")
-    if SCRATCH_FLOATS * 4 > DEVICE_SCRATCH_BYTES_CAP:
+    if scratch_floats(width) * 4 > DEVICE_SCRATCH_BYTES_CAP:
         return MegakernelAdmission(False, "scratch over budget")
     return MegakernelAdmission(True, "engaged")
 
@@ -572,7 +646,7 @@ def _device_attestation() -> dict[str, Any]:
 
 def record_megakernel_receipt(
     *, engaged: bool, reason: str, phases: int = 0, aborted: bool = False,
-    op_counts: Optional[dict] = None, **fields: Any,
+    op_counts: Optional[dict] = None, width: int = 1, **fields: Any,
 ) -> None:
     """Bounded process evidence, in ``qwen4_qsa_indexed``'s conventions.
 
@@ -585,6 +659,7 @@ def record_megakernel_receipt(
         "engaged": bool(engaged),
         "reason": str(reason),
         "phases": int(phases),
+        "width": int(width),
         "aborted": bool(aborted),
         "threads": _THREADS,
         "threadgroups": _THREADGROUPS,
@@ -596,6 +671,7 @@ def record_megakernel_receipt(
         if engaged:
             _STATUS_LAUNCHES += 1
             _STATUS_PHASES += int(phases)
+            _STATUS_WIDTHS[int(width)] += 1
             for name, count in (op_counts or {}).items():
                 _STATUS_OPS[name] += int(count)
         if aborted:
@@ -615,7 +691,10 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             "spin_cap": _SPIN_CAP,
             "scratch_floats": SCRATCH_FLOATS,
             "scratch_bytes": SCRATCH_FLOATS * 4,
+            "scratch_stride": SCRATCH_STRIDE,
             "scratch_bytes_cap": DEVICE_SCRATCH_BYTES_CAP,
+            "max_query_width": MAX_QUERY_WIDTH,
+            "widths": {str(w): c for w, c in sorted(_STATUS_WIDTHS.items())},
             "threadgroup_bytes_cap": THREADGROUP_BYTES_CAP,
             "phase_rows": dict(PHASE_ROWS),
             "moe_down_fold_experts": MOE_DOWN_FOLD_EXPERTS,
@@ -649,6 +728,7 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             _STATUS_LAUNCHES = 0
             _STATUS_PHASES = 0
             _STATUS_OPS.clear()
+            _STATUS_WIDTHS.clear()
     return report
 
 

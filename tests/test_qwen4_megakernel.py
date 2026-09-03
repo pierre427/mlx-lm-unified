@@ -287,3 +287,86 @@ class TestStatus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------- phase E: query width
+def test_binding_budget_has_headroom_for_width_three():
+    """The slots the width-3 build spends were BOUGHT, not discovered.
+
+    Phase D sat at 23 inputs + 8 outputs = 31 of Metal's 31 -- the build log's
+    "30 of 31" was a miscount by one -- so the next binding anyone wanted had
+    to come from somewhere.  Three came from pure addressing changes with no
+    new arithmetic: ``kbuf``+``vbuf`` -> ``kv``, ``rawk``+``pooled`` ->
+    ``idxl``, and ``meta`` folded into ``actl``.  Assert the count, because a
+    budget that is only checked at link time is checked by a crash.
+    """
+    from mlx_lm.models.qwen4_megakernel_body import IN_NAMES, OUT_NAMES
+    total = len(IN_NAMES) + len(OUT_NAMES)
+    assert total <= mk.BINDING_CAP, f"{total} bindings over {mk.BINDING_CAP}"
+    assert total == 28, f"expected 28 bindings, got {total}"
+    assert "meta" not in IN_NAMES and "kbuf" not in IN_NAMES
+    assert "vbuf" not in IN_NAMES and "rawk" not in IN_NAMES
+    assert "kv" in IN_NAMES and "idxl" in IN_NAMES
+
+
+def test_scratch_planes_are_per_query_and_within_the_raised_cap():
+    """Every named scratch block is per-token, so M=3 is exactly 3 planes."""
+    assert mk.SCRATCH_STRIDE >= mk.SCRATCH_FLOATS
+    assert mk.SCRATCH_STRIDE % 16 == 0, "planes must stay float4 aligned"
+    assert mk.scratch_floats(1) == mk.SCRATCH_STRIDE
+    assert mk.scratch_floats(3) == 3 * mk.SCRATCH_STRIDE
+    per_query = mk.scratch_floats(1) * 4
+    assert per_query <= mk.DEVICE_SCRATCH_BYTES_CAP_PER_QUERY
+    widest = mk.scratch_floats(mk.MAX_QUERY_WIDTH) * 4
+    assert widest <= mk.DEVICE_SCRATCH_BYTES_CAP, widest
+
+
+def test_admission_takes_a_width_instead_of_refusing_it():
+    kw = dict(batch=1, pack=object(), schedule=[1], speculating=False,
+              training=False, sharded=False, dtype="bfloat16")
+    mk.set_qwen4_megakernel(True)
+    try:
+        for width in range(1, mk.MAX_QUERY_WIDTH + 1):
+            decision = mk.admit_megakernel_decode(width=width, **kw)
+            assert decision.reason != f"query width {width}", width
+        over = mk.MAX_QUERY_WIDTH + 1
+        assert mk.admit_megakernel_decode(width=over, **kw).reason == (
+            f"query width {over}")
+        # A width-1 speculative step is a DRAFTER and still has no restore
+        # point; a wider slab is the verify half and carries its own.
+        assert mk.admit_megakernel_decode(
+            width=1, **{**kw, "speculating": True}).reason == (
+                "speculative rollback")
+        assert mk.admit_megakernel_decode(
+            width=3, **{**kw, "speculating": True}).reason != (
+                "speculative rollback")
+    finally:
+        mk.set_qwen4_megakernel(False)
+
+
+def test_per_query_control_blocks_do_not_share_a_tail_block():
+    """The tail block ADVANCES mid-slab, and nothing else in `actl` may hide it.
+
+    At a slab starting on position 3 with width 3 the queries sit at 3, 4, 5,
+    whose tails are blocks 0, 1, 1 -- and query 0 is the one that CLOSES block
+    0, so its `pool_new_block` differs from its neighbours' too.  A control
+    block that carried one tail for the slab would leave the newest positions
+    of two queries in no scored block at all, which is exactly the defect the
+    2026-09-03 perplexity gate caught at M=1.
+    """
+    header = mk.ACTL_M0
+    stride = mk.ACTL_M_STRIDE
+    for start in range(0, 9):
+        tails, closes, positions = [], [], []
+        for m in range(3):
+            pos = start + m
+            length = pos + 1
+            tails.append(pos // mk.IDX_COMPRESS)
+            closes.append(int(length % mk.IDX_COMPRESS == 0))
+            positions.append(pos)
+        # the layout must give each query room for its own copy
+        assert header + 3 * stride <= mk.ACTL_IDS
+        assert len(set(positions)) == 3
+        if start % mk.IDX_COMPRESS in (2, 3):
+            assert len(set(tails)) == 2, (start, tails)
+        assert sum(closes) in (0, 1), (start, closes)
