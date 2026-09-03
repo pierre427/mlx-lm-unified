@@ -54,6 +54,8 @@ class _EnvMixin:
         "MLX_QWEN4_MEGAKERNEL_TUNE", "MLX_QWEN4_MEGAKERNEL_TUNE_CACHE",
         "MLX_QWEN4_MEGAKERNEL_TUNE_BUDGET_S",
         "MLX_QWEN4_MEGAKERNEL_GPU_CORES",
+        "MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH",
+        "MLX_QWEN4_MEGAKERNEL_TUNE_ADOPT",
     )
 
     def setUp(self):
@@ -463,8 +465,6 @@ class TestCache(_EnvMixin, unittest.TestCase):
         lease = os.path.join(self.dir.name, "gpu.lock")
         os.makedirs(lease)
         os.environ["MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH"] = lease
-        self.ENV = self.ENV + ("MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH",)
-        self._env.setdefault("MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH", None)
         self.assertEqual(MT.gpu_is_busy(), lease)
 
         probe = probe_from()
@@ -495,6 +495,26 @@ class TestCache(_EnvMixin, unittest.TestCase):
         MT.ensure_tuned(probe=probe_from())
         self.assertEqual([c["respect_lease"] for c in calls], [False])
 
+    def test_the_sweep_is_recorded_not_adopted_where_the_rule_answers(self):
+        """The proxy is weaker evidence than the rule it would override.
+
+        Measured twice on this M5 Max: the sweep chose T=512/G=80 while the
+        real per-token mix measures that geometry 13% slower than the shipped
+        T=512/G=40 the rule reproduces.
+        """
+        probe = probe_from()
+        adopt, why = MT._adopt_decision(probe)
+        self.assertFalse(adopt)
+        self.assertIn("recorded, not adopted", why)
+
+        # ...but where the rule has nothing, a measurement beats a constant.
+        adopt, why = MT._adopt_decision(probe_from(gpu_cores=None))
+        self.assertTrue(adopt)
+
+        # ...and an operator can override the whole judgement.
+        os.environ["MLX_QWEN4_MEGAKERNEL_TUNE_ADOPT"] = "1"
+        self.assertTrue(MT._adopt_decision(probe)[0])
+
     def test_an_unknown_tune_mode_is_refused(self):
         os.environ["MLX_QWEN4_MEGAKERNEL_TUNE"] = "sideways"
         with self.assertRaises(ValueError):
@@ -507,6 +527,12 @@ class TestAdmissionIsWired(_EnvMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
         os.environ["MLX_QWEN4_MEGAKERNEL_TUNE"] = "skip"
+        # An empty cache of our own: this machine's real cache may hold a
+        # passing primitive result, and "uncalibrated" is the case under test.
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        os.environ["MLX_QWEN4_MEGAKERNEL_TUNE_CACHE"] = os.path.join(
+            self.dir.name, "tune.json")
         self._enabled = mk._MEGAKERNEL_ENABLED
         mk.set_qwen4_megakernel(True)
         self.addCleanup(mk.set_qwen4_megakernel, self._enabled)

@@ -57,6 +57,7 @@ ENV_CACHE = "MLX_QWEN4_MEGAKERNEL_TUNE_CACHE"
 ENV_MODE = "MLX_QWEN4_MEGAKERNEL_TUNE"
 ENV_BUDGET = "MLX_QWEN4_MEGAKERNEL_TUNE_BUDGET_S"
 ENV_BUSY = "MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH"
+ENV_ADOPT = "MLX_QWEN4_MEGAKERNEL_TUNE_ADOPT"
 # A sweep is a TIMING measurement, and a timing measurement taken while another
 # job owns the GPU is not a measurement of the geometry.  Proven on 2026-09-03:
 # the same machine, the same workload, half an hour apart -- 256x160 while a
@@ -299,11 +300,20 @@ _SWEEP_SRC = r"""
       for (uint h = tg; h < HV; h += ntg) {
         for (uint k = tid; k < SLEN; k += nt) {
           float v = float(qw[h * SLEN + k] & 0xFFFFu) * 1.5258789e-05f;
-          for (uint r = 0u; r < STV; ++r) st[r] = st[r] * 0.999f + v;
+          // COUPLED on purpose.  An update whose every lane sees the same
+          // scalar collapses: `st[r] = st[r]*g + v` is linear with a shared
+          // coefficient, so a compiler reduces 64 registers to one running
+          // sum and the phase stops costing the occupancy it exists to cost.
+          float carry = st[STV - 1u];
+          for (uint r = 0u; r < STV; ++r) {
+            float next = st[r] * 0.999f + v * carry;
+            carry = st[r];
+            st[r] = next;
+          }
         }
       }
       float acc = 0.0f;
-      for (uint r = 0u; r < STV; ++r) acc += st[r];
+      for (uint r = 0u; r < STV; ++r) acc += st[r] * st[r];
       float s = simd_sum(acc);
       if (lane == 0u && tg < RDIM) out[tg] = s;
       if (!gbar(ctr, ab, ntg, tid, phase, CAP)) break;
@@ -605,7 +615,10 @@ def calibrate(*, probe: Optional[MD.DeviceProbe] = None, sweep: bool = True,
 
     result = run_sweep(probe=probe, budget_s=budget_s)
     entry["sweep"] = result
-    if result.get("ok"):
+    adopt, why = _adopt_decision(probe)
+    result["adopted"] = adopt
+    result["adopt_reason"] = why
+    if result.get("ok") and adopt:
         winner = result["winner"]
         entry["threads"] = int(winner["threads"])
         entry["groups"] = int(winner["groups"])
@@ -624,6 +637,36 @@ def calibrate(*, probe: Optional[MD.DeviceProbe] = None, sweep: bool = True,
     if write:
         write_entry(probe.signature, entry, path)
     return entry
+
+
+def _adopt_decision(probe: MD.DeviceProbe) -> tuple[bool, str]:
+    """Whether the sweep's winner may OVERRIDE the probe rule, and why.
+
+    It may not, by default, on a machine where the probe rule has an answer --
+    and this is a measured position, not caution.  On this M5 Max the proxy
+    chose T=512/G=80 twice (0.390 ms with a pure matvec chain, 0.354 with the
+    recurrent phase added, against 0.492 and 0.446 at the shipped T=512/G=40),
+    while the real per-token mix measures G=80 at 11.870 ms against 10.465 --
+    13% SLOWER.  A synthetic chain is strong evidence that the kernel is legal
+    here and weak evidence about which grid a whole token wants; the probe
+    rule carries the real per-token measurement forward and the sweep does
+    not.
+
+    Where the probe rule has NOTHING -- an unreadable core count -- a measured
+    candidate beats a constant from another machine, and the sweep is adopted.
+    ``MLX_QWEN4_MEGAKERNEL_TUNE_ADOPT=1`` adopts it anyway, for bringing up a
+    part where the rule is the thing under suspicion.
+    """
+    from . import qwen4_megakernel_config as MC
+
+    raw = os.environ.get(ENV_ADOPT)
+    if raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}:
+        return True, "MLX_QWEN4_MEGAKERNEL_TUNE_ADOPT=1"
+    threads, groups = MC.derive_geometry(probe)
+    if threads is None or groups is None:
+        return True, "the probe rule has no geometry for this device"
+    return False, ("the probe rule carries a real per-token measurement; the "
+                   "sweep is a synthetic proxy and is recorded, not adopted")
 
 
 def _default_geometry(probe: MD.DeviceProbe) -> tuple[int, int]:

@@ -66,6 +66,12 @@ before the GPU is touched.
 ``MLX_QWEN4_MEGAKERNEL_TUNE_BUSY_PATH``
     A lease path that DEFERS the timing sweep while it exists.  Default is
     the lab GPU lease directory; empty disables the check.
+``MLX_QWEN4_MEGAKERNEL_TUNE_ADOPT``
+    ``1`` lets the sweep's winner OVERRIDE the probe rule.  Off by default:
+    on the one machine where the real per-token answer is known, the proxy
+    chose a grid the real mix measures 13% slower, so the sweep is recorded
+    and the rule stands -- except where the rule has no answer at all (an
+    unreadable core count), where a measured candidate is adopted.
 ``MLX_QWEN4_MEGAKERNEL_REQUIRE_PRIMITIVES``
     ``1`` (default) refuses the kernel on a signature whose grid-barrier and
     device-scope fence tests have not passed here.  ``0`` is an escape hatch
