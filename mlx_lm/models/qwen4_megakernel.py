@@ -578,8 +578,17 @@ def admit_megakernel_decode(
         return MegakernelAdmission(False, "masked decode")
     if dtype is not None and str(dtype).rsplit(".", 1)[-1] != ACTIVATION_DTYPE:
         return MegakernelAdmission(False, f"dtype {dtype}")
-    threads = _THREADS if threads is None else int(threads)
-    groups = _THREADGROUPS if groups is None else int(groups)
+    # Geometry is RESOLVED, not assumed: explicit environment, then a
+    # calibration cached for this device signature, then a rule derived from
+    # what the device reports, then the shipped M5 Max constants.
+    settings = _portable_config()
+    if settings.get("error"):
+        return MegakernelAdmission(False, f"config {settings['error']}")
+    values = settings.get("values", {})
+    threads = (int(values.get("threads", _THREADS)) if threads is None
+               else int(threads))
+    groups = (int(values.get("groups", _THREADGROUPS)) if groups is None
+              else int(groups))
     if threads % 32 or threads <= 0 or threads > 32 * 16:
         return MegakernelAdmission(False, f"threads {threads}")
     if groups < 1:
@@ -587,6 +596,10 @@ def admit_megakernel_decode(
     if GDN_VALUE_DIM % (threads // 32):
         return MegakernelAdmission(
             False, f"geometry {threads}x{groups} splits the GDN value dim")
+    refusal = _portability_refusal(
+        settings, threads=threads, groups=groups, width=width, pack=pack)
+    if refusal is not None:
+        return MegakernelAdmission(False, refusal)
     if layer_types is not None:
         unported = sorted(set(layer_types) - PORTED_LAYER_TYPES)
         if unported:
@@ -719,6 +732,7 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             # version query -- so the architecture family is what can be
             # asserted here and the kernel's own abort flag is the real proof.
             "device": _device_attestation(),
+            "portability": _portable_config(),
             "last_decision": _STATUS_LAST,
         }
         if reset:
@@ -1153,3 +1167,41 @@ inline void select_top_blocks(const device float* scores, uint n, uint k,
 def kernel_header() -> str:
     """The full MSL header: barrier, matvec helpers, top-block selection."""
     return MEGA_BARRIER + MEGA_QMV.replace("BF", "bfloat16_t") + MEGA_TOPB
+
+
+# ----------------------------------------------------------- portability
+# Every geometry constant above is a MEASUREMENT on an M5 Max, and every cap
+# is a budget that was tuned rather than read.  ``qwen4_megakernel_config``
+# resolves the first against the device in front of it and checks the second
+# against the device's own limits; the import is lazy so a CPU-only import of
+# this module still costs no probe and no calibration.
+def _portable_config() -> dict[str, Any]:
+    """Resolved settings, their sources, the probe and the cache state."""
+    try:
+        from . import qwen4_megakernel_config as MC
+
+        return MC.config_receipt()
+    except Exception as exc:  # pragma: no cover - no Metal device
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _portability_refusal(settings: dict, *, threads: int, groups: int,
+                         width: int = 1, pack: Any = None) -> Optional[str]:
+    """The device's own reason to refuse this geometry, or ``None``.
+
+    A machine that cannot hold the model, cannot run the threadgroup, or has
+    never had its grid barrier and device-scope fence proven gets a named
+    decline here -- before the pack, before the launch.
+    """
+    try:
+        from . import qwen4_megakernel_config as MC
+
+        return MC.portability_refusal(
+            threads=threads, groups=groups, width=width, pack=pack,
+            scratch_bytes=SCRATCH_FLOATS * 4 * max(int(width), 1),
+            threadgroup_bytes=settings.get("values", {}).get(
+                "threadgroup_bytes"),
+            primitives=settings.get("primitives"),
+        )
+    except Exception as exc:  # pragma: no cover - no Metal device
+        return f"portability check failed: {type(exc).__name__}"

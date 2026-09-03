@@ -7,12 +7,38 @@ schedule the kernel walks round-trips, and that the in-kernel block selection
 algorithm agrees with the stock ``argpartition`` it replaces.
 """
 
+import os
 import unittest
 
 import mlx.core as mx
 import numpy as np
 
 from mlx_lm.models import qwen4_megakernel as mk
+from mlx_lm.models import qwen4_megakernel_config as MC
+
+# Admission now also asks the DEVICE whether this geometry is legal here, and
+# refuses a signature whose grid-barrier and device-scope fence tests have not
+# passed.  That gate is a device test; these are the CPU-only contract tests,
+# so the calibration is skipped and the gate waived for this module.
+_PORTABILITY_ENV = ("MLX_QWEN4_MEGAKERNEL_TUNE",
+                    "MLX_QWEN4_MEGAKERNEL_REQUIRE_PRIMITIVES")
+_SAVED_ENV: dict = {}
+
+
+def setUpModule():
+    _SAVED_ENV.update({k: os.environ.get(k) for k in _PORTABILITY_ENV})
+    os.environ["MLX_QWEN4_MEGAKERNEL_TUNE"] = "skip"
+    os.environ["MLX_QWEN4_MEGAKERNEL_REQUIRE_PRIMITIVES"] = "0"
+    MC.invalidate()
+
+
+def tearDownModule():
+    for name, value in _SAVED_ENV.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    MC.invalidate()
 
 
 class TestAdmission(unittest.TestCase):
