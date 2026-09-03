@@ -1,0 +1,133 @@
+"""Structure of the per-token schedule, with no checkpoint and no GPU.
+
+What a real token costs in PHASES is the number the megakernel design turns
+on -- the spike priced 150 empty phases at 0.38-0.55 ms against ~13.5 ms of
+dispatch floor -- so it is asserted here rather than discovered on the GPU.
+"""
+
+import unittest
+
+from mlx_lm.models import qwen4_megakernel as mk
+from mlx_lm.models.qwen4_megakernel_pack import decode_path_keys
+from mlx_lm.models.qwen4_megakernel_schedule import (
+    LayerPlan,
+    build_layer_schedule,
+    build_token_schedule,
+)
+
+LAYER_TYPES = [
+    "linear_attention" if (i + 1) % 4 else "full_attention" for i in range(48)
+]
+
+
+class _StubEntry:
+    def __init__(self, index):
+        self.index = index
+
+
+class _StubPack:
+    """Only the index map, which is all the schedule builder reads."""
+
+    def __init__(self, keys):
+        self.entries = {key: _StubEntry(i) for i, key in enumerate(keys)}
+
+
+def _pack():
+    plan = decode_path_keys(
+        num_layers=48, layer_types=LAYER_TYPES, ple_layer_ids=[2],
+        include_mtp=True,
+    )
+    return _StubPack([key for key, _ in plan])
+
+
+class TestSchedule(unittest.TestCase):
+    def test_layer_phase_counts(self):
+        pack = _pack()
+        for index, expected_branch in ((0, "gdn"), (3, "attention")):
+            schedule = mk.Schedule()
+            plan = LayerPlan(
+                index=index,
+                is_linear=LAYER_TYPES[index] == "linear_attention",
+                prefix=f"language_model.model.layers.{index}",
+            )
+            landed = build_layer_schedule(
+                schedule, pack, plan,
+                mk.SCRATCH["RESID_A"], mk.SCRATCH["RESID_B"],
+            )
+            # two hyper blocks of 5, two injects, one branch, one MoE block
+            ops = [step.op for step in schedule.steps]
+            self.assertEqual(ops.count(mk.OP_GROUP_RMSNORM), 2, expected_branch)
+            self.assertEqual(ops.count(mk.OP_HC_MIX), 2, expected_branch)
+            self.assertEqual(ops.count(mk.OP_INJECT), 2, expected_branch)
+            self.assertEqual(ops.count(mk.OP_MOE_TOPK), 1, expected_branch)
+            self.assertEqual(ops.count(mk.OP_MOE_E1), 1, expected_branch)
+            self.assertEqual(ops.count(mk.OP_MOE_E2), 1, expected_branch)
+            if plan.is_linear:
+                self.assertEqual(ops.count(mk.OP_GDN_CORE), 1)
+                self.assertEqual(ops.count(mk.OP_ATTN), 0)
+            else:
+                self.assertEqual(ops.count(mk.OP_ATTN), 1)
+                self.assertEqual(ops.count(mk.OP_INDEX_TOPB), 1)
+            # a layer ends in the slab it did not start in: two injects, so
+            # back where it started
+            self.assertEqual(landed, mk.SCRATCH["RESID_A"])
+
+    def test_residual_slab_ping_pongs(self):
+        """No phase may read and write the same residual address.
+
+        The spike's U2 result is that a REUSED scratch address is what goes
+        stale, and this kernel reuses every address 48 times.
+        """
+        pack = _pack()
+        schedule = mk.Schedule()
+        plan = LayerPlan(index=0, is_linear=True,
+                         prefix="language_model.model.layers.0")
+        build_layer_schedule(schedule, pack, plan,
+                             mk.SCRATCH["RESID_A"], mk.SCRATCH["RESID_B"])
+        for step in schedule.steps:
+            if step.op == mk.OP_INJECT:
+                self.assertNotEqual(step.src, step.dst)
+                self.assertIn(step.src, (mk.SCRATCH["RESID_A"],
+                                         mk.SCRATCH["RESID_B"]))
+                self.assertIn(step.dst, (mk.SCRATCH["RESID_A"],
+                                         mk.SCRATCH["RESID_B"]))
+
+    def test_token_schedule_phase_budget(self):
+        pack = _pack()
+        schedule = build_token_schedule(pack, layer_types=LAYER_TYPES)
+        ops = [step.op for step in schedule.steps]
+        self.assertEqual(ops.count(mk.OP_GDN_CORE), 36)
+        self.assertEqual(ops.count(mk.OP_ATTN), 12)
+        self.assertEqual(ops.count(mk.OP_MOE_E2), 48)
+        self.assertEqual(ops.count(mk.OP_INJECT), 96)
+        # MEASURED 2026-09-03: 1,361 phases, 940 device barriers.  At the
+        # spike's per-barrier cost that is 2.3 ms (2.4 us, synthetic kernel)
+        # to 4.9 ms (5.2 us, the register-heavy GDN kernel), against ~13.5 ms
+        # of per-dispatch floor and 24.5 ms of GPU busy in a token today.
+        #
+        # The spike's "150 phases = 0.4 ms" is NOT the comparison: it covered
+        # one GDN block and one MoE block with no hyper-connection glue, and a
+        # real token runs two GatedResidual blocks per layer -- the part the
+        # bandwidth page priced at 7.8 ms/token of dispatches, and the part a
+        # megakernel should swallow most profitably.  Cutting the count
+        # further is phase FUSION, which is the tuning spec's call; this gate
+        # only stops it growing.
+        self.assertLessEqual(schedule.device_barriers, 1000)
+        self.assertGreater(len(schedule), 500)
+
+    def test_barrier_map_is_data(self):
+        """Adjacent independent projections may skip the grid barrier."""
+        pack = _pack()
+        schedule = mk.Schedule()
+        plan = LayerPlan(index=0, is_linear=True,
+                         prefix="language_model.model.layers.0")
+        build_layer_schedule(schedule, pack, plan,
+                             mk.SCRATCH["RESID_A"], mk.SCRATCH["RESID_B"])
+        kinds = {step.barrier for step in schedule.steps}
+        self.assertIn(mk.BAR_NONE, kinds)
+        self.assertIn(mk.BAR_DEVICE, kinds)
+        self.assertLess(schedule.device_barriers, len(schedule))
+
+
+if __name__ == "__main__":
+    unittest.main()

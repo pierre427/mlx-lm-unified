@@ -163,11 +163,38 @@ class SourceTensor:
     group_size: int = 0
 
 
+# Gains the checkpoint ships ZERO-centred.  ``TextModel.sanitize`` adds 1.0 to
+# each of these on load, so a pack built from the shards that skipped the fold
+# would load cleanly and produce deterministic garbage -- the mlx-vlm
+# #2041/#2045 class.  Kept in step with ``qwen4_exp.TextModel.sanitize``.
+ZERO_CENTRED_SUFFIXES = (
+    ".hc_norm.weight",
+    ".norm_key.weight",
+    ".norm_query.weight",
+    ".norm_conv.weight",
+    ".q_layernorm.weight",
+    ".k_layernorm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+    "hyper_connection_mixer.hc_norm.weight",
+    "pre_fc_norm_embedding.weight",
+    "pre_fc_norm_hidden.weight",
+)
+
+
 class SafetensorsSource:
-    """Reads packable tensors straight out of the shards.
+    """Reads packable tensors straight out of the shards, AS THE MODEL SEES THEM.
 
     Used by the CPU-side contract tests: it never instantiates the model, so a
-    two-layer round trip costs two layers of memory rather than 104 GiB.
+    two-layer round trip costs two layers of memory rather than 104 GiB.  Two
+    load-time transforms are reproduced here, because a pack that skipped them
+    would disagree with the live module and the disagreement is silent:
+
+    * ``sanitize``'s zero-centred gain fold and the conv1d axis move;
+    * ``transform_moe_weights``' gate/up fusion, so ``switch_mlp.gate_up_proj``
+      resolves whether the checkpoint ships it fused or split.  The fused
+      layout is also what the kernel's expert phase wants, so on a live model
+      the pack reads it with no concatenation at all.
     """
 
     def __init__(self, path: str):
@@ -200,10 +227,23 @@ class SafetensorsSource:
     def release(self) -> None:
         self._cache = {}
 
-    def has(self, key: str) -> bool:
+    def _raw_available(self, key: str) -> bool:
         return key in self.weight_map or f"{key}.weight" in self.weight_map
 
-    def fetch(self, key: str) -> dict[str, mx.array]:
+    def _split_pair(self, key: str) -> Optional[tuple[str, str]]:
+        """``...gate_up_proj`` -> the split spelling, when only that exists."""
+        if not key.endswith("gate_up_proj"):
+            return None
+        stem = key[: -len("gate_up_proj")]
+        gate, up = f"{stem}gate_proj", f"{stem}up_proj"
+        if self._raw_available(gate) and self._raw_available(up):
+            return gate, up
+        return None
+
+    def has(self, key: str) -> bool:
+        return self._raw_available(key) or self._split_pair(key) is not None
+
+    def _fetch_raw(self, key: str) -> dict[str, mx.array]:
         if f"{key}.weight" in self.weight_map:
             out = {}
             for part in ("weight", "scales", "biases"):
@@ -213,6 +253,30 @@ class SafetensorsSource:
             return out
         name = key if key in self.weight_map else f"{key}.weight"
         return {"weight": self._shard(self.weight_map[name])[name]}
+
+    def _sanitize(self, key: str, parts: dict[str, mx.array]) -> dict[str, mx.array]:
+        weight = parts["weight"]
+        if "conv1d.weight" in key and weight.ndim == 3 and weight.shape[-1] != 1:
+            parts = dict(parts)
+            parts["weight"] = mx.contiguous(weight.moveaxis(2, 1))
+            return parts
+        if any(key.endswith(suffix) for suffix in ZERO_CENTRED_SUFFIXES):
+            parts = dict(parts)
+            parts["weight"] = weight + 1.0
+        return parts
+
+    def fetch(self, key: str) -> dict[str, mx.array]:
+        pair = None if self._raw_available(key) else self._split_pair(key)
+        if pair is None:
+            return self._sanitize(key, self._fetch_raw(key))
+        # ``transform_moe_weights`` concatenates on axis -2, gate rows first.
+        gate, up = (self._fetch_raw(name) for name in pair)
+        return {
+            part: mx.contiguous(
+                mx.concatenate([gate[part], up[part]], axis=-2)
+            )
+            for part in gate
+        }
 
 
 class ModuleSource:
@@ -268,6 +332,7 @@ def decode_path_keys(
     ple_layer_ids: Iterable[int] = (),
     include_mtp: bool = True,
     include_experts: bool = True,
+    fuse_gate_up: bool = True,
     layers: Optional[Iterable[int]] = None,
 ) -> list[tuple[str, str]]:
     """Every tensor the decode megakernel reads, as ``(key, group_role)``.
@@ -278,6 +343,14 @@ def decode_path_keys(
     """
     wanted = set(range(num_layers)) if layers is None else set(layers)
     ple = set(int(i) - 1 for i in ple_layer_ids)
+    # The live module fuses the routed gate and up projections into one
+    # ``gate_up_proj`` table at load time, and that IS the layout the kernel's
+    # first expert phase wants -- so on a live model the pack reads it with no
+    # concatenation.  The split spelling stays reachable for a raw checkpoint.
+    expert_names = (
+        ("gate_up_proj", "down_proj") if fuse_gate_up
+        else ("gate_proj", "up_proj", "down_proj")
+    )
     out: list[tuple[str, str]] = []
 
     def add(key: str, role: str = "main") -> None:
@@ -323,7 +396,7 @@ def decode_path_keys(
         for name in ("gate_proj", "up_proj", "down_proj"):
             add(f"{base}.mlp.shared_expert.{name}")
         if include_experts:
-            for name in ("gate_proj", "up_proj", "down_proj"):
+            for name in expert_names:
                 add(f"{base}.mlp.switch_mlp.{name}", "experts")
 
     mixer = "language_model.model.hyper_connection_mixer"
@@ -359,7 +432,7 @@ def decode_path_keys(
         for name in ("gate_proj", "up_proj", "down_proj"):
             add(f"{base}.mlp.shared_expert.{name}")
         if include_experts:
-            for name in ("gate_proj", "up_proj", "down_proj"):
+            for name in expert_names:
                 add(f"{base}.mlp.switch_mlp.{name}", "experts")
     return out
 

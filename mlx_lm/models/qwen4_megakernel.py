@@ -196,6 +196,9 @@ _SCRATCH_BLOCKS = (
     ("MOE_TOPW", TOPK),
     ("MOE_ACT", TOPK * FF),
     ("SHARED_ACT", FF),
+    ("SHARED_UP", FF),
+    ("SHARED_OUT", HIDDEN),
+    ("SHARED_GATE", 1),
     ("SCRATCH_TMP", 1024),
 )
 
