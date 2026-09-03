@@ -333,6 +333,38 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _carry_fused_gate_up_overrides(config: dict, weights: dict) -> int:
+    """Map per-path quantization overrides onto fused ``gate_up_proj`` tables.
+
+    ``config["quantization"]`` names ``switch_mlp.gate_proj`` / ``up_proj``.
+    When sanitize fused them into one ``gate_up_proj`` table, the loader's
+    exact-path lookup misses and the fused module gets the default bits, so a
+    mixed-precision checkpoint fails on shape. Carry the ``gate_proj`` entry
+    over and refuse a gate/up pair that disagrees. Returns entries added.
+    """
+    quant = config.get("quantization")
+    if not isinstance(quant, dict):
+        return 0
+    added = 0
+    for key, spec in list(quant.items()):
+        if not (isinstance(spec, dict) and key.endswith(".switch_mlp.gate_proj")):
+            continue
+        prefix = key[: -len("gate_proj")]
+        fused_key = f"{prefix}gate_up_proj"
+        if f"{fused_key}.weight" not in weights or fused_key in quant:
+            continue
+        up_spec = quant.get(f"{prefix}up_proj")
+        if up_spec is not None and up_spec != spec:
+            raise ValueError(
+                f"{prefix}gate_proj and up_proj have different quantization "
+                f"({spec} vs {up_spec}); they cannot share one fused table. "
+                "Set MLX_QWEN4_MOE_FUSED_GATE_UP=0 to load them separately."
+            )
+        quant[fused_key] = spec
+        added += 1
+    return added
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -426,6 +458,7 @@ def load_model(
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
+        _carry_fused_gate_up_overrides(config, weights)
 
     # Opt-in NVMe-backed PLE tables for Qwen4-Exp: verify the sidecar was
     # built from this artifact, then swap the resident ShardedEmbedding for
