@@ -172,9 +172,11 @@ class MegakernelDecoder:
         validate: bool = False,
         include_experts: bool = True,
         include_mtp: bool = False,
+        include_lm_head: bool = True,
         max_group_bytes: int = 8 << 30,
         contiguous_source_sb: bool = True,
     ):
+        self.include_lm_head = bool(include_lm_head)
         self.args = args
         self.model = model
         self.layer_types = list(args.layer_types)
@@ -216,7 +218,8 @@ class MegakernelDecoder:
             self.restored_sb = self.restore_source_contiguity()
         self.schedule = MS.build_token_schedule(
             self.pack, layer_types=self.layer_types, layers=self.layers,
-            ple_layer_ids=self.ple_layer_ids, include_lm_head=True)
+            ple_layer_ids=self.ple_layer_ids,
+            include_lm_head=self.include_lm_head)
         self.op_counts = _op_histogram(self.schedule)
         body_cls = DualWidthMegakernelBody if DUAL_WIDTH else MegakernelBody
         self.body = body_cls(
