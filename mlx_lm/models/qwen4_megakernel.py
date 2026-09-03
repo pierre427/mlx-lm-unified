@@ -339,9 +339,11 @@ class Schedule:
 
     def __init__(self) -> None:
         self.steps: list[Step] = []
+        self._array_cache: Optional[mx.array] = None
 
     def add(self, step: Step) -> int:
         self.steps.append(step)
+        self._array_cache = None
         return len(self.steps) - 1
 
     def __len__(self) -> int:
@@ -352,9 +354,18 @@ class Schedule:
         return sum(1 for step in self.steps if step.barrier == BAR_DEVICE)
 
     def to_array(self) -> mx.array:
-        return mx.array(
-            [value for step in self.steps for value in step.row()], mx.uint32
-        )
+        # Memoized: a schedule is built once and then read by every
+        # MegakernelBody constructed from it (dual-width builds two).
+        # `pack.table`/`pack.buffers` are already shared by attribute
+        # reference; without caching here, `self.sched` would be a FRESH
+        # array per body and the "one pack, one schedule" sharing contract
+        # `DualWidthMegakernelBody._ensure_wide` asserts on would be false
+        # by construction, not by a real copy.
+        if self._array_cache is None:
+            self._array_cache = mx.array(
+                [value for step in self.steps for value in step.row()],
+                mx.uint32)
+        return self._array_cache
 
 
 # ------------------------------------------------------------- scratch layout
