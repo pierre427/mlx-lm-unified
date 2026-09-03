@@ -222,20 +222,33 @@ class TestGridCoverage(unittest.TestCase):
         self.assertEqual(mk.guarded_coverage(48, 40), set(range(40)))
         self.assertNotEqual(mk.guarded_coverage(48, 40), set(range(48)))
 
-    def test_shipped_grid_covers_everything_either_way(self):
-        # the shipped G=80 hides the bug, which is why the strided form has to
-        # be a rule rather than a measurement
+    def test_shipped_grid_is_inside_the_trap(self):
+        # Phase B moved the shipped geometry to T=512/G=40 on a measurement,
+        # and G=40 is BELOW the 48 GDN value heads.  So the guarded form is no
+        # longer merely theoretically wrong -- at the geometry we actually
+        # ship it drops 8 of 48 heads.  The strided form is load-bearing.
+        self.assertLess(mk._THREADGROUPS, mk.PHASE_WORK["gdn_core"])
+        self.assertEqual(mk.uncovered_work(), {"gdn_core": 8})
+        for name, work in mk.PHASE_WORK.items():
+            self.assertEqual(
+                mk.strided_coverage(work, mk._THREADGROUPS),
+                set(range(work)),
+                f"{name} incomplete at the shipped G={mk._THREADGROUPS}",
+            )
+
+    def test_a_wider_grid_would_have_hidden_it(self):
+        # kept as the contrast: the spec's old G=80 covers everything either
+        # way, which is why "it timed fine" was never evidence of correctness.
         self.assertEqual(mk.uncovered_work(groups=80), {})
-        self.assertEqual(mk.uncovered_work(), {})
 
 
 class TestSpecAdoption(unittest.TestCase):
     """Numbers taken from results/qwen4-megakernel-build-spec-20260903.md."""
 
     def test_geometry(self):
-        self.assertEqual(mk._THREADS, 256)
-        self.assertEqual(mk._THREADGROUPS, 80)
-        # 40 GPU cores x 2 threadgroups x 256 threads = 512 threads/core
+        self.assertEqual(mk._THREADS, 512)
+        self.assertEqual(mk._THREADGROUPS, 40)
+        # 40 GPU cores x 1 threadgroup x 512 threads = 512 threads/core
         self.assertEqual(mk._THREADGROUPS * mk._THREADS // 40, 512)
 
     def test_phase_rows(self):

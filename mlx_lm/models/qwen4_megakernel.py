@@ -242,17 +242,49 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 
 
 _MEGAKERNEL_ENABLED = _env_flag("MLX_QWEN4_MEGAKERNEL")
-# Geometry, ADOPTED from the tuning spec
-# (results/qwen4-megakernel-build-spec-20260903.md Sec. 1-2, tuning commit
-# 69d7fd5a): T=256, G=80.  That is 512 threads per core on 40 cores, and the
-# spec's own (T, G) sweep makes 512 threads/core the optimum by every route --
-# T=256/G=80 is 3.82 ms, the minimum of the whole table, against 3.86 for
-# T=512/G=40 (the other route to 512/core), 4.73 for T=256/G=40 and 4.64 for
-# T=512/G=80.  Barrier cost tracks G, not T: 1.2 / 2.1 / 4.0 us at G = 40 /
-# 80 / 160.  A wider grid does not help a phase with less work than
-# threadgroups -- an idle threadgroup still pays the barrier.
-_THREADGROUPS = _env_int("MLX_QWEN4_MEGAKERNEL_GROUPS", 80, minimum=1)
-_THREADS = _env_int("MLX_QWEN4_MEGAKERNEL_THREADS", 256, minimum=32)
+# Geometry: T=512, G=40 -- RE-MEASURED in phase B, superseding the spec's
+# T=256/G=80 (results/qwen4-megakernel-geometry-20260903.py / .json).
+#
+# The spec tuned the GDN+MoE chain alone and read T=256/G=80 as the optimum.
+# The hyper-connection phase, prototyped after the spec, wants T=512 and is 20%
+# slower at T=256, so one persistent dispatch -- Metal fixes the threadgroup
+# size for the whole dispatch -- had a real conflict to price.  Pricing it on
+# the per-token mix (36 GDN + 48 MoE x 1.09 + 96 hyper + a geometry-blind
+# attention constant), with both workloads timed in the same window and the
+# geometry alternated inside the repeat loop:
+#
+#   T=512 G= 40  (512 thr/core)  10.465 ms/token   <-- adopted
+#   T=256 G= 80  (512 thr/core)  10.987          1.050x
+#   T=512 G= 80  (1024)          11.870          1.134x
+#   T=256 G=160  (1024)          12.399          1.185x
+#   T=256 G= 40  (256)           12.581          1.202x
+#   T=512 G=160  (2048)          15.830          1.513x
+#
+# The conflict dissolves rather than being split: BOTH workloads want 512
+# threads per core and disagreed only on the route to it.  Taking that 512 as
+# T=512/G=40 instead of T=256/G=80 gives the hyper phase its wider threadgroup
+# (2.405 ms vs 2.752 for 96 mixers, -12.6%) and costs the chain nothing --
+# 3.963 ms vs 4.050 at K=24, i.e. the chain is 2% FASTER, not hurt.  Per block:
+# GDN 62.1 us (best anywhere is 60.1 at T=512/G=80, so +3.3%), MoE 90.6 us
+# (the best of the whole table), hyper +8.3% off its own optimum -- and that
+# residual is a G difference, which is equally fixed per dispatch, so no
+# per-phase escape exists for it either.
+#
+# Per-phase threads is NOT available as a lever: Metal fixes the threadgroup
+# size per dispatch, so the only in-dispatch alternative is to let a phase use
+# part of its threads and idle the rest.  Measured lower bound on that: the
+# T=256/G=40 row is exactly the same active work as a half-idle T=512/G=40
+# phase but WITHOUT the idle lanes' register cost, and it is 22.6% worse on the
+# chain (4.859 vs 3.963) and 24.2% worse on hyper (2.988 vs 2.405).  A real
+# half-idle phase can only be worse than that.  So: never idle lanes.
+#
+# G=40 is BELOW the 48 GDN value heads.  That is the spike's silent-wrong-answer
+# trap (`if (tg < HV)` drops heads 40-47), and the shipped geometry now sits in
+# it, so the strided form `for (i = grow; i < work; i += nrow)` is load-bearing
+# in production and not merely hygiene.  See test_qwen4_megakernel.py's
+# coverage tests, which assert it at G = 1..320 for every phase.
+_THREADGROUPS = _env_int("MLX_QWEN4_MEGAKERNEL_GROUPS", 40, minimum=1)
+_THREADS = _env_int("MLX_QWEN4_MEGAKERNEL_THREADS", 512, minimum=32)
 # Rows per simdgroup, per phase, from the spec's Sec. 1 table.  These are the
 # tuned values, not guesses: 8 rows on the GDN input projection measured 217
 # GB/s against 340 at 2 rows -- register spill, not load count -- and DEPTH
