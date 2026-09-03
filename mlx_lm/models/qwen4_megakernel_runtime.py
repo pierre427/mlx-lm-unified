@@ -33,6 +33,7 @@ what makes a mixed run -- stock prefill, megakernel decode -- possible.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -40,7 +41,15 @@ import numpy as np
 
 from . import qwen4_megakernel_pack as MP
 from . import qwen4_megakernel_schedule as MS
-from .qwen4_megakernel_body import MegakernelBody, OUT_NAMES
+from .qwen4_megakernel_body import DualWidthMegakernelBody, MegakernelBody, OUT_NAMES
+
+# Phase G: both a plain-decode-only build (one MegakernelBody, MAX_QUERY_WIDTH
+# planes reserved but never touched at width 1) and a dual-width build (a
+# narrow pipeline built eagerly plus a wide one built lazily on first verify
+# call) stay reachable from the same MegakernelDecoder.  Default OFF, same
+# posture as MLX_QWEN4_MEGAKERNEL itself -- opting a served profile in is a
+# separate decision from having the code exist.
+DUAL_WIDTH = bool(int(os.environ.get("MLX_QWEN4_MEGAKERNEL_DUAL_WIDTH") or 0))
 from .qwen4_megakernel import (
     ACTL,
     ACTL_HEADER,
@@ -209,9 +218,11 @@ class MegakernelDecoder:
             self.pack, layer_types=self.layer_types, layers=self.layers,
             ple_layer_ids=self.ple_layer_ids, include_lm_head=True)
         self.op_counts = _op_histogram(self.schedule)
-        self.body = MegakernelBody(
+        body_cls = DualWidthMegakernelBody if DUAL_WIDTH else MegakernelBody
+        self.body = body_cls(
             self.pack, self.schedule, gdn_layers=max(len(self.gdn_layers), 1),
             vocab=VOCAB, threads=threads, groups=groups)
+        self.dual_width = DUAL_WIDTH
         self._allocate()
         self.position = 0
         self._pending = None
@@ -400,7 +411,8 @@ class MegakernelDecoder:
                 engaged=True, reason="engaged", phases=len(self.schedule),
                 op_counts=self.op_counts, position=position, width=width,
                 context=position + width,
-                device_barriers=self.device_barriers)
+                device_barriers=self.device_barriers,
+                variant=getattr(self.body, "last_variant", "single"))
         return logits
 
     def step(self, embedding: mx.array, *, ple_embedding=None,
@@ -436,7 +448,8 @@ class MegakernelDecoder:
             record_megakernel_receipt(
                 engaged=True, reason="engaged", phases=len(self.schedule),
                 op_counts=self.op_counts, position=position, width=1,
-                context=position + 1, device_barriers=self.device_barriers)
+                context=position + 1, device_barriers=self.device_barriers,
+                variant=getattr(self.body, "last_variant", "single"))
         return logits
 
     def commit(self) -> None:
@@ -491,6 +504,9 @@ class MegakernelDecoder:
             "threadgroups": self.body.groups,
             "kv_columns": self.total,
             "pack": self.pack.summary(),
+            "dual_width": self.dual_width,
+            "dual_width_receipt": (self.body.receipt() if self.dual_width
+                                   else None),
         }
 
 

@@ -34,6 +34,7 @@ which is the arithmetic the stock module actually runs.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -93,31 +94,50 @@ from .qwen4_megakernel_pack import TABLE_STRIDE
 MAX_SIMDGROUPS = 16              # NT = 512 is the widest geometry we build
 RMAX = 4                         # rows per simdgroup the dispatcher offers
 
-_TG_BLOCKS = (
-    ("TGX", HIDDEN),             # staged source vector for a HIDDEN-wide matvec
-    ("TLOG", NUM_EXPERTS),       # router logits, so top-k is threadgroup-local
-    ("SQ", GDN_KEY_DIM),
-    ("SK", GDN_KEY_DIM),
-    ("SV", GDN_VALUE_DIM),
-    ("SY", GDN_VALUE_DIM),
-    ("TLR", HC_LOWRANK),         # hyper low-rank vector, re-read HIDDEN times
-    ("RED", MAX_SIMDGROUPS),     # cross-simdgroup reduction slots
-    ("PART", RMAX * MAX_SIMDGROUPS),   # split-K partials
-    ("GSC", HC_COUNT),           # the four GroupRMSNorm scales
-    ("SHR", 8),                  # GDN core's shared scalars
-    ("TOPW", MAX_QUERY_WIDTH * TOPK),   # per-query routing weights
-)
+def _tg_blocks(max_query_width: int):
+    return (
+        ("TGX", HIDDEN),          # staged source vector for a HIDDEN-wide matvec
+        ("TLOG", NUM_EXPERTS),    # router logits, so top-k is threadgroup-local
+        ("SQ", GDN_KEY_DIM),
+        ("SK", GDN_KEY_DIM),
+        ("SV", GDN_VALUE_DIM),
+        ("SY", GDN_VALUE_DIM),
+        ("TLR", HC_LOWRANK),      # hyper low-rank vector, re-read HIDDEN times
+        ("RED", MAX_SIMDGROUPS),  # cross-simdgroup reduction slots
+        ("PART", RMAX * MAX_SIMDGROUPS),   # split-K partials
+        ("GSC", HC_COUNT),        # the four GroupRMSNorm scales
+        ("SHR", 8),                # GDN core's shared scalars
+        ("TOPW", max_query_width * TOPK),   # per-query routing weights
+    )
 
-TG: dict[str, int] = {}
-_off = 0
-for _name, _size in _TG_BLOCKS:
-    TG[_name] = _off
-    _off += _size
-TG_FLOATS = _off
-del _off, _name, _size
 
-# + the top-k expert ids, which are uint and live in their own array
-THREADGROUP_BYTES = TG_FLOATS * 4 + MAX_QUERY_WIDTH * TOPK * 4
+def compute_tg_layout(max_query_width: int):
+    """The threadgroup arena, sized for one build's query width.
+
+    Every named block except ``TOPW`` is width-invariant, so the two builds a
+    dual-width process holds share the same offsets for everything up to
+    ``TOPW`` and differ only in the arena's tail and total size -- which is
+    exactly what lets the narrow build's threadgroup footprint shrink instead
+    of carrying the wide build's ``TOPW``/``topi`` allocation on every decode
+    token.  Returns ``(tg_dict, tg_floats, threadgroup_bytes)``.
+    """
+    tg: dict[str, int] = {}
+    off = 0
+    for name, size in _tg_blocks(max_query_width):
+        tg[name] = off
+        off += size
+    tg_floats = off
+    # + the top-k expert ids, which are uint and live in their own array
+    threadgroup_bytes = tg_floats * 4 + max_query_width * TOPK * 4
+    return tg, tg_floats, threadgroup_bytes
+
+
+# Module-level layout, at the process ceiling (``MAX_QUERY_WIDTH``).  Kept for
+# every caller that references ``TG``/``TG_FLOATS``/``THREADGROUP_BYTES``
+# directly -- a single-width build (the common case) never calls
+# ``compute_tg_layout`` itself.  A dual-width build computes its own narrow
+# layout separately; see ``build_body_kernel``.
+TG, TG_FLOATS, THREADGROUP_BYTES = compute_tg_layout(MAX_QUERY_WIDTH)
 
 
 # ---------------------------------------------------------------- MSL: helpers
@@ -382,7 +402,23 @@ BODY_SRC = r"""
   // in M scratch planes SCSTRIDE floats apart and whose per-query control --
   // position, block count, and above all the incomplete TAIL block, which
   // ADVANCES mid-slab -- lives in the per-query blocks at ACTLM0.
+  //
+  // A MAXMW=1 build never receives mwidth > 1 (the host asserts it), so the
+  // actl[23] read is provably 1 every launch -- but the compiler cannot see
+  // through a device-memory load, and every mq-loop, mc offset and MW==1u/
+  // MW==2u/else dispatch chain below stays generic runtime logic on top of a
+  // narrowed register footprint.  #if turns MW into an actual compile-time
+  // constant on the narrow build (the preprocessor drops the actl[23] read
+  // entirely, before the compiler ever sees it), which is what lets every
+  // site below fold: the mq-loops collapse to their mq=0 iteration, ACTLM0 +
+  // 0*ACTLMS becomes the same address the header already read, and the
+  // MW==2u/else specializations are dead code.  A MAXMW=3 build is untouched
+  // -- MW is still the runtime read, same as before this change.
+#if MAXMW == 1
+  const uint MW = 1u;
+#else
   const uint MW = actl[23] == 0u ? 1u : actl[23];
+#endif
   // Host inputs per repetition.  The first HCH floats are the residual
   // streams; a surplus is the MTP head's embedding, which its `fuse` reads
   // from SC_BRANCH.  Anything the schedule reads must be WRITTEN here --
@@ -1741,10 +1777,27 @@ _KERNEL_CACHE: dict[Any, Any] = {}
 
 
 def build_body_kernel(*, threads: int = None, rdown: int = 4,
-                      rgu: int = 2, rdn: int = 2, spin_cap: int = None):
-    """Compile the schedule-walking kernel.  One binary for every schedule."""
+                      rgu: int = 2, rdn: int = 2, spin_cap: int = None,
+                      max_query_width: int = None):
+    """Compile the schedule-walking kernel.  One binary for every schedule.
+
+    ``max_query_width`` is the REGISTER-FOOTPRINT ceiling this one binary is
+    built for -- it controls ``MAXMW`` (register-array sizing, the
+    threadgroup arena's ``TOPW`` block, and the ``#if MAXMW == 1`` compile-out
+    in the body source) and nothing else.  It is deliberately independent of
+    ``ACTLIDS``/``ACTLM0``/``ACTLMS``, which stay pinned to the PROCESS
+    ceiling (``MAX_QUERY_WIDTH``) regardless -- those three constants are the
+    ``actl`` control buffer's layout, shared with the weight pack and the
+    scratch offset table (``SCRATCH``, width-invariant already) as the ONE
+    addressing scheme every build agrees on.  A dual-width process therefore
+    calls this twice, at ``max_query_width=1`` and ``max_query_width=3``, and
+    gets two compiled pipelines that read the SAME ``actl``/scratch layout but
+    carry different register/threadgroup footprints -- not two processes with
+    two incompatible layouts.
+    """
     threads = _THREADS if threads is None else threads
     spin_cap = _SPIN_CAP if spin_cap is None else spin_cap
+    mqw = MAX_QUERY_WIDTH if max_query_width is None else int(max_query_width)
     nsg = threads // 32
     if threads % 32 or nsg > MAX_SIMDGROUPS:
         raise ValueError(f"threads={threads} must be a multiple of 32, <= 512")
@@ -1756,15 +1809,35 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
     # maximum.  A maximum above 3 would leave width 3 falling into the
     # MAXMW branch, instantiating a body that reads a source plane the slab
     # does not have -- silently.  Fail closed rather than generate that.
-    if MAX_QUERY_WIDTH > 3:
+    if mqw > 3 or mqw < 1:
         raise ValueError(
-            f"MAX_QUERY_WIDTH={MAX_QUERY_WIDTH}: the kernel's per-width "
-            "dispatch chains cover 1, 2 and the maximum, so a wider build "
-            "needs the chains generated, not extended by hand"
+            f"max_query_width={mqw}: the kernel's per-width dispatch chains "
+            "cover 1, 2 and the maximum, so a build outside 1..3 needs the "
+            "chains generated, not extended by hand"
         )
-    key = (threads, rdown, rgu, rdn, spin_cap)
+    if mqw > MAX_QUERY_WIDTH:
+        raise ValueError(
+            f"max_query_width={mqw} exceeds the process ceiling "
+            f"MAX_QUERY_WIDTH={MAX_QUERY_WIDTH} that ACTLIDS/scratch are "
+            "sized against -- raise MLX_QWEN4_MEGAKERNEL_MAX_WIDTH instead "
+            "of building past it"
+        )
+    key = (threads, rdown, rgu, rdn, spin_cap, mqw)
     if key in _KERNEL_CACHE:
         return _KERNEL_CACHE[key]
+
+    tg, tg_floats, tg_bytes = compute_tg_layout(mqw)
+    need = 256 + 2 * threads + 2
+    if need > tg["TLOG"]:
+        raise ValueError(
+            f"top-block selector needs {need} threadgroup words but only "
+            f"{tg['TLOG']} are aliasable over TGX"
+        )
+    if tg_bytes > 16 * 1024:
+        raise ValueError(
+            f"threadgroup arena {tg_bytes} B over the 16 KiB cap at "
+            f"max_query_width={mqw}"
+        )
 
     subs = {
         "NT": threads, "NSGC": nsg, "SPINCAP": spin_cap,
@@ -1778,19 +1851,20 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         "IDXH": IDX_HEADS, "IDXD": IDX_HEAD_DIM,
         "INVIDXD": f"{IDX_HEAD_DIM ** -0.5:.17g}f",
         "ROTD": ROTARY_DIM, "ACTLH": ACTL_HEADER,
+        # Pinned to the PROCESS ceiling -- see the docstring.  NOT ``mqw``.
         "ACTLIDS": ACTL_IDS, "ACTLM0": ACTL_M0, "ACTLMS": ACTL_M_STRIDE,
         "BTK": BLOCK_TOPK,
-        "SCSTRIDE": SCRATCH_STRIDE, "MAXMW": MAX_QUERY_WIDTH,
+        "SCSTRIDE": SCRATCH_STRIDE, "MAXMW": mqw,
         "PERQMASK": "29159800u",
         "PLEK": PLE_CONV_KERNEL, "PLEN": PLE_NGRAM, "PLES": PLE_STATE_LEN,
         "PLEQS": f"{HIDDEN ** -0.5:.17g}f",
         "RDOWN": rdown, "RGU": rgu, "RDN": rdn, "RMAXN": RMAX,
-        "TGF": TG_FLOATS,
+        "TGF": tg_floats,
         "QSCALE": f"{GDN_KEY_DIM ** -0.5:.17g}f",
         "NEPS": f"{RMS_EPS:.17g}f",
         "BFT": "bfloat16_t",
     }
-    for name, off in TG.items():
+    for name, off in tg.items():
         subs[f"TG_{name}"] = off
     for name, off in SCRATCH.items():
         subs[f"SC_{name}"] = off
@@ -1803,7 +1877,7 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         src = pattern.sub(str(subs[name]), src)
         hdr = pattern.sub(str(subs[name]), hdr)
     kernel = mx.fast.metal_kernel(
-        name=f"qwen4_mega_t{threads}_d{rdown}_g{rgu}_n{rdn}",
+        name=f"qwen4_mega_t{threads}_d{rdown}_g{rgu}_n{rdn}_w{mqw}",
         input_names=IN_NAMES, output_names=OUT_NAMES,
         source=src, header=hdr,
     )
@@ -1815,16 +1889,21 @@ class MegakernelBody:
     """Launches the persistent kernel over a packed model and a schedule."""
 
     def __init__(self, pack, schedule, *, gdn_layers: int, vocab: int = 1,
-                 threads: int = None, groups: int = None, **kw):
+                 threads: int = None, groups: int = None,
+                 max_query_width: int = None, **kw):
+        self.max_query_width = (MAX_QUERY_WIDTH if max_query_width is None
+                                else int(max_query_width))
+        tg, _, tg_bytes = compute_tg_layout(self.max_query_width)
         need = (256 + 2 * (_THREADS if threads is None else threads) + 2)
-        if need > TG["TLOG"]:
+        if need > tg["TLOG"]:
             raise ValueError(
                 f"top-block selector needs {need} threadgroup words but only "
-                f"{TG['TLOG']} are aliasable over TGX"
+                f"{tg['TLOG']} are aliasable over TGX"
             )
-        if THREADGROUP_BYTES > 16 * 1024:
+        if tg_bytes > 16 * 1024:
             raise ValueError(
-                f"threadgroup arena {THREADGROUP_BYTES} B over the 16 KiB cap"
+                f"threadgroup arena {tg_bytes} B over the 16 KiB cap at "
+                f"max_query_width={self.max_query_width}"
             )
         if len(pack.buffers) > MAX_GROUPS:
             raise ValueError(
@@ -1837,7 +1916,8 @@ class MegakernelBody:
         self.vocab = max(int(vocab), 1)
         self.threads = _THREADS if threads is None else threads
         self.groups = _THREADGROUPS if groups is None else groups
-        self.kernel = build_body_kernel(threads=self.threads, **kw)
+        self.kernel = build_body_kernel(
+            threads=self.threads, max_query_width=self.max_query_width, **kw)
         pad = mx.zeros((16,), mx.uint32)
         self.wbufs = list(pack.buffers) + [pad] * (MAX_GROUPS - len(pack.buffers))
         self.table = pack.table
@@ -1872,9 +1952,10 @@ class MegakernelBody:
         nsteps = len(self.schedule) if steps is None else int(steps)
         width = int(xin.shape[-1])
         mwidth = max(int(mwidth), 1)
-        if mwidth > MAX_QUERY_WIDTH:
+        if mwidth > self.max_query_width:
             raise ValueError(
-                f"query width {mwidth} over the built maximum {MAX_QUERY_WIDTH}"
+                f"query width {mwidth} over the built maximum "
+                f"{self.max_query_width}"
             )
         if kv is None:
             if kbuf is None:
@@ -1926,3 +2007,131 @@ class MegakernelBody:
         bars = sum(1 for st in self.schedule.steps[:nsteps] if st.barrier == 2)
         self.phase += reps * (bars + 2)
         return outs
+
+
+class DualWidthMegakernelBody:
+    """Two compiled pipelines, one pack, one call surface.
+
+    Phase F's knob (``MLX_QWEN4_MEGAKERNEL_MAX_WIDTH``) picks ONE
+    ``MAX_QUERY_WIDTH`` at import and the process is stuck with it -- a
+    draft-narrow/verify-wide k=2 round needs both in the SAME process, one
+    dispatched per call by the caller's actual query width.  This class is
+    that dispatch.
+
+    **What is genuinely shared, not duplicated.**  Both ``MegakernelBody``
+    instances are constructed from the SAME ``pack``/``schedule`` objects, so
+    ``list(pack.buffers)`` in each instance's ``__init__`` copies the PYTHON
+    list, never the underlying ~70 GiB of GPU buffers -- ``narrow.wbufs[i] is
+    wide.wbufs[i]`` for every packed group, asserted below rather than
+    assumed.  ``ACTLIDS``/``ACTLM0``/``ACTLMS`` and the ``SCRATCH`` offset
+    table are pinned to the process ceiling for both builds (see
+    ``build_body_kernel``'s docstring), so the ``actl``/scratch layout is the
+    ONE addressing scheme both pipelines read -- a narrow call never differs
+    from a wide call in anything but which planes it touches.  The scratch
+    buffer itself is not a hand-managed persistent allocation: it is an MLX
+    kernel OUTPUT, freshly sized to ``scratch_floats(mwidth)`` every launch,
+    exactly as a single-width build already does -- dual-width adds no new
+    scratch duplication risk, because there was never a persistent scratch
+    buffer to duplicate.  What dual-width DOES duplicate, deliberately, is
+    the threadgroup arena and the register file: two different compiled
+    pipelines, which is the entire point.
+
+    **Lazy wide build.**  The narrow (``max_query_width=1``) body is built
+    eagerly in ``__init__`` -- plain decode needs it on the first call.  The
+    wide (``max_query_width=MAX_QUERY_WIDTH``) body is built on first use at
+    ``mwidth > 1``, so a plain-decode deployment that never verifies never
+    pays its compile time or its larger threadgroup/register footprint.
+
+    **One barrier generation, shared.**  ``ctrl``'s atomic counters and the
+    ``phase`` value that seeds them are a running sequence across a decode
+    session; a draft dispatch and the verify dispatch that follows it must
+    agree on that sequence regardless of which pipeline ran.  This class owns
+    ``ctrl``/``phase`` itself and stamps them onto whichever sub-body is about
+    to launch, then reads the advanced ``phase`` back -- the two
+    ``MegakernelBody`` instances never disagree about how many barriers have
+    already happened.
+    """
+
+    def __init__(self, pack, schedule, *, gdn_layers: int, vocab: int = 1,
+                 threads: int = None, groups: int = None,
+                 narrow_width: int = 1, wide_width: int = None, **kw):
+        self.pack = pack
+        self.schedule = schedule
+        self.wide_width = MAX_QUERY_WIDTH if wide_width is None else int(wide_width)
+        self.narrow_width = int(narrow_width)
+        if self.narrow_width >= self.wide_width:
+            raise ValueError(
+                f"narrow_width={self.narrow_width} must be < "
+                f"wide_width={self.wide_width}"
+            )
+        self._kw = dict(gdn_layers=gdn_layers, vocab=vocab, threads=threads,
+                        groups=groups, **kw)
+        self.narrow = MegakernelBody(
+            pack, schedule, max_query_width=self.narrow_width, **self._kw)
+        self._wide: Optional[MegakernelBody] = None
+        self.threads = self.narrow.threads
+        self.groups = self.narrow.groups
+        self.wide_build_seconds: Optional[float] = None
+        self.calls_narrow = 0
+        self.calls_wide = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.ctrl = mx.zeros((64,), mx.uint32)
+        mx.eval(self.ctrl)
+        self.phase = 0
+        self.narrow.ctrl = self.ctrl
+        self.narrow.phase = 0
+        if self._wide is not None:
+            self._wide.ctrl = self.ctrl
+            self._wide.phase = 0
+
+    def _ensure_wide(self) -> MegakernelBody:
+        if self._wide is None:
+            t0 = time.perf_counter()
+            wide = MegakernelBody(
+                self.pack, self.schedule, max_query_width=self.wide_width,
+                **self._kw)
+            mx.eval(wide.wbufs, wide.table, wide.sched)
+            self.wide_build_seconds = time.perf_counter() - t0
+            # Weight-pack sharing is a claim about object identity, not a
+            # hope -- assert it rather than infer it from a passing gate.
+            for a, b in zip(self.narrow.wbufs, wide.wbufs):
+                if a is not b and not (a.size <= 16 and b.size <= 16):
+                    raise AssertionError(
+                        "wide body's weight buffers are not the SAME arrays "
+                        "as the narrow body's -- the pack was copied"
+                    )
+            assert self.narrow.table is wide.table, "offset table copied"
+            assert self.narrow.sched is wide.sched, "schedule buffer copied"
+            wide.ctrl = self.ctrl
+            wide.phase = self.phase
+            self._wide = wide
+        return self._wide
+
+    def __call__(self, *args, mwidth: int = 1, **kwargs):
+        mwidth = max(int(mwidth), 1)
+        if mwidth <= self.narrow_width:
+            body, self.calls_narrow = self.narrow, self.calls_narrow + 1
+            variant = "narrow"
+        else:
+            body = self._ensure_wide()
+            self.calls_wide += 1
+            variant = "wide"
+        body.ctrl = self.ctrl
+        body.phase = self.phase
+        outs = body(*args, mwidth=mwidth, **kwargs)
+        self.phase = body.phase
+        self.last_variant = variant
+        return outs
+
+    def receipt(self) -> dict:
+        return {
+            "narrow_width": self.narrow_width,
+            "wide_width": self.wide_width,
+            "wide_built": self._wide is not None,
+            "wide_build_seconds": self.wide_build_seconds,
+            "calls_narrow": self.calls_narrow,
+            "calls_wide": self.calls_wide,
+            "last_variant": getattr(self, "last_variant", None),
+        }
