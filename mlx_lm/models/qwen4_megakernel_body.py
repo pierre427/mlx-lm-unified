@@ -259,10 +259,12 @@ BODY_SRC = r"""
   device atomic_uint* ctr =
       reinterpret_cast<device atomic_uint*>(const_cast<device uint*>(ctrl));
   device atomic_uint* ab = ctr + 1;
-  uint phase = base[0];
-
   const uint nsteps = meta[0];
   const uint reps   = meta[1];
+  // The barrier's generation base travels in `meta`, not its own binding: a
+  // one-word buffer is worth as much of the 31-binding budget as an 8 GiB
+  // weight group.
+  uint phase = meta[3];
   // Host inputs per repetition.  The first HCH floats are the residual
   // streams; a surplus is the MTP head's embedding, which its `fuse` reads
   // from SC_BRANCH.  Anything the schedule reads must be WRITTEN here --
@@ -272,7 +274,7 @@ BODY_SRC = r"""
   const uint xw = meta[2] == 0u ? HCH : meta[2];
 
   // Every packed group is a binding; the table's `group` field selects one.
-  const device uint* WB[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+  const device uint* WB[10] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9};
 
   device float* sc = scratch;
   // Block ids for the attention phase.  ``OP_INDEX_TOPB`` writes them into
@@ -1190,8 +1192,14 @@ BODY_SRC = r"""
   }
 """
 
+# Ten weight buffers, and the barrier's generation counter folded into `meta`.
+# Both are BINDING arithmetic, not preference.  MLX binds inputs and outputs
+# alike, so the budget is Metal's 31 for the pair: eight outputs leaves 23, and
+# the 63 GiB of experts needs eight groups on its own because a group is
+# uint32-indexed and so caps at 2^31 words = 8 GiB.  Ten buffers + main +
+# lm_head + the table fits in 22 inputs, for 30 of 31.
 IN_NAMES = [
-    "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7",
+    "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9",
     "tbl", "sched", "meta", "cs_in", "rec_in", "kbuf", "vbuf", "pooled",
     # The raw index-key ledger and the PLE conv state.  Both are LEDGERS the
     # kernel appends to in place, like ``ctrl``, not values it returns: the
@@ -1199,12 +1207,12 @@ IN_NAMES = [
     # two phases later, so an output would put the host in the middle of the
     # dispatch.  21 bindings of Metal's 31.
     "rawk", "pconv",
-    "actl", "ctrl", "base",
+    "actl", "ctrl",
 ]
 OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "logits",
              "status"]
 
-MAX_GROUPS = 8
+MAX_GROUPS = 10
 
 _KERNEL_CACHE: dict[Any, Any] = {}
 
@@ -1317,8 +1325,7 @@ class MegakernelBody:
         """
         nsteps = len(self.schedule) if steps is None else int(steps)
         width = int(xin.shape[-1])
-        meta = mx.array([nsteps, reps, width], mx.uint32)
-        base = mx.array([self.phase], mx.uint32)
+        meta = mx.array([nsteps, reps, width, self.phase], mx.uint32)
         if kbuf is None:
             kbuf = mx.zeros((N_KV_HEADS, 1, HEAD_DIM), mx.bfloat16)
             vbuf = kbuf
@@ -1333,7 +1340,7 @@ class MegakernelBody:
         outs = self.kernel(
             inputs=[xin, *self.wbufs, self.table, self.sched, meta,
                     cs_in, rec_in, kbuf, vbuf, pooled, rawk, pconv, actl,
-                    self.ctrl, base],
+                    self.ctrl],
             grid=(self.groups * self.threads, 1, 1),
             threadgroup=(self.threads, 1, 1),
             output_shapes=[

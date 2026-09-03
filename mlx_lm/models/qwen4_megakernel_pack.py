@@ -334,6 +334,14 @@ class ModuleSource:
 
     def rebind(self, key: str, parts: dict[str, mx.array]) -> None:
         module = self._resolve(key)
+        if isinstance(module, mx.array):
+            # A bare parameter -- ``q_norm.weight``, ``A_log``, ``conv1d.weight``
+            # -- resolves to the ARRAY, so the attribute has to be set on its
+            # parent.  Setting it on the array itself raises, which is what a
+            # full-model rebind found the first time one was tried.
+            parent, _, leaf = key.rpartition(".")
+            setattr(self._resolve(parent), leaf, parts["weight"])
+            return
         for part, value in parts.items():
             setattr(module, part, value)
 

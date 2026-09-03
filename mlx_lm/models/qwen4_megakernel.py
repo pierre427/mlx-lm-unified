@@ -43,7 +43,7 @@ import os
 import threading
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import mlx.core as mx
 
@@ -427,12 +427,23 @@ _STATUS_LAST: Optional[dict[str, Any]] = None
 _STATUS_ABORTS = 0
 _STATUS_LAUNCHES = 0
 _STATUS_PHASES = 0
+_STATUS_OPS: Counter = Counter()
 
 
 @dataclass(frozen=True)
 class MegakernelAdmission:
     accepted: bool
     reason: str
+
+
+# Layer kinds the kernel has a phase for.  Anything else is a refusal by name
+# rather than a silent fallthrough: a schedule builder that met an unknown
+# layer type would emit nothing for it and the token would simply skip a layer.
+PORTED_LAYER_TYPES = frozenset({"linear_attention", "full_attention"})
+# The activation dtype the phases are written for.  The pack's scale/bias
+# regions are read as bfloat16 and the KV, raw-index-key and pooled ledgers are
+# written as bfloat16, so a float16 or float32 model is not a cast away.
+ACTIVATION_DTYPE = "bfloat16"
 
 
 def admit_megakernel_decode(
@@ -445,13 +456,26 @@ def admit_megakernel_decode(
     training: bool,
     sharded: bool,
     mask: Any = None,
+    dtype: Any = None,
+    threads: Optional[int] = None,
+    groups: Optional[int] = None,
+    layer_types: Optional[Iterable[str]] = None,
 ) -> MegakernelAdmission:
     """Pure structural admission; safe to exercise without MLX eval.
 
-    Refuses everything the first cut does not serve.  ``M != 1`` is the
-    headline: the kernel holds one token's activations in threadgroup memory
-    and one recurrent state per value head per threadgroup, so a wider slab is
-    not a parameter change.
+    Refuses everything the first cut does not serve, each by its own name.
+    ``M != 1`` is the headline: the kernel holds one token's activations in
+    threadgroup memory and one recurrent state per value head per threadgroup,
+    so a wider slab is not a parameter change.
+
+    Four of these are cheap to state and expensive to discover by running.
+    A non-bfloat16 model would read the pack's scale/bias region as the wrong
+    type and write the KV ledger as the wrong type; a threadgroup width that is
+    not a multiple of 32, or wider than the sixteen simdgroups the kernel maps
+    its arrays over, would index past them; a grid of zero threadgroups can
+    never satisfy the barrier's arrival count; and an unported layer type would
+    emit NO phases at all -- the token would skip a layer and still look
+    healthy.
     """
     if not _megakernel_enabled():
         return MegakernelAdmission(False, "disabled")
@@ -467,6 +491,21 @@ def admit_megakernel_decode(
         return MegakernelAdmission(False, f"query width {width}")
     if mask is not None:
         return MegakernelAdmission(False, "masked decode")
+    if dtype is not None and str(dtype).rsplit(".", 1)[-1] != ACTIVATION_DTYPE:
+        return MegakernelAdmission(False, f"dtype {dtype}")
+    threads = _THREADS if threads is None else int(threads)
+    groups = _THREADGROUPS if groups is None else int(groups)
+    if threads % 32 or threads <= 0 or threads > 32 * 16:
+        return MegakernelAdmission(False, f"threads {threads}")
+    if groups < 1:
+        return MegakernelAdmission(False, f"threadgroups {groups}")
+    if GDN_VALUE_DIM % (threads // 32):
+        return MegakernelAdmission(
+            False, f"geometry {threads}x{groups} splits the GDN value dim")
+    if layer_types is not None:
+        unported = sorted(set(layer_types) - PORTED_LAYER_TYPES)
+        if unported:
+            return MegakernelAdmission(False, f"unported layer {unported[0]}")
     if pack is None:
         return MegakernelAdmission(False, "weights not packed")
     if schedule is None or len(schedule) == 0:
@@ -504,16 +543,41 @@ def _device_supported() -> bool:
     return str(info.get("architecture", "")).startswith("applegpu")
 
 
+def _device_attestation() -> dict[str, Any]:
+    try:
+        info = dict(mx.device_info())
+    except Exception:  # pragma: no cover - no Metal device
+        return {"available": False}
+    return {
+        "available": True,
+        "architecture": str(info.get("architecture", "")),
+        "device_name": str(info.get("device_name", "")),
+        "max_buffer_length": int(info.get("max_buffer_length", 0)),
+        "max_recommended_working_set_size": int(
+            info.get("max_recommended_working_set_size", 0)),
+        "supported": _device_supported(),
+    }
+
+
 def record_megakernel_receipt(
     *, engaged: bool, reason: str, phases: int = 0, aborted: bool = False,
-    **fields: Any,
+    op_counts: Optional[dict] = None, **fields: Any,
 ) -> None:
+    """Bounded process evidence, in ``qwen4_qsa_indexed``'s conventions.
+
+    Nothing here evaluates a device array.  ``op_counts`` is the per-opcode
+    phase histogram of the schedule that ran, which is what makes "every phase
+    engaged" checkable from the receipt instead of by inspection.
+    """
     global _STATUS_LAST, _STATUS_ABORTS, _STATUS_LAUNCHES, _STATUS_PHASES
     receipt = {
         "engaged": bool(engaged),
-        "reason": reason,
+        "reason": str(reason),
         "phases": int(phases),
         "aborted": bool(aborted),
+        "threads": _THREADS,
+        "threadgroups": _THREADGROUPS,
+        "op_counts": None if op_counts is None else dict(op_counts),
         **fields,
     }
     with _STATUS_LOCK:
@@ -521,6 +585,8 @@ def record_megakernel_receipt(
         if engaged:
             _STATUS_LAUNCHES += 1
             _STATUS_PHASES += int(phases)
+            for name, count in (op_counts or {}).items():
+                _STATUS_OPS[name] += int(count)
         if aborted:
             _STATUS_ABORTS += 1
         _STATUS_LAST = receipt
@@ -549,8 +615,20 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             "counts": dict(_STATUS_COUNTS),
             "launches": _STATUS_LAUNCHES,
             "phases": _STATUS_PHASES,
+            "op_counts": dict(_STATUS_OPS),
             "aborts": _STATUS_ABORTS,
+            "ported_layer_types": sorted(PORTED_LAYER_TYPES),
+            "activation_dtype": ACTIVATION_DTYPE,
+            "declines": {
+                reason: count for reason, count in _STATUS_COUNTS.items()
+                if reason != "engaged"
+            },
             "mlx_version": str(getattr(mx, "__version__", "unknown")),
+            # Device attestation: the grid barrier is a device-scope
+            # threadgroup_barrier, which is Metal 3.2, and MLX exposes no
+            # version query -- so the architecture family is what can be
+            # asserted here and the kernel's own abort flag is the real proof.
+            "device": _device_attestation(),
             "last_decision": _STATUS_LAST,
         }
         if reset:
@@ -559,6 +637,7 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             _STATUS_ABORTS = 0
             _STATUS_LAUNCHES = 0
             _STATUS_PHASES = 0
+            _STATUS_OPS.clear()
     return report
 
 
