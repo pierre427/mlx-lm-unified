@@ -180,13 +180,34 @@ class TestPackLayout(unittest.TestCase):
         with self.assertRaises(PackError):
             build_pack(source, [("nope", "main")])
 
-    def test_fuse_puts_scales_first(self):
+    def test_fuse_layouts(self):
         scales = mx.arange(6).reshape(2, 3).astype(mx.bfloat16)
         biases = (mx.arange(6).reshape(2, 3) + 100).astype(mx.bfloat16)
+        # shipped layout: a row's scales and biases adjacent
         fused = fuse_scales_biases(scales, biases)
         self.assertEqual(tuple(fused.shape), (2, 2, 3))
-        self.assertTrue(mx.array_equal(fused[0], scales).item())
-        self.assertTrue(mx.array_equal(fused[1], biases).item())
+        self.assertTrue(mx.array_equal(fused[:, 0, :], scales).item())
+        self.assertTrue(mx.array_equal(fused[:, 1, :], biases).item())
+        split = fuse_scales_biases(scales, biases, "split")
+        self.assertTrue(mx.array_equal(split[0], scales).item())
+        self.assertTrue(mx.array_equal(split[1], biases).item())
+        with self.assertRaises(PackError):
+            fuse_scales_biases(scales, biases, "nope")
+
+    def test_both_layouts_round_trip(self):
+        plan = [("a.proj", "main"), ("b.experts", "experts"),
+                ("b.gate", "main"), ("a.norm.weight", "main")]
+        for layout in ("interleaved", "split"):
+            source = self._source()
+            pack = build_pack(source, plan, validate=True, sb_layout=layout)
+            self.assertEqual(pack.stats["sb_layout"], layout)
+            for key, _ in plan:
+                got, want = pack.views(key), source.fetch(key)
+                for part, value in want.items():
+                    self.assertTrue(
+                        mx.array_equal(got[part], value).item(),
+                        f"{layout}/{key}.{part}",
+                    )
 
 
 class TestDecodePathPlan(unittest.TestCase):

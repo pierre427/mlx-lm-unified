@@ -26,16 +26,24 @@ Layout of one quantized entry, matching what the spike's ``qdot4_rows`` and
 ``qdot8_rows`` read (``results/qwen4-megakernel-spike-20260903_stage2.py``):
 
 * ``payload`` -- the ``.weight`` ``uint32`` array, flat, row-major, untouched.
-* ``sb`` -- ``scales`` and ``biases`` fused into one ``[2, ...rows, ngroups]``
-  bfloat16 array, flat, reinterpreted as ``uint32`` words.  The fusion is not
-  cosmetic: the naive layout needed 31 bindings for two layers.  The split is
-  on the LEADING axis, not the spike's per-row interleave, for one reason:
-  ``sb[0]`` and ``sb[1]`` are then each a contiguous slice, so the source
-  module's ``scales`` and ``biases`` can be rebound to zero-copy views.  The
-  per-row interleave makes both of them strided and forces a gather.  The
-  kernel pays one extra scalar for it -- the bias base is ``sb_off + n_sb/2``
-  words rather than ``soff + ngroups`` -- and reads two streams instead of one
-  interleaved stream.
+* ``sb`` -- ``scales`` and ``biases`` fused into one array, flat,
+  reinterpreted as ``uint32`` words.  The fusion is not cosmetic: the naive
+  layout needed 31 bindings for two layers.  Two layouts exist and the
+  default is the tuning spec's:
+
+  ``"interleaved"`` (DEFAULT, spec Sec. 6) -- ``[..., rows, 2, ngroups]``, a
+  row's scales and biases adjacent, which is what the spike measured and what
+  ``qdot4_rows`` reads as ``sb[soff + g]`` and ``sb[soff + ng + g]``.  One
+  stream, best locality.  Its cost is on the OTHER side: both halves are
+  strided, so ``rebind`` hands the source module lazy strided views that
+  materialise the first time a stock forward touches them.  That is free while
+  the megakernel serves the token and a per-call copy if it falls back, which
+  is the right way round.
+
+  ``"split"`` -- ``[2, ..., rows, ngroups]``, scales then biases, each half a
+  contiguous slice and so rebindable zero-copy.  Costs one extra scalar in the
+  kernel (bias base ``sb_off + n_sb/2``) and reads two streams.  Kept for a
+  fallback-heavy configuration; not the shipped layout.
 
 Both are aligned to ``_ALIGN`` words so a ``uint4``/``float4`` cast inside the
 kernel is legal at every entry base.
@@ -136,17 +144,28 @@ def _as_words(array: mx.array) -> mx.array:
     return mx.view(flat, mx.uint32)
 
 
-def fuse_scales_biases(scales: mx.array, biases: mx.array) -> mx.array:
-    """``[..., rows, ngroups] x2`` -> ``[2, ..., rows, ngroups]``.
+SB_INTERLEAVED = "interleaved"
+SB_SPLIT = "split"
+DEFAULT_SB_LAYOUT = SB_INTERLEAVED
 
-    Leading-axis split, so each half stays contiguous and can be handed back
-    to the source module as a zero-copy view.
+
+def fuse_scales_biases(
+    scales: mx.array, biases: mx.array, layout: str = DEFAULT_SB_LAYOUT
+) -> mx.array:
+    """Fuse a projection's scales and biases into one array.
+
+    ``interleaved`` -> ``[..., rows, 2, ngroups]`` (the shipped layout).
+    ``split`` -> ``[2, ..., rows, ngroups]``.
     """
     if scales.shape != biases.shape:
         raise PackError(
             f"scale/bias shape mismatch: {scales.shape} vs {biases.shape}"
         )
-    return mx.stack([scales, biases], axis=0)
+    if layout == SB_INTERLEAVED:
+        return mx.stack([scales, biases], axis=-2)
+    if layout == SB_SPLIT:
+        return mx.stack([scales, biases], axis=0)
+    raise PackError(f"unknown scale/bias layout {layout!r}")
 
 
 # --------------------------------------------------------------------- sources
@@ -449,6 +468,7 @@ class MegaWeightPack:
     entries: dict[str, PackEntry] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     table: Optional[mx.array] = None
+    sb_layout: str = DEFAULT_SB_LAYOUT
     stats: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------ readback
@@ -475,12 +495,21 @@ class MegaWeightPack:
         weight = self.payload(key).reshape(entry.shape)
         sb = self.scales_biases(key)
         ngroups = entry.cols // entry.group_size
-        half = sb.size // 2
         sb_shape = (*entry.shape[:-1], ngroups)
+        if self.sb_layout == SB_SPLIT:
+            half = sb.size // 2
+            return {
+                "weight": weight,
+                "scales": sb[:half].reshape(sb_shape),
+                "biases": sb[half:].reshape(sb_shape),
+            }
+        # Interleaved: both halves are strided views.  MLX keeps them lazy, so
+        # nothing is copied until a stock forward actually reads one.
+        sb = sb.reshape(*entry.shape[:-1], 2, ngroups)
         return {
             "weight": weight,
-            "scales": sb[:half].reshape(sb_shape),
-            "biases": sb[half:].reshape(sb_shape),
+            "scales": sb[..., 0, :],
+            "biases": sb[..., 1, :],
         }
 
     def table_row(self, key: str) -> dict[str, int]:
@@ -557,6 +586,7 @@ def build_pack(
     max_group_bytes: int = 8 << 30,
     validate: bool = True,
     rebind: bool = False,
+    sb_layout: str = DEFAULT_SB_LAYOUT,
     quant_spec: Optional[Callable[[str], tuple[int, int]]] = None,
 ) -> MegaWeightPack:
     """Pack ``plan``'s tensors into group buffers and prove the round trip.
@@ -583,9 +613,10 @@ def build_pack(
         n_sb = 0
         sb_shape = None
         if "scales" in parts:
-            fused = fuse_scales_biases(parts["scales"], parts["biases"])
+            fused = fuse_scales_biases(parts["scales"], parts["biases"],
+                                       sb_layout)
             n_sb = _words(fused)
-            sb_shape = fused.shape
+            sb_shape = tuple(parts["scales"].shape)
         meta[key] = {
             "role": role,
             "n_w": n_w,
@@ -598,7 +629,7 @@ def build_pack(
     source.release()
 
     groups = _plan_groups(sizes, max_group_bytes)
-    pack = MegaWeightPack()
+    pack = MegaWeightPack(sb_layout=sb_layout)
     source_bytes = 0
     packed_bytes = 0
     peak_transient = 0
@@ -622,7 +653,8 @@ def build_pack(
                 used += pad
             entry_sb_off = used
             if info["quantized"]:
-                fused = fuse_scales_biases(parts["scales"], parts["biases"])
+                fused = fuse_scales_biases(parts["scales"], parts["biases"],
+                                           sb_layout)
                 source_bytes += (
                     parts["scales"].size * parts["scales"].dtype.size
                     + parts["biases"].size * parts["biases"].dtype.size
@@ -696,6 +728,7 @@ def build_pack(
         "rebound": bool(rebind and hasattr(source, "rebind")),
         "validated_entries": validated,
         "max_group_bytes": max_group_bytes,
+        "sb_layout": sb_layout,
     }
     return pack
 

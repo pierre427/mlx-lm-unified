@@ -108,6 +108,15 @@ OP_INDEX_TOPB = 12  # bounded top-BLOCK_TOPK selection over the block scores
 OP_COPY = 13
 OP_ADD = 14
 OP_SILU_MUL = 15
+# Fused hyper-connection phases, adopted from the tuning spec
+# (results/qwen4-megakernel-build-spec-20260903.md Sec. 7): one GatedResidual
+# is TWO phases, not five.  ``hc_norm`` is a per-group reduction over the
+# residual, so a threadgroup can recompute the whole 10,240-float normed
+# vector for itself -- 40 KiB of reads against a 2.1 us barrier -- and both
+# phases do, which is what removes the norm's own barrier and lets the mix
+# stay threadgroup-local.
+OP_HC_DOWN = 16     # local hc_norm, then the 10240 -> 320 mix-down + silu
+OP_HC_UP = 17       # 320 -> 10240 mix-up + sigmoid + mean, and the inject gate
 
 OP_NAMES = {
     value: name
@@ -197,6 +206,7 @@ _SCRATCH_BLOCKS = (
     ("MOE_ACT", TOPK * FF),
     ("SHARED_ACT", FF),
     ("SHARED_UP", FF),
+    ("MOE_ROUTED", HIDDEN),
     ("SHARED_OUT", HIDDEN),
     ("SHARED_GATE", 1),
     ("SCRATCH_TMP", 1024),
@@ -232,13 +242,44 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 
 
 _MEGAKERNEL_ENABLED = _env_flag("MLX_QWEN4_MEGAKERNEL")
-# Geometry.  Provisional: the spike cleared G in {40, 80} x T in {256, 512} for
-# residency and measured the two-block chain fastest at G=80/T=256, but its
-# own phase profile says the geometry is not settled (T=512 lost on that kernel
-# and won by 1.5x on a plain stream).  ``opus-mk-tune`` owns these numbers;
-# they are read from the environment so adopting the spec cannot need an edit.
+# Geometry, ADOPTED from the tuning spec
+# (results/qwen4-megakernel-build-spec-20260903.md Sec. 1-2, tuning commit
+# 69d7fd5a): T=256, G=80.  That is 512 threads per core on 40 cores, and the
+# spec's own (T, G) sweep makes 512 threads/core the optimum by every route --
+# T=256/G=80 is 3.82 ms, the minimum of the whole table, against 3.86 for
+# T=512/G=40 (the other route to 512/core), 4.73 for T=256/G=40 and 4.64 for
+# T=512/G=80.  Barrier cost tracks G, not T: 1.2 / 2.1 / 4.0 us at G = 40 /
+# 80 / 160.  A wider grid does not help a phase with less work than
+# threadgroups -- an idle threadgroup still pays the barrier.
 _THREADGROUPS = _env_int("MLX_QWEN4_MEGAKERNEL_GROUPS", 80, minimum=1)
 _THREADS = _env_int("MLX_QWEN4_MEGAKERNEL_THREADS", 256, minimum=32)
+# Rows per simdgroup, per phase, from the spec's Sec. 1 table.  These are the
+# tuned values, not guesses: 8 rows on the GDN input projection measured 217
+# GB/s against 340 at 2 rows -- register spill, not load count -- and DEPTH
+# (contiguous uint2 blocks per lane) is NOT a lever at all (2 neutral, 4 costs
+# 10%), so it is deliberately absent.
+PHASE_ROWS = {
+    "gdn_in_proj": 2,
+    "gdn_out_proj": 4,
+    "moe_router": 4,
+    "moe_gate_up": 2,      # 2 pairs, 4 accumulators
+    "moe_down": 2,
+    "generic_qmv": 4,
+}
+# The 10-expert loop folded into the K axis of the down projection.  K=640 is
+# 40 uint2 blocks over 32 lanes = 62.5% lane occupancy; 10 x 40 = 400 blocks is
+# 96%.  Worth 1.41x on that phase and the largest single win of the tuning
+# round -- 230 -> 325 GB/s.
+MOE_DOWN_FOLD_EXPERTS = True
+# Hard caps the build must respect (spec Sec. 6).
+THREADGROUP_BYTES_CAP = 16 * 1024      # 25.6 KiB is what made DNSTAGE lose
+DEVICE_SCRATCH_BYTES_CAP = 512 * 1024
+BINDING_CAP = 31
+# One kernel, not two.  The two-dispatch split is bit-identical and 21% faster
+# when its halves batch, but a layer cannot batch its halves, so it costs 2
+# dispatches per layer: 0.574 ms against 0.406 ms per chain.  The 0.140 ms
+# launch floor beats the occupancy gain.
+SINGLE_KERNEL = True
 _SPIN_CAP = _env_int("MLX_QWEN4_MEGAKERNEL_SPIN_CAP", 400_000, minimum=1)
 
 _STATUS_LOCK = threading.Lock()
@@ -293,6 +334,8 @@ def admit_megakernel_decode(
         return MegakernelAdmission(False, "empty schedule")
     if not _device_supported():
         return MegakernelAdmission(False, "device unsupported")
+    if SCRATCH_FLOATS * 4 > DEVICE_SCRATCH_BYTES_CAP:
+        return MegakernelAdmission(False, "scratch over budget")
     return MegakernelAdmission(True, "engaged")
 
 
@@ -356,6 +399,13 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             "spin_cap": _SPIN_CAP,
             "scratch_floats": SCRATCH_FLOATS,
             "scratch_bytes": SCRATCH_FLOATS * 4,
+            "scratch_bytes_cap": DEVICE_SCRATCH_BYTES_CAP,
+            "threadgroup_bytes_cap": THREADGROUP_BYTES_CAP,
+            "phase_rows": dict(PHASE_ROWS),
+            "moe_down_fold_experts": MOE_DOWN_FOLD_EXPERTS,
+            "phase_work": dict(PHASE_WORK),
+            "guarded_form_would_drop": uncovered_work(),
+            "single_kernel": SINGLE_KERNEL,
             "step_stride": STEP_STRIDE,
             "counts": dict(_STATUS_COUNTS),
             "launches": _STATUS_LAUNCHES,
@@ -516,6 +566,50 @@ def select_top_blocks_threaded_mirror(scores, k: int, nt: int = 256):
                     out[gt_before + eq_before] = i
                 eq_before += 1
     return out
+
+
+# ------------------------------------------------------- grid coverage (trap)
+# The natural work count of every phase whose parallelism is NOT the output
+# row count.  A phase with fewer work items than threadgroups must still cover
+# all of them.
+PHASE_WORK = {
+    "gdn_core": GDN_VALUE_HEADS,          # 48 value heads
+    "attn_heads": N_Q_HEADS,              # 24 query heads
+    "moe_experts": TOPK,                  # 10 routed experts
+    "hc_streams": HC_COUNT,               # 4 residual streams
+}
+
+
+def strided_coverage(work: int, groups: int) -> set[int]:
+    """Work items covered by ``for (i = tg; i < work; i += ntg)``."""
+    return {index for tg in range(groups) for index in range(tg, work, groups)}
+
+
+def guarded_coverage(work: int, groups: int) -> set[int]:
+    """Work items covered by the spike's ``if (tg < work)`` form.
+
+    THE TRAP.  At ``G = 40`` the spike's GDN core silently dropped value heads
+    40--47: it timed beautifully and computed the wrong answer, because a
+    threadgroup that does not exist cannot report a missing head.  Kept here so
+    the difference is a test, not a comment -- every phase in this kernel uses
+    the strided form, and ``test_grid_coverage`` proves the guarded form fails
+    where the strided one does not.
+    """
+    return {tg for tg in range(groups) if tg < work}
+
+
+def uncovered_work(groups: int = None) -> dict[str, int]:
+    """Phases the guarded form would drop work from, at this grid size.
+
+    Always empty for the shipped kernel; a non-empty result means a phase was
+    written with a grid-size-dependent guard.
+    """
+    groups = _THREADGROUPS if groups is None else groups
+    return {
+        name: work - len(guarded_coverage(work, groups))
+        for name, work in PHASE_WORK.items()
+        if len(guarded_coverage(work, groups)) < work
+    }
 
 
 # -------------------------------------------------------------- kernel source

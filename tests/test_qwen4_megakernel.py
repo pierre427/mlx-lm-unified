@@ -203,6 +203,57 @@ class TestTopBlockSelection(unittest.TestCase):
         self.assertEqual(mk.BLOCK_TOPK, 512)
 
 
+class TestGridCoverage(unittest.TestCase):
+    """The spike's G < 48 trap, encoded so a regression is a failing test."""
+
+    def test_strided_form_covers_every_phase_at_every_grid(self):
+        for name, work in mk.PHASE_WORK.items():
+            for groups in (1, 2, 4, 8, 16, 32, 40, 48, 80, 160, 320):
+                covered = mk.strided_coverage(work, groups)
+                self.assertEqual(covered, set(range(work)), f"{name}@G={groups}")
+
+    def test_guarded_form_drops_work_below_the_natural_count(self):
+        # 48 GDN value heads at G=40: heads 40..47 vanish, which is exactly
+        # what the spike shipped and what timed beautifully while computing
+        # the wrong answer.
+        dropped = mk.uncovered_work(groups=40)
+        self.assertEqual(dropped["gdn_core"], 8)
+        self.assertNotIn("attn_heads", dropped)
+        self.assertEqual(mk.guarded_coverage(48, 40), set(range(40)))
+        self.assertNotEqual(mk.guarded_coverage(48, 40), set(range(48)))
+
+    def test_shipped_grid_covers_everything_either_way(self):
+        # the shipped G=80 hides the bug, which is why the strided form has to
+        # be a rule rather than a measurement
+        self.assertEqual(mk.uncovered_work(groups=80), {})
+        self.assertEqual(mk.uncovered_work(), {})
+
+
+class TestSpecAdoption(unittest.TestCase):
+    """Numbers taken from results/qwen4-megakernel-build-spec-20260903.md."""
+
+    def test_geometry(self):
+        self.assertEqual(mk._THREADS, 256)
+        self.assertEqual(mk._THREADGROUPS, 80)
+        # 40 GPU cores x 2 threadgroups x 256 threads = 512 threads/core
+        self.assertEqual(mk._THREADGROUPS * mk._THREADS // 40, 512)
+
+    def test_phase_rows(self):
+        self.assertEqual(mk.PHASE_ROWS["gdn_in_proj"], 2)
+        self.assertEqual(mk.PHASE_ROWS["gdn_out_proj"], 4)
+        self.assertEqual(mk.PHASE_ROWS["moe_router"], 4)
+        self.assertEqual(mk.PHASE_ROWS["moe_gate_up"], 2)
+        self.assertEqual(mk.PHASE_ROWS["moe_down"], 2)
+        self.assertTrue(mk.MOE_DOWN_FOLD_EXPERTS)
+        self.assertTrue(mk.SINGLE_KERNEL)
+
+    def test_scratch_is_inside_the_spec_budget(self):
+        self.assertLessEqual(
+            mk.SCRATCH_FLOATS * 4, mk.DEVICE_SCRATCH_BYTES_CAP
+        )
+        self.assertEqual(mk.THREADGROUP_BYTES_CAP, 16 * 1024)
+
+
 class TestStatus(unittest.TestCase):
     def test_receipts_accumulate_and_reset(self):
         mk.qwen4_megakernel_status(reset=True)
