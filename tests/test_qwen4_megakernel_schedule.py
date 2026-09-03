@@ -11,7 +11,9 @@ from mlx_lm.models import qwen4_megakernel as mk
 from mlx_lm.models.qwen4_megakernel_pack import decode_path_keys
 from mlx_lm.models.qwen4_megakernel_schedule import (
     LayerPlan,
+    DST_OUT,
     build_layer_schedule,
+    build_mtp_schedule,
     build_token_schedule,
 )
 
@@ -152,3 +154,53 @@ class TestSchedule(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPhaseBSchedules(unittest.TestCase):
+    """The shapes phase B's kernel body actually walks."""
+
+    def test_attention_branch_emits_the_indexer_and_both_attention_passes(self):
+        pack = _pack()
+        schedule = mk.Schedule()
+        plan = LayerPlan(index=3, is_linear=False,
+                         prefix="language_model.model.layers.3")
+        build_layer_schedule(schedule, pack, plan, mk.SCRATCH["RESID_A"],
+                             mk.SCRATCH["RESID_B"])
+        ops = [step.op for step in schedule.steps]
+        for op in (mk.OP_INDEX_SCORE, mk.OP_INDEX_TOPB, mk.OP_ATTN,
+                   mk.OP_ATTN_COMBINE):
+            self.assertEqual(ops.count(op), 1, mk.OP_NAMES[op])
+        # the score has to be published before the selection reads it, and the
+        # selection before the attend, or the phases are simply out of order
+        self.assertLess(ops.index(mk.OP_INDEX_SCORE), ops.index(mk.OP_INDEX_TOPB))
+        self.assertLess(ops.index(mk.OP_INDEX_TOPB), ops.index(mk.OP_ATTN))
+        self.assertLess(ops.index(mk.OP_ATTN), ops.index(mk.OP_ATTN_COMBINE))
+
+    def test_mtp_head_fuses_every_stream_and_ends_in_the_lm_head(self):
+        pack = _pack()
+        schedule = build_mtp_schedule(pack)
+        ops = [step.op for step in schedule.steps]
+        # fc_hidden is one OP_QMV per hyper stream: a matvec op reads ONE
+        # source vector, so four streams are four steps, not one
+        fc = [s for s in schedule.steps
+              if s.op == mk.OP_QMV
+              and s.entry == pack.entries["mtp.fc_hidden"].index]
+        self.assertEqual(len(fc), mk.HC_COUNT)
+        self.assertEqual(
+            sorted(s.src for s in fc),
+            [mk.SCRATCH["NORMED"] + i * mk.HIDDEN for i in range(mk.HC_COUNT)],
+        )
+        self.assertEqual(ops.count(mk.OP_ADD_BCAST), 1)
+        self.assertEqual(schedule.steps[-1].arg2, DST_OUT)
+        self.assertEqual(schedule.steps[-1].entry,
+                         pack.entries["language_model.lm_head"].index)
+
+
+class TestThreadgroupBudget(unittest.TestCase):
+    def test_arena_and_the_selector_both_fit(self):
+        from mlx_lm.models import qwen4_megakernel_body as body
+        self.assertLessEqual(body.THREADGROUP_BYTES, mk.THREADGROUP_BYTES_CAP)
+        # the top-block selector aliases its histogram and per-thread counters
+        # over the TGX staging block, which is not live while it runs
+        for threads in (128, 256, 512):
+            self.assertLessEqual(256 + 2 * threads + 2, body.TG["TLOG"])
