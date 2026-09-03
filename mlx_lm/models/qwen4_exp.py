@@ -195,34 +195,51 @@ def _trace_flags() -> tuple:
 # verify round, buying 0.057 ms at width 3 and 0.164 ms at width 16 in
 # isolation and +0.2% decode at 64K end to end.
 #
-# DEMOTED to opt-in 2026-09-03.  It was promoted default-on on the strength of
-# "BIT-IDENTICAL (max abs diff 0.0)", measured on random inputs at widths
-# 1/3/16/17.  That evidence does not hold: on a real 16K prefill the compiled
-# and eager chains give DIFFERENT final logits, and the difference is INPUT
-# dependent, not width dependent -- a width-1 slab carrying the triggering row
-# diverges exactly as the 2048 slab does, so a width gate would be cosmetic.
+# DEMOTED to opt-in 2026-09-03, then FIXED and re-promoted the same day.
 #
-# The mechanism, isolated: ``gate``, both projections and all three norms are
-# bit-identical.  The first difference is ``gated = mx.sigmoid(gate) * value``,
-# and the cause is the SIGMOID.  ``mx.compile`` fuses an elementwise chain into
-# one kernel, and that kernel's sigmoid is not the standalone ``Sigmoid``
-# primitive: swept over x in [-12, 12] in fp32 it differs on 1343 of 4001
-# points, by up to 8.5e-07 relative, and is ~5x FURTHER from the true value
-# (worst relative error 8.1e-07 against the primitive's 1.7e-07).  A single op
-# under ``mx.compile`` is not fused and so does not show it -- only a chain
-# does.
+# The demotion: promoted default-on on "BIT-IDENTICAL (max abs diff 0.0)" at
+# widths 1/3/16/17 on random inputs, then caught giving DIFFERENT final logits
+# on a real 16K prefill.  Input dependent, not width dependent -- a width-1
+# slab carrying the triggering row diverged exactly as the 2048 slab did, so a
+# width gate would have been cosmetic.
 #
-# In bf16 that gap survives the round only where the product sits on a bf16
-# boundary, so the damage is rare and input dependent: 40 of 2048 rows in one
-# 16K prefill chunk, at 1-3 ULP, max abs 3.8e-06 at ``gated``, 1.2e-04 at the
-# layer output and 2.0e-03 at ``normed``.  Rare is not narrow -- the compiled
-# chain is LESS accurate than stock, not a reordering of it, so it is not the
-# norm-reduction class Pierre accepted on 2026-09-02.
-# ``MLX_QWEN4_PLE_COMPILE=1`` opts in.
+# The mechanism, root-caused in wiki/docs/research/
+# mlx-compile-fused-sigmoid-rca-2026-09-03.md: it is NOT the fusion, it is the
+# COMPILATION UNIT.  ``Sigmoid`` (mlx unary_ops.h:308) is the only operator
+# struct in MLX's Metal headers that calls an unqualified ``metal::exp``
+# instead of ``metal::precise::exp``.  The prebuilt mlx.metallib is built
+# offline with ``-fno-fast-math``, which resolves that to the precise
+# implementation.  Every ``Compiled`` primitive is instead built at RUNTIME by
+# Device::build_library_, where the same text resolves to the fast
+# approximation even at MTLMathModeSafe -- measured: a hand-written
+# mx.fast.metal_kernel carrying the verbatim struct body, with no fusion at
+# all, reproduces the compiled answer BIT FOR BIT, and swapping in
+# ``precise::exp`` reproduces eager bit for bit.  Result: a sigmoid inside a
+# compiled span is ~5x further from the truth than the primitive (worst
+# relative error 8.1e-07 against 1.6e-07 over x in [-12, 12]), which in bf16
+# lands as 1-3 ULP wherever the product sits on a bf16 boundary -- 40 of 2048
+# rows in one 16K prefill chunk, up to 1.2e-04 at the layer output.
 #
-# wiki/docs/plans/qwen4-ple-device-fusion.md "Prefill exactness and the width
-# gate"; raw data results/qwen4-ple-compile-{prefill,width,rows,mech}-20260903*.
-_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE")
+# The fix, therefore, is structural rather than numerical: keep the chain
+# compiled but CUT THE TRACE AT THE SIGMOID (``_chain_gate`` /
+# ``mx.sigmoid`` / ``_chain_tail``), so the sigmoid is the standalone
+# metallib primitive again.  The boundary is nearly free -- ``_chain_gate``
+# ends in a reduction that was never fusable with what follows it.
+# ``nn.silu`` in the conv is deliberately NOT touched: it is ``mx.compile``d
+# upstream, so it uses the approximate sigmoid in BOTH arms, consistently;
+# making it precise would move the stock digest instead of matching it.
+#
+# Re-promoted default-ON on that proof: the real 1K and 16K prefills reproduce
+# the stock eager digests cbd35548f24416ee and 3fdd36a8dd9179c2, all 8 PLE
+# calls of the 16K prefill are byte-identical, and so are the chunk-6 width-1
+# slab at row 1028 and the full width-2048 call that first diverged.
+# ``MLX_QWEN4_PLE_COMPILE=0`` opts out.
+#
+# wiki/docs/plans/qwen4-ple-device-fusion.md sections 8-9;
+# wiki/docs/research/mlx-compile-fused-sigmoid-rca-2026-09-03.md;
+# raw data results/qwen4-ple-compile-{prefill,width,rows,mech,exact}-20260903*
+# and results/mlx-compile-sigmoid-rca-20260903*.
+_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE", default=True)
 # One traced graph per (batch, width, mask, state-write, dtype) signature.  A
 # single run legitimately holds several: the prefill chunk width and its short
 # tail, the decode width, the verify slab width, and each of those again with
@@ -2382,6 +2399,28 @@ class PLELayer(nn.Module):
         That purity is the whole point -- it is what lets ``mx.compile`` trace
         the chain, and the ONLY thing the compiled path changes.  Returns
         ``[out, normed]``, plus the new conv state when ``write_state``.
+
+        Split at the SIGMOID rather than written straight through, because the
+        sigmoid is the one op a fused span computes differently -- see the
+        ``_PLE_COMPILE`` comment.  The eager path calls the two halves back to
+        back, so this function is unchanged arithmetic; the compiled path
+        traces the halves separately and keeps ``mx.sigmoid`` between them,
+        where it stays the standalone primitive.
+        """
+        gate, value = self._chain_gate(hidden, embeddings)
+        return self._chain_tail(
+            tuple(hidden.shape),
+            mx.sigmoid(gate),
+            value,
+            mask,
+            state,
+            write_state,
+        )
+
+    def _chain_gate(self, hidden, embeddings):
+        """``key_proj``/``value_proj``/norms/gate arithmetic, up to the sigmoid.
+
+        Ends one op EARLY on purpose: the caller applies ``mx.sigmoid``.
         """
         key = self.norm_key(self.key_proj(embeddings)).reshape(
             *hidden.shape[:-1], self.hc_count, self.hidden_size
@@ -2392,7 +2431,15 @@ class PLELayer(nn.Module):
         )
         gate = mx.sum(key * query, axis=-1, keepdims=True) / math.sqrt(self.hidden_size)
         gate = mx.sign(gate) * mx.sqrt(mx.maximum(mx.abs(gate), 1e-6))
-        gated = (mx.sigmoid(gate) * value[..., None, :]).reshape(*hidden.shape)
+        return gate, value
+
+    def _chain_tail(self, out_shape, sigmoid, value, mask, state, write_state: bool):
+        """Everything after the sigmoid: gate product, norm, conv, residual.
+
+        ``out_shape`` rather than ``hidden`` so the compiled tail carries no
+        buffer it does not read; shapes are static within a traced signature.
+        """
+        gated = (sigmoid * value[..., None, :]).reshape(*out_shape)
         normed = self.norm_conv(gated)
         if mask is not None:
             gated = mx.where(mask[..., None], gated, 0)
@@ -2473,31 +2520,42 @@ class PLELayer(nn.Module):
         if len(cache) >= _PLE_COMPILE_CACHE_MAX:
             _record_ple_compile("overflow", signature=repr(signature))
             return None
+        out_shape = tuple(signature[0])
         try:
+            # TWO traced spans, not one, with the sigmoid left eager between
+            # them.  ``mx.compile`` fuses an elementwise chain into a runtime
+            # JIT kernel whose ``metal::exp`` is the fast approximation, so a
+            # sigmoid INSIDE a span is ~5x less accurate than the primitive
+            # (see the ``_PLE_COMPILE`` comment).  The span boundary is free
+            # here: the gate ends in a reduction, which was never fusable with
+            # what follows it anyway.
+            def head(hidden, embeddings):
+                return list(self._chain_gate(hidden, embeddings))
+
             # Every optional argument is baked in at build time rather than
             # passed as ``None``: ``mx.compile`` flattens its argument tree, so
             # a signature must have a fixed arity of real arrays.
             if has_mask and has_state:
 
-                def chain(hidden, embeddings, mask, state, _ws=write_state):
-                    return self._device_chain(hidden, embeddings, mask, state, _ws)
+                def tail(sig, value, mask, state, _os=out_shape, _ws=write_state):
+                    return self._chain_tail(_os, sig, value, mask, state, _ws)
 
             elif has_mask:
 
-                def chain(hidden, embeddings, mask, _ws=write_state):
-                    return self._device_chain(hidden, embeddings, mask, None, _ws)
+                def tail(sig, value, mask, _os=out_shape, _ws=write_state):
+                    return self._chain_tail(_os, sig, value, mask, None, _ws)
 
             elif has_state:
 
-                def chain(hidden, embeddings, state, _ws=write_state):
-                    return self._device_chain(hidden, embeddings, None, state, _ws)
+                def tail(sig, value, state, _os=out_shape, _ws=write_state):
+                    return self._chain_tail(_os, sig, value, None, state, _ws)
 
             else:
 
-                def chain(hidden, embeddings, _ws=write_state):
-                    return self._device_chain(hidden, embeddings, None, None, _ws)
+                def tail(sig, value, _os=out_shape, _ws=write_state):
+                    return self._chain_tail(_os, sig, value, None, None, _ws)
 
-            compiled = mx.compile(chain)
+            compiled = (mx.compile(head), mx.compile(tail))
         except Exception as exc:  # pragma: no cover - defensive
             compiled = None
             _record_ple_compile(
@@ -2542,11 +2600,18 @@ class PLELayer(nn.Module):
         compiled = self._compiled_chain(signature, has_mask, has_state, write_state)
         if compiled is None:
             return self._device_chain(hidden, embeddings, mask, state, write_state)
-        args = tuple(
-            a for a in (hidden, embeddings, mask, state) if a is not None
-        )
+        compiled_head, compiled_tail = compiled
         try:
-            return compiled(*args)
+            gate, value = compiled_head(hidden, embeddings)
+            # OUTSIDE both spans on purpose -- this is the whole fix.  A lone
+            # ``Sigmoid`` primitive runs the prebuilt-metallib kernel, whose
+            # ``metal::exp`` the offline ``-fno-fast-math`` build resolves to
+            # the precise implementation.
+            sigmoid = mx.sigmoid(gate)
+            args = tuple(
+                a for a in (sigmoid, value, mask, state) if a is not None
+            )
+            return compiled_tail(*args)
         except Exception as exc:
             # Fail closed: demote this signature for the rest of the process
             # and answer from the eager chain, which is the same arithmetic.

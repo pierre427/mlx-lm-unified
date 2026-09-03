@@ -2530,35 +2530,80 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
         self.assertGreater(status["counts"]["skips"], 0)
         self.assertEqual(status["last_receipt"]["reason"], "float32_activations")
 
-    def test_the_lever_is_opt_in_and_needs_an_explicit_one(self):
-        """Unset means OFF: the promotion was withdrawn 2026-09-03."""
+    def test_the_lever_is_default_on_and_needs_an_explicit_zero_to_leave(self):
+        """Unset means ON: re-promoted 2026-09-03 once the chain was exact."""
         read = qwen4_exp_module._env_flag
         with mock.patch.dict(environ, {}, clear=False):
             environ.pop("MLX_QWEN4_PLE_COMPILE", None)
-            self.assertFalse(read("MLX_QWEN4_PLE_COMPILE"))
+            self.assertTrue(read("MLX_QWEN4_PLE_COMPILE", default=True))
         for value in ("1", "on", "true", "yes"):
             with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": value}):
-                self.assertTrue(read("MLX_QWEN4_PLE_COMPILE"), f"{value!r}")
+                self.assertTrue(
+                    read("MLX_QWEN4_PLE_COMPILE", default=True), f"{value!r}"
+                )
         for value in ("0", "off", "false", "no"):
             with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": value}):
-                self.assertFalse(read("MLX_QWEN4_PLE_COMPILE"), f"{value!r}")
+                self.assertFalse(
+                    read("MLX_QWEN4_PLE_COMPILE", default=True), f"{value!r}"
+                )
 
-    def test_the_shipped_default_traces_nothing_and_answers_eagerly(self):
+    def test_the_shipped_default_traces_the_chain(self):
         layer, args = self._layer()
         hidden, ids = self._inputs(args, 3)
         with mock.patch.dict(environ, {}, clear=False):
             environ.pop("MLX_QWEN4_PLE_COMPILE", None)
             qwen4_exp_module._PLE_COMPILE = qwen4_exp_module._env_flag(
-                "MLX_QWEN4_PLE_COMPILE"
+                "MLX_QWEN4_PLE_COMPILE", default=True
             )
-        self.assertFalse(qwen4_exp_module._PLE_COMPILE)
+        self.assertTrue(qwen4_exp_module._PLE_COMPILE)
         cache = Qwen4ArraysCache(4)
         mx.eval(layer(hidden, ids, cache))
         status = qwen4_exp_module.qwen4_ple_compile_status()
-        self.assertFalse(status["enabled"])
-        self.assertEqual(status["counts"]["builds"], 0)
-        self.assertEqual(status["counts"]["hits"], 0)
-        self.assertEqual(getattr(layer, "_ple_compile_cache", {}), {})
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["counts"]["builds"], 1)
+        self.assertNotEqual(getattr(layer, "_ple_compile_cache", {}), {})
+
+    def test_the_sigmoid_stays_outside_the_traced_spans(self):
+        """The fix, as behaviour rather than as source.
+
+        A ``mx.compile``d span replays from its traced graph, so any op INSIDE
+        it stops calling back into Python once the trace is cached.  The
+        sigmoid must keep calling back on every invocation -- that is what
+        makes it the standalone ``Sigmoid`` primitive (metallib,
+        ``-fno-fast-math``, precise ``exp``) instead of a fast-``exp`` copy
+        emitted into the runtime-JIT kernel.  See
+        wiki/docs/research/mlx-compile-fused-sigmoid-rca-2026-09-03.md.
+        """
+        layer, args = self._layer()
+        hidden, ids = self._inputs(args, 3)
+        qwen4_exp_module._PLE_COMPILE = True
+        calls = []
+        original = qwen4_exp_module.mx.sigmoid
+
+        def counting(x):
+            calls.append(1)
+            return original(x)
+
+        seen = []
+        with mock.patch.object(qwen4_exp_module.mx, "sigmoid", counting):
+            for _ in range(3):
+                cache = Qwen4ArraysCache(4)
+                mx.eval(layer(hidden, ids, cache))
+                seen.append(len(calls))
+        status = qwen4_exp_module.qwen4_ple_compile_status()
+        self.assertEqual(status["counts"]["builds"], 1)
+        self.assertEqual(status["counts"]["hits"], 2)
+        # The first invocation also traces the shapeless ``nn.silu``, which
+        # calls the same patched symbol once; the SETTLED rate is what the
+        # claim rests on.  One per invocation means the chain's sigmoid is
+        # still executed in Python, i.e. it is still a live primitive rather
+        # than a node baked into a cached graph.
+        self.assertEqual(
+            [seen[1] - seen[0], seen[2] - seen[1]],
+            [1, 1],
+            "the sigmoid was traced into a compiled span -- it must stay "
+            f"eager between _chain_gate and _chain_tail (saw {seen})",
+        )
 
     def test_a_non_metal_device_runs_eager_with_a_receipt(self):
         """Bit-identity was measured on Metal, and does not hold off it.
@@ -2626,6 +2671,15 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
         self.assertLess(gap, 1e-5)
         if mx.default_device() == mx.gpu:
             self.assertGreater(gap, 0.0, "-6.84375 no longer separates them")
+
+        # ...and the shape of the fix: hoist the sigmoid out of the span and
+        # the SAME compiled remainder is bit-identical to stock again.
+        split = mx.compile(lambda s_, v: s_ * v)(mx.sigmoid(gate), value)
+        mx.eval(split)
+        self.assertTrue(
+            mx.array_equal(stock, split).item(),
+            "an eager sigmoid feeding a compiled remainder must be exact",
+        )
 
     def test_a_compile_failure_falls_back_with_a_receipt(self):
         layer, args = self._layer()
