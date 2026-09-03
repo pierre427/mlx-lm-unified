@@ -257,6 +257,13 @@ BODY_SRC = r"""
 
   const uint nsteps = meta[0];
   const uint reps   = meta[1];
+  // Host inputs per repetition.  The first HCH floats are the residual
+  // streams; a surplus is the MTP head's embedding, which its `fuse` reads
+  // from SC_BRANCH.  Anything the schedule reads must be WRITTEN here --
+  // scratch is a fresh allocation every call, so a phase that reads an
+  // uninitialised slot is grid-dependent garbage, which is exactly what the
+  // G-sweep coverage test reports as "differs".
+  const uint xw = meta[2] == 0u ? HCH : meta[2];
 
   // Every packed group is a binding; the table's `group` field selects one.
   const device uint* WB[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
@@ -291,8 +298,11 @@ BODY_SRC = r"""
   for (uint rep = 0; rep < reps && live; ++rep) {
     // The residual streams arrive hoisted: PLE's n-gram gather and the
     // embedding depend only on the input token, so they are host work.
-    for (uint i = tg * NT + tid; i < HCH; i += ntg * NT)
-      sc[SC_RESID_A + i] = float(xin[(size_t)rep * HCH + i]);
+    for (uint i = tg * NT + tid; i < xw; i += ntg * NT) {
+      const float v = float(xin[(size_t)rep * xw + i]);
+      if (i < HCH) sc[SC_RESID_A + i] = v;
+      else         sc[SC_BRANCH + (i - HCH)] = v;
+    }
     live = gbar(ctr, ab, ntg, tid, phase, SPINCAP);
     if (!live) break;
 
@@ -343,9 +353,19 @@ BODY_SRC = r"""
               else              qmv8<1>(W, woff, sboff, cols, ng, r0, rows, 0u, dx4, lane, acc);
             }
           }
-          if (lane == 0u)
-            for (uint r = 0; r < R; ++r)
-              if (r0 + r < rows) sc[dst + r0 + r] = apply_act(acc[r], a1);
+          if (lane == 0u) {
+            // arg2 == 1 is DST_OUT: 248,320 vocabulary rows do not fit the
+            // 512 KiB scratch, so lm_head writes its own output buffer.
+            if (a2 == 1u) {
+              for (uint r = 0; r < R; ++r)
+                if (r0 + r < rows)
+                  logits[(size_t)rep * rows + r0 + r] =
+                      static_cast<BFT>(apply_act(acc[r], a1));
+            } else {
+              for (uint r = 0; r < R; ++r)
+                if (r0 + r < rows) sc[dst + r0 + r] = apply_act(acc[r], a1);
+            }
+          }
         }
       }
 
@@ -905,6 +925,15 @@ BODY_SRC = r"""
                           hist, gtc, eqc, shared, tid, NT);
       }
 
+      // ------------------------------------------------ OP_ADD_BCAST (20)
+      // ``dst[h * width + d] += src[d]`` over the H streams.  The MTP head's
+      // fuse adds one embedding vector into all four of them.
+      else if (op == 20u) {
+        const uint width = a0, count = a1;
+        for (uint i = tg * NT + tid; i < count * width; i += ntg * NT)
+          sc[dst + i] = sc[dst + i] + sc[src + (i % width)];
+      }
+
       // --------------------------------------------- OP_SILU_MUL (15)
       else if (op == 15u) {
         for (uint i = tg * NT + tid; i < a1; i += ntg * NT)
@@ -947,7 +976,8 @@ IN_NAMES = [
     "tbl", "sched", "meta", "cs_in", "rec_in", "kbuf", "vbuf", "pooled",
     "actl", "ctrl", "base",
 ]
-OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "status"]
+OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "logits",
+             "status"]
 
 MAX_GROUPS = 8
 
@@ -1011,7 +1041,7 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
 class MegakernelBody:
     """Launches the persistent kernel over a packed model and a schedule."""
 
-    def __init__(self, pack, schedule, *, gdn_layers: int,
+    def __init__(self, pack, schedule, *, gdn_layers: int, vocab: int = 1,
                  threads: int = None, groups: int = None, **kw):
         need = (256 + 2 * (_THREADS if threads is None else threads) + 2)
         if need > TG["TLOG"]:
@@ -1031,6 +1061,7 @@ class MegakernelBody:
         self.pack = pack
         self.schedule = schedule
         self.gdn_layers = max(int(gdn_layers), 1)
+        self.vocab = max(int(vocab), 1)
         self.threads = _THREADS if threads is None else threads
         self.groups = _THREADGROUPS if groups is None else groups
         self.kernel = build_body_kernel(threads=self.threads, **kw)
@@ -1056,7 +1087,8 @@ class MegakernelBody:
         with the tail compiled out.
         """
         nsteps = len(self.schedule) if steps is None else int(steps)
-        meta = mx.array([nsteps, reps], mx.uint32)
+        width = int(xin.shape[-1])
+        meta = mx.array([nsteps, reps, width], mx.uint32)
         base = mx.array([self.phase], mx.uint32)
         if kbuf is None:
             kbuf = mx.zeros((N_KV_HEADS, 1, HEAD_DIM), mx.bfloat16)
@@ -1077,10 +1109,12 @@ class MegakernelBody:
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
                 (2 * N_Q_HEADS * SDPA_BLOCKS,),
                 (N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM,),
+                (reps, self.vocab),
                 (4,),
             ],
             output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16,
-                           mx.float32, mx.float32, mx.bfloat16, mx.uint32],
+                           mx.float32, mx.float32, mx.bfloat16, mx.bfloat16,
+                           mx.uint32],
         )
         # One grid barrier for the residual load, one after the output write,
         # plus the schedule's own device barriers, per repetition.

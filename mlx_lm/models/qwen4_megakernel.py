@@ -133,6 +133,9 @@ OP_HC_UP = 17       # 320 -> 10240 mix-up + sigmoid + mean, and the inject gate
 OP_ATTN_COMBINE = 18
 # The indexer's block score, read by OP_INDEX_TOPB.
 OP_INDEX_SCORE = 19
+# ``dst[h * width + d] += src[d]``: the MTP head's fuse adds one embedding
+# vector into all four hyper-connection streams.
+OP_ADD_BCAST = 20
 
 OP_NAMES = {
     value: name

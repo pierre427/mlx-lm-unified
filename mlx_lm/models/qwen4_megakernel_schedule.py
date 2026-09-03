@@ -50,6 +50,7 @@ from .qwen4_megakernel import (
     OP_ATTN_COMBINE,
     OP_HC_DOWN,
     OP_HC_UP,
+    OP_ADD_BCAST,
     OP_INDEX_SCORE,
     PHASE_ROWS,
     BAR_NONE,
@@ -403,6 +404,74 @@ def build_token_schedule(
         LayerPlan(index=-1, is_linear=True, prefix=mixer.rsplit(".", 1)[0]),
         mixer.rsplit(".", 1)[1], resid, fused=fused_hyper,
     )
+    if include_lm_head:
+        schedule.add(Step(
+            op=OP_QMV, entry=_entry_id(pack, "language_model.lm_head"),
+            src=SCRATCH["MIXED"], dst=0, arg0=R_GENERIC, arg2=DST_OUT,
+            barrier=BAR_NONE,
+        ))
+    return schedule
+
+
+def build_mtp_schedule(
+    pack,
+    *,
+    prefix: str = "mtp",
+    include_lm_head: bool = True,
+    fused_hyper: bool = True,
+) -> Schedule:
+    """The MTP head: fuse, one full-attention layer, its mixer, the lm head.
+
+    ``Qwen4ExpMTP.fuse`` is four phases, not one op: a plain RMSNorm over the
+    embedding (a GroupRMSNorm whose group IS the whole vector), its projection,
+    a GroupRMSNorm over the four hyper streams, and ``fc_hidden`` applied to
+    each stream separately -- one ``OP_QMV`` per stream, because a matvec op
+    reads one source vector.  The embedding is then broadcast into all four.
+
+    The embedding arrives in ``SCRATCH["BRANCH"]`` and the trunk's scheme-A
+    hyper hiddens in ``SCRATCH["RESID_A"]``; both are host inputs, in the same
+    class as the PLE gather.
+    """
+    schedule = Schedule()
+    # embedding: RMSNorm over the whole vector, then fc_embedding
+    schedule.add(Step(
+        op=OP_GROUP_RMSNORM,
+        entry=_entry_id(pack, f"{prefix}.pre_fc_norm_embedding.weight"),
+        src=SCRATCH["BRANCH"], dst=SCRATCH["MIXED"],
+        arg0=HIDDEN, arg1=HIDDEN, barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_QMV, entry=_entry_id(pack, f"{prefix}.fc_embedding"),
+        src=SCRATCH["MIXED"], dst=SCRATCH["SHARED_OUT"],
+        arg0=R_GENERIC, barrier=BAR_DEVICE,
+    ))
+    # the four hyper streams: one GroupRMSNorm, then fc_hidden per stream
+    schedule.add(Step(
+        op=OP_GROUP_RMSNORM,
+        entry=_entry_id(pack, f"{prefix}.pre_fc_norm_hidden.weight"),
+        src=SCRATCH["RESID_A"], dst=SCRATCH["NORMED"],
+        arg0=HC_HIDDEN, arg1=HIDDEN, barrier=BAR_DEVICE,
+    ))
+    for stream in range(HC_COUNT):
+        schedule.add(Step(
+            op=OP_QMV, entry=_entry_id(pack, f"{prefix}.fc_hidden"),
+            src=SCRATCH["NORMED"] + stream * HIDDEN,
+            dst=SCRATCH["RESID_B"] + stream * HIDDEN,
+            arg0=R_GENERIC,
+            barrier=BAR_NONE if stream < HC_COUNT - 1 else BAR_DEVICE,
+        ))
+    schedule.add(Step(
+        op=OP_ADD_BCAST, src=SCRATCH["SHARED_OUT"], dst=SCRATCH["RESID_B"],
+        arg0=HIDDEN, arg1=HC_COUNT, barrier=BAR_DEVICE,
+    ))
+    plan = LayerPlan(index=0, is_linear=False, prefix=f"{prefix}.layers.0")
+    landed = build_layer_schedule(
+        schedule, pack, plan, SCRATCH["RESID_B"], SCRATCH["RESID_A"],
+        fused_hyper=fused_hyper,
+    )
+    _hyper_block(schedule, pack,
+                 LayerPlan(index=-1, is_linear=True, prefix=prefix),
+                 "hyper_connection_mixer", landed, fused=fused_hyper)
     if include_lm_head:
         schedule.add(Step(
             op=OP_QMV, entry=_entry_id(pack, "language_model.lm_head"),
