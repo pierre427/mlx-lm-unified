@@ -199,7 +199,9 @@ class TestTopBlockSelection(unittest.TestCase):
 
     def test_selection_fits_the_scratch_slot(self):
         self.assertGreaterEqual(mk.MAX_BLOCKS, 16384)
-        self.assertEqual(dict(mk._SCRATCH_BLOCKS)["IDX_SEL"], mk.BLOCK_TOPK)
+        # BLOCK_TOPK selected blocks plus the one incomplete TAIL slot
+        self.assertEqual(dict(mk._SCRATCH_BLOCKS)["IDX_SEL"],
+                         mk.BLOCK_TOPK + 1)
         self.assertEqual(mk.BLOCK_TOPK, 512)
 
 

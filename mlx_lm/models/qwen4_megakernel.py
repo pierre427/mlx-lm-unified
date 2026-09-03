@@ -129,6 +129,9 @@ ACTL = {
     "pooled_stride": 15, # pooled rows reserved per attention layer
     "pool_new_block": 16,   # 1 when this token closed a block
     "n_attn_layers": 17,
+    # The incomplete tail block this query must attend even though the
+    # indexer never scored it.  ``count > n_sel`` says a tail slot is live.
+    "tail_block": 18,
 }
 ACTL_HEADER = 32         # the ids start here; keep it a multiple of 16
 
@@ -301,7 +304,15 @@ _SCRATCH_BLOCKS = (
     ("ATT_O", Q_DIM),
     ("IDX_QK", (IDX_HEADS + 1) * IDX_HEAD_DIM),
     ("IDX_SCORE", MAX_BLOCKS),
-    ("IDX_SEL", BLOCK_TOPK),
+    # BLOCK_TOPK selected blocks plus ONE slot for the incomplete TAIL block.
+    # The indexer only ever scores CLOSED blocks -- ``n_blocks = length //
+    # compress_ratio`` -- so a query whose length is not a multiple of the
+    # ratio has 1..3 most recent positions, ITS OWN INCLUDED, in no scored
+    # block at all.  Stock's sparse mask is ``selected | tail`` and the
+    # shipped indexed kernel appends that tail block at slot ``n_sel``; both
+    # need the extra slot, and without it the newest positions are simply not
+    # attended (2026-09-03 perplexity gate).
+    ("IDX_SEL", BLOCK_TOPK + 1),
     ("MOE_LOGITS", NUM_EXPERTS),
     ("MOE_TOPI", TOPK),
     ("MOE_TOPW", TOPK),

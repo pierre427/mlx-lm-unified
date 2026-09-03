@@ -938,6 +938,18 @@ BODY_SRC = r"""
         select_top_blocks(sc + src, actl[10], a0,
                           reinterpret_cast<device uint*>(sc + dst),
                           hist, gtc, eqc, shared, tid, NT);
+        // The INCOMPLETE TAIL block, appended at slot `n_sel` exactly as
+        // `compact_blocks_to_kernel_inputs` does for the shipped kernel.  The
+        // indexer scores only closed blocks, so without this slot a query
+        // whose length is not a multiple of the block size cannot attend its
+        // own newest positions -- itself included.  `count > n_sel` is the
+        // host's statement that the slot is live; OP_ATTN then admits it only
+        // through `logical >= complete`, never by membership, so a block that
+        // is both selected and the tail is not counted twice.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (actl[2] > actl[3] && tid == 0u) {
+          reinterpret_cast<device uint*>(sc + dst)[actl[3]] = actl[18];
+        }
       }
 
       // -------------------------------------------- OP_QK_NORM_ROPE (21)
@@ -1332,7 +1344,7 @@ class MegakernelBody:
         if pooled is None:
             pooled = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
         if actl is None:
-            actl = mx.zeros((ACTL_HEADER + BLOCK_TOPK,), mx.uint32)
+            actl = mx.zeros((ACTL_HEADER + BLOCK_TOPK + 1,), mx.uint32)
         if rawk is None:
             rawk = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
         if pconv is None:

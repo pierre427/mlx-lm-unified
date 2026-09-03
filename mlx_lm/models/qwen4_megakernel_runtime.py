@@ -255,11 +255,24 @@ class MegakernelDecoder:
         length = position + 1
         n_blocks = length // IDX_COMPRESS
         budget = min(BLOCK_TOPK, n_blocks)
-        actl = np.zeros(ACTL_HEADER + BLOCK_TOPK, np.uint32)
+        # THE TAIL BLOCK.  ``n_blocks`` counts only CLOSED blocks, so when the
+        # length is not a multiple of the compression ratio the 1..3 newest
+        # positions -- the query's own included -- are in no scored block.
+        # Stock's sparse mask is ``selected_tokens | tail`` with
+        # ``tail = (complete <= t <= q_pos)``, and the shipped indexed kernel
+        # appends that tail block at slot ``n_sel`` and counts it in ``count``.
+        # This path did neither until 2026-09-03, so three tokens in four
+        # could not attend their own most recent context; the teacher-forced
+        # perplexity gate is what found it.
+        tail_block = position // IDX_COMPRESS
+        has_tail = int(length % IDX_COMPRESS != 0)
+        count = budget + has_tail
+        actl = np.zeros(ACTL_HEADER + BLOCK_TOPK + 1, np.uint32)
         actl[ACTL["total"]] = self.total
-        actl[ACTL["u_width"]] = budget
-        actl[ACTL["count"]] = budget
+        actl[ACTL["u_width"]] = count
+        actl[ACTL["count"]] = count
         actl[ACTL["n_sel"]] = budget
+        actl[ACTL["tail_block"]] = tail_block
         actl[ACTL["q_pos"]] = position
         actl[ACTL["block_size"]] = IDX_COMPRESS
         actl[ACTL["ids_from_scratch"]] = 1
