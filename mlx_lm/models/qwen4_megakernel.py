@@ -108,13 +108,18 @@ OP_INDEX_TOPB = 12  # bounded top-BLOCK_TOPK selection over the block scores
 OP_COPY = 13
 OP_ADD = 14
 OP_SILU_MUL = 15
-# Fused hyper-connection phases, adopted from the tuning spec
-# (results/qwen4-megakernel-build-spec-20260903.md Sec. 7): one GatedResidual
-# is TWO phases, not five.  ``hc_norm`` is a per-group reduction over the
-# residual, so a threadgroup can recompute the whole 10,240-float normed
-# vector for itself -- 40 KiB of reads against a 2.1 us barrier -- and both
-# phases do, which is what removes the norm's own barrier and lets the mix
-# stay threadgroup-local.
+# Fused hyper-connection phases.  One GatedResidual is THREE phases, not five
+# -- the form phase A prototyped and measured, and the only form anyone has a
+# timing for (2.36 ms for 96 mixers).  The norm publishes the normed vector,
+# the down phase takes the 10,240 -> 320 mix-down AND the 4-row inject gate
+# from it, and the up phase takes the mix-up with the mean folded in.
+#
+# The norm keeps its own device barrier rather than being recomputed inside
+# both later phases.  Only its four GROUP SCALES are recomputed per
+# threadgroup (4 x 2,560 reads); the 10,240-float normed vector itself is
+# written once, cooperatively.  Recomputing the vector in both phases instead
+# would cost G x 60 KiB per mixer -- ~460 MB per token at G=40 -- to save one
+# 2.1 us barrier, which is the wrong side of the trade by two orders.
 OP_HC_DOWN = 16     # local hc_norm, then the 10240 -> 320 mix-down + silu
 OP_HC_UP = 17       # 320 -> 10240 mix-up + sigmoid + mean, and the inject gate
 

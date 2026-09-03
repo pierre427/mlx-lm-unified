@@ -54,10 +54,12 @@ class TestSchedule(unittest.TestCase):
                 schedule, pack, plan,
                 mk.SCRATCH["RESID_A"], mk.SCRATCH["RESID_B"],
             )
-            # two hyper blocks of 5, two injects, one branch, one MoE block
+            # two hyper blocks of 3, two injects, one branch, one MoE block
             ops = [step.op for step in schedule.steps]
             self.assertEqual(ops.count(mk.OP_GROUP_RMSNORM), 2, expected_branch)
-            self.assertEqual(ops.count(mk.OP_HC_MIX), 2, expected_branch)
+            self.assertEqual(ops.count(mk.OP_HC_DOWN), 2, expected_branch)
+            self.assertEqual(ops.count(mk.OP_HC_UP), 2, expected_branch)
+            self.assertEqual(ops.count(mk.OP_HC_MIX), 0, expected_branch)
             self.assertEqual(ops.count(mk.OP_INJECT), 2, expected_branch)
             self.assertEqual(ops.count(mk.OP_MOE_TOPK), 1, expected_branch)
             self.assertEqual(ops.count(mk.OP_MOE_E1), 1, expected_branch)
@@ -71,6 +73,25 @@ class TestSchedule(unittest.TestCase):
             # a layer ends in the slab it did not start in: two injects, so
             # back where it started
             self.assertEqual(landed, mk.SCRATCH["RESID_A"])
+
+    def test_the_unfused_hyper_spelling_is_the_same_arithmetic(self):
+        # Five steps instead of three: the norm, the two projections, the mix
+        # and the inject gate.  Kept selectable so a barrier-cost experiment
+        # can price the fusion, and because the mirror was written against it.
+        pack = _pack()
+        counts = {}
+        for fused in (True, False):
+            schedule = mk.Schedule()
+            plan = LayerPlan(index=0, is_linear=True,
+                             prefix="language_model.model.layers.0")
+            build_layer_schedule(schedule, pack, plan, mk.SCRATCH["RESID_A"],
+                                 mk.SCRATCH["RESID_B"], fused_hyper=fused)
+            ops = [step.op for step in schedule.steps]
+            counts[fused] = (len(schedule), ops.count(mk.OP_HC_MIX))
+        self.assertEqual(counts[True][1], 0)
+        self.assertEqual(counts[False][1], 2)
+        # two mixers x two extra steps
+        self.assertEqual(counts[False][0] - counts[True][0], 4)
 
     def test_residual_slab_ping_pongs(self):
         """No phase may read and write the same residual address.

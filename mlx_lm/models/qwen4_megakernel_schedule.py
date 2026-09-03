@@ -47,6 +47,9 @@ import mlx.core as mx
 
 from .qwen4_megakernel import (
     BAR_DEVICE,
+    OP_HC_DOWN,
+    OP_HC_UP,
+    PHASE_ROWS,
     BAR_NONE,
     BAR_THREADGROUP,
     BLOCK_TOPK,
@@ -88,6 +91,16 @@ from .qwen4_megakernel import (
     Step,
 )
 
+# ``OP_QMV.arg0``: rows per simdgroup.  The spec tuned a different value for
+# almost every projection and a data-driven dispatcher cannot specialise per
+# call site, so the tuned number travels with the phase.  1, 2 and 4 are the
+# values the kernel offers; 8 is deliberately absent because the spec measured
+# it spilling (217 GB/s against 340 at 2 rows on the GDN input projection).
+R_GENERIC = PHASE_ROWS["generic_qmv"]
+
+# ``entry`` / entry-carrying argument words use this for "no such tensor".
+NO_ENTRY = 0xFFFFFFFF
+
 # Post-activations an OP_QMV may apply to its own output, in ``arg1``.
 ACT_NONE = 0
 ACT_SILU = 1
@@ -124,17 +137,30 @@ def _entry_id(pack, key: str) -> int:
 
 
 def _hyper_block(
-    schedule: Schedule, pack, plan: LayerPlan, which: str, resid: int
+    schedule: Schedule, pack, plan: LayerPlan, which: str, resid: int,
+    *, fused: bool = True,
 ) -> None:
-    """The five phases of one ``GatedResidual``.
+    """One ``GatedResidual``, as the phases the kernel actually runs.
 
     ``resid`` names which residual slab holds the H streams on entry.  The
     norm reads it and the inject writes the OTHER slab: the spike's U2 result
     is that a reused scratch address is stale without a device fence and this
     kernel reuses every address 48 times, so a phase that both reads and
     writes the streams ping-pongs rather than trusting an in-place update.
+
+    **Fused is the shipped form and it is what was measured.**  Phase A's
+    prototype -- the only timing anyone has for this block -- is THREE phases:
+    the group norm publishes the normed vector, then one phase does the
+    10,240 -> 320 mix-down *and* the 4-row inject gate from that same vector
+    (both K-split across the simdgroups, worth 1.37x here), then one phase
+    does the up-mix d-major with the mean folded in.  The five-phase spelling
+    below is the same arithmetic in separate steps; it is kept because it is
+    what the mirror was first written against, and because a barrier-cost
+    experiment wants both spellings.
     """
     hyper = plan.key(which)
+    inject_key = f"{hyper}.block_inject_weight"
+    has_inject = pack.entries.get(inject_key) is not None
     schedule.add(Step(
         op=OP_GROUP_RMSNORM,
         entry=_entry_id(pack, f"{hyper}.hc_norm.weight"),
@@ -142,25 +168,42 @@ def _hyper_block(
         arg0=HC_HIDDEN, arg1=HIDDEN,      # dim, group size
         barrier=BAR_DEVICE,
     ))
+    if fused:
+        schedule.add(Step(
+            op=OP_HC_DOWN,
+            entry=_entry_id(pack, f"{hyper}.input_mix_weight_down"),
+            src=SCRATCH["NORMED"], dst=SCRATCH["HC_LR"],
+            arg0=_entry_id(pack, inject_key) if has_inject else NO_ENTRY,
+            arg1=SCRATCH["INJECT"],
+            barrier=BAR_DEVICE,
+        ))
+        schedule.add(Step(
+            op=OP_HC_UP,
+            entry=_entry_id(pack, f"{hyper}.input_mix_weight_up"),
+            src=SCRATCH["HC_LR"], dst=SCRATCH["MIXED"],
+            arg0=SCRATCH["NORMED"], arg1=HC_COUNT, arg2=HIDDEN,
+            barrier=BAR_DEVICE,
+        ))
+        return
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{hyper}.input_mix_weight_down"),
-        src=SCRATCH["NORMED"], dst=SCRATCH["HC_LR"], arg1=ACT_SILU_SCALED,
-        barrier=BAR_DEVICE,
+        src=SCRATCH["NORMED"], dst=SCRATCH["HC_LR"],
+        arg0=R_GENERIC, arg1=ACT_SILU_SCALED, barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{hyper}.input_mix_weight_up"),
-        src=SCRATCH["HC_LR"], dst=SCRATCH["HC_W"], arg1=ACT_SIGMOID,
-        barrier=BAR_DEVICE,
+        src=SCRATCH["HC_LR"], dst=SCRATCH["HC_W"],
+        arg0=R_GENERIC, arg1=ACT_SIGMOID, barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_HC_MIX, src=SCRATCH["HC_W"], dst=SCRATCH["MIXED"],
         arg0=HC_COUNT, arg1=HIDDEN, barrier=BAR_DEVICE,
     ))
-    if pack.entries.get(f"{hyper}.block_inject_weight") is not None:
+    if has_inject:
         schedule.add(Step(
-            op=OP_QMV, entry=_entry_id(pack, f"{hyper}.block_inject_weight"),
+            op=OP_QMV, entry=_entry_id(pack, inject_key),
             src=SCRATCH["NORMED"], dst=SCRATCH["INJECT"],
-            arg1=ACT_INJECT_GATE, arg2=DST_REPLICATED,
+            arg0=1, arg1=ACT_INJECT_GATE, arg2=DST_REPLICATED,
             barrier=BAR_THREADGROUP,
         ))
 
@@ -175,19 +218,27 @@ def _gdn_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     ):
         schedule.add(Step(
             op=OP_QMV, entry=_entry_id(pack, f"{attn}.{name}"),
-            src=SCRATCH["MIXED"], dst=dst, arg0=width,
+            src=SCRATCH["MIXED"], dst=dst,
+            arg0=PHASE_ROWS["gdn_in_proj"],
             # the four input projections are independent; only the last needs
             # to publish before the core reads them
             barrier=BAR_NONE if name != "in_proj_a" else BAR_DEVICE,
         ))
+    # The core reads four packed tensors, so the three that do not fit the
+    # ``entry`` field travel in the argument words: A_log, dt_bias and the
+    # gated RMS norm gain.  All three are dense bf16 in the pack.
     schedule.add(Step(
         op=OP_GDN_CORE, entry=_entry_id(pack, f"{attn}.conv1d.weight"),
-        src=SCRATCH["GDN_QKV"], dst=SCRATCH["GDN_Y"], barrier=BAR_DEVICE,
+        src=SCRATCH["GDN_QKV"], dst=SCRATCH["GDN_Y"],
+        arg0=_entry_id(pack, f"{attn}.A_log"),
+        arg1=_entry_id(pack, f"{attn}.dt_bias"),
+        arg2=_entry_id(pack, f"{attn}.norm.weight"),
+        barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{attn}.out_proj"),
-        src=SCRATCH["GDN_Y"], dst=SCRATCH["BRANCH"], arg0=HIDDEN,
-        barrier=BAR_DEVICE,
+        src=SCRATCH["GDN_Y"], dst=SCRATCH["BRANCH"],
+        arg0=PHASE_ROWS["gdn_out_proj"], barrier=BAR_DEVICE,
     ))
 
 
@@ -200,12 +251,13 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     ):
         schedule.add(Step(
             op=OP_QMV, entry=_entry_id(pack, f"{attn}.{name}"),
-            src=SCRATCH["MIXED"], dst=dst,
+            src=SCRATCH["MIXED"], dst=dst, arg0=R_GENERIC,
             barrier=BAR_NONE if name != "v_proj" else BAR_DEVICE,
         ))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{attn}.indexer.index_qk_proj"),
-        src=SCRATCH["MIXED"], dst=SCRATCH["IDX_QK"], barrier=BAR_DEVICE,
+        src=SCRATCH["MIXED"], dst=SCRATCH["IDX_QK"], arg0=R_GENERIC,
+        barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_INDEX_TOPB, src=SCRATCH["IDX_SCORE"], dst=SCRATCH["IDX_SEL"],
@@ -218,7 +270,7 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
                       barrier=BAR_DEVICE))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{attn}.o_proj"),
-        src=SCRATCH["ATT_O"], dst=SCRATCH["BRANCH"], arg0=HIDDEN,
+        src=SCRATCH["ATT_O"], dst=SCRATCH["BRANCH"], arg0=R_GENERIC,
         barrier=BAR_DEVICE,
     ))
 
@@ -227,7 +279,8 @@ def _moe_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     mlp = plan.key("mlp")
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{mlp}.gate"),
-        src=SCRATCH["MIXED"], dst=SCRATCH["MOE_LOGITS"], barrier=BAR_DEVICE,
+        src=SCRATCH["MIXED"], dst=SCRATCH["MOE_LOGITS"],
+        arg0=PHASE_ROWS["moe_router"], barrier=BAR_DEVICE,
     ))
     # Recomputed per threadgroup, so it costs no grid barrier -- the spike's
     # phase 5, which profiled at ~0.00 ms.
@@ -245,23 +298,24 @@ def _moe_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     ))
     schedule.add(Step(
         op=OP_MOE_E2, entry=_entry_id(pack, f"{mlp}.switch_mlp.down_proj"),
-        src=SCRATCH["MOE_ACT"], dst=SCRATCH["BRANCH"], arg0=HIDDEN,
-        barrier=BAR_DEVICE,
+        src=SCRATCH["MOE_ACT"], dst=SCRATCH["BRANCH"],
+        arg0=PHASE_ROWS["moe_down"], barrier=BAR_DEVICE,
     ))
     # shared expert, added into the same branch slot
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{mlp}.shared_expert.gate_proj"),
-        src=SCRATCH["MIXED"], dst=SCRATCH["SHARED_ACT"], arg1=ACT_SILU,
-        barrier=BAR_NONE,
+        src=SCRATCH["MIXED"], dst=SCRATCH["SHARED_ACT"],
+        arg0=R_GENERIC, arg1=ACT_SILU, barrier=BAR_NONE,
     ))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{mlp}.shared_expert.up_proj"),
-        src=SCRATCH["MIXED"], dst=SCRATCH["SHARED_UP"], barrier=BAR_NONE,
+        src=SCRATCH["MIXED"], dst=SCRATCH["SHARED_UP"],
+        arg0=R_GENERIC, barrier=BAR_NONE,
     ))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{mlp}.shared_expert_gate"),
         src=SCRATCH["MIXED"], dst=SCRATCH["SHARED_GATE"], arg0=1,
-        arg1=ACT_SIGMOID, arg2=DST_REPLICATED, barrier=BAR_THREADGROUP,
+        arg1=ACT_SIGMOID, arg2=DST_SCRATCH, barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_SILU_MUL, src=SCRATCH["SHARED_ACT"], dst=SCRATCH["SHARED_ACT"],
@@ -270,7 +324,7 @@ def _moe_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{mlp}.shared_expert.down_proj"),
         src=SCRATCH["SHARED_ACT"], dst=SCRATCH["SHARED_OUT"],
-        arg0=HIDDEN, arg1=ACT_NONE, barrier=BAR_DEVICE,
+        arg0=R_GENERIC, arg1=ACT_NONE, barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_ADD, src=SCRATCH["SHARED_OUT"], dst=SCRATCH["BRANCH"],
@@ -279,10 +333,12 @@ def _moe_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
 
 
 def build_layer_schedule(
-    schedule: Schedule, pack, plan: LayerPlan, resid: int, other: int
+    schedule: Schedule, pack, plan: LayerPlan, resid: int, other: int,
+    *, fused_hyper: bool = True,
 ) -> int:
     """Append one decoder layer.  Returns the slab the output landed in."""
-    _hyper_block(schedule, pack, plan, "attn_hyper_connection", resid)
+    _hyper_block(schedule, pack, plan, "attn_hyper_connection", resid,
+                 fused=fused_hyper)
     if plan.is_linear:
         _gdn_branch(schedule, pack, plan)
     else:
@@ -292,7 +348,8 @@ def build_layer_schedule(
         arg1=SCRATCH["INJECT"], arg2=HC_COUNT, barrier=BAR_DEVICE,
     ))
     resid, other = other, resid
-    _hyper_block(schedule, pack, plan, "mlp_hyper_connection", resid)
+    _hyper_block(schedule, pack, plan, "mlp_hyper_connection", resid,
+                 fused=fused_hyper)
     _moe_branch(schedule, pack, plan)
     schedule.add(Step(
         op=OP_INJECT, src=resid, dst=other, arg0=SCRATCH["BRANCH"],
@@ -308,6 +365,7 @@ def build_token_schedule(
     layers: Optional[list[int]] = None,
     prefix: str = "language_model.model.layers",
     include_lm_head: bool = True,
+    fused_hyper: bool = True,
     mixer: str = "language_model.model.hyper_connection_mixer",
 ) -> Schedule:
     """The whole per-token phase sequence, hyper-connections included."""
@@ -320,19 +378,20 @@ def build_token_schedule(
             is_linear=layer_types[index] == "linear_attention",
             prefix=f"{prefix}.{index}",
         )
-        landed = build_layer_schedule(schedule, pack, plan, resid, other)
+        landed = build_layer_schedule(schedule, pack, plan, resid, other,
+                                      fused_hyper=fused_hyper)
         resid, other = landed, (resid if landed == other else other)
     # final mixer: same GatedResidual, without the inject combine
     tail = LayerPlan(index=-1, is_linear=True, prefix=mixer.rsplit(".", 1)[0])
     _hyper_block(
         schedule, pack,
         LayerPlan(index=-1, is_linear=True, prefix=mixer.rsplit(".", 1)[0]),
-        mixer.rsplit(".", 1)[1], resid,
+        mixer.rsplit(".", 1)[1], resid, fused=fused_hyper,
     )
     if include_lm_head:
         schedule.add(Step(
             op=OP_QMV, entry=_entry_id(pack, "language_model.lm_head"),
-            src=SCRATCH["MIXED"], dst=0, arg0=0, arg2=DST_OUT,
+            src=SCRATCH["MIXED"], dst=0, arg0=R_GENERIC, arg2=DST_OUT,
             barrier=BAR_NONE,
         ))
     return schedule
@@ -353,6 +412,7 @@ class MirrorExecutor:
         self.scratch = mx.zeros((SCRATCH_FLOATS,), mx.float32)
         self.out: Optional[mx.array] = None
         self.state = state or {}
+        self.gdn_slot = 0
         self.trace: list[str] = []
         self._weights: dict[str, dict[str, mx.array]] = {}
         self._by_index = {
@@ -388,6 +448,7 @@ class MirrorExecutor:
 
     # -- ops
     def run(self, schedule: Schedule) -> None:
+        self.gdn_slot = 0
         for step in schedule.steps:
             handler = getattr(self, f"_op_{step.op}", None)
             if handler is None:
@@ -461,6 +522,95 @@ class MirrorExecutor:
         left = self.read(step.src, width)
         right = self.read(step.arg0, width)
         self.write(step.dst, left * right)
+
+    def _op_7(self, step: Step) -> None:  # OP_GDN_CORE
+        """The conv step, SiLU, L2 normalisation, gated delta rule, gated norm.
+
+        ``self.state`` carries ``conv`` [L, K-1, CONV_DIM] and ``rec``
+        [L, HV, DV, DK]; the slot is the running count of cores executed, the
+        same rule the kernel uses, so neither side needs a field for it.
+        """
+        conv_w = self.weights(step.entry)["weight"].astype(mx.float32)
+        conv_w = conv_w.reshape(CONV_DIM, CONV_KERNEL)
+        a_log = self.weights(step.arg0)["weight"].astype(mx.float32)
+        dt_bias = self.weights(step.arg1)["weight"].astype(mx.float32)
+        gain = self.weights(step.arg2)["weight"].astype(mx.float32)
+
+        slot = self.gdn_slot
+        self.gdn_slot += 1
+        conv_state = self.state["conv"][slot].astype(mx.float32)
+        rec = self.state["rec"][slot].astype(mx.float32)
+
+        qkv = self.read(step.src, CONV_DIM)
+        z = self.read(SCRATCH["GDN_Z"], VALUE_DIM)
+        bb = self.read(SCRATCH["GDN_BA"], GDN_VALUE_HEADS)
+        aa = self.read(SCRATCH["GDN_BA"] + GDN_VALUE_HEADS, GDN_VALUE_HEADS)
+
+        hist = mx.concatenate([conv_state, qkv[None, :]], axis=0)
+        conv_out = (hist * conv_w.T).sum(axis=0)
+        conv_out = conv_out * mx.sigmoid(conv_out)
+        self.state["conv_out"] = self.state.get("conv_out", {})
+        self.state["conv_out"][slot] = hist[1:]
+
+        key_dim = GDN_KEY_HEADS * GDN_KEY_DIM
+        qh = conv_out[:key_dim].reshape(GDN_KEY_HEADS, GDN_KEY_DIM)
+        kh = conv_out[key_dim: 2 * key_dim].reshape(GDN_KEY_HEADS, GDN_KEY_DIM)
+        vh = conv_out[2 * key_dim:].reshape(GDN_VALUE_HEADS, GDN_VALUE_DIM)
+        qh = qh * mx.rsqrt(mx.sum(qh * qh, axis=-1, keepdims=True) + 1.0e-6)
+        kh = kh * mx.rsqrt(mx.sum(kh * kh, axis=-1, keepdims=True) + 1.0e-6)
+        qh = qh * (GDN_KEY_DIM ** -0.5)
+
+        decay = mx.exp(
+            -mx.exp(a_log) * mx.logaddexp(aa + dt_bias, mx.zeros_like(aa))
+        )
+        beta = mx.sigmoid(bb)
+        qf = mx.repeat(qh, GDN_RATIO, axis=0)
+        kf = mx.repeat(kh, GDN_RATIO, axis=0)
+
+        state = rec * decay[:, None, None]
+        kv = (state * kf[:, None, :]).sum(-1)
+        delta = (vh - kv) * beta[:, None]
+        state = state + delta[:, :, None] * kf[:, None, :]
+        y = (state * qf[:, None, :]).sum(-1)
+        self.state["rec_out"] = self.state.get("rec_out", {})
+        self.state["rec_out"][slot] = state
+
+        scale = mx.rsqrt((y * y).mean(axis=-1, keepdims=True) + RMS_EPS)
+        y = gain * (y * scale)
+        y = y * mx.sigmoid(z.reshape(GDN_VALUE_HEADS, GDN_VALUE_DIM))
+        self.write(step.dst, y.reshape(VALUE_DIM))
+
+    def _op_16(self, step: Step) -> None:  # OP_HC_DOWN
+        entry = self.entry(step.entry)
+        parts = self.weights(step.entry)
+        x = self.read(step.src, entry.cols)
+        down = mx.quantized_matmul(
+            x, parts["weight"], parts["scales"], parts["biases"],
+            transpose=True, group_size=entry.group_size, bits=entry.bits,
+        )
+        self.write(step.dst, _activate(down, ACT_SILU_SCALED))
+        if step.arg0 == NO_ENTRY:
+            return
+        gate_entry = self.entry(step.arg0)
+        gate = self.weights(step.arg0)
+        inject = mx.quantized_matmul(
+            x, gate["weight"], gate["scales"], gate["biases"], transpose=True,
+            group_size=gate_entry.group_size, bits=gate_entry.bits,
+        )
+        self.write(step.arg1, _activate(inject, ACT_INJECT_GATE))
+
+    def _op_17(self, step: Step) -> None:  # OP_HC_UP
+        entry = self.entry(step.entry)
+        parts = self.weights(step.entry)
+        count, width = step.arg1, step.arg2
+        up = mx.quantized_matmul(
+            self.read(step.src, entry.cols), parts["weight"], parts["scales"],
+            parts["biases"], transpose=True, group_size=entry.group_size,
+            bits=entry.bits,
+        )
+        weights = mx.sigmoid(up).reshape(count, width)
+        streams = self.read(step.arg0, count * width).reshape(count, width)
+        self.write(step.dst, mx.mean(weights * streams, axis=0))
 
     def _op_8(self, step: Step) -> None:  # OP_MOE_TOPK
         k, experts = step.arg0, step.arg1
