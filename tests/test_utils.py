@@ -137,8 +137,8 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(model.custom_attribute, "This is a custom model")
         self.assertTrue(hasattr(model, "qwenWeights"))
 
-    def test_get_classes_remaps_bailing_v3_architecture(self):
-        from mlx_lm.models import bailing_moe_v3
+    def test_get_classes_bailing_hybrid_is_native(self):
+        from mlx_lm.models import bailing_hybrid, bailing_moe_v3
 
         model_cls, args_cls = utils._get_classes(
             {
@@ -146,7 +146,11 @@ class TestUtils(unittest.TestCase):
                 "architectures": ["BailingMoeV3ForCausalLM"],
             }
         )
+        self.assertIs(model_cls, bailing_hybrid.Model)
+        self.assertIs(args_cls, bailing_hybrid.ModelArgs)
 
+        # The upstream module stays reachable by its own model_type.
+        model_cls, args_cls = utils._get_classes({"model_type": "bailing_moe_v3"})
         self.assertIs(model_cls, bailing_moe_v3.Model)
         self.assertIs(args_cls, bailing_moe_v3.ModelArgs)
 

@@ -67,9 +67,10 @@ MODEL_REMAPPING = {
     "Dream": "dream",
 }
 
-MODEL_ARCHITECTURE_REMAPPING = {
-    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
-}
+# (model_type, architecture) pairs that resolve to a module of another name.
+# `bailing_hybrid` (Ling-3.0) has its own native module; `bailing_moe_v3` is
+# reachable only by that explicit model_type.
+MODEL_ARCHITECTURE_REMAPPING = {}
 
 MAX_FILE_SIZE_GB = 5
 

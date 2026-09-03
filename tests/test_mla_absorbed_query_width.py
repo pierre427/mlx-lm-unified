@@ -29,6 +29,7 @@ from mlx_lm.models.cache import make_prompt_cache
 # This list is *checked* against the tree (see test_every_twin_consults_the_gate)
 # rather than trusted, so a new twin cannot quietly copy-paste the old gate.
 MLA_TWINS = [
+    "bailing_hybrid",
     "bailing_moe_v3",
     "deepseek_v2",
     "deepseek_v3",
