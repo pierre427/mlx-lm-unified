@@ -177,6 +177,28 @@ ACTL_M_STRIDE = 16       # keep the per-query block 16-word aligned
 # defined further down the module, so the read is inline.
 MAX_QUERY_WIDTH = max(1, min(3, int(
     os.environ.get("MLX_QWEN4_MEGAKERNEL_MAX_WIDTH") or 3)))
+
+# The accepted fidelity cost, recorded once and carried on every receipt so
+# the number that decided the ship/no-ship call travels with the artifact
+# instead of living only in a results file.  Teacher-forced NLL,
+# `results/qwen4-megakernel-exactness-20260903-ppl.py`, 196 documents /
+# 200,508 tokens, kernel vs the same weights run stock: +0.00234 nats/token,
+# perplexity 8.8070 vs 8.7864 (+0.234%), bootstrap 95% CI [+0.00042, +0.00425]
+# nats -- excludes zero, so the kernel is measurably but not alarmingly worse.
+# This is a corpus-level constant, not a per-call measurement; it does not
+# change with `reset` and it is not evidence about a specific launch.
+FIDELITY_DECISION = {
+    "gate": "teacher-forced NLL, natural corpus",
+    "documents": 196,
+    "tokens": 200508,
+    "diff_mean_nll": 0.0023407492144027486,
+    "diff_ci95": [0.00041154721463050256, 0.004234659338129661],
+    "mega_ppl": 8.806963834038678,
+    "stock_ppl": 8.786373048696777,
+    "ppl_ratio": 1.0023434909066324,
+    "accepted": True,
+    "note": "excludes zero; Pierre accepted the fidelity cost, ship as-is",
+}
 ACTL_HEADER = 32                                   # shared header words
 ACTL_M0 = ACTL_HEADER                              # per-query blocks start
 ACTL_IDS = ACTL_M0 + ACTL_M_STRIDE * MAX_QUERY_WIDTH   # the ids start here
@@ -748,6 +770,7 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             # asserted here and the kernel's own abort flag is the real proof.
             "device": _device_attestation(),
             "portability": _portable_config(),
+            "fidelity": dict(FIDELITY_DECISION),
             "last_decision": _STATUS_LAST,
         }
         if reset:
