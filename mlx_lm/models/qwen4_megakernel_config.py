@@ -43,6 +43,11 @@ before the GPU is touched.
 ``MLX_QWEN4_MEGAKERNEL_ROWS``
     Per-phase rows per simdgroup as ``name=rows,name=rows`` (for example
     ``moe_down=2,gdn_in_proj=2``).  Names are the keys of ``PHASE_ROWS``.
+    **Resolved and reported, not yet consumed**: ``build_body_kernel`` still
+    takes its row counts from its own defaults, so this setting reaches the
+    receipt and not the kernel.  Wiring it is one keyword at that call site
+    and is deliberately left to the phase-E rewrite of the body, which owns
+    that file today.
 ``MLX_QWEN4_MEGAKERNEL_THREADGROUP_BYTES``
     Threadgroup arena budget in bytes.  The 16 KiB default is a residency
     choice (two threadgroups per core), not the hardware limit.

@@ -176,7 +176,7 @@ inline bool gbar(device atomic_uint* ctr, device atomic_uint* ab,
 # abort flag and stops -- it does not hang.
 _PROBE_SRC = r"""
   uint tid = thread_position_in_threadgroup.x;
-  uint nt  = threads_per_threadgroup.x;
+  const uint nt = NT;
   uint tg  = threadgroup_position_in_grid.x;
   uint ntg = threadgroups_per_grid.x;
 
@@ -234,7 +234,7 @@ _PROBE_SRC = r"""
 # memory exactly as the real bodies stage theirs.
 _SWEEP_SRC = r"""
   uint tid = thread_position_in_threadgroup.x;
-  uint nt  = threads_per_threadgroup.x;
+  const uint nt = NT;
   uint tg  = threadgroup_position_in_grid.x;
   uint ntg = threadgroups_per_grid.x;
   uint sg  = tid / 32u;
@@ -294,21 +294,21 @@ _PROBE_CACHE: dict[tuple, Any] = {}
 _SWEEP_CACHE: dict[tuple, Any] = {}
 
 
-def _probe_kernel():
-    if "k" not in _PROBE_CACHE:
-        _PROBE_CACHE["k"] = mx.fast.metal_kernel(
-            name="qwen4_mk_primitives",
+def _probe_kernel(threads: int):
+    if threads not in _PROBE_CACHE:
+        _PROBE_CACHE[threads] = mx.fast.metal_kernel(
+            name=f"qwen4_mk_primitives_t{threads}",
             input_names=["ctrl", "pub", "params"],
             output_names=["phases", "stale", "info"],
-            source=_PROBE_SRC, header=_GBAR,
+            source=_PROBE_SRC, header=_GBAR + f"\n#define NT {threads}u\n",
         )
-    return _PROBE_CACHE["k"]
+    return _PROBE_CACHE[threads]
 
 
 def _sweep_kernel(threads: int, rows: int, rdim: int, kdim: int):
     key = (threads, rows, rdim, kdim)
     if key not in _SWEEP_CACHE:
-        header = _GBAR + (f"\n#define ROWS {rows}u\n"
+        header = _GBAR + (f"\n#define ROWS {rows}u\n#define NT {threads}u\n"
                           f"#define RDIM {rdim}u\n#define KDIM {kdim}u\n")
         _SWEEP_CACHE[key] = mx.fast.metal_kernel(
             name=f"qwen4_mk_sweep_t{threads}_r{rows}",
@@ -329,7 +329,7 @@ def run_primitive_tests(*, threads: int, groups: int, rounds: int = 32,
     an ANSWER, and it is the answer the guardrail needs.
     """
     started = time.perf_counter()
-    kernel = _probe_kernel()
+    kernel = _probe_kernel(threads)
     ctrl = mx.zeros((8,), dtype=mx.uint32)
     pub = mx.zeros((pub_words,), dtype=mx.uint32)
     params = mx.array([rounds, pub_words, spin_cap], dtype=mx.uint32)
