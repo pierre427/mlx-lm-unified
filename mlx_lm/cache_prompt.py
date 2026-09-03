@@ -7,11 +7,13 @@ import time
 
 import mlx.core as mx
 
-from .generate import generate_step, validate_kv_quantization_args
+from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
+    generate_step,
+    validate_kv_quantization_args,
+)
 from .models.cache import make_prompt_cache, save_prompt_cache
 from .utils import load
-
-DEFAULT_QUANTIZED_KV_START = 5000
 
 
 def setup_arg_parser():
@@ -162,11 +164,18 @@ def main():
 
     print()
     print(f"Peak memory: {mx.get_peak_memory() / 1e9:.3f} GB")
+    if args.kv_bits is not None:
+        print(f"Quantized KV cache from step: {args.quantized_kv_start}")
 
     print("Saving...")
     metadata = {}
     metadata["model"] = args.model
     metadata["tokenizer_config"] = json.dumps(tokenizer_config)
+    if args.kv_bits is not None:
+        # Receipt: the cache on disk was quantized from this step onward, so
+        # a later --prompt-cache-file load can be matched against the
+        # schedule it was actually built with.
+        metadata["quantized_kv_start"] = str(args.quantized_kv_start)
     save_prompt_cache(args.prompt_cache_file, cache, metadata)
 
 
