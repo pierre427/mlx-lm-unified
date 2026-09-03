@@ -95,6 +95,43 @@ MAX_BLOCKS = 16384
 # answer.
 SDPA_BLOCKS = 128
 
+# PLE.  ``ple_layer_ids`` is [2], so exactly ONE of the 48 layers carries this
+# chain; the n-gram gather in front of it stays hoisted on the host.  The conv
+# is depthwise with dilation ``PLE_NGRAM``, so its persistent state is
+# ``(kernel - 1) * ngram`` rows -- 9, not 3.
+PLE_EMBED_DIM = 2560
+PLE_CONV_KERNEL = 4
+PLE_NGRAM = 3
+PLE_STATE_LEN = (PLE_CONV_KERNEL - 1) * PLE_NGRAM
+
+# ---- the per-token attention control block --------------------------------
+# One header for the whole token, then the selected block ids.  Everything in
+# it except the per-layer ledger bases is shared by all twelve attention
+# layers -- the query position, the context geometry and the scale do not vary
+# with depth -- so the layer index travels in the SCHEDULE (``arg0``/``arg2``)
+# and the control block stays one array.
+ACTL = {
+    "total": 0,          # physical KV width (allocated columns)
+    "u_width": 1,        # selected blocks the attention phase walks
+    "count": 2,
+    "n_sel": 3,
+    "q_pos": 4,          # the new token's LOGICAL position
+    "left_pad": 5,
+    "block_size": 6,
+    "ids_from_scratch": 7,
+    "scale_bits": 8,
+    "logical_len": 9,    # q_pos + 1: valid columns, <= total
+    "n_blocks": 10,
+    "n_valid": 11,
+    "rope_pos": 12,
+    "rope_theta_bits": 13,
+    "kv_slot": 14,       # physical column the append writes
+    "pooled_stride": 15, # pooled rows reserved per attention layer
+    "pool_new_block": 16,   # 1 when this token closed a block
+    "n_attn_layers": 17,
+}
+ACTL_HEADER = 32         # the ids start here; keep it a multiple of 16
+
 
 # -------------------------------------------------------------------- opcodes
 OP_NOP = 0
@@ -136,6 +173,47 @@ OP_INDEX_SCORE = 19
 # ``dst[h * width + d] += src[d]``: the MTP head's fuse adds one embedding
 # vector into all four hyper-connection streams.
 OP_ADD_BCAST = 20
+# ---- the attention LAYER, not just its attention phase ---------------------
+# Everything between the projections and the split-K attention that phase B
+# left on the host.  Each names the stock op it matches, because that is where
+# the tolerance class of the attention layer is decided:
+#
+# * ``OP_QK_NORM_ROPE`` -- ``nn.RMSNorm(head_dim)`` per head followed by
+#   partial RoPE.  Stock runs ``mx.fast.rms_norm`` and ``mx.fast.rope`` for
+#   attention q/k and the EAGER ``_apply_rope_positions`` for the indexer's q,
+#   so this phase matches the eager fp32 form of both and rounds to bfloat16
+#   at each of the two boundaries stock rounds at (norm out, rope out).  The
+#   bf16 round is not cosmetic: the attention phase's bit-identity with the
+#   shipped indexed kernel holds only if ``q`` is exactly ``float(bf16 q)``.
+# * ``OP_KV_APPEND`` -- ``cache.update_and_fetch(k, v)`` plus
+#   ``cache.update_index_keys(raw)``.  It writes the KV ledger and the raw
+#   index-key ledger IN PLACE through their bindings, the same const_cast the
+#   grid barrier already makes on ``ctrl``: a decode token appends one column,
+#   and a phase that returned it as an output would put the host back between
+#   two phases of the same launch.
+# * ``OP_POOL_BLOCK`` -- ``QSAIndexer._pool_blocks`` for the ONE block a decode
+#   token can close.  Phase B left pooling on the host, in the PLE class.  It
+#   cannot stay there: ``n_blocks = total // compress_ratio`` counts the
+#   current token, so every 4th token scores a block whose keys were written
+#   by the same launch.  Mean over the block in fp32 (the stock cast order),
+#   k_layernorm, then RoPE at the block's START position.
+# * ``OP_GATE_MUL`` -- ``out * mx.sigmoid(gate)``, the second half of q_proj's
+#   doubled output.  bf16 in stock, fp32 here, i.e. class 2.
+OP_QK_NORM_ROPE = 21
+OP_KV_APPEND = 22
+OP_GATE_MUL = 23
+# ---- the PLE chain's device half ------------------------------------------
+# The n-gram gather stays hoisted; everything after it is device work.
+# ``OP_PLE_GATE`` is the key/query dot, the sign-sqrt and the SIGMOID, and
+# that sigmoid is the reason this is its own phase: the engine's compiled PLE
+# chain is exact only because ``mx.sigmoid`` stays a standalone primitive
+# OUTSIDE the traced span (wiki research/mlx-compile-fused-sigmoid-rca), so the
+# kernel matches the standalone op with ``metal::precise::exp`` rather than the
+# fast intrinsic a fused span would have used.
+OP_PLE_GATE = 24
+OP_PLE_CONV = 25    # dilated depthwise conv + silu + the gated residual
+# ``QSAIndexer._pool_blocks`` for the one block a decode token can close.
+OP_POOL_BLOCK = 26
 
 OP_NAMES = {
     value: name
@@ -213,6 +291,11 @@ _SCRATCH_BLOCKS = (
     ("GDN_BA", 2 * GDN_VALUE_HEADS),
     ("GDN_Y", VALUE_DIM),
     ("ATT_QG", 2 * Q_DIM),
+    # q_proj emits [q | gate] PER HEAD, so its q is strided by 2*head_dim.
+    # The attention phase reads a contiguous head-major q, and the norm
+    # + RoPE phase is where the two layouts meet, so it needs a slab of
+    # its own rather than an in-place rewrite.
+    ("ATT_Q", Q_DIM),
     ("ATT_K", N_KV_HEADS * HEAD_DIM),
     ("ATT_V", N_KV_HEADS * HEAD_DIM),
     ("ATT_O", Q_DIM),
@@ -228,6 +311,11 @@ _SCRATCH_BLOCKS = (
     ("MOE_ROUTED", HIDDEN),
     ("SHARED_OUT", HIDDEN),
     ("SHARED_GATE", 1),
+    # The PLE n-gram embedding for the ONE layer that carries a PLE chain.
+    # It arrives as a host input like the residual streams, and it needs a slot
+    # of its own rather than BRANCH: BRANCH is the per-layer branch output, so
+    # layer 0's MoE would overwrite an embedding layer 1 has not read yet.
+    ("PLE_EMB", HIDDEN),
     ("SCRATCH_TMP", 1024),
 )
 

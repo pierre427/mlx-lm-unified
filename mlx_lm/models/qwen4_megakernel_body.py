@@ -39,7 +39,13 @@ from typing import Any, Optional
 import mlx.core as mx
 
 from .qwen4_megakernel import (
+    ACTL,
+    ACTL_HEADER,
     BLOCK_TOPK,
+    PLE_CONV_KERNEL,
+    PLE_NGRAM,
+    PLE_STATE_LEN,
+    ROTARY_DIM,
     CONV_DIM,
     CONV_KERNEL,
     FF,
@@ -272,7 +278,7 @@ BODY_SRC = r"""
   // Block ids for the attention phase.  ``OP_INDEX_TOPB`` writes them into
   // scratch as floats (a block index is < 2^24, so the round trip is exact);
   // a standalone probe hands them in through ``actl`` instead.
-  const device uint* sel_ids = actl + 16u;
+  const device uint* sel_ids = actl + ACTLH;
   const uint ids_from_scratch = actl[7];
 
   threadgroup float A[TGF];
@@ -300,8 +306,9 @@ BODY_SRC = r"""
     // embedding depend only on the input token, so they are host work.
     for (uint i = tg * NT + tid; i < xw; i += ntg * NT) {
       const float v = float(xin[(size_t)rep * xw + i]);
-      if (i < HCH) sc[SC_RESID_A + i] = v;
-      else         sc[SC_BRANCH + (i - HCH)] = v;
+      if (i < HCH)            sc[SC_RESID_A + i] = v;
+      else if (i < HCH + HID) sc[SC_BRANCH + (i - HCH)] = v;
+      else                    sc[SC_PLE_EMB + (i - HCH - HID)] = v;
     }
     live = gbar(ctr, ab, ntg, tid, phase, SPINCAP);
     if (!live) break;
@@ -761,6 +768,9 @@ BODY_SRC = r"""
         const uint token_width = U * BS;
         const uint elements = HD / 32u;
         const uint units = NQH * ABLK;
+        // `a0` is the attention layer's slot; all twelve KV ledgers share one
+        // binding pair, NKVH * TOT * HD elements apart.
+        const size_t kvbase = (size_t)a0 * NKVH * (size_t)TOT * HD;
         for (uint unit = grow; unit < units; unit += nrow) {
           const uint qh = unit / ABLK;
           const uint block_idx = unit - qh * ABLK;
@@ -785,9 +795,9 @@ BODY_SRC = r"""
             if (physical < 0 || physical >= int(TOT) || logical > qp) continue;
             if (!(slot < nsel || logical >= complete)) continue;
             const device BFT* krow =
-                kbuf + ((size_t)hkv * TOT + (size_t)physical) * HD;
+                kbuf + kvbase + ((size_t)hkv * TOT + (size_t)physical) * HD;
             const device BFT* vrow =
-                vbuf + ((size_t)hkv * TOT + (size_t)physical) * HD;
+                vbuf + kvbase + ((size_t)hkv * TOT + (size_t)physical) * HD;
             float score = 0.0f;
             for (uint part = 0; part < elements; ++part)
               score += q_values[part] * float(krow[lane * elements + part]);
@@ -887,12 +897,15 @@ BODY_SRC = r"""
         const uint nblocks = actl[10], nvalid = actl[11];
         const uint heads = IDXH, hd = IDXD;
         const float inv = INVIDXD;
+        // `a0` is the attention layer's slot: the pooled ledgers of all
+        // twelve live in one binding, `actl[15]` rows apart.
+        const size_t pbase = (size_t)a0 * actl[15] * hd;
         for (uint n = grow; n < nblocks; n += nrow) {
           if (n >= nvalid) {
             if (lane == 0u) sc[dst + n] = -INFINITY;
             continue;
           }
-          const device BFT* prow = pooled + (size_t)n * hd;
+          const device BFT* prow = pooled + pbase + (size_t)n * hd;
           float acc = 0.0f;
           for (uint h = 0; h < heads; ++h) {
             float d = 0.0f;
@@ -923,6 +936,212 @@ BODY_SRC = r"""
         select_top_blocks(sc + src, actl[10], a0,
                           reinterpret_cast<device uint*>(sc + dst),
                           hist, gtc, eqc, shared, tid, NT);
+      }
+
+      // -------------------------------------------- OP_QK_NORM_ROPE (21)
+      // Per-head RMSNorm then partial RoPE, one SIMDGROUP per head.  Both
+      // boundaries round to bfloat16, because both stock ops return the
+      // activation dtype -- and the attention phase's bit-identity with the
+      // shipped indexed kernel holds only if it reads exactly float(bf16 q).
+      //
+      // `a2` is the SOURCE stride per head: q_proj emits [q | gate] per head
+      // (2 * head_dim) while k_proj and the indexer's q are packed.  The
+      // destination is always head-major and packed.
+      //
+      // The rope pair is (i, i + half) with half = ROTD/2 = 32 = the SIMD
+      // width, so lane `l` wrote both halves of its own pair in the norm pass
+      // above.  The simdgroup barrier makes that ordering explicit rather
+      // than relying on it.
+      else if (op == 21u) {
+        const device uint* T = tbl + ent * TSTRIDE;
+        const device BFT* g = reinterpret_cast<const device BFT*>(
+            WB[T[TBL_GROUP]] + T[TBL_WOFF]);
+        const uint heads = a0, hd = a1;
+        const uint sstride = (a2 == 0u) ? hd : a2;
+        const uint hrot = ROTD / 2u;
+        const float pos = float(actl[12]);
+        const float logtheta = metal::precise::log(as_type<float>(actl[13]));
+        for (uint h = grow; h < heads; h += nrow) {
+          float ss = 0.0f;
+          for (uint i = lane; i < hd; i += 32u) {
+            const float v = sc[src + h * sstride + i];
+            ss += v * v;
+          }
+          ss = simd_sum(ss);
+          const float inv = metal::precise::rsqrt(ss / float(hd) + NEPS);
+          for (uint i = lane; i < hd; i += 32u) {
+            const float v = sc[src + h * sstride + i] * inv * float(g[i]);
+            sc[dst + h * hd + i] = float(static_cast<BFT>(v));
+          }
+          simdgroup_barrier(mem_flags::mem_device);
+          for (uint i = lane; i < hrot; i += 32u) {
+            const float freq = metal::precise::exp(
+                -logtheta * (2.0f * float(i)) / float(ROTD));
+            const float ang = pos * freq;
+            const float c = metal::precise::cos(ang);
+            const float sn = metal::precise::sin(ang);
+            const float l = sc[dst + h * hd + i];
+            const float r = sc[dst + h * hd + hrot + i];
+            sc[dst + h * hd + i] = float(static_cast<BFT>(l * c - r * sn));
+            sc[dst + h * hd + hrot + i] =
+                float(static_cast<BFT>(r * c + l * sn));
+          }
+        }
+      }
+
+      // ------------------------------------------------ OP_KV_APPEND (22)
+      // `cache.update_and_fetch` and `cache.update_index_keys`, in place.
+      // `src` is k, `a0` is v, `a1` is the raw index key, `a2` is the
+      // attention layer's slot -- the ONE thing about attention that varies
+      // with depth, so it travels in the schedule and the control block stays
+      // one array for the whole token.
+      else if (op == 22u) {
+        const uint TOT = actl[0], slot = actl[14], li = a2;
+        device BFT* kw = const_cast<device BFT*>(kbuf);
+        device BFT* vw = const_cast<device BFT*>(vbuf);
+        const size_t kb = (size_t)li * NKVH * (size_t)TOT * HD;
+        for (uint i = tg * NT + tid; i < NKVH * HD; i += ntg * NT) {
+          const uint h = i / HD, d = i - h * HD;
+          const size_t off = kb + ((size_t)h * TOT + slot) * HD + d;
+          kw[off] = static_cast<BFT>(sc[src + i]);
+          vw[off] = static_cast<BFT>(sc[a0 + i]);
+        }
+        device BFT* rw = const_cast<device BFT*>(rawk);
+        const size_t rb = (size_t)li * (size_t)TOT * IDXD + (size_t)slot * IDXD;
+        for (uint i = tg * NT + tid; i < IDXD; i += ntg * NT)
+          rw[rb + i] = static_cast<BFT>(sc[a1 + i]);
+      }
+
+      // ------------------------------------------------ OP_POOL_BLOCK (26)
+      // The ONE block a decode token can close, pooled exactly as
+      // `QSAIndexer._pool_blocks` does it: mean over the block's four raw
+      // keys with the fp32 upcast stock takes, back to bf16, k_layernorm,
+      // then RoPE at the block's START position.  `actl[16]` is 0 on the
+      // three tokens in four that close nothing, and the phase is then a
+      // no-op that still costs its barrier.
+      else if (op == 26u) {
+        if (actl[16] != 0u) {
+          const uint TOT = actl[0], BSZ = actl[6], li = a2;
+          const uint nb = actl[10];              // blocks after this token
+          const uint blk = nb - 1u;
+          const uint start = blk * BSZ;
+          const device uint* T = tbl + ent * TSTRIDE;
+          const device BFT* g = reinterpret_cast<const device BFT*>(
+              WB[T[TBL_GROUP]] + T[TBL_WOFF]);
+          device BFT* pw = const_cast<device BFT*>(pooled);
+          const size_t rb = (size_t)li * (size_t)TOT * IDXD;
+          const size_t pb = ((size_t)li * actl[15] + blk) * IDXD;
+          // One simdgroup does the whole 128-wide block; every threadgroup
+          // computes the same answer and writes it, which is the same
+          // replicate-rather-than-barrier trade OP_INDEX_TOPB makes.
+          if (sg == 0u) {
+            float ss = 0.0f;
+            float mine[IDXD / 32];
+            for (uint j = 0; j < IDXD / 32u; ++j) {
+              const uint i = lane + j * 32u;
+              float acc = 0.0f;
+              for (uint t = 0; t < BSZ; ++t)
+                acc += float(rawk[rb + (size_t)(start + t) * IDXD + i]);
+              const float m = float(static_cast<BFT>(acc / float(BSZ)));
+              mine[j] = m;
+              ss += m * m;
+            }
+            ss = simd_sum(ss);
+            const float inv = metal::precise::rsqrt(ss / float(IDXD) + NEPS);
+            const uint hrot = ROTD / 2u;
+            const float logtheta =
+                metal::precise::log(as_type<float>(actl[13]));
+            float normed[IDXD / 32];
+            for (uint j = 0; j < IDXD / 32u; ++j) {
+              const uint i = lane + j * 32u;
+              normed[j] = float(static_cast<BFT>(
+                  mine[j] * inv * float(g[i])));
+            }
+            // Lane `l` owns rope indices l and l + half of the FIRST 64 dims,
+            // which are j = 0 (i = l, l < 32 == hrot) and j = 1 (i = l + 32).
+            const float freq = metal::precise::exp(
+                -logtheta * (2.0f * float(lane)) / float(ROTD));
+            const float ang = float(start) * freq;
+            const float c = metal::precise::cos(ang);
+            const float sn = metal::precise::sin(ang);
+            const float l0 = normed[0], r0 = normed[1];
+            normed[0] = float(static_cast<BFT>(l0 * c - r0 * sn));
+            normed[1] = float(static_cast<BFT>(r0 * c + l0 * sn));
+            for (uint j = 0; j < IDXD / 32u; ++j)
+              pw[pb + lane + j * 32u] = static_cast<BFT>(normed[j]);
+          }
+        }
+      }
+
+      // -------------------------------------------------- OP_GATE_MUL (23)
+      // `out * mx.sigmoid(gate)`.  The gate is the second half of q_proj's
+      // doubled per-head output, so it is strided by `a2` while the attention
+      // output is packed.
+      else if (op == 23u) {
+        const uint heads = a0, hd = a1, sstride = a2;
+        for (uint i = tg * NT + tid; i < heads * hd; i += ntg * NT) {
+          const uint h = i / hd, d = i - h * hd;
+          sc[dst + i] = sc[dst + i]
+              * sigmoid_f(sc[src + h * sstride + hd + d]);
+        }
+      }
+
+      // -------------------------------------------------- OP_PLE_GATE (24)
+      // `_chain_gate` plus the sigmoid and the gate product.  `src` is the
+      // normed key (HCN x HID), `a0` the normed query (HCN x HID), `a1` the
+      // value (HID); `dst` takes the gated result (HCN x HID).
+      //
+      // The sigmoid is `metal::precise::exp`, matching the STANDALONE
+      // `mx.sigmoid` primitive.  That is the whole reason this is a phase of
+      // its own: the engine's compiled PLE chain is exact only because the
+      // sigmoid sits OUTSIDE the traced span, where a fused rewrite cannot
+      // reach it.
+      else if (op == 24u) {
+        for (uint h = grow; h < HCN; h += nrow) {
+          float acc = 0.0f;
+          for (uint i = lane; i < HID; i += 32u)
+            acc += sc[src + h * HID + i] * sc[a0 + h * HID + i];
+          acc = simd_sum(acc);
+          float gate = acc * PLEQS;
+          gate = (gate < 0.0f ? -1.0f : (gate > 0.0f ? 1.0f : 0.0f))
+               * metal::precise::sqrt(metal::max(metal::abs(gate), 1e-6f));
+          gate = sigmoid_f(gate);
+          for (uint i = lane; i < HID; i += 32u)
+            sc[dst + h * HID + i] = gate * sc[a1 + i];
+        }
+      }
+
+      // -------------------------------------------------- OP_PLE_CONV (25)
+      // The dilated depthwise conv, its silu, the gated residual, and the
+      // conv-state roll.  `src` is the conv-normed vector, `a0` the gated
+      // vector, `dst` the hyper-connection residual the result adds into.
+      //
+      // At M = 1 the conv window is the 9 state rows plus the new one and the
+      // taps are 3 apart, so the output reads rows 0, 3, 6 of the state and
+      // the new row -- and the new state is rows 1..9 of that window, i.e. the
+      // old state shifted by one with the new row appended.  The shift is
+      // deliberately done AFTER the whole output is read, behind a
+      // threadgroup barrier per element rather than a copy: every channel is
+      // independent, so one thread owning a channel does read-then-write with
+      // no cross-thread hazard at all.
+      else if (op == 25u) {
+        const device uint* T = tbl + ent * TSTRIDE;
+        const device BFT* w = reinterpret_cast<const device BFT*>(
+            WB[T[TBL_GROUP]] + T[TBL_WOFF]);
+        device BFT* st = const_cast<device BFT*>(pconv);
+        for (uint c = tg * NT + tid; c < HCH; c += ntg * NT) {
+          const float xnew = sc[src + c];
+          float acc = 0.0f;
+          for (uint kk = 0; kk + 1u < PLEK; ++kk)
+            acc += float(w[c * PLEK + kk])
+                 * float(st[(size_t)(kk * PLEN) * HCH + c]);
+          acc += float(w[c * PLEK + (PLEK - 1u)]) * xnew;
+          sc[dst + c] = sc[dst + c] + sc[a0 + c] + silu_f(acc);
+          // roll: state row r <- row r+1, last row <- the new vector
+          for (uint r = 0; r + 1u < PLES; ++r)
+            st[(size_t)r * HCH + c] = st[(size_t)(r + 1u) * HCH + c];
+          st[(size_t)(PLES - 1u) * HCH + c] = static_cast<BFT>(xnew);
+        }
       }
 
       // ------------------------------------------------ OP_ADD_BCAST (20)
@@ -974,6 +1193,12 @@ BODY_SRC = r"""
 IN_NAMES = [
     "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7",
     "tbl", "sched", "meta", "cs_in", "rec_in", "kbuf", "vbuf", "pooled",
+    # The raw index-key ledger and the PLE conv state.  Both are LEDGERS the
+    # kernel appends to in place, like ``ctrl``, not values it returns: the
+    # decode token that writes them is the same launch that reads them back
+    # two phases later, so an output would put the host in the middle of the
+    # dispatch.  21 bindings of Metal's 31.
+    "rawk", "pconv",
     "actl", "ctrl", "base",
 ]
 OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "logits",
@@ -1011,6 +1236,9 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         "AGQA": N_Q_HEADS // N_KV_HEADS, "ABLK": SDPA_BLOCKS, "NSGA": nsg,
         "IDXH": IDX_HEADS, "IDXD": IDX_HEAD_DIM,
         "INVIDXD": f"{IDX_HEAD_DIM ** -0.5:.17g}f",
+        "ROTD": ROTARY_DIM, "ACTLH": ACTL_HEADER,
+        "PLEK": PLE_CONV_KERNEL, "PLEN": PLE_NGRAM, "PLES": PLE_STATE_LEN,
+        "PLEQS": f"{HIDDEN ** -0.5:.17g}f",
         "RDOWN": rdown, "RGU": rgu, "RDN": rdn, "RMAXN": RMAX,
         "TGF": TG_FLOATS,
         "QSCALE": f"{GDN_KEY_DIM ** -0.5:.17g}f",
@@ -1079,7 +1307,8 @@ class MegakernelBody:
 
     def __call__(self, xin, cs_in, rec_in, *, reps: int = 1,
                  steps: Optional[int] = None, kbuf=None, vbuf=None,
-                 pooled=None, actl=None, total: int = 1):
+                 pooled=None, actl=None, total: int = 1, rawk=None,
+                 pconv=None):
         """``steps`` truncates the schedule, for cumulative phase profiling.
 
         The barrier map lives in the schedule, so a prefix is a real, running
@@ -1096,10 +1325,14 @@ class MegakernelBody:
         if pooled is None:
             pooled = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
         if actl is None:
-            actl = mx.zeros((16 + BLOCK_TOPK,), mx.uint32)
+            actl = mx.zeros((ACTL_HEADER + BLOCK_TOPK,), mx.uint32)
+        if rawk is None:
+            rawk = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
+        if pconv is None:
+            pconv = mx.zeros((PLE_STATE_LEN, HC_HIDDEN), mx.bfloat16)
         outs = self.kernel(
             inputs=[xin, *self.wbufs, self.table, self.sched, meta,
-                    cs_in, rec_in, kbuf, vbuf, pooled, actl,
+                    cs_in, rec_in, kbuf, vbuf, pooled, rawk, pconv, actl,
                     self.ctrl, base],
             grid=(self.groups * self.threads, 1, 1),
             threadgroup=(self.threads, 1, 1),

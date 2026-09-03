@@ -47,12 +47,6 @@ import mlx.core as mx
 
 from .qwen4_megakernel import (
     BAR_DEVICE,
-    OP_ATTN_COMBINE,
-    OP_HC_DOWN,
-    OP_HC_UP,
-    OP_ADD_BCAST,
-    OP_INDEX_SCORE,
-    PHASE_ROWS,
     BAR_NONE,
     BAR_THREADGROUP,
     BLOCK_TOPK,
@@ -67,31 +61,53 @@ from .qwen4_megakernel import (
     HC_COUNT,
     HC_HIDDEN,
     HC_LOWRANK,
+    HEAD_DIM,
     HIDDEN,
+    IDX_COMPRESS,
+    IDX_HEADS,
+    IDX_HEAD_DIM,
     KEY_DIM,
     NUM_EXPERTS,
+    N_KV_HEADS,
+    N_Q_HEADS,
     OP_ADD,
+    OP_ADD_BCAST,
     OP_ATTN,
+    OP_ATTN_COMBINE,
     OP_COPY,
+    OP_GATE_MUL,
     OP_GDN_CORE,
     OP_GROUP_RMSNORM,
+    OP_HC_DOWN,
     OP_HC_MIX,
+    OP_HC_UP,
+    OP_INDEX_SCORE,
     OP_INDEX_TOPB,
     OP_INJECT,
+    OP_KV_APPEND,
     OP_MOE_E1,
     OP_MOE_E2,
     OP_MOE_TOPK,
     OP_NOP,
+    OP_PLE_CONV,
+    OP_PLE_GATE,
+    OP_POOL_BLOCK,
+    OP_QK_NORM_ROPE,
     OP_QMV,
     OP_RMSNORM,
     OP_SILU_MUL,
+    PHASE_ROWS,
+    PLE_CONV_KERNEL,
+    PLE_NGRAM,
+    PLE_STATE_LEN,
     RMS_EPS,
+    ROTARY_DIM,
     SCRATCH,
     SCRATCH_FLOATS,
-    TOPK,
-    VALUE_DIM,
     Schedule,
     Step,
+    TOPK,
+    VALUE_DIM,
 )
 
 # ``OP_QMV.arg0``: rows per simdgroup.  The spec tuned a different value for
@@ -245,7 +261,17 @@ def _gdn_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     ))
 
 
-def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
+def _attention_branch(schedule: Schedule, pack, plan: LayerPlan,
+                      slot: int = 0) -> None:
+    """One full-attention branch, complete: projections, q/k norms and RoPE,
+    the KV and raw-index-key appends, the block the token closes, the indexer
+    score and selection, split-K attention, the output gate and ``o_proj``.
+
+    ``slot`` is this layer's index AMONG THE ATTENTION LAYERS.  It is the only
+    thing about attention that varies with depth -- the twelve KV, raw-key and
+    pooled ledgers share one binding each -- so it travels in the schedule and
+    the per-token control block stays a single array.
+    """
     attn = plan.key("self_attn")
     for name, dst in (
         ("q_proj", SCRATCH["ATT_QG"]),
@@ -262,6 +288,42 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
         src=SCRATCH["MIXED"], dst=SCRATCH["IDX_QK"], arg0=R_GENERIC,
         barrier=BAR_DEVICE,
     ))
+    # q/k norms and RoPE.  q_proj emits [q | gate] per head, so its q is
+    # strided by 2 * head_dim and lands in a packed slab of its own; k and the
+    # indexer's q are already packed and are normed in place.
+    schedule.add(Step(
+        op=OP_QK_NORM_ROPE, entry=_entry_id(pack, f"{attn}.q_norm.weight"),
+        src=SCRATCH["ATT_QG"], dst=SCRATCH["ATT_Q"],
+        arg0=N_Q_HEADS, arg1=HEAD_DIM, arg2=2 * HEAD_DIM, barrier=BAR_NONE,
+    ))
+    schedule.add(Step(
+        op=OP_QK_NORM_ROPE, entry=_entry_id(pack, f"{attn}.k_norm.weight"),
+        src=SCRATCH["ATT_K"], dst=SCRATCH["ATT_K"],
+        arg0=N_KV_HEADS, arg1=HEAD_DIM, arg2=HEAD_DIM, barrier=BAR_NONE,
+    ))
+    schedule.add(Step(
+        op=OP_QK_NORM_ROPE,
+        entry=_entry_id(pack, f"{attn}.indexer.q_layernorm.weight"),
+        src=SCRATCH["IDX_QK"], dst=SCRATCH["IDX_QK"],
+        arg0=IDX_HEADS, arg1=IDX_HEAD_DIM, arg2=IDX_HEAD_DIM,
+        barrier=BAR_DEVICE,
+    ))
+    # The KV and raw-index-key appends, then the one block this token can
+    # close.  Both write their bindings in place; the pooling MUST be here
+    # rather than on the host, because ``n_blocks = total // compress_ratio``
+    # counts the current token, so every fourth token scores a block whose raw
+    # keys were written two phases earlier in this same launch.
+    schedule.add(Step(
+        op=OP_KV_APPEND, src=SCRATCH["ATT_K"], dst=0,
+        arg0=SCRATCH["ATT_V"],
+        arg1=SCRATCH["IDX_QK"] + IDX_HEADS * IDX_HEAD_DIM,
+        arg2=slot, barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_POOL_BLOCK,
+        entry=_entry_id(pack, f"{attn}.indexer.k_layernorm.weight"),
+        src=0, dst=0, arg2=slot, barrier=BAR_DEVICE,
+    ))
     # The indexer's score, then the selection.  The pooled-key ledger is a
     # host binding: one block closes every ``compress_ratio`` tokens, so
     # pooling it is incremental host state in the PLE class.  The block count
@@ -270,7 +332,8 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     schedule.add(Step(
         op=OP_INDEX_SCORE,
         entry=_entry_id(pack, f"{attn}.indexer.q_layernorm.weight"),
-        src=SCRATCH["IDX_QK"], dst=SCRATCH["IDX_SCORE"], barrier=BAR_DEVICE,
+        src=SCRATCH["IDX_QK"], dst=SCRATCH["IDX_SCORE"], arg0=slot,
+        barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
         op=OP_INDEX_TOPB, src=SCRATCH["IDX_SCORE"], dst=SCRATCH["IDX_SEL"],
@@ -280,10 +343,15 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
         # to be visible to the attention phase, which is a device barrier
         barrier=BAR_DEVICE,
     ))
-    schedule.add(Step(op=OP_ATTN, src=SCRATCH["ATT_QG"], dst=SCRATCH["ATT_O"],
-                      barrier=BAR_DEVICE))
-    schedule.add(Step(op=OP_ATTN_COMBINE, src=SCRATCH["ATT_QG"],
+    schedule.add(Step(op=OP_ATTN, src=SCRATCH["ATT_Q"], dst=SCRATCH["ATT_O"],
+                      arg0=slot, barrier=BAR_DEVICE))
+    schedule.add(Step(op=OP_ATTN_COMBINE, src=SCRATCH["ATT_Q"],
                       dst=SCRATCH["ATT_O"], barrier=BAR_DEVICE))
+    # ``out * mx.sigmoid(gate)``: the gate is q_proj's second per-head half.
+    schedule.add(Step(
+        op=OP_GATE_MUL, src=SCRATCH["ATT_QG"], dst=SCRATCH["ATT_O"],
+        arg0=N_Q_HEADS, arg1=HEAD_DIM, arg2=2 * HEAD_DIM, barrier=BAR_DEVICE,
+    ))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{attn}.o_proj"),
         src=SCRATCH["ATT_O"], dst=SCRATCH["BRANCH"], arg0=R_GENERIC,
@@ -348,17 +416,78 @@ def _moe_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
     ))
 
 
+def _ple_chain(schedule: Schedule, pack, plan: LayerPlan, resid: int) -> None:
+    """The PLE chain's DEVICE half: ``x = x + ple(x, input_ids)``.
+
+    Only the n-gram gather in front of this stays hoisted -- it is a file-backed
+    lookup that depends on the input token alone, the same class as
+    ``embed_tokens`` -- and its rows arrive in ``SCRATCH["PLE_EMB"]`` as a host
+    input.  Everything from ``key_proj`` through the residual add is here.
+
+    Which stock op each boundary matches: ``key_proj``/``value_proj`` are
+    ``quantized_matmul``; ``norm_key``/``norm_query``/``norm_conv`` are
+    ``GroupRMSNorm`` in its eager fp32 form; ``OP_PLE_GATE`` is
+    ``PLELayer._chain_gate`` -- the key/query dot scaled by
+    ``1/sqrt(hidden)``, ``sign(g) * sqrt(max(|g|, 1e-6))`` -- followed by the
+    STANDALONE ``mx.sigmoid`` and the ``sigmoid * value`` product; and
+    ``OP_PLE_CONV`` is ``nn.silu(conv1d(...))`` plus ``gated + conv``.
+
+    The sigmoid is the reason the gate is a phase of its own.  The engine's
+    compiled PLE chain is exact only because ``mx.sigmoid`` is kept eager
+    OUTSIDE the traced span -- inside one, the fused rewrite disagrees with the
+    standalone primitive.  The kernel therefore matches the standalone op, with
+    ``metal::precise::exp``, not the fast intrinsic.
+    """
+    ple = plan.key("ple")
+    schedule.add(Step(
+        op=OP_QMV, entry=_entry_id(pack, f"{ple}.key_proj"),
+        src=SCRATCH["PLE_EMB"], dst=SCRATCH["HC_W"], arg0=R_GENERIC,
+        barrier=BAR_NONE,
+    ))
+    schedule.add(Step(
+        op=OP_QMV, entry=_entry_id(pack, f"{ple}.value_proj"),
+        src=SCRATCH["PLE_EMB"], dst=SCRATCH["SHARED_OUT"], arg0=R_GENERIC,
+        barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_GROUP_RMSNORM, entry=_entry_id(pack, f"{ple}.norm_key.weight"),
+        src=SCRATCH["HC_W"], dst=SCRATCH["NORMED"],
+        arg0=HC_HIDDEN, arg1=HIDDEN, barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_GROUP_RMSNORM, entry=_entry_id(pack, f"{ple}.norm_query.weight"),
+        src=resid, dst=SCRATCH["HC_W"],
+        arg0=HC_HIDDEN, arg1=HIDDEN, barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_PLE_GATE, src=SCRATCH["NORMED"], dst=SCRATCH["NORMED"],
+        arg0=SCRATCH["HC_W"], arg1=SCRATCH["SHARED_OUT"], barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_GROUP_RMSNORM, entry=_entry_id(pack, f"{ple}.norm_conv.weight"),
+        src=SCRATCH["NORMED"], dst=SCRATCH["HC_W"],
+        arg0=HC_HIDDEN, arg1=HIDDEN, barrier=BAR_DEVICE,
+    ))
+    schedule.add(Step(
+        op=OP_PLE_CONV, entry=_entry_id(pack, f"{ple}.conv1d.weight"),
+        src=SCRATCH["HC_W"], dst=resid, arg0=SCRATCH["NORMED"],
+        barrier=BAR_DEVICE,
+    ))
+
+
 def build_layer_schedule(
     schedule: Schedule, pack, plan: LayerPlan, resid: int, other: int,
-    *, fused_hyper: bool = True,
+    *, fused_hyper: bool = True, attn_slot: int = 0, has_ple: bool = False,
 ) -> int:
     """Append one decoder layer.  Returns the slab the output landed in."""
+    if has_ple:
+        _ple_chain(schedule, pack, plan, resid)
     _hyper_block(schedule, pack, plan, "attn_hyper_connection", resid,
                  fused=fused_hyper)
     if plan.is_linear:
         _gdn_branch(schedule, pack, plan)
     else:
-        _attention_branch(schedule, pack, plan)
+        _attention_branch(schedule, pack, plan, attn_slot)
     schedule.add(Step(
         op=OP_INJECT, src=resid, dst=other, arg0=SCRATCH["BRANCH"],
         arg1=SCRATCH["INJECT"], arg2=HC_COUNT, barrier=BAR_DEVICE,
@@ -382,12 +511,25 @@ def build_token_schedule(
     prefix: str = "language_model.model.layers",
     include_lm_head: bool = True,
     fused_hyper: bool = True,
+    ple_layer_ids: Optional[list[int]] = None,
     mixer: str = "language_model.model.hyper_connection_mixer",
 ) -> Schedule:
     """The whole per-token phase sequence, hyper-connections included."""
     schedule = Schedule()
     resid, other = SCRATCH["RESID_A"], SCRATCH["RESID_B"]
-    indices = range(len(layer_types)) if layers is None else layers
+    indices = list(range(len(layer_types))) if layers is None else list(layers)
+    # A layer's attention slot is its rank among the FULL-ATTENTION layers of
+    # the whole model, not of the subset a probe selects -- the ledgers are
+    # allocated per model layer, so a 3-layer probe on layers 0/1/3 must still
+    # address slot 0 for layer 3 only if it allocated one ledger.  Ranking
+    # within the emitted set keeps probe and full token consistent.
+    attn_rank = {
+        index: rank
+        for rank, index in enumerate(
+            i for i in indices if layer_types[i] != "linear_attention"
+        )
+    }
+    ple = set(int(i) - 1 for i in (ple_layer_ids or ()))
     for index in indices:
         plan = LayerPlan(
             index=index,
@@ -395,7 +537,9 @@ def build_token_schedule(
             prefix=f"{prefix}.{index}",
         )
         landed = build_layer_schedule(schedule, pack, plan, resid, other,
-                                      fused_hyper=fused_hyper)
+                                      fused_hyper=fused_hyper,
+                                      attn_slot=attn_rank.get(index, 0),
+                                      has_ple=index in ple)
         resid, other = landed, (resid if landed == other else other)
     # final mixer: same GatedResidual, without the inject combine
     tail = LayerPlan(index=-1, is_linear=True, prefix=mixer.rsplit(".", 1)[0])
@@ -664,6 +808,95 @@ class MirrorExecutor:
         y = y * mx.sigmoid(z.reshape(GDN_VALUE_HEADS, GDN_VALUE_DIM))
         self.write(step.dst, y.reshape(VALUE_DIM))
 
+    # ---- the attention layer's non-matvec steps, and the PLE device half
+    def _rope(self, x: mx.array, position, dims: int) -> mx.array:
+        """``_apply_rope_positions``: the eager, non-traditional partial form.
+
+        The indexer runs exactly this; ``mx.fast.rope`` runs the same formula
+        for attention q/k with its own reduction of the angle, which is where
+        the attention layer's class-2 gap against stock comes from.
+        """
+        base = float(self.state.get("rope_theta", 1.0e7))
+        half = dims // 2
+        freqs = mx.exp(-math.log(base) * mx.arange(0, dims, 2) / dims)
+        angles = mx.array(float(position), mx.float32) * freqs
+        cos, sin = mx.cos(angles), mx.sin(angles)
+        left, right = x[..., :half], x[..., half:dims]
+        rot = mx.concatenate(
+            [left * cos - right * sin, right * cos + left * sin], axis=-1
+        )
+        return mx.concatenate([_bf(rot), x[..., dims:]], axis=-1)
+
+    def _op_21(self, step: Step) -> None:  # OP_QK_NORM_ROPE
+        heads, hd, stride = step.arg0, step.arg1, step.arg2 or step.arg1
+        gain = self.weights(step.entry)["weight"].astype(mx.float32)
+        rows = mx.stack([
+            self.read(step.src + h * stride, hd) for h in range(heads)
+        ])
+        scale = mx.rsqrt(mx.mean(rows * rows, axis=-1, keepdims=True) + RMS_EPS)
+        normed = _bf(rows * scale * gain)
+        roped = self._rope(normed, self.state.get("rope_pos", 0), ROTARY_DIM)
+        self.write(step.dst, roped.reshape(-1))
+
+    def _op_22(self, step: Step) -> None:  # OP_KV_APPEND
+        """The mirror keeps the appends as plain host state; the KERNEL writes
+        its bindings in place.  Both are the same values in the same slots."""
+        slot, li = self.state.get("kv_slot", 0), step.arg2
+        for name, base, width in (
+            ("k", step.src, N_KV_HEADS * HEAD_DIM),
+            ("v", step.arg0, N_KV_HEADS * HEAD_DIM),
+            ("raw", step.arg1, IDX_HEAD_DIM),
+        ):
+            self.state.setdefault(name, {})[(li, slot)] = _bf(
+                self.read(base, width)
+            )
+
+    def _op_26(self, step: Step) -> None:  # OP_POOL_BLOCK
+        if not self.state.get("pool_new_block"):
+            return
+        li, block = step.arg2, self.state["n_blocks"] - 1
+        size = self.state.get("block_size", IDX_COMPRESS)
+        start = block * size
+        gain = self.weights(step.entry)["weight"].astype(mx.float32)
+        rows = mx.stack([
+            self.state["raw"][(li, start + t)] for t in range(size)
+        ])
+        pooled = _bf(mx.mean(rows, axis=0))
+        scale = mx.rsqrt(mx.mean(pooled * pooled, keepdims=True) + RMS_EPS)
+        pooled = self._rope(_bf(pooled * scale * gain), start, ROTARY_DIM)
+        self.state.setdefault("pooled", {})[(li, block)] = pooled
+
+    def _op_23(self, step: Step) -> None:  # OP_GATE_MUL
+        heads, hd, stride = step.arg0, step.arg1, step.arg2
+        gate = mx.stack([
+            self.read(step.src + h * stride + hd, hd) for h in range(heads)
+        ]).reshape(-1)
+        self.write(step.dst, self.read(step.dst, heads * hd) * mx.sigmoid(gate))
+
+    def _op_24(self, step: Step) -> None:  # OP_PLE_GATE
+        key = self.read(step.src, HC_HIDDEN).reshape(HC_COUNT, HIDDEN)
+        query = self.read(step.arg0, HC_HIDDEN).reshape(HC_COUNT, HIDDEN)
+        value = self.read(step.arg1, HIDDEN)
+        gate = mx.sum(key * query, axis=-1, keepdims=True) / math.sqrt(HIDDEN)
+        gate = mx.sign(gate) * mx.sqrt(mx.maximum(mx.abs(gate), 1e-6))
+        self.write(step.dst, (mx.sigmoid(gate) * value[None, :]).reshape(-1))
+
+    def _op_25(self, step: Step) -> None:  # OP_PLE_CONV
+        weight = self.weights(step.entry)["weight"].astype(mx.float32)
+        weight = weight.reshape(HC_HIDDEN, PLE_CONV_KERNEL)
+        state = self.state["ple_conv"].astype(mx.float32)
+        new = self.read(step.src, HC_HIDDEN)
+        window = mx.concatenate([state, new[None, :]], axis=0)
+        taps = mx.stack([
+            window[k * PLE_NGRAM] for k in range(PLE_CONV_KERNEL)
+        ])
+        conv = mx.sum(taps * weight.T, axis=0)
+        conv = conv * mx.sigmoid(conv)
+        self.state["ple_conv_out"] = window[1:]
+        self.write(step.dst,
+                   self.read(step.dst, HC_HIDDEN)
+                   + self.read(step.arg0, HC_HIDDEN) + conv)
+
     def _op_16(self, step: Step) -> None:  # OP_HC_DOWN
         entry = self.entry(step.entry)
         parts = self.weights(step.entry)
@@ -736,6 +969,15 @@ class MirrorExecutor:
         ).reshape(TOPK, HIDDEN)
         weights = self.read(SCRATCH["MOE_TOPW"], TOPK)
         self.write(step.dst, (out * weights[:, None]).sum(0))
+
+
+def _bf(x: mx.array) -> mx.array:
+    """Round at a boundary stock rounds at.  ``mx.fast.rms_norm`` and
+    ``mx.fast.rope`` both return the activation dtype, so a phase that keeps
+    fp32 through them would not be comparable at the next boundary -- and the
+    attention phase's bit-identity with the shipped indexed kernel requires
+    exactly ``float(bf16 q)``."""
+    return x.astype(mx.bfloat16).astype(mx.float32)
 
 
 def _activate(x: mx.array, kind: int) -> mx.array:
