@@ -341,6 +341,55 @@ class MegakernelDecoder:
                 actl[ACTL[name]] = actl[ACTL_M0 + off]
         return mx.array(actl)
 
+    def step_slab(self, embeddings: mx.array, *, ple_embeddings=None,
+                  position: Optional[int] = None, record: bool = True):
+        """A width-M VERIFY SLAB: M embeddings in, M logit rows out, ONE
+        dispatch.
+
+        This is the half of a k=2 self-MTP round the megakernel used to
+        refuse.  `embeddings` is (M, HIDDEN) -- the draft token and its k
+        proposals, already embedded on the host -- and the queries land at
+        positions `position, position + 1, ... position + M - 1`.
+
+        **What the caller owns.**  The recurrent and conv state after the slab
+        is the state after ALL M queries, because writing a restore point per
+        query costs +227 MB of write traffic a token.  `cs_in`/`rec_in` are a
+        separate buffer from the outputs, so the pre-slab state survives the
+        launch untouched: on a partial accept the caller re-launches a
+        narrower slab from it rather than restoring.  Commit the outputs only
+        when every query was accepted.
+        """
+        width = int(embeddings.shape[0])
+        decision = self.admit(width=width)
+        if not decision.accepted:
+            if record:
+                record_megakernel_receipt(engaged=False,
+                                          reason=decision.reason, width=width)
+            raise RuntimeError(f"megakernel declined: {decision.reason}")
+        position = self.position if position is None else int(position)
+        parts = []
+        for m in range(width):
+            streams = mx.tile(embeddings[m].reshape(-1), (HC_COUNT,))
+            row = [streams.astype(mx.bfloat16),
+                   mx.zeros((HIDDEN,), mx.bfloat16)]
+            if ple_embeddings is not None:
+                row.append(ple_embeddings[m].reshape(-1).astype(mx.bfloat16))
+            parts.append(mx.concatenate(row))
+        xin = mx.stack(parts)
+        outs = self.body(
+            xin, self.cs, self.rec, reps=1, kv=self.kv, idxl=self.idxl,
+            pconv=self.pconv, actl=self.control(position, width),
+            mwidth=width)
+        logits = outs[OUT["logits"]]
+        self._pending = outs
+        if record:
+            record_megakernel_receipt(
+                engaged=True, reason="engaged", phases=len(self.schedule),
+                op_counts=self.op_counts, position=position, width=width,
+                context=position + width,
+                device_barriers=self.device_barriers)
+        return logits
+
     def step(self, embedding: mx.array, *, ple_embedding=None,
              position: Optional[int] = None, record: bool = True):
         """One decode token: embedding in, logits out, ONE dispatch.
@@ -372,7 +421,7 @@ class MegakernelDecoder:
         if record:
             record_megakernel_receipt(
                 engaged=True, reason="engaged", phases=len(self.schedule),
-                op_counts=self.op_counts, position=position,
+                op_counts=self.op_counts, position=position, width=1,
                 context=position + 1, device_barriers=self.device_barriers)
         return logits
 

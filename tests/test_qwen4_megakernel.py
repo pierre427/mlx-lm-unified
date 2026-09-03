@@ -396,3 +396,71 @@ def test_per_query_control_blocks_do_not_share_a_tail_block():
         if start % mk.IDX_COMPRESS in (2, 3):
             assert len(set(tails)) == 2, (start, tails)
         assert sum(closes) in (0, 1), (start, closes)
+
+
+def test_threadgroup_arena_still_fits_after_widening_the_routing():
+    """The arena is the sharp budget: 16 KiB hard, and it had 320 B free.
+
+    Widening `topi`/`topw` by the query width spends 160 of those.  The
+    expert-UNION arrays -- 61 words -- do not come out of the remainder at
+    all: they alias the GDN core's `SQ` staging block, which is 128 words and
+    is never live beside the MoE, because a layer runs its recurrent or
+    attention branch to completion before its MoE phases start.  Assert both,
+    because an arena overflow is a link-time crash and an alias that is too
+    small is silent corruption.
+    """
+    from mlx_lm.models import qwen4_megakernel_body as body
+    assert body.THREADGROUP_BYTES <= mk.THREADGROUP_BYTES_CAP, (
+        body.THREADGROUP_BYTES)
+    sq_words = body.TG["SK"] - body.TG["SQ"]
+    union_words = 2 * mk.MAX_QUERY_WIDTH * mk.TOPK + 1
+    assert union_words <= sq_words, (union_words, sq_words)
+
+
+def _union_mirror(topi_per_query):
+    """The CPU definition of `build_expert_union`.
+
+    Query 0's choices in its own order first, then whatever each later query
+    adds.  That order is what makes the M=1 MoE bit-identical: the union IS
+    query 0's top-k, unchanged, so the K-fold's loop bounds and its
+    accumulation order are the ones that shipped.
+    """
+    uni, slots = [], []
+    for m, row in enumerate(topi_per_query):
+        for t, e in enumerate(row):
+            if e in uni:
+                at = uni.index(e)
+            else:
+                at = len(uni)
+                uni.append(e)
+                slots.append(0)
+            slots[at] |= (t + 1) << (8 * m)
+    return uni, slots
+
+
+def test_expert_union_is_query_zero_first_and_masks_by_slot():
+    k = mk.TOPK
+    # M=1: the union is exactly the query's own list, in its own order.
+    row = list(range(100, 100 + k))
+    uni, slots = _union_mirror([row])
+    assert uni == row
+    assert slots == [(t + 1) for t in range(k)]
+    # Identical routing across the slab: the union does not grow at all, and
+    # every entry carries a slot for every query.
+    uni, slots = _union_mirror([row, row, row])
+    assert uni == row and len(uni) == k
+    for t, packed in enumerate(slots):
+        for m in range(3):
+            assert (packed >> (8 * m)) & 255 == t + 1
+    # Disjoint routing: the union is the worst case the plan names.
+    rows = [list(range(m * k, m * k + k)) for m in range(3)]
+    uni, slots = _union_mirror(rows)
+    assert len(uni) == 3 * k
+    for u, packed in enumerate(slots):
+        m, t = divmod(u, k)
+        assert (packed >> (8 * m)) & 255 == t + 1
+        for other in range(3):
+            if other != m:
+                assert (packed >> (8 * other)) & 255 == 0
+    # A slot index must fit the byte the mask packs it into.
+    assert mk.TOPK + 1 < 256
