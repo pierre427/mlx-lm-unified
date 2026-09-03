@@ -464,3 +464,20 @@ def test_expert_union_is_query_zero_first_and_masks_by_slot():
                 assert (packed >> (8 * other)) & 255 == 0
     # A slot index must fit the byte the mask packs it into.
     assert mk.TOPK + 1 < 256
+
+
+def test_every_admitted_width_has_a_dispatch_branch():
+    """A width with no branch of its own is a silent out-of-bounds read.
+
+    The kernel's M dispatch chains are written out for 1, 2 and the built
+    maximum.  If the maximum ever rose above 3, width 3 would fall into the
+    MAXMW branch: the body would read a source plane the slab's scratch does
+    not have and index its accumulators with a stride the caller does not use,
+    with no error anywhere.  The build refuses instead.
+    """
+    assert mk.MAX_QUERY_WIDTH <= 3, (
+        "raising the built maximum needs the per-width dispatch chains "
+        "generated rather than extended by hand")
+    covered = {1, 2, mk.MAX_QUERY_WIDTH}
+    for width in range(1, mk.MAX_QUERY_WIDTH + 1):
+        assert width in covered, width

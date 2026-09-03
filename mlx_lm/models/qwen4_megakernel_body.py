@@ -1022,7 +1022,7 @@ BODY_SRC = r"""
         for (uint r0 = grow * RGU; r0 < nu * width; r0 += nrow * RGU) {
           uint u = r0 / width, j = r0 - u * width;
           uint eid = uni[u], packed = uslot[u];
-          float g_[RGU * MAXMW], u_[RGU * MAXMW];
+          float g_[RMAXN * MAXMW], u_[RMAXN * MAXMW];
           if (MW == 1u) {
             if (staged) {
               qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
@@ -1033,6 +1033,18 @@ BODY_SRC = r"""
               qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
                          j, rows, eid * rows, dx4, dxs4, lane, g_);
               qmv_any<1>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         width + j, rows, eid * rows, dx4, dxs4, lane, u_);
+            }
+          } else if (MW == 2u) {
+            if (staged) {
+              qmv_any<2>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         j, rows, eid * rows, tgx4, sxs4, lane, g_);
+              qmv_any<2>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         width + j, rows, eid * rows, tgx4, sxs4, lane, u_);
+            } else {
+              qmv_any<2>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
+                         j, rows, eid * rows, dx4, dxs4, lane, g_);
+              qmv_any<2>(true, RGU, W, T[TBL_WOFF], T[TBL_SBOFF], cols, ng,
                          width + j, rows, eid * rows, dx4, dxs4, lane, u_);
             }
           } else if (staged) {
@@ -1739,6 +1751,16 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
     if GDN_VALUE_DIM % nsg:
         raise ValueError(
             f"GDN core splits {GDN_VALUE_DIM} value dims over {nsg} simdgroups"
+        )
+    # The M dispatch chains are written out for widths 1, 2 and the built
+    # maximum.  A maximum above 3 would leave width 3 falling into the
+    # MAXMW branch, instantiating a body that reads a source plane the slab
+    # does not have -- silently.  Fail closed rather than generate that.
+    if MAX_QUERY_WIDTH > 3:
+        raise ValueError(
+            f"MAX_QUERY_WIDTH={MAX_QUERY_WIDTH}: the kernel's per-width "
+            "dispatch chains cover 1, 2 and the maximum, so a wider build "
+            "needs the chains generated, not extended by hand"
         )
     key = (threads, rdown, rgu, rdn, spin_cap)
     if key in _KERNEL_CACHE:
