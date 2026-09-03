@@ -192,16 +192,37 @@ def _trace_flags() -> tuple:
 # projections, three ``GroupRMSNorm``s, the gate arithmetic, the pad ``where``s,
 # the dilated short conv and the residual add.  Scoped in
 # ``wiki/docs/plans/qwen4-ple-device-fusion.md``: 49-57 dispatches once per
-# verify round, and compiling them is BIT-IDENTICAL (max abs diff 0.0) while
-# buying 0.057 ms at width 3 and 0.164 ms at width 16 in isolation.  Same
-# mechanism ``nn.silu`` and ``qwen3_next._precise_swiglu`` already use.
+# verify round, buying 0.057 ms at width 3 and 0.164 ms at width 16 in
+# isolation and +0.2% decode at 64K end to end.
 #
-# PROMOTED (2026-09-02) on the end-to-end serving gate: B1 self-MTP k=2 gave an
-# identical 256-token digest at 16K and 64K, decode +0.2% at 64K with a positive
-# sign at both contexts, and 431 replays over 16 generations with 0 fallbacks,
-# 0 overflows and 0 retraces.  Unset means ON; ``MLX_QWEN4_PLE_COMPILE=0``
-# reverts to the eager chain, which is the same arithmetic.
-_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE", default=True)
+# DEMOTED to opt-in 2026-09-03.  It was promoted default-on on the strength of
+# "BIT-IDENTICAL (max abs diff 0.0)", measured on random inputs at widths
+# 1/3/16/17.  That evidence does not hold: on a real 16K prefill the compiled
+# and eager chains give DIFFERENT final logits, and the difference is INPUT
+# dependent, not width dependent -- a width-1 slab carrying the triggering row
+# diverges exactly as the 2048 slab does, so a width gate would be cosmetic.
+#
+# The mechanism, isolated: ``gate``, both projections and all three norms are
+# bit-identical.  The first difference is ``gated = mx.sigmoid(gate) * value``,
+# and the cause is the SIGMOID.  ``mx.compile`` fuses an elementwise chain into
+# one kernel, and that kernel's sigmoid is not the standalone ``Sigmoid``
+# primitive: swept over x in [-12, 12] in fp32 it differs on 1343 of 4001
+# points, by up to 8.5e-07 relative, and is ~5x FURTHER from the true value
+# (worst relative error 8.1e-07 against the primitive's 1.7e-07).  A single op
+# under ``mx.compile`` is not fused and so does not show it -- only a chain
+# does.
+#
+# In bf16 that gap survives the round only where the product sits on a bf16
+# boundary, so the damage is rare and input dependent: 40 of 2048 rows in one
+# 16K prefill chunk, at 1-3 ULP, max abs 3.8e-06 at ``gated``, 1.2e-04 at the
+# layer output and 2.0e-03 at ``normed``.  Rare is not narrow -- the compiled
+# chain is LESS accurate than stock, not a reordering of it, so it is not the
+# norm-reduction class Pierre accepted on 2026-09-02.
+# ``MLX_QWEN4_PLE_COMPILE=1`` opts in.
+#
+# wiki/docs/plans/qwen4-ple-device-fusion.md "Prefill exactness and the width
+# gate"; raw data results/qwen4-ple-compile-{prefill,width,rows,mech}-20260903*.
+_PLE_COMPILE = _env_flag("MLX_QWEN4_PLE_COMPILE")
 # One traced graph per (batch, width, mask, state-write, dtype) signature.  A
 # single run legitimately holds several: the prefill chunk width and its short
 # tail, the decode width, the verify slab width, and each of those again with
@@ -235,6 +256,8 @@ def qwen4_ple_compile_status(*, reset: bool = False) -> dict:
 
     ``fallbacks`` MUST be 0 on a healthy run: every one is a signature that
     raised while tracing or replaying and was demoted to the eager chain.
+    ``enabled`` is False by default -- the lever is opt-in, see the module
+    comment on ``_PLE_COMPILE``.
     """
 
     global _PLE_COMPILE_LAST_RECEIPT
@@ -2498,14 +2521,10 @@ class PLELayer(nn.Module):
             _record_ple_compile("skips", reason="non_metal_device")
             return self._device_chain(hidden, embeddings, mask, state, write_state)
         if mx.float32 in (hidden.dtype, embeddings.dtype):
-            # MEASURED, not assumed: with bf16 or fp16 activations the compiled
-            # chain is bit-identical at widths 1/3/16/17 masked and unmasked,
-            # because every fusible span ends at an ``astype`` back to the
-            # activation dtype that absorbs the difference.  With fp32
-            # activations that boundary is gone and the fused kernel's FMA
-            # contraction shows through at ~1 ULP (2.2e-8 to 6.0e-8).  The
-            # lever's contract is that it may change COST ONLY, so fp32 runs
-            # eager rather than "nearly" exact.
+            # fp32 activations show the fused kernel at ~1 ULP (2.2e-8 to
+            # 6.0e-8) on EVERY element, so they are refused outright.  bf16 and
+            # fp16 are not exact either -- see the module comment -- but there
+            # the flag, not this refusal, is what holds them back.
             _record_ple_compile("skips", reason="float32_activations")
             return self._device_chain(hidden, embeddings, mask, state, write_state)
         has_mask = mask is not None

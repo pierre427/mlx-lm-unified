@@ -2430,9 +2430,15 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
 
     The PLE scope study (``wiki/docs/plans/qwen4-ple-device-fusion.md`` 3.3)
     measured the chain from ``key_proj`` through ``gated + conv`` as 49-57
-    dispatches once per verify round, and compiling it as BIT-IDENTICAL --
-    max abs diff 0.0 at widths 3 and 16.  Bit-identical is therefore the bar
-    these tests hold, not a tolerance: the lever may only change cost.
+    dispatches once per verify round.
+
+    These tests hold bit-identity as the bar, but bit-identity on SYNTHETIC
+    inputs is not a proof of it -- 2026-09-03 found the chain diverging on a
+    real 16K prefill while every test here passed, because an element is
+    eligible only when its bf16 gate lands on the -6.84375 sigmoid boundary.
+    ``test_the_fused_sigmoid_product_elides_a_rounding`` pins that
+    counterexample so the identity tests below cannot be read as general.
+    The lever is opt-in for exactly that reason.
     """
 
     PLE_LAYER = 1  # ple_layer_ids=[2] is layer_idx + 1
@@ -2524,24 +2530,26 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
         self.assertGreater(status["counts"]["skips"], 0)
         self.assertEqual(status["last_receipt"]["reason"], "float32_activations")
 
-    def test_the_lever_is_promoted_and_an_explicit_zero_reverts_it(self):
-        """Unset means ON; ``=0`` is how an operator turns a promotion off."""
+    def test_the_lever_is_opt_in_and_needs_an_explicit_one(self):
+        """Unset means OFF: the promotion was withdrawn 2026-09-03."""
         read = qwen4_exp_module._env_flag
         with mock.patch.dict(environ, {}, clear=False):
             environ.pop("MLX_QWEN4_PLE_COMPILE", None)
-            self.assertTrue(read("MLX_QWEN4_PLE_COMPILE", default=True))
+            self.assertFalse(read("MLX_QWEN4_PLE_COMPILE"))
+        for value in ("1", "on", "true", "yes"):
+            with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": value}):
+                self.assertTrue(read("MLX_QWEN4_PLE_COMPILE"), f"{value!r}")
         for value in ("0", "off", "false", "no"):
             with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": value}):
-                self.assertFalse(
-                    read("MLX_QWEN4_PLE_COMPILE", default=True), f"{value!r}"
-                )
+                self.assertFalse(read("MLX_QWEN4_PLE_COMPILE"), f"{value!r}")
 
-    def test_env_explicit_zero_traces_nothing_and_answers_eagerly(self):
+    def test_the_shipped_default_traces_nothing_and_answers_eagerly(self):
         layer, args = self._layer()
         hidden, ids = self._inputs(args, 3)
-        with mock.patch.dict(environ, {"MLX_QWEN4_PLE_COMPILE": "0"}):
+        with mock.patch.dict(environ, {}, clear=False):
+            environ.pop("MLX_QWEN4_PLE_COMPILE", None)
             qwen4_exp_module._PLE_COMPILE = qwen4_exp_module._env_flag(
-                "MLX_QWEN4_PLE_COMPILE", default=True
+                "MLX_QWEN4_PLE_COMPILE"
             )
         self.assertFalse(qwen4_exp_module._PLE_COMPILE)
         cache = Qwen4ArraysCache(4)
@@ -2571,6 +2579,53 @@ class TestPLEDeviceChainCompile(unittest.TestCase):
         self.assertEqual(status["counts"]["builds"], 0)
         self.assertGreater(status["counts"]["skips"], 0)
         self.assertEqual(status["last_receipt"]["reason"], "non_metal_device")
+
+    def test_a_fused_chain_uses_a_less_accurate_sigmoid(self):
+        """Why the lever is opt-in, as arithmetic rather than as prose.
+
+        On a real 16K prefill the compiled chain gives different logits from
+        the eager one.  Bisected, everything up to and including ``gate`` is
+        bit-identical and the first difference is ``mx.sigmoid(gate) * value``.
+        The cause is the sigmoid: a FUSED elementwise kernel does not use the
+        standalone ``Sigmoid`` primitive, and its answer is further from the
+        true value.  A single op under ``mx.compile`` is not fused, which is
+        why the identity tests above -- and the promotion that trusted them --
+        never saw it.
+        """
+        x = mx.linspace(-12.0, 12.0, 4001).astype(mx.float32)
+        ones = mx.ones_like(x)
+        primitive = mx.sigmoid(x)
+        fused = mx.compile(lambda a, b: mx.sigmoid(a) * b)(x, ones)
+        mx.eval(primitive, fused)
+        truth = 1.0 / (1.0 + np.exp(-np.asarray(x, np.float64)))
+        rel_p = float(
+            (np.abs(np.asarray(primitive, np.float64) - truth) / truth).max()
+        )
+        rel_f = float((np.abs(np.asarray(fused, np.float64) - truth) / truth).max())
+        # Both are accurate in absolute terms; the point is which is closer.
+        self.assertLess(rel_p, 1e-6)
+        self.assertLess(rel_f, 1e-5)
+        if mx.default_device() == mx.gpu:
+            self.assertFalse(
+                mx.array_equal(primitive, fused).item(),
+                "the fused kernel now agrees with the Sigmoid primitive -- "
+                "re-measure the PLE chain before re-promoting the lever",
+            )
+            self.assertLess(
+                rel_p, rel_f, "the fused sigmoid is no longer the worse one"
+            )
+        # In bf16 the gap survives the round only on a boundary value.  This
+        # is the one the 16K prefill actually hit.
+        gate = mx.array([-6.84375], dtype=mx.bfloat16)
+        value = mx.array([0.302734375], dtype=mx.bfloat16)
+        stock = mx.sigmoid(gate) * value
+        chain = mx.compile(lambda g, v: mx.sigmoid(g) * v)(gate, value)
+        mx.eval(stock, chain)
+        gap = mx.max(mx.abs(stock.astype(mx.float32)
+                            - chain.astype(mx.float32))).item()
+        self.assertLess(gap, 1e-5)
+        if mx.default_device() == mx.gpu:
+            self.assertGreater(gap, 0.0, "-6.84375 no longer separates them")
 
     def test_a_compile_failure_falls_back_with_a_receipt(self):
         layer, args = self._layer()
