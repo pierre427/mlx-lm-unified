@@ -829,68 +829,125 @@ BODY_SRC = r"""
       // = 3072 units over the grid's simdgroups -- which is the S = 128 case.
       else if (op == 11u) {
         const uint TOT   = actl[0];
-        const uint U     = actl[1];
-        const uint count = actl[2];
-        const uint nsel  = actl[3];
-        const int  qp    = int(actl[4]);
         const int  lpad  = int(actl[5]);
         const uint BS    = actl[6];
         const float qscale = as_type<float>(actl[8]);
-        const int complete = int(((uint(qp) + 1u) / BS) * BS);
-        const uint token_width = U * BS;
         const uint elements = HD / 32u;
         const uint units = NQH * ABLK;
         // `a0` is the attention layer's slot; all twelve KV ledgers share one
         // binding pair, NKVH * TOT * HD elements apart.
         const size_t kvbase = (size_t)a0 * NKVH * (size_t)TOT * HD;
+
+        // ------------------------------------------ per-query causal edge
+        // Everything that bounds the walk is the QUERY's, not the slab's.
+        // Query m sits at p + m, so its `q_pos`, its selected-block count,
+        // its `n_sel` boundary and its `complete` -- the position at which
+        // the incomplete tail begins -- all advance mid-slab.  Sharing any
+        // of them silently drops attention: the newest positions of the
+        // later queries fall outside `complete` and outside the scored
+        // blocks at once, which is exactly the 2026-09-03 defect.
+        uint mU[MAXMW], mcount[MAXMW], mnsel[MAXMW];
+        int  mqp[MAXMW], mcomplete[MAXMW];
+        uint token_width = 0u;
+        for (uint m = 0; m < MW; ++m) {
+          const device uint* MC = actl + ACTLM0 + m * ACTLMS;
+          mU[m] = MC[0]; mcount[m] = MC[1]; mnsel[m] = MC[11];
+          mqp[m] = int(MC[2]);
+          mcomplete[m] = int(MC[10]);
+          token_width = metal::max(token_width, mU[m] * BS);
+        }
+
         for (uint unit = grow; unit < units; unit += nrow) {
           const uint qh = unit / ABLK;
           const uint block_idx = unit - qh * ABLK;
           const uint hkv = qh / AGQA;
-          float q_values[HD / 32u];
-          for (uint part = 0; part < elements; ++part)
-            q_values[part] =
-                qscale * sc[src + qh * HD + lane * elements + part];
-          float out_values[HD / 32u];
-          for (uint part = 0; part < elements; ++part) out_values[part] = 0.0f;
-          float maximum = -3.402823466e+38F;
-          float total = 0.0f;
+          // M query vectors and M online-softmax states in registers.  At
+          // HD = 256 that is 8 floats of q and 8 of accumulator per query
+          // plus two scalars -- 18 registers a query, 54 at M = 3.
+          float q_values[MAXMW * (HD / 32u)];
+          float out_values[MAXMW * (HD / 32u)];
+          float maximum[MAXMW], total[MAXMW];
+          for (uint m = 0; m < MW; ++m) {
+            const device float* scm = scratch + (size_t)m * SCSTRIDE;
+            for (uint part = 0; part < elements; ++part) {
+              q_values[m * elements + part] =
+                  qscale * scm[src + qh * HD + lane * elements + part];
+              out_values[m * elements + part] = 0.0f;
+            }
+            maximum[m] = -3.402823466e+38F;
+            total[m] = 0.0f;
+          }
+
           for (uint token = block_idx; token < token_width; token += ABLK) {
             const uint slot = token / BS;
             const uint tail = token - slot * BS;
-            if (slot >= count) continue;
-            const int block = int(ids_from_scratch
-                ? reinterpret_cast<const device uint*>(sc + SC_IDX_SEL)[slot]
-                : sel_ids[slot]);
-            const int logical = block * int(BS) + int(tail);
-            const int physical = lpad + logical;
-            if (physical < 0 || physical >= int(TOT) || logical > qp) continue;
-            if (!(slot < nsel || logical >= complete)) continue;
-            const device BFT* krow =
-                kbuf + kvbase + ((size_t)hkv * TOT + (size_t)physical) * HD;
-            const device BFT* vrow =
-                vbuf + kvbase + ((size_t)hkv * TOT + (size_t)physical) * HD;
-            float score = 0.0f;
-            for (uint part = 0; part < elements; ++part)
-              score += q_values[part] * float(krow[lane * elements + part]);
-            score = simd_sum(score);
-            const float new_max = metal::max(maximum, score);
-            const float factor = metal::fast::exp(maximum - new_max);
-            const float probability = metal::fast::exp(score - new_max);
-            maximum = new_max;
-            total = total * factor + probability;
-            for (uint part = 0; part < elements; ++part)
-              out_values[part] = out_values[part] * factor
-                  + probability * float(vrow[lane * elements + part]);
+            // The K/V row this slot names, per query.  -1 is "this query
+            // does not attend this slot".
+            int phys[MAXMW];
+            for (uint m = 0; m < MW; ++m) {
+              phys[m] = -1;
+              if (slot >= mcount[m]) continue;
+              const device float* scm = scratch + (size_t)m * SCSTRIDE;
+              const device uint* sids = sel_ids + m * (BTK + 1u);
+              const int block = int(ids_from_scratch
+                  ? reinterpret_cast<const device uint*>(scm + SC_IDX_SEL)[slot]
+                  : sids[slot]);
+              const int logical = block * int(BS) + int(tail);
+              const int physical = lpad + logical;
+              if (physical < 0 || physical >= int(TOT) || logical > mqp[m])
+                continue;
+              if (!(slot < mnsel[m] || logical >= mcomplete[m])) continue;
+              phys[m] = physical;
+            }
+            // ONE K/V read serves every query that names the same row.  The
+            // queries of a slab differ by at most k positions, so their
+            // top-512 selections agree at most slots and this is the whole
+            // amortisation attention gets; when they disagree the load
+            // simply happens again, and the arithmetic each query sees is
+            // the same sequence in the same order either way.
+            int loaded = -1;
+            float kvals[HD / 32u], vvals[HD / 32u];
+            for (uint m = 0; m < MW; ++m) {
+              if (phys[m] < 0) continue;
+              if (phys[m] != loaded) {
+                const device BFT* krow = kbuf + kvbase
+                    + ((size_t)hkv * TOT + (size_t)phys[m]) * HD;
+                const device BFT* vrow = vbuf + kvbase
+                    + ((size_t)hkv * TOT + (size_t)phys[m]) * HD;
+                for (uint part = 0; part < elements; ++part) {
+                  kvals[part] = float(krow[lane * elements + part]);
+                  vvals[part] = float(vrow[lane * elements + part]);
+                }
+                loaded = phys[m];
+              }
+              float score = 0.0f;
+              for (uint part = 0; part < elements; ++part)
+                score += q_values[m * elements + part] * kvals[part];
+              score = simd_sum(score);
+              const float new_max = metal::max(maximum[m], score);
+              const float factor = metal::fast::exp(maximum[m] - new_max);
+              const float probability = metal::fast::exp(score - new_max);
+              maximum[m] = new_max;
+              total[m] = total[m] * factor + probability;
+              for (uint part = 0; part < elements; ++part)
+                out_values[m * elements + part] =
+                    out_values[m * elements + part] * factor
+                    + probability * vvals[part];
+            }
           }
+
           const uint state = qh * ABLK + block_idx;
-          if (lane == 0u) {
-            apm[state] = maximum;
-            apm[NQH * ABLK + state] = total;
+          for (uint m = 0; m < MW; ++m) {
+            const size_t sbase = (size_t)m * 2u * NQH * ABLK;
+            if (lane == 0u) {
+              apm[sbase + state] = maximum[m];
+              apm[sbase + NQH * ABLK + state] = total[m];
+            }
+            for (uint part = 0; part < elements; ++part)
+              apo[((size_t)m * NQH * ABLK + state) * HD
+                  + lane * elements + part] =
+                  static_cast<BFT>(out_values[m * elements + part]);
           }
-          for (uint part = 0; part < elements; ++part)
-            apo[(size_t)state * HD + lane * elements + part] =
-                static_cast<BFT>(out_values[part]);
         }
       }
 
@@ -906,11 +963,16 @@ BODY_SRC = r"""
         threadgroup float* tr = A + TG_TGX;      // 1024 floats, aliased
         const uint ROLES = 32u;
         const uint per = ROLES / NSGA;           // roles per simdgroup
+        // Pass 1 wrote M planes of partials.  The combine has no weight to
+        // share, so it is a per-query phase: `mq` selects the plane and `sc`
+        // is already rebased onto the same query's scratch.
+        const size_t apm_base = (size_t)mq * 2u * NQH * ABLK;
+        const size_t apo_base = (size_t)mq * NQH * ABLK;
         for (uint qh = tg; qh < NQH; qh += ntg) {
           const uint state = qh * ABLK;
-          const device float* row_m = apm + state;
-          const device float* row_l = apm + NQH * ABLK + state;
-          const device BFT* row_o = apo + (size_t)state * HD;
+          const device float* row_m = apm + apm_base + state;
+          const device float* row_l = apm + apm_base + NQH * ABLK + state;
+          const device BFT* row_o = apo + (apo_base + state) * HD;
           float maximum = -3.402823466e+38F;
           for (uint g = 0; g < ABLK / 32u; ++g)
             maximum = metal::max(maximum, row_m[lane + 32u * g]);
@@ -1090,20 +1152,32 @@ BODY_SRC = r"""
       // with depth, so it travels in the schedule and the control block stays
       // one array for the whole token.
       else if (op == 22u) {
-        const uint TOT = actl[0], slot = actl[14], li = a2;
+        const uint TOT = actl[0], li = a2;
         device BFT* kw = const_cast<device BFT*>(kbuf);
         device BFT* vw = const_cast<device BFT*>(vbuf);
-        const size_t kb = (size_t)li * NKVH * (size_t)TOT * HD;
-        for (uint i = tg * NT + tid; i < NKVH * HD; i += ntg * NT) {
-          const uint h = i / HD, d = i - h * HD;
-          const size_t off = kb + ((size_t)h * TOT + slot) * HD + d;
-          kw[off] = static_cast<BFT>(sc[src + i]);
-          vw[off] = static_cast<BFT>(sc[a0 + i]);
-        }
         device BFT* rw = const_cast<device BFT*>(rawk);
-        const size_t rb = (size_t)li * (size_t)TOT * IDXD + (size_t)slot * IDXD;
-        for (uint i = tg * NT + tid; i < IDXD; i += ntg * NT)
-          rw[rb + i] = static_cast<BFT>(sc[a1 + i]);
+        const size_t kb = (size_t)li * NKVH * (size_t)TOT * HD;
+        // M columns, one per query, each at its OWN physical slot p + m.
+        // INTRA-SLAB CAUSALITY LIVES HERE: this phase precedes the indexer
+        // and the attention phases inside the layer, so by the time query
+        // m + 1 scores and attends, query m's column is already in the
+        // ledger and the tail block it names contains it.  The ordering was
+        // already right for M = 1; what makes it right for a slab is that
+        // ALL M columns land before ANY query attends.
+        for (uint m = 0; m < MW; ++m) {
+          const device float* scm = scratch + (size_t)m * SCSTRIDE;
+          const uint slot = (actl + ACTLM0 + m * ACTLMS)[7];
+          for (uint i = tg * NT + tid; i < NKVH * HD; i += ntg * NT) {
+            const uint h = i / HD, d = i - h * HD;
+            const size_t off = kb + ((size_t)h * TOT + slot) * HD + d;
+            kw[off] = static_cast<BFT>(scm[src + i]);
+            vw[off] = static_cast<BFT>(scm[a0 + i]);
+          }
+          const size_t rb =
+              (size_t)li * (size_t)TOT * IDXD + (size_t)slot * IDXD;
+          for (uint i = tg * NT + tid; i < IDXD; i += ntg * NT)
+            rw[rb + i] = static_cast<BFT>(scm[a1 + i]);
+        }
       }
 
       // ------------------------------------------------ OP_POOL_BLOCK (26)
@@ -1114,9 +1188,16 @@ BODY_SRC = r"""
       // three tokens in four that close nothing, and the phase is then a
       // no-op that still costs its barrier.
       else if (op == 26u) {
-        if (actl[16] != 0u) {
+        // Over a slab, blocks close at most once per BS positions, so at
+        // M = 3 and BS = 4 AT MOST ONE query closes a block -- the phase
+        // becomes a count and a start rather than M pooling passes.  The
+        // loop is written for the general case and costs nothing when M < BS
+        // because the predicate is false for every other query.
+        for (uint m = 0; m < MW; ++m) {
+        const device uint* PC = actl + ACTLM0 + m * ACTLMS;
+        if (PC[8] != 0u) {
           const uint TOT = actl[0], BSZ = actl[6], li = a2;
-          const uint nb = actl[10];              // blocks after this token
+          const uint nb = PC[4];                 // blocks after this query
           const uint blk = nb - 1u;
           const uint start = blk * BSZ;
           const device uint* T = tbl + ent * TSTRIDE;
@@ -1165,6 +1246,7 @@ BODY_SRC = r"""
               pw[pb + lane + j * 32u] = static_cast<BFT>(normed[j]);
           }
         }
+        }   // per-query pooling
       }
 
       // -------------------------------------------------- OP_GATE_MUL (23)
@@ -1356,8 +1438,9 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         "INVIDXD": f"{IDX_HEAD_DIM ** -0.5:.17g}f",
         "ROTD": ROTARY_DIM, "ACTLH": ACTL_HEADER,
         "ACTLIDS": ACTL_IDS, "ACTLM0": ACTL_M0, "ACTLMS": ACTL_M_STRIDE,
+        "BTK": BLOCK_TOPK,
         "SCSTRIDE": SCRATCH_STRIDE, "MAXMW": MAX_QUERY_WIDTH,
-        "PERQMASK": "28897656u",
+        "PERQMASK": "29159800u",
         "PLEK": PLE_CONV_KERNEL, "PLEN": PLE_NGRAM, "PLES": PLE_STATE_LEN,
         "PLEQS": f"{HIDDEN ** -0.5:.17g}f",
         "RDOWN": rdown, "RGU": rgu, "RDN": rdn, "RMAXN": RMAX,
@@ -1488,8 +1571,8 @@ class MegakernelBody:
                 (scratch_floats(mwidth),), (reps, HIDDEN),
                 (self.gdn_layers, CONV_KERNEL - 1, CONV_DIM),
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
-                (2 * N_Q_HEADS * SDPA_BLOCKS,),
-                (N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM,),
+                (mwidth * 2 * N_Q_HEADS * SDPA_BLOCKS,),
+                (mwidth * N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM,),
                 (reps, self.vocab),
                 (4,),
             ],
