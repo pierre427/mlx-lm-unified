@@ -240,6 +240,20 @@ inline void qmv4_ksplit(const device uint* W, uint w_off, uint sb_off,
   for (uint r = 0; r < R; ++r) acc[r] = simd_sum(acc[r]);
 }
 
+// Which opcodes rerun per query, and which take the slab inside their own
+// inner loop.  The distinction is whether the phase has a WEIGHT to amortise:
+// a matvec reads its weight once for all M queries, a norm against a shared
+// gain vector has nothing to share and simply runs M times.  Attention, the
+// GDN core and the ledgers are amortising for the same reason -- they reuse
+// every K/V read, read and write the recurrent state once, and append M
+// columns in one pass.
+//
+// A bitmask rather than a switch: `op` is uniform across the threadgroup, so
+// this is a scalar test in front of a loop, not a per-thread branch.
+inline bool per_query_op(uint op) {
+  return ((PERQMASK >> op) & 1u) != 0u;
+}
+
 inline float apply_act(float v, uint kind) {
   if (kind == 1u) return silu_f(v);                       // ACT_SILU
   if (kind == 2u) return sigmoid_f(v);                    // ACT_SIGMOID
@@ -297,6 +311,8 @@ BODY_SRC = r"""
   // Every packed group is a binding; the table's `group` field selects one.
   const device uint* WB[10] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9};
 
+  // Plane 0.  A phase body gets its own `sc` inside the per-query loop; this
+  // one serves the residual load and the phases that address plane 0 by name.
   device float* sc = scratch;
   // Block ids for the attention phase.  ``OP_INDEX_TOPB`` writes them into
   // scratch as floats (a block index is < 2^24, so the round trip is exact);
@@ -327,11 +343,18 @@ BODY_SRC = r"""
   for (uint rep = 0; rep < reps && live; ++rep) {
     // The residual streams arrive hoisted: PLE's n-gram gather and the
     // embedding depend only on the input token, so they are host work.
-    for (uint i = tg * NT + tid; i < xw; i += ntg * NT) {
-      const float v = float(xin[(size_t)rep * xw + i]);
-      if (i < HCH)            sc[SC_RESID_A + i] = v;
-      else if (i < HCH + HID) sc[SC_BRANCH + (i - HCH)] = v;
-      else                    sc[SC_PLE_EMB + (i - HCH - HID)] = v;
+    // M embeddings for a width-M slab, one per plane.  `xin` is laid out
+    // (rep, query, xw): a verify slab hands in the embedding of each of its
+    // k+1 tokens, and each lands in its own scratch plane.
+    for (uint mq = 0; mq < MW; ++mq) {
+      device float* scm = scratch + (size_t)mq * SCSTRIDE;
+      const size_t xbase = ((size_t)rep * MW + mq) * xw;
+      for (uint i = tg * NT + tid; i < xw; i += ntg * NT) {
+        const float v = float(xin[xbase + i]);
+        if (i < HCH)            scm[SC_RESID_A + i] = v;
+        else if (i < HCH + HID) scm[SC_BRANCH + (i - HCH)] = v;
+        else                    scm[SC_PLE_EMB + (i - HCH - HID)] = v;
+      }
     }
     live = gbar(ctr, ab, ntg, tid, phase, SPINCAP);
     if (!live) break;
@@ -341,6 +364,32 @@ BODY_SRC = r"""
       const device uint* S = sched + step * 8u;
       const uint op = S[0], ent = S[1], src = S[2], dst = S[3];
       const uint a0 = S[4], a1 = S[5], a2 = S[6], bar = S[7];
+
+      // ------------------------------------------------- the query loop
+      // Two classes of phase, and the split is the whole economics of a
+      // verify slab.
+      //
+      // AMORTISING phases read a weight and use it for every query in the
+      // slab, so they take M inside their own inner loop and run ONCE: the
+      // weight traffic, which is what a decode token is made of, is paid
+      // once for the whole slab.  Those are the matvecs, attention (one
+      // simdgroup owns a (head, block) unit and reuses every K/V read), the
+      // GDN core (the 3.1 MB/layer state is read and written once and the
+      // delta rule is applied sequentially over the queries), and the
+      // ledgers.
+      //
+      // PER-QUERY phases have no weight to amortise -- norms against a
+      // shared gain vector, elementwise work, the router's own selection --
+      // so they simply run M times with `sc` rebased onto the query's
+      // plane.  That is ~3x of a small term, which is the plan's estimate
+      // and is what makes the slab worth having: 3x of 0.35 ms beside 1.05x
+      // of the matvecs.
+      const uint mloops = per_query_op(op) ? MW : 1u;
+      for (uint mq = 0; mq < mloops; ++mq) {
+      device float* sc = scratch + (size_t)mq * SCSTRIDE;
+      // This query's control block.  Query 0's block is mirrored into the
+      // shared header, so an un-widened body reading `actl[k]` reads query 0.
+      const device uint* mc = actl + ACTLM0 + mq * ACTLMS;
 
       // ------------------------------------------------------- OP_QMV (1)
       if (op == 1u) {
@@ -917,7 +966,9 @@ BODY_SRC = r"""
       else if (op == 19u) {
         // Both are context-length dependent, so they arrive per token in the
         // control block rather than being baked into the schedule.
-        const uint nblocks = actl[10], nvalid = actl[11];
+        // Per-query: query m has `(p + m + 1) // 4` closed blocks, so the
+        // count advances mid-slab and the scores land in query m's plane.
+        const uint nblocks = mc[4], nvalid = mc[5];
         const uint heads = IDXH, hd = IDXD;
         const float inv = INVIDXD;
         // `a0` is the attention layer's slot: the pooled ledgers of all
@@ -956,7 +1007,7 @@ BODY_SRC = r"""
             reinterpret_cast<threadgroup uint*>(A + TG_TGX) + 256u;
         threadgroup uint* eqc = gtc + NT;
         threadgroup uint* shared = eqc + NT;
-        select_top_blocks(sc + src, actl[10], a0,
+        select_top_blocks(sc + src, mc[4], a0,
                           reinterpret_cast<device uint*>(sc + dst),
                           hist, gtc, eqc, shared, tid, NT);
         // The INCOMPLETE TAIL block, appended at slot `n_sel` exactly as
@@ -968,8 +1019,14 @@ BODY_SRC = r"""
         // through `logical >= complete`, never by membership, so a block that
         // is both selected and the tail is not counted twice.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (actl[2] > actl[3] && tid == 0u) {
-          reinterpret_cast<device uint*>(sc + dst)[actl[3]] = actl[18];
+        // THE TAIL BLOCK, per query.  `count > n_sel` says this query has
+        // an incomplete tail, and the block it names is `(p + m) // BS`,
+        // which ADVANCES mid-slab: for a slab at p = 3 the three queries
+        // want blocks 0, 1, 1.  One shared tail would leave two of the
+        // three queries unable to attend their own newest positions --
+        // the 2026-09-03 defect, three times over.
+        if (mc[1] > mc[11] && tid == 0u) {
+          reinterpret_cast<device uint*>(sc + dst)[mc[11]] = mc[9];
         }
       }
 
@@ -994,7 +1051,9 @@ BODY_SRC = r"""
         const uint heads = a0, hd = a1;
         const uint sstride = (a2 == 0u) ? hd : a2;
         const uint hrot = ROTD / 2u;
-        const float pos = float(actl[12]);
+        // Per-query: the RoPE angle is THIS query's position, and the
+        // three queries of a verify slab sit at p, p+1, p+2.
+        const float pos = float(mc[6]);
         const float logtheta = metal::precise::log(as_type<float>(actl[13]));
         for (uint h = grow; h < heads; h += nrow) {
           float ss = 0.0f;
@@ -1207,6 +1266,14 @@ BODY_SRC = r"""
           sc[dst + i] = sc[src + i];
       }
 
+      // The passes write DIFFERENT scratch planes, so device memory needs no
+      // barrier between them -- but they SHARE the threadgroup arena (`tgx`,
+      // `tlog`, `red`, `part`, `gsc`), so pass m+1 would overwrite staging
+      // that pass m's stragglers are still reading.  One threadgroup barrier
+      // per pass, and only when there is more than one pass.
+      if (mloops > 1u) threadgroup_barrier(mem_flags::mem_threadgroup);
+      }   // per-query loop
+
       if (bar == 2u) {
         live = gbar(ctr, ab, ntg, tid, phase, SPINCAP);
       } else if (bar == 1u) {
@@ -1290,6 +1357,7 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         "ROTD": ROTARY_DIM, "ACTLH": ACTL_HEADER,
         "ACTLIDS": ACTL_IDS, "ACTLM0": ACTL_M0, "ACTLMS": ACTL_M_STRIDE,
         "SCSTRIDE": SCRATCH_STRIDE, "MAXMW": MAX_QUERY_WIDTH,
+        "PERQMASK": "28897656u",
         "PLEK": PLE_CONV_KERNEL, "PLEN": PLE_NGRAM, "PLES": PLE_STATE_LEN,
         "PLEQS": f"{HIDDEN ** -0.5:.17g}f",
         "RDOWN": rdown, "RGU": rgu, "RDN": rdn, "RMAXN": RMAX,
