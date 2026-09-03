@@ -89,6 +89,11 @@ VOCAB = 248320
 # The block grid the in-kernel selector must handle.  16,384 blocks is 65,536
 # tokens of context at compress ratio 4.
 MAX_BLOCKS = 16384
+# The fixed partial-block count of MLX's sdpa_vector_2pass, which
+# ``qwen4_qsa_indexed`` clones.  It is NOT a tuning knob here: the combine
+# pass's reduction order is written around it, and changing it changes the
+# answer.
+SDPA_BLOCKS = 128
 
 
 # -------------------------------------------------------------------- opcodes
@@ -122,6 +127,12 @@ OP_SILU_MUL = 15
 # 2.1 us barrier, which is the wrong side of the trade by two orders.
 OP_HC_DOWN = 16     # local hc_norm, then the 10240 -> 320 mix-down + silu
 OP_HC_UP = 17       # 320 -> 10240 mix-up + sigmoid + mean, and the inject gate
+# Pass 2 of indexed split-K attention.  Pass 1 is OP_ATTN; the two are separate
+# opcodes because the split is a device barrier -- 128 per-block partials have
+# to be visible to the head that combines them.
+OP_ATTN_COMBINE = 18
+# The indexer's block score, read by OP_INDEX_TOPB.
+OP_INDEX_SCORE = 19
 
 OP_NAMES = {
     value: name

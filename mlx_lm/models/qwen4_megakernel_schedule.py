@@ -47,8 +47,10 @@ import mlx.core as mx
 
 from .qwen4_megakernel import (
     BAR_DEVICE,
+    OP_ATTN_COMBINE,
     OP_HC_DOWN,
     OP_HC_UP,
+    OP_INDEX_SCORE,
     PHASE_ROWS,
     BAR_NONE,
     BAR_THREADGROUP,
@@ -259,15 +261,28 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan) -> None:
         src=SCRATCH["MIXED"], dst=SCRATCH["IDX_QK"], arg0=R_GENERIC,
         barrier=BAR_DEVICE,
     ))
+    # The indexer's score, then the selection.  The pooled-key ledger is a
+    # host binding: one block closes every ``compress_ratio`` tokens, so
+    # pooling it is incremental host state in the PLE class.  The block count
+    # and the causal validity edge are context-dependent and arrive per token
+    # in the control block, not in the schedule.
+    schedule.add(Step(
+        op=OP_INDEX_SCORE,
+        entry=_entry_id(pack, f"{attn}.indexer.q_layernorm.weight"),
+        src=SCRATCH["IDX_QK"], dst=SCRATCH["IDX_SCORE"], barrier=BAR_DEVICE,
+    ))
     schedule.add(Step(
         op=OP_INDEX_TOPB, src=SCRATCH["IDX_SCORE"], dst=SCRATCH["IDX_SEL"],
         arg0=BLOCK_TOPK,
-        # the selector is one threadgroup's work end to end, so the boundary
-        # inside it is a threadgroup barrier; only its result crosses the grid
+        # every threadgroup runs the whole selection for itself, so its own
+        # internal boundaries are threadgroup barriers; the result still has
+        # to be visible to the attention phase, which is a device barrier
         barrier=BAR_DEVICE,
     ))
     schedule.add(Step(op=OP_ATTN, src=SCRATCH["ATT_QG"], dst=SCRATCH["ATT_O"],
                       barrier=BAR_DEVICE))
+    schedule.add(Step(op=OP_ATTN_COMBINE, src=SCRATCH["ATT_QG"],
+                      dst=SCRATCH["ATT_O"], barrier=BAR_DEVICE))
     schedule.add(Step(
         op=OP_QMV, entry=_entry_id(pack, f"{attn}.o_proj"),
         src=SCRATCH["ATT_O"], dst=SCRATCH["BRANCH"], arg0=R_GENERIC,

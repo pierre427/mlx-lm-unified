@@ -39,6 +39,7 @@ from typing import Any, Optional
 import mlx.core as mx
 
 from .qwen4_megakernel import (
+    BLOCK_TOPK,
     CONV_DIM,
     CONV_KERNEL,
     FF,
@@ -50,8 +51,15 @@ from .qwen4_megakernel import (
     HC_COUNT,
     HC_HIDDEN,
     HC_LOWRANK,
+    HEAD_DIM,
     HIDDEN,
+    IDX_HEADS,
+    IDX_HEAD_DIM,
     KEY_DIM,
+    N_KV_HEADS,
+    N_Q_HEADS,
+    Q_DIM,
+    SDPA_BLOCKS,
     NUM_EXPERTS,
     RMS_EPS,
     SCRATCH,
@@ -254,6 +262,11 @@ BODY_SRC = r"""
   const device uint* WB[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
 
   device float* sc = scratch;
+  // Block ids for the attention phase.  ``OP_INDEX_TOPB`` writes them into
+  // scratch as floats (a block index is < 2^24, so the round trip is exact);
+  // a standalone probe hands them in through ``actl`` instead.
+  const device uint* sel_ids = actl + 16u;
+  const uint ids_from_scratch = actl[7];
 
   threadgroup float A[TGF];
   threadgroup uint  topi[TOPKN];
@@ -701,6 +714,197 @@ BODY_SRC = r"""
         }
       }
 
+
+      // ------------------------------------------------------ OP_ATTN (11)
+      // Pass 1 of indexed split-K attention, arithmetic-for-arithmetic with
+      // qwen4_qsa_indexed's `_SOURCE` -- itself a clone of MLX's native
+      // sdpa_vector_2pass_1 on the compact token order.  Everything here is
+      // load-bearing for bit-identity: the lane -> d map (`lane*elements +
+      // part`), the online-softmax rescale order, and `fast::exp` rather than
+      // the precise one the rest of this kernel uses.
+      //
+      // The shipped kernel's `S` splits only distribute the fixed 128 blocks
+      // over threadgroups; every block keeps its global index and its own
+      // sequential token walk, so the per-block arithmetic does not depend on
+      // S at all.  Here one SIMDGROUP owns one (head, block) unit -- 24 x 128
+      // = 3072 units over the grid's simdgroups -- which is the S = 128 case.
+      else if (op == 11u) {
+        const uint TOT   = actl[0];
+        const uint U     = actl[1];
+        const uint count = actl[2];
+        const uint nsel  = actl[3];
+        const int  qp    = int(actl[4]);
+        const int  lpad  = int(actl[5]);
+        const uint BS    = actl[6];
+        const float qscale = as_type<float>(actl[8]);
+        const int complete = int(((uint(qp) + 1u) / BS) * BS);
+        const uint token_width = U * BS;
+        const uint elements = HD / 32u;
+        const uint units = NQH * ABLK;
+        for (uint unit = grow; unit < units; unit += nrow) {
+          const uint qh = unit / ABLK;
+          const uint block_idx = unit - qh * ABLK;
+          const uint hkv = qh / AGQA;
+          float q_values[HD / 32u];
+          for (uint part = 0; part < elements; ++part)
+            q_values[part] =
+                qscale * sc[src + qh * HD + lane * elements + part];
+          float out_values[HD / 32u];
+          for (uint part = 0; part < elements; ++part) out_values[part] = 0.0f;
+          float maximum = -3.402823466e+38F;
+          float total = 0.0f;
+          for (uint token = block_idx; token < token_width; token += ABLK) {
+            const uint slot = token / BS;
+            const uint tail = token - slot * BS;
+            if (slot >= count) continue;
+            const int block = int(ids_from_scratch
+                ? reinterpret_cast<const device uint*>(sc + SC_IDX_SEL)[slot]
+                : sel_ids[slot]);
+            const int logical = block * int(BS) + int(tail);
+            const int physical = lpad + logical;
+            if (physical < 0 || physical >= int(TOT) || logical > qp) continue;
+            if (!(slot < nsel || logical >= complete)) continue;
+            const device BFT* krow =
+                kbuf + ((size_t)hkv * TOT + (size_t)physical) * HD;
+            const device BFT* vrow =
+                vbuf + ((size_t)hkv * TOT + (size_t)physical) * HD;
+            float score = 0.0f;
+            for (uint part = 0; part < elements; ++part)
+              score += q_values[part] * float(krow[lane * elements + part]);
+            score = simd_sum(score);
+            const float new_max = metal::max(maximum, score);
+            const float factor = metal::fast::exp(maximum - new_max);
+            const float probability = metal::fast::exp(score - new_max);
+            maximum = new_max;
+            total = total * factor + probability;
+            for (uint part = 0; part < elements; ++part)
+              out_values[part] = out_values[part] * factor
+                  + probability * float(vrow[lane * elements + part]);
+          }
+          const uint state = qh * ABLK + block_idx;
+          if (lane == 0u) {
+            apm[state] = maximum;
+            apm[NQH * ABLK + state] = total;
+          }
+          for (uint part = 0; part < elements; ++part)
+            apo[(size_t)state * HD + lane * elements + part] =
+                static_cast<BFT>(out_values[part]);
+        }
+      }
+
+      // ---------------------------------------------- OP_ATTN_COMBINE (18)
+      // Pass 2, arithmetic-for-arithmetic with `_COMBINE_SOURCE`.  That
+      // kernel uses THIRTY-TWO simdgroups and a 32x32 threadgroup transpose;
+      // this one has sixteen, so each takes two of the 32 roles.  The set
+      // summed by each final `simd_sum` and the order inside every role's
+      // accumulation are unchanged, so the result is unchanged -- the role
+      // count is a schedule, not an arithmetic choice.
+      else if (op == 18u) {
+        const uint elements = HD / 32u;
+        threadgroup float* tr = A + TG_TGX;      // 1024 floats, aliased
+        const uint ROLES = 32u;
+        const uint per = ROLES / NSGA;           // roles per simdgroup
+        for (uint qh = tg; qh < NQH; qh += ntg) {
+          const uint state = qh * ABLK;
+          const device float* row_m = apm + state;
+          const device float* row_l = apm + NQH * ABLK + state;
+          const device BFT* row_o = apo + (size_t)state * HD;
+          float maximum = -3.402823466e+38F;
+          for (uint g = 0; g < ABLK / 32u; ++g)
+            maximum = metal::max(maximum, row_m[lane + 32u * g]);
+          maximum = simd_max(maximum);
+          float total = 0.0f;
+          for (uint g = 0; g < ABLK / 32u; ++g) {
+            const uint block = lane + 32u * g;
+            total += metal::fast::exp(row_m[block] - maximum) * row_l[block];
+          }
+          total = simd_sum(total);
+          float values[(HD / 32u) * (32u / NSGA)];
+          for (uint r = 0; r < per; ++r) {
+            const uint role = sg + r * NSGA;
+            for (uint part = 0; part < elements; ++part)
+              values[r * elements + part] = 0.0f;
+            for (uint g = 0; g < ABLK / 32u; ++g) {
+              const uint block = role + 32u * g;
+              const float factor =
+                  metal::fast::exp(row_m[block] - maximum);
+              for (uint part = 0; part < elements; ++part)
+                values[r * elements + part] += factor * float(
+                    row_o[(size_t)block * HD + lane * elements + part]);
+            }
+          }
+          for (uint part = 0; part < elements; ++part) {
+            for (uint r = 0; r < per; ++r)
+              tr[lane * 32u + sg + r * NSGA] = values[r * elements + part];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint r = 0; r < per; ++r) {
+              const uint role = sg + r * NSGA;
+              float v = simd_sum(tr[role * 32u + lane]);
+              v = total == 0.0f ? v : v / total;
+              if (lane == 0u)
+                sc[dst + qh * HD + role * elements + part] =
+                    float(static_cast<BFT>(v));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        }
+      }
+
+
+      // ---------------------------------------------- OP_INDEX_SCORE (19)
+      // The indexer's block score: sum over its heads of relu(q_h . pooled_n),
+      // divided by sqrt(head_dim), and -inf for a block the causal geometry
+      // rejects.  That shape is why the selector's tie rule matters -- a block
+      // no head likes is exactly 0.0 and an invalid one is exactly -inf, so
+      // ties are common rather than exotic.
+      //
+      // The pooled-key ledger is a host binding, not device work: one new
+      // block closes every `block_size` tokens, so pooling it is incremental
+      // host state in the same class as the PLE n-gram gather.
+      else if (op == 19u) {
+        // Both are context-length dependent, so they arrive per token in the
+        // control block rather than being baked into the schedule.
+        const uint nblocks = actl[10], nvalid = actl[11];
+        const uint heads = IDXH, hd = IDXD;
+        const float inv = INVIDXD;
+        for (uint n = grow; n < nblocks; n += nrow) {
+          if (n >= nvalid) {
+            if (lane == 0u) sc[dst + n] = -INFINITY;
+            continue;
+          }
+          const device BFT* prow = pooled + (size_t)n * hd;
+          float acc = 0.0f;
+          for (uint h = 0; h < heads; ++h) {
+            float d = 0.0f;
+            for (uint i = lane; i < hd; i += 32u)
+              d += sc[src + h * hd + i] * float(prow[i]);
+            d = simd_sum(d);
+            acc += metal::max(d, 0.0f);
+          }
+          if (lane == 0u) sc[dst + n] = acc * inv;
+        }
+      }
+
+      // ----------------------------------------------- OP_INDEX_TOPB (12)
+      // Top-BLOCK_TOPK over the block scores, in ONE threadgroup: four 8-bit
+      // radix passes over a monotone float key narrow to the exact k-th key,
+      // then one order-free emit places each element at
+      // `gt_before + min(eq_before, need)`.  Every threadgroup runs the whole
+      // selection for itself and writes the same answer, which is what buys
+      // the device barrier it would otherwise pay -- six sweeps of a 16,384
+      // score array against a 5.2 us barrier.
+      else if (op == 12u) {
+        threadgroup atomic_uint* hist =
+            reinterpret_cast<threadgroup atomic_uint*>(A + TG_TGX);
+        threadgroup uint* gtc =
+            reinterpret_cast<threadgroup uint*>(A + TG_TGX) + 256u;
+        threadgroup uint* eqc = gtc + NT;
+        threadgroup uint* shared = eqc + NT;
+        select_top_blocks(sc + src, actl[10], a0,
+                          reinterpret_cast<device uint*>(sc + dst),
+                          hist, gtc, eqc, shared, tid, NT);
+      }
+
       // --------------------------------------------- OP_SILU_MUL (15)
       else if (op == 15u) {
         for (uint i = tg * NT + tid; i < a1; i += ntg * NT)
@@ -740,9 +944,10 @@ BODY_SRC = r"""
 
 IN_NAMES = [
     "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7",
-    "tbl", "sched", "meta", "cs_in", "rec_in", "ctrl", "base",
+    "tbl", "sched", "meta", "cs_in", "rec_in", "kbuf", "vbuf", "pooled",
+    "actl", "ctrl", "base",
 ]
-OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "status"]
+OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "status"]
 
 MAX_GROUPS = 8
 
@@ -772,6 +977,10 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         "HV": GDN_VALUE_HEADS, "HK": GDN_KEY_HEADS, "RATIO": GDN_RATIO,
         "DK": GDN_KEY_DIM, "DV": GDN_VALUE_DIM,
         "TOPKN": TOPK, "TSTRIDE": TABLE_STRIDE,
+        "HD": HEAD_DIM, "NQH": N_Q_HEADS, "NKVH": N_KV_HEADS,
+        "AGQA": N_Q_HEADS // N_KV_HEADS, "ABLK": SDPA_BLOCKS, "NSGA": nsg,
+        "IDXH": IDX_HEADS, "IDXD": IDX_HEAD_DIM,
+        "INVIDXD": f"{IDX_HEAD_DIM ** -0.5:.17g}f",
         "RDOWN": rdown, "RGU": rgu, "RDN": rdn, "RMAXN": RMAX,
         "TGF": TG_FLOATS,
         "QSCALE": f"{GDN_KEY_DIM ** -0.5:.17g}f",
@@ -804,6 +1013,12 @@ class MegakernelBody:
 
     def __init__(self, pack, schedule, *, gdn_layers: int,
                  threads: int = None, groups: int = None, **kw):
+        need = (256 + 2 * (_THREADS if threads is None else threads) + 2)
+        if need > TG["TLOG"]:
+            raise ValueError(
+                f"top-block selector needs {need} threadgroup words but only "
+                f"{TG['TLOG']} are aliasable over TGX"
+            )
         if THREADGROUP_BYTES > 16 * 1024:
             raise ValueError(
                 f"threadgroup arena {THREADGROUP_BYTES} B over the 16 KiB cap"
@@ -832,7 +1047,8 @@ class MegakernelBody:
         self.phase = 0
 
     def __call__(self, xin, cs_in, rec_in, *, reps: int = 1,
-                 steps: Optional[int] = None):
+                 steps: Optional[int] = None, kbuf=None, vbuf=None,
+                 pooled=None, actl=None, total: int = 1):
         """``steps`` truncates the schedule, for cumulative phase profiling.
 
         The barrier map lives in the schedule, so a prefix is a real, running
@@ -842,19 +1058,29 @@ class MegakernelBody:
         nsteps = len(self.schedule) if steps is None else int(steps)
         meta = mx.array([nsteps, reps], mx.uint32)
         base = mx.array([self.phase], mx.uint32)
+        if kbuf is None:
+            kbuf = mx.zeros((N_KV_HEADS, 1, HEAD_DIM), mx.bfloat16)
+            vbuf = kbuf
+        if pooled is None:
+            pooled = mx.zeros((1, IDX_HEAD_DIM), mx.bfloat16)
+        if actl is None:
+            actl = mx.zeros((16 + BLOCK_TOPK,), mx.uint32)
         outs = self.kernel(
             inputs=[xin, *self.wbufs, self.table, self.sched, meta,
-                    cs_in, rec_in, self.ctrl, base],
+                    cs_in, rec_in, kbuf, vbuf, pooled, actl,
+                    self.ctrl, base],
             grid=(self.groups * self.threads, 1, 1),
             threadgroup=(self.threads, 1, 1),
             output_shapes=[
                 (SCRATCH_FLOATS,), (reps, HIDDEN),
                 (self.gdn_layers, CONV_KERNEL - 1, CONV_DIM),
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
+                (2 * N_Q_HEADS * SDPA_BLOCKS,),
+                (N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM,),
                 (4,),
             ],
             output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16,
-                           mx.float32, mx.uint32],
+                           mx.float32, mx.float32, mx.bfloat16, mx.uint32],
         )
         # One grid barrier for the residual load, one after the output write,
         # plus the schedule's own device barriers, per repetition.
