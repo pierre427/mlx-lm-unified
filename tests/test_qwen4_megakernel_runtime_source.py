@@ -384,3 +384,104 @@ def test_tree_clone_keeps_qsa_side_ledgers_and_refuses_armed_state():
     assert "c.index_keys = mx.contiguous" in source
     assert "c._qsa_pooled_keys = mx.contiguous" in source
     assert 'identity["complete_blocks"] = 0' in source
+
+
+def test_packing_guard_uses_live_memory_peak_and_swap_without_a_gpu_import():
+    ns = {}
+    refuse = _source_function("qwen4_megakernel_runtime.py",
+                              "packing_memory_refusal", ns)
+    gib = 1 << 30
+    snapshot = {"active_bytes": 67 * gib, "cache_bytes": 0,
+                "host_rss_bytes": 67 * gib,
+                "host_peak_rss_bytes": 67 * gib, "swap_used_bytes": 0}
+    kwargs = dict(baseline_swap=0, limit=96 * gib,
+                  group_bytes=8 * gib, reserved_bytes=8 * gib)
+    assert refuse(snapshot, **kwargs) is None
+    # Retained sources must be detected before the next group submission.
+    assert "peak bound" in refuse({**snapshot, "active_bytes": 80 * gib}, **kwargs)
+    assert "peak bound" in refuse({**snapshot, "cache_bytes": 13 * gib}, **kwargs)
+    assert "peak bound" in refuse({**snapshot, "host_rss_bytes": 90 * gib}, **kwargs)
+    assert refuse({**snapshot, "host_peak_rss_bytes": 90 * gib}, **kwargs) is None
+    assert "swap grew" in refuse({**snapshot, "swap_used_bytes": 513 << 20}, **kwargs)
+    assert refuse({**snapshot, "swap_used_bytes": 512 << 20}, **kwargs) is None
+    assert "no positive" in refuse(snapshot, **{**kwargs, "limit": 0})
+
+
+def test_pack_planning_drops_raw_references_and_guards_each_submission():
+    source = (MODELS / "qwen4_megakernel_pack.py").read_text()
+    build = source[source.index("def build_pack("):source.index("def _validate_entry(")]
+    first_pass = build[:build.index("groups = _plan_groups")]
+    assert "fuse_scales_biases(" not in first_pass
+    assert "del parts, weight" in first_pass
+    assert "del parts, weight, words" in build
+    assert build.index('stage="before_group"') < build.index("chunks: list[mx.array]")
+    assert build.index("mx.eval(buf)") < build.index("gc.collect()")
+    assert build.index("mx.clear_cache()") < build.index('stage="after_group"')
+
+
+def test_packing_snapshot_reads_host_swap_and_allocator_counters_only():
+    import re
+
+    calls = []
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(stdout=("120" if argv[0] == "/bin/ps" else
+                                       "total = 14.00G used = 1.25G free = 12.75G"))
+    ns = {"sys": SimpleNamespace(platform="darwin"), "re": re,
+          "os": SimpleNamespace(getpid=lambda: 123),
+          "subprocess": SimpleNamespace(run=run),
+          "resource": SimpleNamespace(RUSAGE_SELF=0, getrusage=lambda _: SimpleNamespace(ru_maxrss=123)),
+          "mx": SimpleNamespace(get_active_memory=lambda: 100, get_cache_memory=lambda: 20)}
+    snapshot = _source_function("qwen4_megakernel_runtime.py", "packing_memory_snapshot", ns)
+    assert snapshot() == {"active_bytes": 100, "cache_bytes": 20,
+                          "host_rss_bytes": 120 * 1024,
+                          "host_peak_rss_bytes": 123, "swap_used_bytes": 5 * (1 << 28)}
+    assert calls[0][1]["timeout"] == 5
+
+
+def test_scale_bias_metadata_matches_fixed_dtype_fusion_and_rejects_promotion():
+    bf16 = SimpleNamespace(size=2, name="bfloat16")
+    fp32 = SimpleNamespace(size=4, name="float32")
+    ns = {"mx": SimpleNamespace(bfloat16=bf16), "PackError": ValueError}
+    size = _source_function("qwen4_megakernel_pack.py", "_scale_bias_bytes", ns)
+    scales = SimpleNamespace(shape=(1,), size=1, dtype=bf16)
+    assert size(scales, scales) == 4
+    with pytest.raises(ValueError, match="both be bfloat16"):
+        size(scales, SimpleNamespace(shape=(1,), size=1, dtype=fp32))
+    with pytest.raises(ValueError, match="shape pair"):
+        size(scales, None)
+    source = (MODELS / "qwen4_megakernel_pack.py").read_text()
+    assert source.count("_scale_bias_bytes(scales, biases)") == 4
+
+
+def test_constructor_phase_guards_release_only_fulfilled_reservations():
+    source = (MODELS / "qwen4_megakernel_runtime.py").read_text()
+    before_restore = source.index('stage="before_restore"')
+    restored = source.index("self.restored_sb = self.restore_source_contiguity()")
+    restore_fulfilled = source.index("self._pack_reserved_bytes -= planned_restore_bytes")
+    after_restore = source.index('stage="after_restore"')
+    before_allocate = source.index('stage="before_allocate"')
+    allocated = source.index("self._allocate()")
+    ledger_fulfilled = source.index('self._pack_reserved_bytes -= self.ledger_bytes["total"]')
+    after_allocate = source.index('stage="after_allocate"')
+    assert before_restore < restored < restore_fulfilled < after_restore
+    assert after_restore < before_allocate < allocated < ledger_fulfilled < after_allocate
+    restore_fn = source[source.index("    def restore_source_contiguity("):source.index("    def _allocate(")]
+    assert restore_fn.index("mx.eval(restored_arrays)") < restore_fn.index("return restored")
+
+
+def test_guard_receipt_reports_remaining_reserve_not_a_fulfilled_allocation():
+    snapshots = {"active_bytes": 12, "cache_bytes": 0, "host_rss_bytes": 12,
+                 "host_peak_rss_bytes": 20, "swap_used_bytes": 0}
+    ns = {"packing_memory_snapshot": lambda: snapshots}
+    ns["packing_memory_refusal"] = _source_function(
+        "qwen4_megakernel_runtime.py", "packing_memory_refusal", {})
+    guard = _source_function("qwen4_megakernel_runtime.py", "_guard_pack_memory", ns,
+                             class_name="MegakernelDecoder")
+    decoder = SimpleNamespace(_pack_baseline_swap=0, _pack_memory_limit=20,
+                              _pack_reserved_bytes=8, pack_memory_checks=[])
+    guard(decoder, stage="before_restore", group_index=-1, group_bytes=0)
+    snapshots["active_bytes"] = 16
+    decoder._pack_reserved_bytes = 4
+    guard(decoder, stage="after_restore", group_index=-1, group_bytes=0)
+    assert [r["reserved_bytes"] for r in decoder.pack_memory_checks] == [8, 4]

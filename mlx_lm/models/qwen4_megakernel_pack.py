@@ -7,16 +7,18 @@ addressed through an offset table the kernel indexes by (layer, projection).
 
 Two properties this module is responsible for:
 
-**No duplicated memory.**  Packing is a copy, and the decode path is ~67 GiB
+**Bounded packing memory.** Packing is a copy, and the decode path is ~67 GiB
 here, so a naive pack would need a second copy of the model resident.  MLX
 gives contiguous 1-D slices, reshapes and ``mx.view`` for free -- measured
 2026-09-03 on ``0.32.2.dev20260829``: a 64 MiB slice of a 256 MiB parent moves
 ``get_active_memory`` by 0.0 MiB, while ``mx.contiguous`` of the same slice
 moves it by 64 MiB.  So the pack is built one GROUP at a time and each source
-module parameter is then rebound to a zero-copy view of the packed buffer, and
-the source array is dropped.  Steady-state cost is zero; the transient is one
-group (``max_group_bytes``, 8 GiB by default), not the whole model.  Never call
-``mx.contiguous`` on a rebound view -- that is what re-materialises it.
+module parameter is then rebound to a zero-copy view of the packed buffer.
+That does not prove the old allocation was released: sibling views or graph
+owners can retain it. The decoder checks measured allocator and host memory
+before each group, reserves two groups for output plus staging, and refuses
+further submissions on budget or swap growth. Never call ``mx.contiguous`` on
+a rebound weight view -- that is what re-materialises it.
 
 **Round-trip validation.**  Every packed entry is checked bit-for-bit against
 the array it came from, at pack time, before the source is released.  A pack
@@ -51,6 +53,7 @@ kernel is legal at every entry base.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 from dataclasses import dataclass, field
@@ -149,6 +152,15 @@ SB_SPLIT = "split"
 DEFAULT_SB_LAYOUT = SB_INTERLEAVED
 
 
+def _scale_bias_bytes(scales, biases) -> int:
+    """Metadata-only size for the kernel's fixed bfloat16 scale/bias format."""
+    if biases is None or scales.shape != biases.shape:
+        raise PackError("invalid scale/bias shape pair")
+    if scales.dtype != mx.bfloat16 or biases.dtype != mx.bfloat16:
+        raise PackError("scale/bias tensors must both be bfloat16")
+    return 2 * int(scales.size) * int(scales.dtype.size)
+
+
 def fuse_scales_biases(
     scales: mx.array, biases: mx.array, layout: str = DEFAULT_SB_LAYOUT
 ) -> mx.array:
@@ -157,10 +169,7 @@ def fuse_scales_biases(
     ``interleaved`` -> ``[..., rows, 2, ngroups]`` (the shipped layout).
     ``split`` -> ``[2, ..., rows, ngroups]``.
     """
-    if scales.shape != biases.shape:
-        raise PackError(
-            f"scale/bias shape mismatch: {scales.shape} vs {biases.shape}"
-        )
+    _scale_bias_bytes(scales, biases)
     if layout == SB_INTERLEAVED:
         return mx.stack([scales, biases], axis=-2)
     if layout == SB_SPLIT:
@@ -622,16 +631,7 @@ def estimate_pack(source, plan: list[tuple[str, str]], *,
             n_sb = 0
             if "scales" in parts:
                 scales, biases = parts["scales"], parts.get("biases")
-                if biases is None or scales.shape != biases.shape:
-                    raise PackError(f"{key}: invalid scale/bias pair")
-                sb_bytes = (
-                    int(scales.size) * int(scales.dtype.size)
-                    + int(biases.size) * int(biases.dtype.size)
-                )
-                if sb_bytes % 4:
-                    raise PackError(
-                        f"{key}: scale/bias payload is not whole uint32 words"
-                    )
+                sb_bytes = _scale_bias_bytes(scales, biases)
                 n_sb = sb_bytes // 4
                 scale_bias_bytes += sb_bytes
             sizes.append((key, role, _align(n_w) + _align(n_sb)))
@@ -662,6 +662,7 @@ def build_pack(
     rebind: bool = False,
     sb_layout: str = DEFAULT_SB_LAYOUT,
     quant_spec: Optional[Callable[[str], tuple[int, int]]] = None,
+    memory_guard: Optional[Callable[..., None]] = None,
 ) -> MegaWeightPack:
     """Pack ``plan``'s tensors into group buffers and prove the round trip.
 
@@ -669,6 +670,10 @@ def build_pack(
     came from, while that array is still resident.  ``rebind`` then replaces the
     source module's parameter with a zero-copy view of the pack, which is what
     keeps the pack from doubling the model's footprint.
+
+    ``memory_guard`` runs before any group staging and after its evaluated
+    output is rebound and temporary references are released. It may refuse
+    the next submission; the caller must not reuse a partially rebound model.
     """
     quant_spec = quant_spec or source.quant_spec
     missing = [key for key, _ in plan if not source.has(key)]
@@ -687,10 +692,11 @@ def build_pack(
         n_sb = 0
         sb_shape = None
         if "scales" in parts:
-            fused = fuse_scales_biases(parts["scales"], parts["biases"],
-                                       sb_layout)
-            n_sb = _words(fused)
+            scales, biases = parts["scales"], parts.get("biases")
+            sb_bytes = _scale_bias_bytes(scales, biases)
+            n_sb = sb_bytes // 4
             sb_shape = tuple(parts["scales"].shape)
+            del scales, biases
         meta[key] = {
             "role": role,
             "n_w": n_w,
@@ -700,6 +706,7 @@ def build_pack(
             "quantized": "scales" in parts,
         }
         sizes.append((key, role, _align(n_w) + _align(n_sb)))
+        del parts, weight
     source.release()
 
     groups = _plan_groups(sizes, max_group_bytes)
@@ -708,8 +715,13 @@ def build_pack(
     packed_bytes = 0
     peak_transient = 0
     validated = 0
+    words_by_key = {key: words for key, _, words in sizes}
 
     for group_index, (role, keys) in enumerate(groups):
+        group_bytes = sum(words_by_key[key] for key in keys) * 4
+        if memory_guard is not None:
+            memory_guard(stage="before_group", group_index=group_index,
+                         group_bytes=group_bytes)
         chunks: list[mx.array] = []
         used = 0
         for key in keys:
@@ -734,6 +746,7 @@ def build_pack(
                     + parts["biases"].size * parts["biases"].dtype.size
                 )
                 chunks.append(_as_words(fused))
+                del fused
                 used += info["n_sb"]
                 pad = _align(used) - used
                 if pad:
@@ -765,6 +778,7 @@ def build_pack(
             )
             pack.entries[key] = entry
             pack.order.append(key)
+            del parts, weight, words
 
         if device_cap is not None and used * 4 > device_cap:
             raise PackError(
@@ -787,6 +801,13 @@ def build_pack(
                 if rebind and hasattr(source, "rebind"):
                     source.rebind(key, pack.views(key))
             source.release()
+        if rebind:
+            # Evaluated packed outputs no longer need source graph temporaries.
+            gc.collect()
+            mx.clear_cache()
+        if memory_guard is not None:
+            memory_guard(stage="after_group", group_index=group_index,
+                         group_bytes=0)
 
     table = mx.array(
         [value for key in pack.order for value in pack.entries[key].row()],

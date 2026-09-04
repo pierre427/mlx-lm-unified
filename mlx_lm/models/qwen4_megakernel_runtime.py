@@ -33,6 +33,10 @@ what makes a mixed run -- stock prefill, megakernel decode -- possible.
 from __future__ import annotations
 
 import os
+import re
+import resource
+import subprocess
+import sys
 import threading
 from typing import Any, Optional
 
@@ -92,6 +96,7 @@ from .qwen4_megakernel import (
     PLE_STATE_LEN,
     SDPA_BLOCKS,
     SCRATCH,
+    scratch_floats,
     VOCAB,
     MegakernelAdmission,
     _SPIN_CAP,
@@ -115,6 +120,51 @@ class MegakernelConstructionError(RuntimeError):
 
     model_mutated = True
     stock_fallback_safe = False
+
+
+def packing_memory_snapshot() -> dict[str, int]:
+    """Read allocator use and host pressure without submitting device work."""
+    if sys.platform != "darwin":
+        raise RuntimeError("packing host-memory guard requires macOS")
+    swap = subprocess.run(
+        ["/usr/sbin/sysctl", "-n", "vm.swapusage"],
+        check=True, capture_output=True, text=True, timeout=5,
+    ).stdout
+    match = re.search(r"\bused\s*=\s*([0-9.]+)([KMGTP]?)", swap)
+    if match is None:
+        raise RuntimeError("cannot read swap usage before packing")
+    scale = 1024 ** ("KMGTP".index(match[2]) + 1) if match[2] else 1
+    rss = subprocess.run(
+        ["/bin/ps", "-o", "rss=", "-p", str(os.getpid())],
+        check=True, capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+    if not rss.isdigit():
+        raise RuntimeError("cannot read process RSS before packing")
+    return {
+        "active_bytes": int(mx.get_active_memory()),
+        "cache_bytes": int(mx.get_cache_memory()),
+        "host_rss_bytes": int(rss) * 1024,
+        # Keep the historical peak as evidence, not current admission usage.
+        "host_peak_rss_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss),
+        "swap_used_bytes": int(float(match[1]) * scale),
+    }
+
+
+def packing_memory_refusal(snapshot: dict[str, int], *, baseline_swap: int,
+                           limit: int, group_bytes: int,
+                           reserved_bytes: int) -> Optional[str]:
+    if limit <= 0:
+        return "device has no positive packing memory budget"
+    if snapshot["swap_used_bytes"] - baseline_swap > 512 * (1 << 20):
+        return "host swap grew by more than 512 MiB during packing"
+    resident = max(snapshot["active_bytes"] + snapshot["cache_bytes"],
+                   snapshot["host_rss_bytes"])
+    required = resident + 2 * group_bytes + reserved_bytes
+    if required > limit:
+        return (f"packing peak bound {required} bytes exceeds device budget "
+                f"{limit} bytes (resident={resident}, group={group_bytes}, "
+                f"reserved={reserved_bytes})")
+    return None
 
 
 def ledger_allocation_bytes(*, total: int, attention_layers: int,
@@ -390,12 +440,12 @@ class MegakernelDecoder:
             width=MAX_QUERY_WIDTH, gdn_layers=len(self.gdn_layers),
             vocab=VOCAB if self.include_lm_head else 1,
             score_blocks=self.pooled_stride)
-        # With rebind the peak is one planned group; without it the entire
-        # second copy remains resident.  Account for the actual plan, not the
-        # caller's cap.
+        # One output group plus up to one group of fusion/reshape staging.
+        # Rebind release is checked between groups; it is not assumed.
         self.pack_transient_budget = int(
-            self.pack_estimate["largest_group_bytes"] if rebind
-            else self.pack_estimate["packed_bytes"])
+            2 * self.pack_estimate["largest_group_bytes"] if rebind
+            else (self.pack_estimate["packed_bytes"]
+                  + self.pack_estimate["largest_group_bytes"]))
         planned_restore_bytes = int(
             self.pack_estimate["scale_bias_bytes"]
             if rebind and contiguous_source_sb else 0)
@@ -418,6 +468,17 @@ class MegakernelDecoder:
         if preflight is not None:
             raise RuntimeError(f"megakernel preflight declined: {preflight}")
 
+        self.pack_memory_checks = []
+        self._pack_memory_limit = int(self.portability.get("device", {}).get(
+            "max_recommended_working_set_size") or 0)
+        self._pack_reserved_bytes = (
+            self.ledger_bytes["total"] + self.max_launch_bytes["total"]
+            + scratch_floats(MAX_QUERY_WIDTH) * 4 + planned_restore_bytes)
+        baseline = packing_memory_snapshot()
+        self._pack_baseline_swap = baseline["swap_used_bytes"]
+        self._guard_pack_memory(stage="before_pack", group_index=-1,
+                                group_bytes=self.pack_estimate["largest_group_bytes"])
+
         # 8 GiB is a HARD cap, not a preference: a group is one flat uint32
         # buffer, MLX shape dimensions are int32, and 2^31 words is 8 GiB.
         # Raising it to shrink the buffer count therefore is not available, so
@@ -429,12 +490,18 @@ class MegakernelDecoder:
             self._source_may_be_mutated = bool(rebind)
             self.pack = MP.build_pack(
                 self.source, plan, validate=validate, rebind=rebind,
-                max_group_bytes=max_group_bytes)
+                max_group_bytes=max_group_bytes,
+                memory_guard=self._guard_pack_memory)
             self.restore_source_bytes = (
                 restored_scale_bias_bytes(self.pack)
                 if rebind and contiguous_source_sb else 0)
+            self._guard_pack_memory(stage="before_restore", group_index=-1,
+                                    group_bytes=0)
             if rebind and contiguous_source_sb:
                 self.restored_sb = self.restore_source_contiguity()
+            self._pack_reserved_bytes -= planned_restore_bytes
+            self._guard_pack_memory(stage="after_restore", group_index=-1,
+                                    group_bytes=0)
             self.schedule = MS.build_token_schedule(
                 self.pack, layer_types=self.layer_types, layers=self.layers,
                 ple_layer_ids=self.ple_layer_ids,
@@ -448,14 +515,21 @@ class MegakernelDecoder:
                 threads=self.threads, groups=self.groups,
                 spin_cap=self.spin_cap)
             self.dual_width = DUAL_WIDTH
+            self._guard_pack_memory(stage="before_allocate", group_index=-1,
+                                    group_bytes=0)
             self._allocate()
+            self._pack_reserved_bytes -= self.ledger_bytes["total"]
+            self._guard_pack_memory(stage="after_allocate", group_index=-1,
+                                    group_bytes=0)
         except Exception as exc:
             if rebind:
-                raise MegakernelConstructionError(
+                error = MegakernelConstructionError(
                     "megakernel construction failed after source rebind may "
                     "have begun; the model is mutated and MUST NOT be used as "
                     "a stock fallback"
-                ) from exc
+                )
+                error.pack_memory_checks = list(self.pack_memory_checks)
+                raise error from exc
             raise
         self.position = 0
         self._pending = None
@@ -466,6 +540,21 @@ class MegakernelDecoder:
         self._state_lock = threading.RLock()
         self._in_flight = False
         self._in_flight_owner: Optional[int] = None
+
+    def _guard_pack_memory(self, *, stage: str, group_index: int,
+                           group_bytes: int) -> None:
+        snapshot = packing_memory_snapshot()
+        receipt = {"stage": stage, "group_index": group_index,
+                   "group_bytes": group_bytes,
+                   "reserved_bytes": self._pack_reserved_bytes, **snapshot}
+        reason = packing_memory_refusal(
+            snapshot, baseline_swap=self._pack_baseline_swap,
+            limit=self._pack_memory_limit, group_bytes=group_bytes,
+            reserved_bytes=self._pack_reserved_bytes)
+        receipt["refusal"] = reason
+        self.pack_memory_checks.append(receipt)
+        if reason:
+            raise RuntimeError(f"megakernel packing declined at {stage}: {reason}")
 
     def restore_source_contiguity(self) -> int:
         """Give the STOCK path back CONTIGUOUS scales and biases.
@@ -483,6 +572,7 @@ class MegakernelDecoder:
         Returns the number of entries restored.
         """
         restored = 0
+        restored_arrays = []
         for key, entry in self.pack.entries.items():
             if entry.n_sb == 0 or not self.source.has(key):
                 continue
@@ -490,8 +580,11 @@ class MegakernelDecoder:
             for part in ("scales", "biases"):
                 value = getattr(module, part, None)
                 if isinstance(value, mx.array):
-                    setattr(module, part, mx.contiguous(value))
+                    contiguous = mx.contiguous(value)
+                    setattr(module, part, contiguous)
+                    restored_arrays.append(contiguous)
             restored += 1
+        mx.eval(restored_arrays)
         return restored
 
     # ------------------------------------------------------------- ledgers
@@ -1080,6 +1173,7 @@ class MegakernelDecoder:
             "in_flight_owner": self._in_flight_owner,
             "source_may_be_mutated": self._source_may_be_mutated,
             "pack_estimate": dict(self.pack_estimate),
+            "pack_memory_checks": list(self.pack_memory_checks),
             "poisoned_reason": self._poisoned_reason,
             "pack": self.pack.summary(),
             "dual_width": self.dual_width,
