@@ -1166,6 +1166,251 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+
+# Capacity ladder for ``RingKVCache``. A compiled decode variant is keyed by
+# (width, capacity), so every distinct capacity costs one trace; a geometric
+# ladder keeps the number of traces per completion at O(log n) while bounding
+# the padded columns attention reads to < 2x the live ones. Override per
+# instance, or globally with MLX_LM_RING_KV_BUCKETS (comma-separated).
+_RING_KV_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536)
+
+
+def _ring_buckets() -> tuple:
+    env = os.environ.get("MLX_LM_RING_KV_BUCKETS")
+    if not env:
+        return _RING_KV_BUCKETS
+    buckets = tuple(sorted({int(v) for v in env.split(",") if v.strip()}))
+    if not buckets or buckets[0] <= 0:
+        raise ValueError(f"Invalid MLX_LM_RING_KV_BUCKETS: {env!r}")
+    return buckets
+
+
+class RingKVCache(_BaseCache):
+    """Shape-stable KV cache: preallocated slab, offset held as an array.
+
+    ``KVCache`` grows by concatenating 256-token blocks and hands attention a
+    Python-sliced view ``keys[..., :offset, :]``, so both the buffer shape and
+    the slice length change as decoding proceeds. Neither can appear in a
+    graph that is traced once and replayed, which is what ``mx.compile`` needs
+    to remove the per-token host graph build (see
+    ``wiki/docs/research/qwen4-compiled-replay-microbench-2026-09-04.md``).
+
+    This cache keeps every array shape fixed for a whole capacity bucket:
+
+    * ``keys``/``values`` are ``[B, n_kv_heads, capacity, D]`` slabs allocated
+      once per bucket and written with ``mx.slice_update`` at an **array**
+      start index -- no concatenation, no reallocation, no shape change.
+    * ``offset`` is an ``int32`` scalar ``mx.array``, not a Python ``int``, so
+      RoPE, the write index and the mask all read it from the graph.
+    * ``make_mask`` always returns an array of shape ``[1, 1, N, capacity]``
+      (never ``None``, never the string ``"causal"``): column ``j`` is visible
+      to query row ``i`` iff ``j <= offset + i``, which is causal over the
+      live columns and false everywhere in the padded tail.
+
+    Despite the name there is no circular overwrite: wrapping would drop the
+    oldest keys and change what the model attends to. "Ring" here is the
+    fixed-shape slab with a moving array cursor; when the cursor reaches
+    ``capacity`` the slab is reallocated at the next bucket and the live
+    prefix copied, which invalidates any compiled variant keyed on the old
+    capacity (see ``compiled_decode``).
+
+    **Exactness.** Every op except the attention reduction is bit-identical to
+    ``KVCache``: the same keys and values land at the same positions and the
+    mask admits exactly the same columns. The attention reduction is *not*
+    bit-identical in general, because ``mx.fast.scaled_dot_product_attention``
+    picks its Metal kernel and its block partitioning from the key length it
+    is handed: on M-series the vector path switches to the two-pass kernel at
+    ``k.shape[2] >= 1024`` and changes its block count at 1024/8192/32768/65536
+    (mlx ``backend/metal/scaled_dot_product_attention.cpp``). Padding the key
+    length to a bucket therefore reorders an otherwise identical sum -- the
+    masked columns contribute exactly ``exp(-inf) == 0``. Measured: identical
+    bytes while the padded length stays under 1024, ~1 ULP apart above it. See
+    ``tests/test_ring_kv_cache.py`` and the write-up for the tolerance class.
+    """
+
+    def __init__(self, capacity: Optional[int] = None, buckets=None):
+        self.buckets = tuple(buckets) if buckets is not None else _ring_buckets()
+        self.keys = None
+        self.values = None
+        self.capacity = 0
+        # Host mirror of ``offset``. Every host-side decision (allocation,
+        # trimming, size reporting) reads this; the device array is what the
+        # graph sees. They are advanced together and never read across.
+        self._host_offset = 0
+        self.offset = mx.array(0, dtype=mx.int32)
+        self._cols = None
+
+    def _columns(self):
+        if self._cols is None or self._cols.size != self.capacity:
+            self._cols = mx.arange(self.capacity, dtype=mx.int32)
+        return self._cols
+
+    # -- capacity -------------------------------------------------------
+
+    def _bucket_for(self, n: int) -> int:
+        for b in self.buckets:
+            if n <= b:
+                return b
+        top = self.buckets[-1]
+        return ((n + top - 1) // top) * top
+
+    def _allocate(self, keys, values, needed: int):
+        B, n_kv_heads, _, k_head_dim = keys.shape
+        v_head_dim = values.shape[3]
+        capacity = self._bucket_for(needed)
+        new_k = mx.zeros((B, n_kv_heads, capacity, k_head_dim), keys.dtype)
+        new_v = mx.zeros((B, n_kv_heads, capacity, v_head_dim), values.dtype)
+        if self.keys is not None:
+            live = self._host_offset
+            new_k[..., :live, :] = self.keys[..., :live, :]
+            new_v[..., :live, :] = self.values[..., :live, :]
+        self.keys, self.values, self.capacity = new_k, new_v, capacity
+        self._cols = None
+
+    def reserve(self, n: int) -> bool:
+        """Grow the slab so ``n`` more tokens fit. Returns True if it grew.
+
+        The mask is built from ``capacity`` at the top of the forward while
+        the writes happen inside it, so the slab has to be big enough
+        *before* the step starts or the mask would be narrower than the
+        keys. ``make_mask`` calls this, and the compiled-decode wrapper
+        calls it on every cache before deciding which variant to replay.
+        """
+        if self.keys is None or self._host_offset + n <= self.capacity:
+            return False
+        self._allocate(self.keys, self.values, self._host_offset + n)
+        return True
+
+    # -- update ---------------------------------------------------------
+
+    def update_and_fetch(self, keys, values):
+        S = keys.shape[2]
+        needed = self._host_offset + S
+        if self.keys is None or needed > self.capacity:
+            self._allocate(keys, values, needed)
+        start = self.offset[None]
+        self.keys = mx.slice_update(self.keys, keys, start, axes=(2,))
+        self.values = mx.slice_update(self.values, values, start, axes=(2,))
+        self.offset = self.offset + S
+        self._host_offset += S
+        return self.keys, self.values
+
+    def keys_and_values(self):
+        """Live prefix, host-sliced. Not shape-stable: never call this from
+        inside a traced step -- ``update_and_fetch`` returns the full slab,
+        which is what the mask is built for."""
+        if self.keys is None:
+            return None, None
+        return (
+            self.keys[..., : self._host_offset, :],
+            self.values[..., : self._host_offset, :],
+        )
+
+    # -- mask -----------------------------------------------------------
+
+    def make_mask(self, N: int, return_array: bool = False, window_size=None):
+        # Always an array, always [1, 1, N, capacity]: a None mask (the N == 1
+        # fast path) would be wrong here because the padded tail must be
+        # excluded, and a "causal" string cannot express the padding either.
+        del return_array
+        if self.capacity == 0:
+            raise ValueError("RingKVCache.make_mask before the slab exists")
+        self.reserve(N)
+        rows = self.offset + mx.arange(N, dtype=mx.int32)
+        cols = self._columns()
+        mask = cols[None, :] <= rows[:, None]
+        if window_size is not None:
+            mask = mask & (cols[None, :] > rows[:, None] - window_size)
+        return mask[None, None]
+
+    # -- bookkeeping ----------------------------------------------------
+
+    def size(self):
+        return self._host_offset
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._host_offset, int(n))
+        self._host_offset -= n
+        self.offset = self.offset - n
+        return n
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+    # -- (de)serialization ----------------------------------------------
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return ()
+        return self.keys, self.values, self.offset
+
+    @state.setter
+    def state(self, v):
+        if not v:
+            self.keys = self.values = None
+            self.capacity = 0
+            self._host_offset = 0
+            self.offset = mx.array(0, dtype=mx.int32)
+            self._cols = None
+            return
+        self.keys, self.values, offset = v
+        self.capacity = self.keys.shape[2]
+        self._cols = None
+        self.offset = offset.astype(mx.int32)
+        self._host_offset = int(self.offset.item())
+
+    @property
+    def meta_state(self):
+        return (str(self._host_offset), ",".join(str(b) for b in self.buckets))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        if not v:
+            return
+        self._host_offset = int(v[0])
+        self.offset = mx.array(self._host_offset, dtype=mx.int32)
+        if len(v) > 1 and v[1]:
+            self.buckets = tuple(int(b) for b in v[1].split(","))
+
+    # -- interop --------------------------------------------------------
+
+    @classmethod
+    def from_kv_cache(cls, cache, buckets=None):
+        """Adopt a stock ``KVCache``'s contents into a shape-stable slab."""
+        ring = cls(buckets=buckets)
+        if cache.keys is None:
+            return ring
+        live = int(cache.offset)
+        keys = cache.keys[..., :live, :]
+        values = cache.values[..., :live, :]
+        ring._allocate(keys, values, live)
+        ring.keys[..., :live, :] = keys
+        ring.values[..., :live, :] = values
+        ring._host_offset = live
+        ring.offset = mx.array(live, dtype=mx.int32)
+        return ring
+
+    def to_kv_cache(self):
+        """Copy back into a stock ``KVCache`` (for saving or quantizing)."""
+        out = KVCache()
+        if self.keys is None:
+            return out
+        live = self._host_offset
+        out.keys = mx.contiguous(self.keys[..., :live, :])
+        out.values = mx.contiguous(self.values[..., :live, :])
+        out.offset = live
+        return out
+
 class SinkWindowKVCache(_BaseCache):
     """Bounded draft-only KV with attention sinks and absolute positions.
 
