@@ -437,6 +437,14 @@ BODY_SRC = r"""
   const device BFT* pooled =
       idxl + (size_t)actl[17] * (size_t)actl[0] * IDXD;
 
+  // PLE state is transactional like the GDN state.  Copy it to an output
+  // owned by the launch so a rejected verify slab leaves its input intact.
+  // The same global thread owns a channel here and in OP_PLE_CONV, so no
+  // device barrier is needed between the copy and that later phase.
+  for (uint c = tg * NT + tid; c < HCH; c += ntg * NT)
+    for (uint r = 0; r < PLES; ++r)
+      pconv_out[(size_t)r * HCH + c] = pconv[(size_t)r * HCH + c];
+
   // Every packed group is a binding; the table's `group` field selects one.
   const device uint* WB[10] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9};
 
@@ -1662,7 +1670,7 @@ BODY_SRC = r"""
         const device uint* T = tbl + ent * TSTRIDE;
         const device BFT* w = reinterpret_cast<const device BFT*>(
             WB[T[TBL_GROUP]] + T[TBL_WOFF]);
-        device BFT* st = const_cast<device BFT*>(pconv);
+        device BFT* st = pconv_out;
         // The dilated window rolls M steps.  One thread owns a channel for
         // the whole slab, so the queries simply run in order inside it: no
         // cross-thread hazard, and the state is read and written once even
@@ -1743,10 +1751,10 @@ BODY_SRC = r"""
 
 # Ten weight buffers, and the barrier's generation counter folded into `meta`.
 # Both are BINDING arithmetic, not preference.  MLX binds inputs and outputs
-# alike, so the budget is Metal's 31 for the pair: eight outputs leaves 23, and
+# alike, so the budget is Metal's 31 for the pair: nine outputs leaves 22, and
 # the 63 GiB of experts needs eight groups on its own because a group is
 # uint32-indexed and so caps at 2^31 words = 8 GiB.  Ten buffers + main +
-# lm_head + the table fits in 22 inputs, for 30 of 31.
+# the remaining tables and state fit in 20 inputs.
 # Phase E bought back THREE binding slots, each a pure addressing change with
 # no new arithmetic, because width 3 needs slots and the kernel was AT the
 # ceiling (23 inputs + 8 outputs = 31 of Metal's 31, not the 30 the build log
@@ -1756,7 +1764,8 @@ BODY_SRC = r"""
 #   * ``pooled`` + ``rawk`` -> ``idxl``, the one index ledger.  Same argument.
 #   * ``meta`` -> folded into ``actl``.  A four-word uint32 control buffer was
 #     worth as much of the budget as an 8 GiB weight group.
-# 20 inputs + 8 outputs = 28 of 31, i.e. three free.
+# 20 inputs + 9 outputs = 29 of 31.  The ninth output is the transactional PLE
+# state; keeping it separate from its input makes verify rollback real.
 IN_NAMES = [
     "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9",
     "tbl", "sched", "cs_in", "rec_in",
@@ -1768,8 +1777,8 @@ IN_NAMES = [
     "kv", "idxl", "pconv",
     "actl", "ctrl",
 ]
-OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "apm", "apo", "logits",
-             "status"]
+OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "pconv_out", "apm",
+             "apo", "logits", "status"]
 
 MAX_GROUPS = 10
 
@@ -1916,6 +1925,8 @@ class MegakernelBody:
         self.vocab = max(int(vocab), 1)
         self.threads = _THREADS if threads is None else threads
         self.groups = _THREADGROUPS if groups is None else groups
+        self.spin_cap = (_SPIN_CAP if kw.get("spin_cap") is None
+                         else int(kw["spin_cap"]))
         self.kernel = build_body_kernel(
             threads=self.threads, max_query_width=self.max_query_width, **kw)
         pad = mx.zeros((16,), mx.uint32)
@@ -1993,14 +2004,15 @@ class MegakernelBody:
                 (scratch_floats(mwidth),), (reps * mwidth, HIDDEN),
                 (self.gdn_layers, CONV_KERNEL - 1, CONV_DIM),
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
+                (PLE_STATE_LEN, HC_HIDDEN),
                 (mwidth * 2 * N_Q_HEADS * SDPA_BLOCKS,),
                 (mwidth * N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM,),
                 (reps * mwidth, self.vocab),
                 (4,),
             ],
             output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16,
-                           mx.float32, mx.float32, mx.bfloat16, mx.bfloat16,
-                           mx.uint32],
+                           mx.float32, mx.bfloat16, mx.float32, mx.bfloat16,
+                           mx.bfloat16, mx.uint32],
         )
         # One grid barrier for the residual load, one after the output write,
         # plus the schedule's own device barriers, per repetition.
@@ -2071,6 +2083,7 @@ class DualWidthMegakernelBody:
         self._wide: Optional[MegakernelBody] = None
         self.threads = self.narrow.threads
         self.groups = self.narrow.groups
+        self.spin_cap = self.narrow.spin_cap
         self.wide_build_seconds: Optional[float] = None
         self.calls_narrow = 0
         self.calls_wide = 0
@@ -2134,4 +2147,7 @@ class DualWidthMegakernelBody:
             "calls_narrow": self.calls_narrow,
             "calls_wide": self.calls_wide,
             "last_variant": getattr(self, "last_variant", None),
+            "threads": self.threads,
+            "threadgroups": self.groups,
+            "spin_cap": self.spin_cap,
         }

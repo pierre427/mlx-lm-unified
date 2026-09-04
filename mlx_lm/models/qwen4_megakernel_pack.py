@@ -359,6 +359,7 @@ def decode_path_keys(
     ple_layer_ids: Iterable[int] = (),
     include_mtp: bool = True,
     include_experts: bool = True,
+    include_lm_head: bool = True,
     fuse_gate_up: bool = True,
     layers: Optional[Iterable[int]] = None,
 ) -> list[tuple[str, str]]:
@@ -430,7 +431,8 @@ def decode_path_keys(
     add(f"{mixer}.hc_norm.weight")
     add(f"{mixer}.input_mix_weight_down")
     add(f"{mixer}.input_mix_weight_up")
-    add("language_model.lm_head", "lm_head")
+    if include_lm_head:
+        add("language_model.lm_head", "lm_head")
 
     if include_mtp:
         add("mtp.pre_fc_norm_embedding.weight")
@@ -556,12 +558,20 @@ def _plan_groups(
     let ``experts`` spill into ``main`` would change the binding set with the
     checkpoint.  Within a role, entries stay in consumption order.
 
-    An entry larger than the cap gets a buffer to itself rather than being
-    split -- an entry that straddled two bindings would need a second table
-    field and a branch in every read.  ``build_pack`` refuses one that also
-    exceeds the device's ``max_buffer_length``.
+    An entry cannot straddle two bindings without another table field and a
+    branch in every read, so an entry larger than the cap is refused before
+    any group allocation. The cap is also the runtime's transient-memory
+    reservation and therefore cannot be treated as a soft grouping hint.
     """
+    if (
+        isinstance(max_group_bytes, bool)
+        or not isinstance(max_group_bytes, int)
+        or max_group_bytes <= 0
+    ):
+        raise PackError("max_group_bytes must be a positive integer")
     cap_words = max_group_bytes // 4
+    if cap_words < 1:
+        raise PackError("max_group_bytes is smaller than one uint32 word")
     groups: list[tuple[str, list[str]]] = []
     current_role: Optional[str] = None
     current: list[str] = []
@@ -575,8 +585,12 @@ def _plan_groups(
     ordered = [item for role in by_role for item in by_role[role]]
     for key, role, words in ordered:
         need = _align(words)
+        if need > cap_words:
+            raise PackError(
+                f"{key}: aligned entry is {need * 4} bytes, over the "
+                f"{max_group_bytes}-byte group cap"
+            )
         if current_role != role or (current and used + need > cap_words):
-            # An oversize entry lands alone in the next group by the same rule.
             if current:
                 groups.append((current_role, current))
             current_role, current, used = role, [], 0

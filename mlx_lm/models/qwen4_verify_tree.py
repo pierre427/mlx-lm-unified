@@ -244,36 +244,73 @@ def _ranked_top_b(logits_row: "np.ndarray", b: int) -> List[int]:
 
 
 def _clone_kv(cache: Sequence[Any]) -> List[Any]:
-    """Deep copy of a plain-KVCache list over its valid region only."""
+    """Deep copy supported MTP caches without dropping QSA side state."""
     import mlx.core as mx  # local import keeps the pure path Metal-free
 
     from .cache import KVCache
+    from .qwen4_exp import QSAKVCache
 
     out: List[Any] = []
     for src in cache:
-        c = KVCache()
+        if isinstance(src, QSAKVCache):
+            if (getattr(src, "_mtp_share_topk", False)
+                    or getattr(src, "_mtp_shared_topk", None) is not None):
+                raise RuntimeError("cannot clone an armed QSA MTP cache")
+            identity = getattr(src, "_qsa_summary_identity", None)
+            if identity is not None:
+                identity = dict(identity)
+                identity["complete_blocks"] = 0
+            c = QSAKVCache(identity)
+        elif type(src) is KVCache:
+            c = KVCache()
+        else:
+            raise TypeError(
+                f"MTP tree cache clone does not support {type(src).__name__}"
+            )
         if src.offset > 0:
-            c.keys = mx.array(src.keys[..., : src.offset, :])
-            c.values = mx.array(src.values[..., : src.offset, :])
+            c.keys = mx.contiguous(src.keys[..., : src.offset, :])
+            c.values = mx.contiguous(src.values[..., : src.offset, :])
             c.offset = src.offset
+        if isinstance(src, QSAKVCache):
+            index_keys = src.index_keys
+            if src.offset and index_keys is None:
+                raise RuntimeError(
+                    "populated QSA cache has no raw-key ledger"
+                )
+            if index_keys is not None:
+                if index_keys.shape[1] < src.offset:
+                    raise RuntimeError(
+                        "QSA raw-key ledger is shorter than its KV cursor"
+                    )
+                c.index_keys = mx.contiguous(index_keys[:, : src.offset])
+            pooled = getattr(src, "_qsa_pooled_keys", None)
+            ratio = getattr(src, "_qsa_pooled_ratio", None)
+            if pooled is not None:
+                if not ratio:
+                    raise RuntimeError("QSA pooled keys have no compression ratio")
+                complete = min(src.offset // ratio, pooled.shape[1])
+                if complete:
+                    c._qsa_pooled_keys = mx.contiguous(pooled[:, :complete])
+                    c._qsa_pooled_ratio = ratio
+                    if c._qsa_summary_identity is not None:
+                        c._qsa_summary_identity["complete_blocks"] = complete
         out.append(c)
     return out
 
 
 def _tile_kv(cache: Sequence[Any], b: int) -> List[Any]:
-    """Fresh B=b copies of B=1 caches (valid region only)."""
-    import mlx.core as mx
-
-    from .cache import KVCache
+    """Merge each single-sequence cache into a native B=b cache."""
+    if b < 1:
+        raise ValueError("cache tile breadth must be positive")
 
     out: List[Any] = []
     for src in cache:
-        c = KVCache()
-        if src.offset > 0:
-            c.keys = mx.repeat(src.keys[..., : src.offset, :], b, axis=0)
-            c.values = mx.repeat(src.values[..., : src.offset, :], b, axis=0)
-            c.offset = src.offset
-        out.append(c)
+        merge = getattr(type(src), "merge", None)
+        if merge is None:
+            raise TypeError(
+                f"MTP tree cache tile does not support {type(src).__name__}"
+            )
+        out.append(merge([src] * b))
     return out
 
 

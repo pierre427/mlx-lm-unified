@@ -8,10 +8,10 @@ against the stock arithmetic.  What none of them had was a caller.
 This module is that caller.  ``MegakernelDecoder`` owns one packed model, one
 token schedule, and the ledgers a decode token reads and writes, and turns a
 single token id into logits with ONE dispatch.  It is default OFF
-(``MLX_QWEN4_MEGAKERNEL``), it admits or declines by a named reason before it
-touches the GPU, and every launch leaves a receipt carrying the per-opcode
-phase histogram, so "every phase engaged" is checkable from the receipt rather
-than by reading the schedule.
+(``MLX_QWEN4_MEGAKERNEL``). Structural and device-limit checks run before the
+body and ledgers are allocated, and the packed-size check runs before those
+large persistent allocations. Every launch synchronizes its device status
+before it can be published as engaged.
 
 **What stays on the host, and why.**  Two things, both because they depend on
 the input TOKEN and not on any activation: ``embed_tokens`` and the PLE n-gram
@@ -70,17 +70,85 @@ from .qwen4_megakernel import (
     HIDDEN,
     IDX_COMPRESS,
     IDX_HEAD_DIM,
+    MAX_QUERY_WIDTH,
+    N_Q_HEADS,
     N_KV_HEADS,
     OP_NAMES,
     PLE_STATE_LEN,
+    SDPA_BLOCKS,
     SCRATCH,
     VOCAB,
     MegakernelAdmission,
+    _SPIN_CAP,
+    _THREADGROUPS,
+    _THREADS,
+    _portable_config,
+    _portability_refusal,
     admit_megakernel_decode,
     record_megakernel_receipt,
 )
 
 OUT = {name: index for index, name in enumerate(OUT_NAMES)}
+
+
+class MegakernelDeviceAbort(RuntimeError):
+    """A launch did not complete its device-wide barrier protocol."""
+
+
+def ledger_allocation_bytes(*, total: int, attention_layers: int,
+                            gdn_layers: int) -> dict[str, int]:
+    """Exact persistent ledger allocation sizes, without creating arrays."""
+    n_attn = max(int(attention_layers), 1)
+    n_gdn = max(int(gdn_layers), 1)
+    total = int(total)
+    pooled_stride = total // IDX_COMPRESS
+    sizes = {
+        "kv": 2 * n_attn * N_KV_HEADS * total * HEAD_DIM * 2,
+        "index": n_attn * (total + pooled_stride) * IDX_HEAD_DIM * 2,
+        "gdn_conv": n_gdn * (CONV_KERNEL - 1) * CONV_DIM * 2,
+        "gdn_recurrent": (
+            n_gdn * GDN_VALUE_HEADS * GDN_VALUE_DIM * GDN_KEY_DIM * 4
+        ),
+        "ple_conv": PLE_STATE_LEN * HC_HIDDEN * 2,
+    }
+    sizes["total"] = sum(sizes.values())
+    return sizes
+
+
+def launch_allocation_bytes(*, width: int, gdn_layers: int,
+                            vocab: int) -> dict[str, int]:
+    """Conservative non-scratch allocations created by one launch.
+
+    The portability wrapper accounts for scratch separately.  This covers the
+    input/control arrays constructed after admission plus every other kernel
+    output while the old transactional state is still live.
+    """
+    width = max(int(width), 1)
+    gdn_layers = max(int(gdn_layers), 1)
+    vocab = max(int(vocab), 1)
+    sizes = {
+        "input": width * (HC_COUNT * HIDDEN + HIDDEN + HC_HIDDEN) * 2,
+        "actl": actl_words(width) * 4,
+        "out": width * HIDDEN * 2,
+        "gdn_conv_out": gdn_layers * (CONV_KERNEL - 1) * CONV_DIM * 2,
+        "gdn_recurrent_out": (
+            gdn_layers * GDN_VALUE_HEADS * GDN_VALUE_DIM * GDN_KEY_DIM * 4
+        ),
+        "ple_conv_out": PLE_STATE_LEN * HC_HIDDEN * 2,
+        "attention_partial_max": width * 2 * N_Q_HEADS * SDPA_BLOCKS * 4,
+        "attention_partial_out": (
+            width * N_Q_HEADS * SDPA_BLOCKS * HEAD_DIM * 2
+        ),
+        "result": width * vocab * 2,
+        "status": 4 * 4,
+    }
+    sizes["total"] = sum(sizes.values())
+    return sizes
+
+
+def restored_scale_bias_bytes(pack) -> int:
+    """Upper bound for contiguous source scale/bias copies after rebind."""
+    return sum(int(entry.n_sb) * 4 for entry in pack.entries.values())
 
 
 def build_control_block(position: int, width: int, *, total: int,
@@ -104,7 +172,24 @@ def build_control_block(position: int, width: int, *, total: int,
     Pure and model-free on purpose -- the trap it guards is arithmetic on
     positions, so a test should be able to reach it without a checkpoint.
     """
-    width = max(int(width), 1)
+    position = int(position)
+    width = int(width)
+    total = int(total)
+    if position < 0:
+        raise ValueError(f"position must be non-negative; got {position}")
+    if width < 1:
+        raise ValueError(f"width must be positive; got {width}")
+    if width > MAX_QUERY_WIDTH:
+        raise ValueError(
+            f"width {width} exceeds control capacity {MAX_QUERY_WIDTH}"
+        )
+    if total < 1:
+        raise ValueError(f"total must be positive; got {total}")
+    if position + width > total:
+        raise ValueError(
+            f"control span [{position}, {position + width}) exceeds "
+            f"ledger capacity {total}"
+        )
     actl = np.zeros(actl_words(width), np.uint32)
     actl[ACTL["total"]] = total
     actl[ACTL["block_size"]] = IDX_COMPRESS
@@ -176,6 +261,9 @@ class MegakernelDecoder:
         max_group_bytes: int = 8 << 30,
         contiguous_source_sb: bool = True,
     ):
+        max_context = int(max_context)
+        if max_context < 1:
+            raise ValueError(f"max_context must be positive; got {max_context}")
         self.include_lm_head = bool(include_lm_head)
         self.args = args
         self.model = model
@@ -183,6 +271,14 @@ class MegakernelDecoder:
         self.ple_layer_ids = [int(v) for v in getattr(args, "ple_layer_ids", ())]
         self.layers = (list(range(len(self.layer_types))) if layers is None
                        else list(layers))
+        if len(self.layers) != len(set(self.layers)):
+            raise ValueError("layers must not contain duplicates")
+        invalid_layers = [
+            index for index in self.layers
+            if index < 0 or index >= len(self.layer_types)
+        ]
+        if invalid_layers:
+            raise ValueError(f"layer index out of range: {invalid_layers[0]}")
         self.rope_theta = float(args.rope_theta)
         # The KV ledger is allocated once at its widest, so a decode run never
         # reallocates mid-flight.  The block grid divides it exactly.
@@ -197,6 +293,47 @@ class MegakernelDecoder:
         self.ple_layers = [int(v) - 1 for v in self.ple_layer_ids
                            if int(v) - 1 in self.layers]
 
+        self.portability = _portable_config()
+        if self.portability.get("error"):
+            raise RuntimeError(
+                f"megakernel configuration failed: {self.portability['error']}"
+            )
+        values = self.portability.get("values", {})
+        self.threads = int(values.get("threads", _THREADS) if threads is None
+                           else threads)
+        self.groups = int(values.get("groups", _THREADGROUPS) if groups is None
+                          else groups)
+        self.spin_cap = int(values.get("spin_cap", _SPIN_CAP))
+        if self.threads <= 0 or self.threads > 512 or self.threads % 32:
+            raise ValueError(
+                f"threads={self.threads} must be a multiple of 32, <= 512"
+            )
+        if self.groups < 1:
+            raise ValueError(f"groups must be positive; got {self.groups}")
+        if GDN_VALUE_DIM % (self.threads // 32):
+            raise ValueError(
+                f"threads={self.threads} does not divide the GDN value dim"
+            )
+        self.ledger_bytes = ledger_allocation_bytes(
+            total=self.total, attention_layers=len(self.attn_layers),
+            gdn_layers=len(self.gdn_layers))
+        self.max_launch_bytes = launch_allocation_bytes(
+            width=MAX_QUERY_WIDTH, gdn_layers=len(self.gdn_layers),
+            vocab=VOCAB if self.include_lm_head else 1)
+        # Packing rebinds one group at a time, but that group coexists with
+        # its source arrays until adoption. Reserve the hard group cap before
+        # starting the first large allocation.
+        self.pack_transient_budget = max(int(max_group_bytes), 0)
+        preflight = _portability_refusal(
+            self.portability, threads=self.threads, groups=self.groups,
+            width=MAX_QUERY_WIDTH,
+            extra_bytes=(self.ledger_bytes["total"]
+                         + self.max_launch_bytes["total"]
+                         + self.pack_transient_budget),
+            resident_bytes=int(mx.get_active_memory()))
+        if preflight is not None:
+            raise RuntimeError(f"megakernel preflight declined: {preflight}")
+
         plan = MP.decode_path_keys(
             num_layers=len(self.layer_types),
             layer_types=self.layer_types,
@@ -204,6 +341,7 @@ class MegakernelDecoder:
             layers=self.layers,
             include_mtp=include_mtp,
             include_experts=include_experts,
+            include_lm_head=self.include_lm_head,
         )
         # 8 GiB is a HARD cap, not a preference: a group is one flat uint32
         # buffer, MLX shape dimensions are int32, and 2^31 words is 8 GiB.
@@ -214,6 +352,19 @@ class MegakernelDecoder:
         self.pack = MP.build_pack(
             self.source, plan, validate=validate, rebind=rebind,
             max_group_bytes=max_group_bytes)
+        self.restore_source_bytes = (
+            restored_scale_bias_bytes(self.pack)
+            if rebind and contiguous_source_sb else 0
+        )
+        preflight = _portability_refusal(
+            self.portability, threads=self.threads, groups=self.groups,
+            width=MAX_QUERY_WIDTH, pack=self.pack,
+            extra_bytes=(self.ledger_bytes["total"]
+                         + self.restore_source_bytes
+                         + self.max_launch_bytes["total"]),
+            resident_bytes=int(mx.get_active_memory()))
+        if preflight is not None:
+            raise RuntimeError(f"megakernel preflight declined: {preflight}")
         if rebind and contiguous_source_sb:
             self.restored_sb = self.restore_source_contiguity()
         self.schedule = MS.build_token_schedule(
@@ -224,12 +375,15 @@ class MegakernelDecoder:
         body_cls = DualWidthMegakernelBody if DUAL_WIDTH else MegakernelBody
         self.body = body_cls(
             self.pack, self.schedule, gdn_layers=max(len(self.gdn_layers), 1),
-            vocab=VOCAB, threads=threads, groups=groups)
+            vocab=VOCAB if self.include_lm_head else 1,
+            threads=self.threads, groups=self.groups, spin_cap=self.spin_cap)
         self.dual_width = DUAL_WIDTH
         self._allocate()
         self.position = 0
         self._pending = None
-        self._pending_width = 1
+        self._pending_width = 0
+        self._pending_position: Optional[int] = None
+        self._poisoned_reason: Optional[str] = None
 
     def restore_source_contiguity(self) -> int:
         """Give the STOCK path back CONTIGUOUS scales and biases.
@@ -306,13 +460,28 @@ class MegakernelDecoder:
         -- which is what makes the interleaved gate a comparison of the DECODE
         step rather than of two different histories.
         """
+        if self._pending is not None:
+            raise RuntimeError("cannot seed while a megakernel launch is pending")
+        if self._poisoned_reason is not None:
+            raise MegakernelDeviceAbort(
+                "cannot seed a poisoned megakernel decoder"
+            )
         report = {"attention": 0, "gdn": 0, "ple": 0, "pooled_blocks": 0}
+        seeded_length: Optional[int] = None
         for slot, index in enumerate(self.attn_layers):
             cache = caches[index]
             keys, values = cache.keys, cache.values
             length = int(cache.offset)
-            assert length <= self.total, (
-                f"prefill {length} over the ledger's {self.total} columns")
+            if length > self.total:
+                raise ValueError(
+                    f"prefill {length} over the ledger's {self.total} columns"
+                )
+            if seeded_length is not None and length != seeded_length:
+                raise ValueError(
+                    f"attention cache lengths disagree: {seeded_length} and "
+                    f"{length} at layer {index}"
+                )
+            seeded_length = length
             base = slot * N_KV_HEADS
             self.kv[0, base: base + N_KV_HEADS, :length] = keys[0, :, :length]
             self.kv[1, base: base + N_KV_HEADS, :length] = values[0, :, :length]
@@ -330,7 +499,6 @@ class MegakernelDecoder:
                     mx.bfloat16)
                 report["pooled_blocks"] += n_blocks
             report["attention"] += 1
-            self.position = length
         for slot, index in enumerate(self.gdn_layers):
             cache = caches[index]
             if cache[0] is not None:
@@ -344,19 +512,130 @@ class MegakernelDecoder:
                 self.pconv[:] = state[0].astype(mx.bfloat16)
             report["ple"] += 1
         mx.eval(self.kv, self.idxl, self.cs, self.rec, self.pconv)
+        if seeded_length is not None:
+            self.position = seeded_length
         return report
 
     # ------------------------------------------------------------ admission
     def admit(self, *, width: int = 1, batch: int = 1, dtype=mx.bfloat16,
               speculating: bool = False, training: bool = False,
               sharded: bool = False, mask=None) -> MegakernelAdmission:
-        return admit_megakernel_decode(
+        decision = admit_megakernel_decode(
             width=width, batch=batch, pack=self.pack, schedule=self.schedule,
             speculating=speculating, training=training, sharded=sharded,
             mask=mask, dtype=dtype, threads=self.body.threads,
             groups=self.body.groups,
             layer_types=[self.layer_types[i] for i in self.layers],
         )
+        if not decision.accepted:
+            return decision
+        launch_bytes = launch_allocation_bytes(
+            width=width, gdn_layers=len(self.gdn_layers),
+            vocab=VOCAB if self.include_lm_head else 1)
+        refusal = _portability_refusal(
+            self.portability, threads=self.body.threads,
+            groups=self.body.groups, width=width, pack=self.pack,
+            extra_bytes=launch_bytes["total"],
+            resident_bytes=int(mx.get_active_memory()))
+        if refusal is not None:
+            return MegakernelAdmission(False, refusal)
+        return decision
+
+    def _prepare_launch(self, position: int, width: int) -> None:
+        if self._poisoned_reason is not None:
+            raise MegakernelDeviceAbort(
+                "megakernel decoder is poisoned after "
+                f"{self._poisoned_reason}; construct a new decoder"
+            )
+        if self._pending is not None:
+            raise RuntimeError(
+                "megakernel launch already pending; commit or rollback first"
+            )
+        if position < 0:
+            raise ValueError(f"position must be non-negative; got {position}")
+        if width < 1:
+            raise ValueError(f"width must be positive; got {width}")
+        if position + width > self.total:
+            raise ValueError(
+                f"megakernel span [{position}, {position + width}) exceeds "
+                f"ledger capacity {self.total}"
+            )
+
+    def _geometry_fields(self) -> dict[str, int]:
+        return {
+            "threads": int(self.body.threads),
+            "groups": int(self.body.groups),
+            "spin_cap": int(self.body.spin_cap),
+        }
+
+    def _invoke_body(self, *args, position: int, width: int, **kwargs):
+        try:
+            return self.body(*args, **kwargs)
+        except Exception as exc:
+            reason = f"launch failed: {type(exc).__name__}"
+            self._poisoned_reason = reason
+            record_megakernel_receipt(
+                engaged=False, reason=reason, aborted=True, width=width,
+                position=position, context=position + width,
+                launched="unknown", error=str(exc),
+                **self._geometry_fields())
+            raise MegakernelDeviceAbort(reason) from exc
+
+    def _consume_launch(self, outs, *, position: int, width: int,
+                        record: bool):
+        """Synchronize the status word and publish only a completed launch."""
+        status = outs[OUT["status"]]
+        try:
+            mx.eval(status)
+            device_status = status.tolist()
+            abort_count = int(device_status[0])
+            device_phase = int(device_status[1])
+        except Exception as exc:
+            reason = f"unreadable device status: {type(exc).__name__}"
+            self._poisoned_reason = reason
+            record_megakernel_receipt(
+                engaged=False, reason=reason, aborted=True, width=width,
+                position=position, context=position + width, launched=True,
+                **self._geometry_fields())
+            raise MegakernelDeviceAbort(reason) from exc
+        if abort_count:
+            reason = f"device barrier abort ({abort_count})"
+            self._poisoned_reason = reason
+            record_megakernel_receipt(
+                engaged=False, reason=reason, aborted=True, width=width,
+                position=position, context=position + width, launched=True,
+                device_phase=device_phase, abort_count=abort_count,
+                variant=getattr(self.body, "last_variant", "single"),
+                **self._geometry_fields())
+            raise MegakernelDeviceAbort(reason)
+        expected_phase = int(self.body.phase)
+        if device_phase != expected_phase:
+            reason = (
+                f"device phase mismatch ({device_phase} != {expected_phase})"
+            )
+            self._poisoned_reason = reason
+            record_megakernel_receipt(
+                engaged=False, reason=reason, aborted=True, width=width,
+                position=position, context=position + width, launched=True,
+                device_phase=device_phase, expected_phase=expected_phase,
+                variant=getattr(self.body, "last_variant", "single"),
+                **self._geometry_fields())
+            raise MegakernelDeviceAbort(reason)
+
+        self._pending = outs
+        self._pending_width = width
+        self._pending_position = position
+        if record:
+            record_megakernel_receipt(
+                engaged=True, reason="engaged", phases=len(self.schedule),
+                op_counts=self.op_counts, position=position, width=width,
+                context=position + width, launched=True,
+                device_phase=device_phase,
+                device_barriers=self.device_barriers,
+                variant=getattr(self.body, "last_variant", "single"),
+                **self._geometry_fields())
+        result_name = "logits" if self.include_lm_head else "out"
+        return outs[OUT[result_name]]
 
     # ----------------------------------------------------------- the token
     def control(self, position: int, width: int = 1) -> mx.array:
@@ -369,13 +648,15 @@ class MegakernelDecoder:
 
     def step_slab(self, embeddings: mx.array, *, ple_embeddings=None,
                   position: Optional[int] = None, record: bool = True):
-        """A width-M VERIFY SLAB: M embeddings in, M logit rows out, ONE
+        """A width-M VERIFY SLAB: M embeddings in, M result rows out, ONE
         dispatch.
 
         This is the half of a k=2 self-MTP round the megakernel used to
         refuse.  `embeddings` is (M, HIDDEN) -- the draft token and its k
         proposals, already embedded on the host -- and the queries land at
-        positions `position, position + 1, ... position + M - 1`.
+        positions `position, position + 1, ... position + M - 1`. Results are
+        logits when ``include_lm_head`` is true and final hidden states when it
+        is false.
 
         **What the caller owns.**  The recurrent and conv state after the slab
         is the state after ALL M queries, because writing a restore point per
@@ -386,13 +667,15 @@ class MegakernelDecoder:
         when every query was accepted.
         """
         width = int(embeddings.shape[0])
+        position = self.position if position is None else int(position)
+        self._prepare_launch(position, width)
         decision = self.admit(width=width)
         if not decision.accepted:
             if record:
                 record_megakernel_receipt(engaged=False,
-                                          reason=decision.reason, width=width)
+                                          reason=decision.reason, width=width,
+                                          **self._geometry_fields())
             raise RuntimeError(f"megakernel declined: {decision.reason}")
-        position = self.position if position is None else int(position)
         parts = []
         for m in range(width):
             streams = mx.tile(embeddings[m].reshape(-1), (HC_COUNT,))
@@ -402,38 +685,32 @@ class MegakernelDecoder:
                 row.append(ple_embeddings[m].reshape(-1).astype(mx.bfloat16))
             parts.append(mx.concatenate(row))
         xin = mx.stack(parts)
-        outs = self.body(
+        outs = self._invoke_body(
             xin, self.cs, self.rec, reps=1, kv=self.kv, idxl=self.idxl,
             pconv=self.pconv, actl=self.control(position, width),
-            mwidth=width)
-        logits = outs[OUT["logits"]]
-        self._pending = outs
-        self._pending_width = width
-        if record:
-            record_megakernel_receipt(
-                engaged=True, reason="engaged", phases=len(self.schedule),
-                op_counts=self.op_counts, position=position, width=width,
-                context=position + width,
-                device_barriers=self.device_barriers,
-                variant=getattr(self.body, "last_variant", "single"))
-        return logits
+            mwidth=width, position=position, width=width)
+        return self._consume_launch(
+            outs, position=position, width=width, record=record)
 
     def step(self, embedding: mx.array, *, ple_embedding=None,
              position: Optional[int] = None, record: bool = True):
-        """One decode token: embedding in, logits out, ONE dispatch.
+        """One decode token: embedding in, one result row out, ONE dispatch.
 
         ``embedding`` is ``embed_tokens(token)`` -- the host lookup -- and
         ``ple_embedding`` the n-gram gather's row for the PLE layer.  Both are
         token lookups, not activations, which is exactly why they are the two
-        things left on the host.
+        things left on the host. The result is logits when ``include_lm_head``
+        is true and the final hidden state otherwise.
         """
+        position = self.position if position is None else int(position)
+        self._prepare_launch(position, 1)
         decision = self.admit()
         if not decision.accepted:
             if record:
                 record_megakernel_receipt(engaged=False,
-                                          reason=decision.reason)
+                                          reason=decision.reason,
+                                          **self._geometry_fields())
             raise RuntimeError(f"megakernel declined: {decision.reason}")
-        position = self.position if position is None else int(position)
         # The residual streams are the embedding tiled over the hyper count,
         # which is what Qwen4ExpTextModel.__call__ does before layer 0.
         streams = mx.tile(embedding.reshape(-1), (HC_COUNT,))
@@ -441,19 +718,12 @@ class MegakernelDecoder:
         if ple_embedding is not None:
             parts.append(ple_embedding.reshape(-1).astype(mx.bfloat16))
         xin = mx.concatenate(parts)[None, :]
-        outs = self.body(
+        outs = self._invoke_body(
             xin, self.cs, self.rec, reps=1, kv=self.kv, idxl=self.idxl,
-            pconv=self.pconv, actl=self.control(position))
-        logits = outs[OUT["logits"]]
-        self._pending = outs
-        self._pending_width = 1
-        if record:
-            record_megakernel_receipt(
-                engaged=True, reason="engaged", phases=len(self.schedule),
-                op_counts=self.op_counts, position=position, width=1,
-                context=position + 1, device_barriers=self.device_barriers,
-                variant=getattr(self.body, "last_variant", "single"))
-        return logits
+            pconv=self.pconv, actl=self.control(position), position=position,
+            width=1)
+        return self._consume_launch(
+            outs, position=position, width=1, record=record)
 
     def commit(self) -> None:
         """Roll the GDN and conv states the last ``step`` produced.
@@ -463,19 +733,25 @@ class MegakernelDecoder:
         them would be a read-write hazard on the same address inside one phase.
         The attention ledgers are the opposite case and are written in place.
         """
+        if self._pending is None or self._pending_position is None:
+            raise RuntimeError("no megakernel launch is pending")
         outs = self._pending
         self.cs = outs[OUT["cs_out"]]
         self.rec = outs[OUT["rec_out"]]
-        self.position += self._pending_width
+        self.pconv = outs[OUT["pconv_out"]]
+        self.position = self._pending_position + self._pending_width
+        self._pending = None
+        self._pending_width = 0
+        self._pending_position = None
 
     def rollback(self) -> None:
         """Discard a slab whose queries were not all accepted.
 
-        There is nothing to undo in the recurrent or conv state: `cs_in` and
-        `rec_in` are a SEPARATE buffer from `cs_out`/`rec_out`, so the
-        pre-slab state is still what `self.cs`/`self.rec` point at until
-        `commit` swaps them.  Declining to commit IS the rollback, and a
-        partial accept re-launches a narrower slab from the same position.
+        There is nothing to undo in the recurrent, GDN conv, or PLE conv state:
+        each input is separate from its output, so the pre-slab state is still
+        what this decoder points at until `commit` swaps them.  Declining to
+        commit IS the rollback, and a partial accept re-launches a narrower
+        slab from the same position.
         That is the contract the unified fused GDN verify kernel settled, and
         the reason no restore point is written: one per query would cost
         +227 MB of write traffic per token for a rollback that mostly does
@@ -487,8 +763,11 @@ class MegakernelDecoder:
         both of which come from the position, and the next launch overwrites
         the same physical slots.
         """
+        if self._pending is None:
+            raise RuntimeError("no megakernel launch is pending")
         self._pending = None
         self._pending_width = 0
+        self._pending_position = None
 
     @property
     def device_barriers(self) -> int:
@@ -505,7 +784,18 @@ class MegakernelDecoder:
             "op_counts": dict(self.op_counts),
             "threads": self.body.threads,
             "threadgroups": self.body.groups,
+            "spin_cap": self.body.spin_cap,
             "kv_columns": self.total,
+            "ledger_bytes": dict(self.ledger_bytes),
+            "max_launch_bytes": dict(self.max_launch_bytes),
+            "restore_source_bytes": self.restore_source_bytes,
+            "pack_transient_budget": self.pack_transient_budget,
+            "include_lm_head": self.include_lm_head,
+            "result_kind": "logits" if self.include_lm_head else "hidden",
+            "pending": self._pending is not None,
+            "pending_position": self._pending_position,
+            "pending_width": self._pending_width,
+            "poisoned_reason": self._poisoned_reason,
             "pack": self.pack.summary(),
             "dual_width": self.dual_width,
             "dual_width_receipt": (self.body.receipt() if self.dual_width

@@ -27,8 +27,8 @@ checked: 512 threads is under this device's 1024 limit and the 16 KiB
 threadgroup budget is under its 32 KiB arena, and neither fact was ever
 asserted.  On a part with a smaller arena, a smaller threadgroup, or less
 memory than the model needs, the first evidence today is a compile failure, an
-allocation failure, or a wrong answer.  Each of those is now a named refusal
-before the GPU is touched.
+allocation failure, or a wrong answer. Each becomes a named refusal before the
+full megakernel body and its persistent ledgers are allocated or launched.
 
 **Environment variables** (all optional; the megakernel is default OFF):
 
@@ -242,6 +242,19 @@ def resolve(
     d_threads, d_groups = derive_geometry(probe)
     d_tg_bytes = derive_threadgroup_bytes(probe)
     cached = cache_entry or {}
+    # Cache v1 predates the explicit adoption decision.  Old sweep winners can
+    # carry top-level geometry even though the current policy rejects that
+    # proxy.  A sweep-bearing entry is eligible only when it says it was
+    # adopted; hand-supplied entries without a sweep retain the documented
+    # cache precedence used by tests and controlled deployments.
+    sweep = cached.get("sweep")
+    cache_geometry_ok = (
+        sweep is None
+        or (isinstance(sweep, dict) and sweep.get("adopted") is True)
+    )
+    geometry_cache = cached if cache_geometry_ok else {}
+    if not cache_geometry_ok:
+        cache_state["geometry_ignored"] = "sweep was not explicitly adopted"
 
     def pick(key: str, env_value, cache_value, probe_value, shipped_value):
         if env_value is not None:
@@ -257,8 +270,8 @@ def resolve(
 
     for key, env_value, cache_value, probe_value, shipped_value in (
         ("threads", _env_int(ENV_THREADS, minimum=MD.SIMD_WIDTH),
-         cached.get("threads"), d_threads, SHIPPED_THREADS),
-        ("groups", _env_int(ENV_GROUPS), cached.get("groups"), d_groups,
+         geometry_cache.get("threads"), d_threads, SHIPPED_THREADS),
+        ("groups", _env_int(ENV_GROUPS), geometry_cache.get("groups"), d_groups,
          SHIPPED_GROUPS),
         ("spin_cap", _env_int(ENV_SPIN_CAP), cached.get("spin_cap"), None,
          SHIPPED_SPIN_CAP),
@@ -273,7 +286,7 @@ def resolve(
     # environment, the rest from a calibration -- keeps both sources visible
     # instead of collapsing to whichever dict won.
     env_rows = _env_rows() or {}
-    cache_rows = dict(cached.get("rows") or {})
+    cache_rows = dict(geometry_cache.get("rows") or {})
     rows: dict[str, int] = {}
     row_sources: dict[str, str] = {}
     for name, shipped_value in SHIPPED_ROWS.items():
@@ -326,6 +339,8 @@ def portability_refusal(
     pack: Any = None,
     probe: Optional[MD.DeviceProbe] = None,
     scratch_bytes: int = 0,
+    extra_bytes: int = 0,
+    resident_bytes: int = 0,
     threadgroup_bytes: Optional[int] = None,
     primitives: Optional[dict[str, Any]] = None,
     require_primitives: Optional[bool] = None,
@@ -359,17 +374,23 @@ def portability_refusal(
                 f"{int(arena)} B")
 
     total, largest = _pack_bytes(pack)
-    if total is not None:
-        working_set = probe.max_recommended_working_set_size
-        needed = total + max(int(scratch_bytes), 0)
-        if working_set is not None and needed > int(working_set):
-            return (f"working set {needed / (1 << 30):.1f} GiB over device "
-                    f"budget {int(working_set) / (1 << 30):.1f} GiB")
-        max_buffer = probe.max_buffer_length
-        if (largest is not None and max_buffer is not None
-                and largest > int(max_buffer)):
-            return (f"weight group {largest / (1 << 30):.1f} GiB over max "
-                    f"buffer length {int(max_buffer) / (1 << 30):.1f} GiB")
+    working_set = probe.max_recommended_working_set_size
+    known_pack_bytes = 0 if total is None else total
+    # A live decoder can have model/cache allocations outside the weight pack.
+    # Use the larger base rather than adding both: the resident measurement
+    # normally already includes the pack, while a pure/static caller may only
+    # know the pack size.
+    base_bytes = max(known_pack_bytes, max(int(resident_bytes), 0))
+    needed = (base_bytes + max(int(scratch_bytes), 0)
+              + max(int(extra_bytes), 0))
+    if working_set is not None and needed > int(working_set):
+        return (f"working set {needed / (1 << 30):.1f} GiB over device "
+                f"budget {int(working_set) / (1 << 30):.1f} GiB")
+    max_buffer = probe.max_buffer_length
+    if (largest is not None and max_buffer is not None
+            and largest > int(max_buffer)):
+        return (f"weight group {largest / (1 << 30):.1f} GiB over max "
+                f"buffer length {int(max_buffer) / (1 << 30):.1f} GiB")
 
     if require_primitives is None:
         require_primitives = _env_bool(ENV_REQUIRE_PRIMITIVES, True)

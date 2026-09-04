@@ -12,6 +12,7 @@ import unittest
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mlx_lm.models import qwen4_megakernel as mk
 from mlx_lm.models import qwen4_megakernel_config as MC
@@ -298,7 +299,13 @@ class TestSpecAdoption(unittest.TestCase):
 class TestStatus(unittest.TestCase):
     def test_receipts_accumulate_and_reset(self):
         mk.qwen4_megakernel_status(reset=True)
-        mk.record_megakernel_receipt(engaged=True, reason="engaged", phases=150)
+        mk.record_megakernel_receipt(
+            engaged=True, reason="engaged", phases=150,
+            threads=256, groups=20,
+        )
+        first = mk.qwen4_megakernel_status()
+        self.assertEqual(first["last_decision"]["threads"], 256)
+        self.assertEqual(first["last_decision"]["threadgroups"], 20)
         mk.record_megakernel_receipt(engaged=False, reason="batch 2")
         mk.record_megakernel_receipt(engaged=True, reason="engaged", phases=150,
                                      aborted=True)
@@ -317,19 +324,20 @@ if __name__ == "__main__":
 
 # ------------------------------------------------------- phase E: query width
 def test_binding_budget_has_headroom_for_width_three():
-    """The slots the width-3 build spends were BOUGHT, not discovered.
+    """The slots the width-3 build and transactional PLE state spend fit.
 
     Phase D sat at 23 inputs + 8 outputs = 31 of Metal's 31 -- the build log's
     "30 of 31" was a miscount by one -- so the next binding anyone wanted had
     to come from somewhere.  Three came from pure addressing changes with no
     new arithmetic: ``kbuf``+``vbuf`` -> ``kv``, ``rawk``+``pooled`` ->
-    ``idxl``, and ``meta`` folded into ``actl``.  Assert the count, because a
-    budget that is only checked at link time is checked by a crash.
+    ``idxl``, and ``meta`` folded into ``actl``.  Transactional PLE state uses
+    one slot, leaving two. Assert the count because a link-time-only budget is
+    checked by a crash.
     """
     from mlx_lm.models.qwen4_megakernel_body import IN_NAMES, OUT_NAMES
     total = len(IN_NAMES) + len(OUT_NAMES)
     assert total <= mk.BINDING_CAP, f"{total} bindings over {mk.BINDING_CAP}"
-    assert total == 28, f"expected 28 bindings, got {total}"
+    assert total == 29, f"expected 29 bindings, got {total}"
     assert "meta" not in IN_NAMES and "kbuf" not in IN_NAMES
     assert "vbuf" not in IN_NAMES and "rawk" not in IN_NAMES
     assert "kv" in IN_NAMES and "idxl" in IN_NAMES
@@ -540,3 +548,111 @@ def test_width_one_control_block_matches_the_shipped_header():
                 assert int(a[mk.ACTL[name]]) == int(a[mk.ACTL_M0 + off]), name
         assert int(a[mk.ACTL["q_pos"]]) == pos
         assert int(a[mk.ACTL["tail_block"]]) == pos // mk.IDX_COMPRESS
+
+
+def test_control_block_rejects_spans_outside_the_ledger():
+    from mlx_lm.models.qwen4_megakernel_runtime import build_control_block
+
+    kwargs = dict(total=128, pooled_stride=32, n_attn_layers=12,
+                  rope_theta=1_000_000.0)
+    build_control_block(125, 3, **kwargs)
+    with pytest.raises(ValueError, match="exceeds ledger capacity"):
+        build_control_block(126, 3, **kwargs)
+    with pytest.raises(ValueError, match="control capacity"):
+        build_control_block(0, mk.MAX_QUERY_WIDTH + 1, **kwargs)
+    with pytest.raises(ValueError, match="positive"):
+        build_control_block(0, 0, **kwargs)
+
+
+class TestRuntimeTransactions(unittest.TestCase):
+    @staticmethod
+    def decoder():
+        from mlx_lm.models import qwen4_megakernel_runtime as runtime
+
+        decoder = runtime.MegakernelDecoder.__new__(runtime.MegakernelDecoder)
+        decoder.total = 128
+        decoder.position = 10
+        decoder._pending = None
+        decoder._pending_width = 0
+        decoder._pending_position = None
+        decoder._poisoned_reason = None
+        return decoder, runtime
+
+    def test_launch_span_must_fit_the_ledger(self):
+        decoder, _ = self.decoder()
+        decoder._prepare_launch(125, 3)
+        with self.assertRaisesRegex(ValueError, "exceeds ledger capacity"):
+            decoder._prepare_launch(126, 3)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            decoder._prepare_launch(-1, 1)
+
+    def test_commit_uses_pending_position_and_clears_transaction(self):
+        decoder, runtime = self.decoder()
+        outputs = [None] * len(runtime.OUT)
+        outputs[runtime.OUT["cs_out"]] = "cs"
+        outputs[runtime.OUT["rec_out"]] = "rec"
+        outputs[runtime.OUT["pconv_out"]] = "pconv"
+        decoder._pending = outputs
+        decoder._pending_position = 42
+        decoder._pending_width = 3
+        decoder.commit()
+        self.assertEqual(decoder.position, 45)
+        self.assertEqual((decoder.cs, decoder.rec, decoder.pconv),
+                         ("cs", "rec", "pconv"))
+        self.assertIsNone(decoder._pending)
+        with self.assertRaisesRegex(RuntimeError, "no megakernel launch"):
+            decoder.commit()
+
+    def test_pending_launch_must_be_closed_exactly_once(self):
+        decoder, _ = self.decoder()
+        decoder._pending = [object()]
+        decoder._pending_position = 10
+        decoder._pending_width = 1
+        with self.assertRaisesRegex(RuntimeError, "already pending"):
+            decoder._prepare_launch(11, 1)
+        decoder.rollback()
+        self.assertIsNone(decoder._pending)
+        with self.assertRaisesRegex(RuntimeError, "no megakernel launch"):
+            decoder.rollback()
+
+    def test_ledger_accounting_includes_every_persistent_state(self):
+        _, runtime = self.decoder()
+        sizes = runtime.ledger_allocation_bytes(
+            total=4096, attention_layers=12, gdn_layers=36)
+        self.assertEqual(
+            sizes["total"],
+            sum(value for name, value in sizes.items() if name != "total"),
+        )
+        self.assertGreater(sizes["gdn_recurrent"], sizes["ple_conv"])
+
+    def test_device_abort_poisoning_is_fail_closed(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        decoder, runtime = self.decoder()
+        decoder.body = SimpleNamespace(
+            threads=512, groups=40, spin_cap=400_000, last_variant="narrow"
+        )
+        decoder.include_lm_head = True
+
+        class Status:
+            @staticmethod
+            def tolist():
+                return [1, 17, 0, 0]
+
+        outputs = [None] * len(runtime.OUT)
+        outputs[runtime.OUT["status"]] = Status()
+        with mock.patch.object(runtime.mx, "eval"), mock.patch.object(
+            runtime, "record_megakernel_receipt"
+        ) as receipt:
+            with self.assertRaises(runtime.MegakernelDeviceAbort):
+                decoder._consume_launch(
+                    outputs, position=10, width=1, record=False
+                )
+        self.assertIn("device barrier abort", decoder._poisoned_reason)
+        self.assertIsNone(decoder._pending)
+        receipt.assert_called_once()
+        self.assertFalse(receipt.call_args.kwargs["engaged"])
+        self.assertTrue(receipt.call_args.kwargs["aborted"])
+        with self.assertRaises(runtime.MegakernelDeviceAbort):
+            decoder._prepare_launch(10, 1)

@@ -703,7 +703,9 @@ def _device_attestation() -> dict[str, Any]:
 
 def record_megakernel_receipt(
     *, engaged: bool, reason: str, phases: int = 0, aborted: bool = False,
-    op_counts: Optional[dict] = None, width: int = 1, **fields: Any,
+    op_counts: Optional[dict] = None, width: int = 1,
+    threads: Optional[int] = None, groups: Optional[int] = None,
+    **fields: Any,
 ) -> None:
     """Bounded process evidence, in ``qwen4_qsa_indexed``'s conventions.
 
@@ -718,8 +720,8 @@ def record_megakernel_receipt(
         "phases": int(phases),
         "width": int(width),
         "aborted": bool(aborted),
-        "threads": _THREADS,
-        "threadgroups": _THREADGROUPS,
+        "threads": _THREADS if threads is None else int(threads),
+        "threadgroups": _THREADGROUPS if groups is None else int(groups),
         "op_counts": None if op_counts is None else dict(op_counts),
         **fields,
     }
@@ -1235,19 +1237,23 @@ def _portable_config() -> dict[str, Any]:
 
 
 def _portability_refusal(settings: dict, *, threads: int, groups: int,
-                         width: int = 1, pack: Any = None) -> Optional[str]:
+                         width: int = 1, pack: Any = None,
+                         extra_bytes: int = 0,
+                         resident_bytes: int = 0) -> Optional[str]:
     """The device's own reason to refuse this geometry, or ``None``.
 
     A machine that cannot hold the model, cannot run the threadgroup, or has
     never had its grid barrier and device-scope fence proven gets a named
-    decline here -- before the pack, before the launch.
+    decline here -- before the persistent ledgers and body launch.
     """
     try:
         from . import qwen4_megakernel_config as MC
 
         return MC.portability_refusal(
             threads=threads, groups=groups, width=width, pack=pack,
-            scratch_bytes=SCRATCH_FLOATS * 4 * max(int(width), 1),
+            scratch_bytes=scratch_floats(max(int(width), 1)) * 4,
+            extra_bytes=extra_bytes,
+            resident_bytes=resident_bytes,
             threadgroup_bytes=settings.get("values", {}).get(
                 "threadgroup_bytes"),
             primitives=settings.get("primitives"),

@@ -125,13 +125,25 @@ class TestPackLayout(unittest.TestCase):
         plan = [("a.proj", "main"), ("b.gate", "main")]
         pack = build_pack(source, plan, max_group_bytes=8 * 1024, validate=True)
         self.assertGreater(len(pack.buffers), 1)
-        # every group is either under the cap or a single oversize entry
-        per_group = {}
-        for key in pack.order:
-            per_group.setdefault(pack.entries[key].group, []).append(key)
-        for index, buf in enumerate(pack.buffers):
-            if buf.size * 4 > 8 * 1024:
-                self.assertEqual(len(per_group[index]), 1)
+        self.assertTrue(all(buf.size * 4 <= 8 * 1024 for buf in pack.buffers))
+
+    def test_group_cap_is_a_hard_preallocation_limit(self):
+        source = self._source()
+        with self.assertRaisesRegex(PackError, "over the .* group cap"):
+            build_pack(
+                source,
+                [("b.experts", "experts")],
+                max_group_bytes=1024,
+                validate=False,
+            )
+        for value in (0, -1, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(PackError):
+                build_pack(
+                    source,
+                    [("a.norm.weight", "main")],
+                    max_group_bytes=value,
+                    validate=False,
+                )
 
     def test_entries_are_aligned(self):
         source = self._source()
@@ -265,6 +277,16 @@ class TestDecodePathPlan(unittest.TestCase):
             {role for key, role in plan if key == "language_model.lm_head"},
             {"lm_head"},
         )
+
+    def test_lm_head_can_be_omitted_from_the_pack(self):
+        plan = decode_path_keys(
+            num_layers=48,
+            layer_types=self.LAYER_TYPES,
+            ple_layer_ids=[2],
+            include_lm_head=False,
+        )
+        self.assertNotIn("language_model.lm_head", {key for key, _ in plan})
+        self.assertNotIn("lm_head", {role for _, role in plan})
 
 
 if __name__ == "__main__":

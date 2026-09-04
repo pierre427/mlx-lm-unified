@@ -224,6 +224,20 @@ class TestPrecedence(_EnvMixin, unittest.TestCase):
                          MC.SHIPPED_ROWS["moe_router"])
         self.assertEqual(resolved["row_sources"]["moe_router"], "shipped")
 
+    def test_unadopted_legacy_sweep_geometry_is_ignored(self):
+        cached = {
+            "threads": 512,
+            "groups": 80,
+            "rows": {"generic_qmv": 8},
+            "sweep": {"ok": True, "winner": {"threads": 512, "groups": 80}},
+        }
+        resolved = MC.resolve(
+            probe=probe_from(), cache_entry=cached, tune=False
+        )
+        self.assertEqual(resolved["values"]["groups"], 40)
+        self.assertEqual(resolved["sources"]["groups"], "probe")
+        self.assertIn("geometry_ignored", resolved["cache"])
+
     def test_a_setting_that_cannot_be_honoured_is_an_error_not_a_default(self):
         for name, value in (("MLX_QWEN4_MEGAKERNEL_THREADS", "not-a-number"),
                             ("MLX_QWEN4_MEGAKERNEL_GROUPS", "0"),
@@ -279,6 +293,30 @@ class TestGuardrails(_EnvMixin, unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertTrue(reason.startswith("working set 24.0 GiB over device"),
                         reason)
+
+    def test_persistent_ledgers_are_part_of_the_working_set(self):
+        reason = self.refusal(
+            pack=self._Pack(3 * (1 << 30) // 4),
+            extra_bytes=6 * (1 << 30),
+            scratch_bytes=1 * (1 << 30),
+            probe=probe_from(
+                max_recommended_working_set_size=8 * (1 << 30)
+            ),
+        )
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.startswith("working set 10.0 GiB"), reason)
+
+    def test_live_resident_memory_replaces_the_smaller_pack_base(self):
+        reason = self.refusal(
+            pack=self._Pack(1 << 30),
+            resident_bytes=7 * (1 << 30),
+            extra_bytes=2 * (1 << 30),
+            probe=probe_from(
+                max_recommended_working_set_size=8 * (1 << 30)
+            ),
+        )
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.startswith("working set 9.0 GiB"), reason)
 
     def test_a_weight_group_over_the_max_buffer_length(self):
         pack = self._Pack(1 << 30)                 # 4 GiB in one buffer
