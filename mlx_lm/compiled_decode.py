@@ -50,6 +50,7 @@ from typing import Any, List, Optional, Sequence
 import mlx.core as mx
 
 from .models.cache import ArraysCache, KVCache, RingKVCache
+from .models.precise_ops import precise_span
 
 __all__ = [
     "CompiledDecodeStep",
@@ -319,7 +320,15 @@ class CompiledDecodeStep:
         for slot in self.plan:
             state.extend(slot.collect())
             host.append(slot.host_state())
-        out = compiled(x, *state)
+        # Trace inside a precise span: mx.compile emits a runtime-built
+        # kernel for every elementwise chain it fuses, and MLX's Sigmoid
+        # struct resolves its unqualified metal::exp to the FAST
+        # approximation there (precise in the offline metallib). Any eager
+        # mx.sigmoid this step swallows would be less accurate than the
+        # eager path, not merely reordered -- see models/precise_ops.py.
+        # The flag is read only while tracing, so replays pay nothing.
+        with precise_span():
+            out = compiled(x, *state)
         logits, new_state = out[0], out[1:]
         for slot, (lo, hi), snap in zip(self.plan, splits, host):
             slot.install(new_state[lo:hi])

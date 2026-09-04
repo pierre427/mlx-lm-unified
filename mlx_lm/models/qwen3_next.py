@@ -13,6 +13,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
 from .activations import swiglu
+from .precise_ops import gate_sigmoid
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -891,7 +892,7 @@ class Qwen3NextAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        return self.o_proj(output * gate_sigmoid(gate))
 
 
 class Qwen3NextMLP(nn.Module):
@@ -1221,7 +1222,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 y = self.switch_mlp(x, inds)
                 y = (y * scores[..., None]).sum(axis=-2)
             shared_y = self.shared_expert(x)
-        gate = mx.sigmoid(self.shared_expert_gate(x))
+        gate = gate_sigmoid(self.shared_expert_gate(x))
 
         combined = None
         if glue:
