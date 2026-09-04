@@ -18,7 +18,9 @@ from mlx.utils import tree_flatten
 from mlx_lm.models import qwen3_5_moe, qwen3_next
 from mlx_lm.utils import _carry_fused_gate_up_overrides, load_model
 
-from test_qwen3_5_moe_sanitize_fused_gate_up import TINY, _build
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_qwen3_5_moe_sanitize_fused_gate_up import TINY, _build  # noqa: E402
 
 
 def _write_checkpoint(tmp: Path):
