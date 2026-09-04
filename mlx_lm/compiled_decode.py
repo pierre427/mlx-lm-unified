@@ -30,10 +30,11 @@ returns logits, exactly as production reads them today.
 Not covered, deliberately:
 
 * ``qwen4_exp.QSAKVCache`` (Flash-Next indexed attention). Its
-  ``index_keys`` grow by concatenation, its block-summary ledger is
-  appended to per block, and its MTP cycle state branches on Python
-  ints. ``model_is_compilable`` rejects it; use ``compiled_segments``
-  to compile the linear (GDN) runs and leave the QSA layers eager.
+  ``index_keys`` grow by concatenation on every token, its pooled
+  block-summary ledger grows by concatenation each time a block closes,
+  and the indexer branches on Python ints (``count == n_blocks``,
+  ``count > closed``) to decide what to recompute.
+  ``model_is_compilable`` rejects it by name.
 * Speculation. ``ArraysCache.record_rollback`` stashes a Python closure
   over the step's own intermediates; under tracing that closure would
   capture tracer arrays. ``CompiledDecodeStep`` refuses to run while any
@@ -112,6 +113,11 @@ def model_is_compilable(cache: Sequence[Any]) -> Optional[str]:
                 return f"cache[{i}] carries per-row lengths (batched decode)"
             if getattr(c, "left_padding", None) is not None:
                 return f"cache[{i}] carries left padding (batched decode)"
+            if any(a is None for a in c.cache):
+                # Before the first forward the recurrent slots are empty, so
+                # there is no shape to key a variant on and the traced step
+                # would allocate them as constants.
+                return f"cache[{i}] has not been filled by a forward yet"
             continue
         return f"cache[{i}] is a {type(c).__name__}, which is not shape-stable"
     return None
@@ -137,8 +143,9 @@ class _RingSlot:
         self.cache.keys, self.cache.values, self.cache.offset = arrays
 
     def signature(self):
-        c = self.cache
-        return ("ring", c.keys.shape, str(c.keys.dtype), c.values.shape, c.capacity)
+        # Only the capacity moves: dtype and the head geometry are fixed by
+        # the model, and the write is always at an array index.
+        return self.cache.capacity
 
     def host_state(self):
         return self.cache._host_offset
@@ -174,9 +181,8 @@ class _ArraysSlot:
         self.cache.cache = list(arrays)
 
     def signature(self):
-        return ("arrays",) + tuple(
-            (a.shape, str(a.dtype)) for a in self.cache.cache
-        )
+        # Fixed for the life of the cache once a forward has filled it.
+        return None
 
     def host_state(self):
         return None
@@ -229,6 +235,8 @@ class CompiledDecodeStep:
         self.model = model
         self.cache = cache
         self.plan = _plan(cache)
+        self._ring_slots = [s for s in self.plan if isinstance(s, _RingSlot)]
+        self._capacities = ()
         self._variants = {}
         self.trace_counts = {}
         self.replay_counts = {}
@@ -237,7 +245,11 @@ class CompiledDecodeStep:
     # -- keying ---------------------------------------------------------
 
     def _signature(self, x):
-        return (x.shape, str(x.dtype)) + tuple(s.signature() for s in self.plan)
+        """Variant key. Cheap on purpose -- it runs on every replay, and a
+        key that walked all 48 caches' array shapes would give back part of
+        what the replay saves. Only the input shape/dtype and the KV
+        capacities can change after the first forward."""
+        return (x.shape, x.dtype) + self._capacities
 
     def _guard(self):
         for c in self.cache:
@@ -285,8 +297,11 @@ class CompiledDecodeStep:
         # Grow every slab *before* keying the variant: the mask is built
         # from ``capacity`` at the top of the forward, so a growth inside
         # the traced step would leave the mask narrower than the keys.
-        for slot in self.plan:
-            slot.reserve(width)
+        grew = False
+        for slot in self._ring_slots:
+            grew = slot.reserve(width) or grew
+        if grew or not self._capacities:
+            self._capacities = tuple(s.signature() for s in self._ring_slots)
 
         key = self._signature(x)
         entry = self._variants.get(key)
