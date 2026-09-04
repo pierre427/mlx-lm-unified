@@ -18,6 +18,7 @@ from mlx_lm.models.qwen4_megakernel_pack import (
     PackError,
     build_pack,
     decode_path_keys,
+    estimate_pack,
     fuse_scales_biases,
 )
 
@@ -123,9 +124,25 @@ class TestPackLayout(unittest.TestCase):
     def test_group_cap_splits_buffers(self):
         source = self._source()
         plan = [("a.proj", "main"), ("b.gate", "main")]
-        pack = build_pack(source, plan, max_group_bytes=8 * 1024, validate=True)
-        self.assertGreater(len(pack.buffers), 1)
-        self.assertTrue(all(buf.size * 4 <= 8 * 1024 for buf in pack.buffers))
+        # Entries are 18 KiB and 4.25 KiB: each fits, but their sum does not.
+        cap = 20 * 1024
+        pack = build_pack(source, plan, max_group_bytes=cap, validate=True)
+        self.assertEqual(len(pack.buffers), 2)
+        self.assertTrue(all(buf.size * 4 <= cap for buf in pack.buffers))
+
+    def test_estimate_matches_the_allocated_pack(self):
+        source = self._source()
+        plan = [("a.proj", "main"), ("b.gate", "main")]
+        cap = 20 * 1024
+        estimate = estimate_pack(source, plan, max_group_bytes=cap)
+        pack = build_pack(source, plan, max_group_bytes=cap,
+                          validate=True)
+        actual = [int(buf.size) * 4 for buf in pack.buffers]
+        self.assertEqual(len(actual), 2)
+        self.assertTrue(all(size <= cap for size in actual))
+        self.assertEqual(estimate["group_bytes"], actual)
+        self.assertEqual(estimate["packed_bytes"], sum(actual))
+        self.assertEqual(estimate["largest_group_bytes"], max(actual))
 
     def test_group_cap_is_a_hard_preallocation_limit(self):
         source = self._source()

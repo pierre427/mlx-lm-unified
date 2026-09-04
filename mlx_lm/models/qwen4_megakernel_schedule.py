@@ -332,11 +332,15 @@ def _attention_branch(schedule: Schedule, pack, plan: LayerPlan,
     schedule.add(Step(
         op=OP_INDEX_SCORE,
         entry=_entry_id(pack, f"{attn}.indexer.q_layernorm.weight"),
-        src=SCRATCH["IDX_QK"], dst=SCRATCH["IDX_SCORE"], arg0=slot,
+        # Scores live in the launch-sized score_tiles output, not in the
+        # fixed per-query activation scratch. ``dst`` is intentionally unused.
+        src=SCRATCH["IDX_QK"], dst=0, arg0=slot,
         barrier=BAR_DEVICE,
     ))
     schedule.add(Step(
-        op=OP_INDEX_TOPB, src=SCRATCH["IDX_SCORE"], dst=SCRATCH["IDX_SEL"],
+        # ``src`` is intentionally unused; OP_INDEX_TOPB reads the same
+        # query's dynamic score plane using actl.score_stride.
+        op=OP_INDEX_TOPB, src=0, dst=SCRATCH["IDX_SEL"],
         arg0=BLOCK_TOPK,
         # every threadgroup runs the whole selection for itself, so its own
         # internal boundaries are threadgroup barriers; the result still has

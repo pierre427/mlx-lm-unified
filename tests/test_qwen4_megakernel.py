@@ -224,8 +224,10 @@ class TestTopBlockSelection(unittest.TestCase):
         got = mk.select_top_blocks_threaded_mirror(scores, 512, nt=256)
         np.testing.assert_array_equal(got, want)
 
-    def test_selection_fits_the_scratch_slot(self):
-        self.assertGreaterEqual(mk.MAX_BLOCKS, 16384)
+    def test_selection_ids_fit_scratch_but_scores_are_dynamic(self):
+        self.assertNotIn("IDX_SCORE", dict(mk._SCRATCH_BLOCKS))
+        self.assertEqual(mk.SCORE_TILE_BLOCKS, 4096)
+        self.assertEqual(mk.score_tile_floats(65536, 3), 3 * 65536)
         # BLOCK_TOPK selected blocks plus the one incomplete TAIL slot
         self.assertEqual(dict(mk._SCRATCH_BLOCKS)["IDX_SEL"],
                          mk.BLOCK_TOPK + 1)
@@ -337,7 +339,8 @@ def test_binding_budget_has_headroom_for_width_three():
     from mlx_lm.models.qwen4_megakernel_body import IN_NAMES, OUT_NAMES
     total = len(IN_NAMES) + len(OUT_NAMES)
     assert total <= mk.BINDING_CAP, f"{total} bindings over {mk.BINDING_CAP}"
-    assert total == 29, f"expected 29 bindings, got {total}"
+    assert total == 30, f"expected 30 bindings, got {total}"
+    assert "score_tiles" in OUT_NAMES
     assert "meta" not in IN_NAMES and "kbuf" not in IN_NAMES
     assert "vbuf" not in IN_NAMES and "rawk" not in IN_NAMES
     assert "kv" in IN_NAMES and "idxl" in IN_NAMES
@@ -571,20 +574,33 @@ class TestRuntimeTransactions(unittest.TestCase):
 
         decoder = runtime.MegakernelDecoder.__new__(runtime.MegakernelDecoder)
         decoder.total = 128
+        decoder.max_context = 128
         decoder.position = 10
         decoder._pending = None
         decoder._pending_width = 0
         decoder._pending_position = None
+        decoder._pending_owner = None
         decoder._poisoned_reason = None
+        decoder._state_lock = __import__("threading").RLock()
+        decoder._in_flight = False
+        decoder._in_flight_owner = None
+        decoder.dual_width = False
         return decoder, runtime
 
     def test_launch_span_must_fit_the_ledger(self):
         decoder, _ = self.decoder()
+        decoder.position = 125
         decoder._prepare_launch(125, 3)
+        decoder._release_launch_claim()
+        decoder.position = 126
         with self.assertRaisesRegex(ValueError, "exceeds ledger capacity"):
             decoder._prepare_launch(126, 3)
-        with self.assertRaisesRegex(ValueError, "non-negative"):
+        decoder.position = -1
+        with self.assertRaisesRegex(ValueError, "exceeds ledger capacity"):
             decoder._prepare_launch(-1, 1)
+        decoder.position = 10
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            decoder._prepare_launch(11, 1)
 
     def test_commit_uses_pending_position_and_clears_transaction(self):
         decoder, runtime = self.decoder()
@@ -593,10 +609,11 @@ class TestRuntimeTransactions(unittest.TestCase):
         outputs[runtime.OUT["rec_out"]] = "rec"
         outputs[runtime.OUT["pconv_out"]] = "pconv"
         decoder._pending = outputs
-        decoder._pending_position = 42
+        decoder._pending_position = 10
         decoder._pending_width = 3
+        decoder._pending_owner = __import__("threading").get_ident()
         decoder.commit()
-        self.assertEqual(decoder.position, 45)
+        self.assertEqual(decoder.position, 13)
         self.assertEqual((decoder.cs, decoder.rec, decoder.pconv),
                          ("cs", "rec", "pconv"))
         self.assertIsNone(decoder._pending)
@@ -608,6 +625,7 @@ class TestRuntimeTransactions(unittest.TestCase):
         decoder._pending = [object()]
         decoder._pending_position = 10
         decoder._pending_width = 1
+        decoder._pending_owner = __import__("threading").get_ident()
         with self.assertRaisesRegex(RuntimeError, "already pending"):
             decoder._prepare_launch(11, 1)
         decoder.rollback()
@@ -631,7 +649,8 @@ class TestRuntimeTransactions(unittest.TestCase):
 
         decoder, runtime = self.decoder()
         decoder.body = SimpleNamespace(
-            threads=512, groups=40, spin_cap=400_000, last_variant="narrow"
+            threads=512, groups=40, spin_cap=400_000, last_variant="narrow",
+            max_query_width=3,
         )
         decoder.include_lm_head = True
 

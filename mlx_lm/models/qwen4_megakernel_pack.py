@@ -601,6 +601,58 @@ def _plan_groups(
     return groups
 
 
+def estimate_pack(source, plan: list[tuple[str, str]], *,
+                  max_group_bytes: int = 8 << 30) -> dict[str, Any]:
+    """Compute the exact packed layout without allocating or rebinding.
+
+    This mirrors build_pack's first pass so admission can reject an oversized
+    full pack (when ``rebind=False``), an oversized transient group, or too
+    many Metal bindings before the first large buffer is created.
+    """
+    missing = [key for key, _ in plan if not source.has(key)]
+    if missing:
+        raise PackError(f"{len(missing)} planned tensors absent, first: {missing[0]}")
+    sizes: list[tuple[str, str, int]] = []
+    scale_bias_bytes = 0
+    try:
+        for key, role in plan:
+            parts = source.fetch(key)
+            weight = parts["weight"]
+            n_w = _words(weight)
+            n_sb = 0
+            if "scales" in parts:
+                scales, biases = parts["scales"], parts.get("biases")
+                if biases is None or scales.shape != biases.shape:
+                    raise PackError(f"{key}: invalid scale/bias pair")
+                sb_bytes = (
+                    int(scales.size) * int(scales.dtype.size)
+                    + int(biases.size) * int(biases.dtype.size)
+                )
+                if sb_bytes % 4:
+                    raise PackError(
+                        f"{key}: scale/bias payload is not whole uint32 words"
+                    )
+                n_sb = sb_bytes // 4
+                scale_bias_bytes += sb_bytes
+            sizes.append((key, role, _align(n_w) + _align(n_sb)))
+    finally:
+        source.release()
+    groups = _plan_groups(sizes, max_group_bytes)
+    words_by_key = {key: words for key, _, words in sizes}
+    group_bytes = [
+        sum(words_by_key[key] for key in keys) * 4 for _, keys in groups
+    ]
+    return {
+        "entries": len(sizes),
+        "groups": len(groups),
+        "group_bytes": group_bytes,
+        "packed_bytes": sum(group_bytes),
+        "largest_group_bytes": max(group_bytes, default=0),
+        "scale_bias_bytes": scale_bias_bytes,
+        "max_group_bytes": int(max_group_bytes),
+    }
+
+
 def build_pack(
     source,
     plan: list[tuple[str, str]],

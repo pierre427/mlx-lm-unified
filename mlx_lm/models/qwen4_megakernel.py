@@ -47,6 +47,11 @@ from typing import Any, Iterable, Optional
 
 import mlx.core as mx
 
+from .qwen4_megakernel_contract import (
+    SCORE_TILE_BLOCKS,
+    score_tile_layout,
+)
+
 # ------------------------------------------------------------------ geometry
 HIDDEN = 2560
 HC_COUNT = 4
@@ -86,9 +91,6 @@ TOPK = 10
 FF = 640
 VOCAB = 248320
 
-# The block grid the in-kernel selector must handle.  16,384 blocks is 65,536
-# tokens of context at compress ratio 4.
-MAX_BLOCKS = 16384
 # The fixed partial-block count of MLX's sdpa_vector_2pass, which
 # ``qwen4_qsa_indexed`` clones.  It is NOT a tuning knob here: the combine
 # pass's reduction order is written around it, and changing it changes the
@@ -142,6 +144,11 @@ ACTL = {
     "xw": 21,            # host-input floats per repetition
     "phase_base": 22,    # the grid barrier's generation counter
     "m_width": 23,       # QUERY WIDTH: 1 for a draft, k+1 for a verify slab
+    # Dynamic index-score planes are rounded to SCORE_TILE_BLOCKS.  Keeping
+    # the stride in the launch control makes one binary serve every supported
+    # context without reserving a worst-case score array in every scratch
+    # plane.
+    "score_stride": 24,
 }
 # Per-query control.  Every field here advances WITHIN a verify slab -- the
 # query's own position, the block count it may attend, and above all the
@@ -392,7 +399,6 @@ _SCRATCH_BLOCKS = (
     ("ATT_V", N_KV_HEADS * HEAD_DIM),
     ("ATT_O", Q_DIM),
     ("IDX_QK", (IDX_HEADS + 1) * IDX_HEAD_DIM),
-    ("IDX_SCORE", MAX_BLOCKS),
     # BLOCK_TOPK selected blocks plus ONE slot for the incomplete TAIL block.
     # The indexer only ever scores CLOSED blocks -- ``n_blocks = length //
     # compress_ratio`` -- so a query whose length is not a multiple of the
@@ -438,6 +444,11 @@ SCRATCH_STRIDE = (SCRATCH_FLOATS + 15) & ~15
 def scratch_floats(width: int = 1) -> int:
     """Device scratch a slab of `width` queries needs."""
     return SCRATCH_STRIDE * max(int(width), 1)
+
+
+def score_tile_floats(block_count: int, width: int = 1) -> int:
+    """Float count for width-disjoint, dynamically tiled score planes."""
+    return score_tile_layout(block_count, width)["elements"]
 
 
 # ------------------------------------------------------------------ env/state
@@ -742,6 +753,8 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
     """Admission, geometry and abort evidence for the megakernel path."""
     global _STATUS_LAST, _STATUS_ABORTS, _STATUS_LAUNCHES, _STATUS_PHASES
     with _STATUS_LOCK:
+        portability = _portable_config()
+        values = portability.get("values", {})
         report = {
             "enabled": _megakernel_enabled(),
             "device_supported": _device_supported(),
@@ -749,14 +762,16 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             # resolved one -- reporting the module constants here while
             # admission runs on a cached or probe-derived geometry would put
             # two different answers on one receipt.
-            "threadgroups": _resolved_geometry()[1],
-            "threads": _resolved_geometry()[0],
-            "spin_cap": _SPIN_CAP,
+            "threadgroups": int(values.get("groups", _THREADGROUPS)),
+            "threads": int(values.get("threads", _THREADS)),
+            "spin_cap": int(values.get("spin_cap", _SPIN_CAP)),
             "scratch_floats": SCRATCH_FLOATS,
             "scratch_bytes": SCRATCH_FLOATS * 4,
             "scratch_stride": SCRATCH_STRIDE,
             "scratch_bytes_cap": DEVICE_SCRATCH_BYTES_CAP,
             "max_query_width": MAX_QUERY_WIDTH,
+            "score_layout": "dynamic_tiled",
+            "score_tile_blocks": SCORE_TILE_BLOCKS,
             "widths": {str(w): c for w, c in sorted(_STATUS_WIDTHS.items())},
             "threadgroup_bytes_cap": THREADGROUP_BYTES_CAP,
             "phase_rows": dict(PHASE_ROWS),
@@ -782,7 +797,7 @@ def qwen4_megakernel_status(*, reset: bool = False) -> dict[str, Any]:
             # version query -- so the architecture family is what can be
             # asserted here and the kernel's own abort flag is the real proof.
             "device": _device_attestation(),
-            "portability": _portable_config(),
+            "portability": portability,
             "fidelity": dict(FIDELITY_DECISION),
             "last_decision": _STATUS_LAST,
         }
@@ -829,9 +844,10 @@ def select_top_blocks_mirror(scores, k: int):
     leaves ties unspecified, and ties are not exotic here: the indexer's score
     is a sum of ``relu`` terms, so a block none of whose heads scores positive
     is exactly ``0.0``, and an invalid block is exactly ``-inf``.  Downstream
-    consumes ``selected`` only as a SET, so any tie-break yields the same
-    attention as long as the selected multiset of SCORES matches -- which it
-    does by construction.  Lowest block index wins, deterministically.
+    consumes ``selected`` as a set of block IDs, not scores. Equal-score ties
+    can name different value vectors, so agreement on scores alone does not
+    prove equal attention. Lowest block index wins here, deterministically;
+    qualification must compare selected IDs and downstream logits to stock.
 
     Returns the selected block ids, ascending.
     """
@@ -1106,9 +1122,11 @@ inline float softplus_f(float x) {
 }
 """
 
-# Radix select over the monotone float key.  Four 8-bit passes plus one emit
-# pass, all inside ONE threadgroup, so it needs no grid barrier: 16,384 scores
-# is 5 x 16 KiB of reads, against a 5.2 us barrier it would otherwise pay.
+# Radix select over the monotone float key. Four 8-bit passes plus one emit
+# pass run inside ONE threadgroup. The score plane is dynamically sized and
+# tile-aligned; each histogram pass walks bounded tiles while retaining one
+# global threshold, and the final contiguous emit preserves the original
+# lowest-index tie rule exactly.
 MEGA_TOPB = r"""
 inline uint fkey(float v) {
   uint b = as_type<uint>(v);
@@ -1129,8 +1147,9 @@ inline uint fkey(float v) {
 // the pass is parallel and the result is globally ascending -- which is what
 // lets a kernel-vs-mirror test compare arrays rather than sets.
 //
-// It runs inside ONE threadgroup and needs no grid barrier: 16,384 scores is
-// six 64 KiB sweeps against a 5.2 us device barrier it would otherwise pay.
+// It runs inside ONE threadgroup and needs no grid barrier. Long contexts are
+// traversed in SCTILE-score tiles, but the radix histogram is global: tiling
+// changes allocation and traversal only, never the selected set or tie order.
 //
 // `hist` is 256 atomics, `gtc`/`eqc` are one uint per thread, `shared` is 2.
 inline void select_top_blocks(const device float* scores, uint n, uint k,
@@ -1152,11 +1171,14 @@ inline void select_top_blocks(const device float* scores, uint n, uint k,
       atomic_store_explicit(hist + i, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint prefix = shared[0];
-    for (uint i = tid; i < n; i += nt) {
-      uint key = fkey(scores[i]);
-      if ((key & hi_mask) != prefix) continue;
-      atomic_fetch_add_explicit(hist + ((key >> shift) & 0xFFu), 1u,
-                                memory_order_relaxed);
+    for (uint base = 0u; base < n; base += SCTILE) {
+      const uint end = metal::min(base + SCTILE, n);
+      for (uint i = base + tid; i < end; i += nt) {
+        uint key = fkey(scores[i]);
+        if ((key & hi_mask) != prefix) continue;
+        atomic_fetch_add_explicit(hist + ((key >> shift) & 0xFFu), 1u,
+                                  memory_order_relaxed);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
@@ -1226,12 +1248,12 @@ def kernel_header() -> str:
 # resolves the first against the device in front of it and checks the second
 # against the device's own limits; the import is lazy so a CPU-only import of
 # this module still costs no probe and no calibration.
-def _portable_config() -> dict[str, Any]:
-    """Resolved settings, their sources, the probe and the cache state."""
+def _portable_config(*, autotune: bool = False) -> dict[str, Any]:
+    """Resolved settings without an implicit calibration dispatch by default."""
     try:
         from . import qwen4_megakernel_config as MC
 
-        return MC.config_receipt()
+        return MC.config_receipt(autotune=autotune)
     except Exception as exc:  # pragma: no cover - no Metal device
         return {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -1239,7 +1261,10 @@ def _portable_config() -> dict[str, Any]:
 def _portability_refusal(settings: dict, *, threads: int, groups: int,
                          width: int = 1, pack: Any = None,
                          extra_bytes: int = 0,
-                         resident_bytes: int = 0) -> Optional[str]:
+                         resident_bytes: int = 0,
+                         individual_buffer_bytes: Optional[dict[str, int]] = None,
+                         compiled_width: Optional[int] = None,
+                         ) -> Optional[str]:
     """The device's own reason to refuse this geometry, or ``None``.
 
     A machine that cannot hold the model, cannot run the threadgroup, or has
@@ -1248,14 +1273,23 @@ def _portability_refusal(settings: dict, *, threads: int, groups: int,
     """
     try:
         from . import qwen4_megakernel_config as MC
+        from .qwen4_megakernel_body import compute_tg_layout
+
+        scratch_bytes = scratch_floats(max(int(width), 1)) * 4
+        buffers = dict(individual_buffer_bytes or {})
+        buffers.setdefault("launch.scratch", scratch_bytes)
 
         return MC.portability_refusal(
             threads=threads, groups=groups, width=width, pack=pack,
-            scratch_bytes=scratch_floats(max(int(width), 1)) * 4,
+            scratch_bytes=scratch_bytes,
             extra_bytes=extra_bytes,
             resident_bytes=resident_bytes,
             threadgroup_bytes=settings.get("values", {}).get(
                 "threadgroup_bytes"),
+            actual_threadgroup_bytes=compute_tg_layout(
+                MAX_QUERY_WIDTH if compiled_width is None
+                else max(int(compiled_width), 1))[2],
+            individual_buffer_bytes=buffers,
             primitives=settings.get("primitives"),
         )
     except Exception as exc:  # pragma: no cover - no Metal device

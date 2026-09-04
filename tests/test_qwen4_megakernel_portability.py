@@ -283,6 +283,15 @@ class TestGuardrails(_EnvMixin, unittest.TestCase):
         self.assertEqual(reason,
                          "threadgroup arena 32768 B over device limit 16384 B")
 
+    def test_actual_threadgroup_arena_must_fit_the_residency_budget(self):
+        reason = self.refusal(
+            threadgroup_bytes=8192, actual_threadgroup_bytes=12288)
+        self.assertEqual(
+            reason,
+            "actual threadgroup arena 12288 B over configured residency "
+            "budget 8192 B",
+        )
+
     def test_a_model_the_machine_cannot_hold(self):
         # 24 GiB of packed weights on a part with a 16 GiB working set.
         pack = self._Pack(6 * (1 << 30))          # 6 G words = 24 GiB
@@ -325,6 +334,12 @@ class TestGuardrails(_EnvMixin, unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("over max buffer length", reason)
 
+    def test_every_non_weight_buffer_obeys_max_buffer_length(self):
+        reason = self.refusal(
+            individual_buffer_bytes={"ledger.kv": 3 * (1 << 30)},
+            probe=probe_from(max_buffer_length=2 * (1 << 30)))
+        self.assertIn("ledger.kv buffer 3.0 GiB over max buffer length", reason)
+
     def test_a_device_that_is_not_an_apple_gpu(self):
         self.assertEqual(self.refusal(probe=probe_from(architecture="nvgpu")),
                          "device architecture nvgpu")
@@ -345,7 +360,15 @@ class TestGuardrails(_EnvMixin, unittest.TestCase):
             primitives={"ok": True,
                         "geometry": {"threads": 512, "groups": 40}})
         self.assertEqual(
-            reason, "primitives validated at 512x40, below 512x160")
+            reason, "primitives validated at 512x40, not requested 512x160")
+
+    def test_equal_thread_budget_with_different_geometry_does_not_carry(self):
+        reason = self.refusal(
+            threads=256, groups=80,
+            primitives={"ok": True,
+                        "geometry": {"threads": 512, "groups": 40}})
+        self.assertEqual(
+            reason, "primitives validated at 512x40, not requested 256x80")
 
     def test_the_primitive_gate_has_an_escape_hatch(self):
         os.environ["MLX_QWEN4_MEGAKERNEL_REQUIRE_PRIMITIVES"] = "0"

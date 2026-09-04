@@ -342,6 +342,8 @@ def portability_refusal(
     extra_bytes: int = 0,
     resident_bytes: int = 0,
     threadgroup_bytes: Optional[int] = None,
+    actual_threadgroup_bytes: Optional[int] = None,
+    individual_buffer_bytes: Optional[dict[str, int]] = None,
     primitives: Optional[dict[str, Any]] = None,
     require_primitives: Optional[bool] = None,
 ) -> Optional[str]:
@@ -367,11 +369,17 @@ def portability_refusal(
         return f"threads {threads} over device max {int(limit)}"
 
     arena = probe.max_threadgroup_memory
-    want_tg = (SHIPPED_THREADGROUP_BYTES if threadgroup_bytes is None
-               else int(threadgroup_bytes))
+    budget_tg = (SHIPPED_THREADGROUP_BYTES if threadgroup_bytes is None
+                 else int(threadgroup_bytes))
+    want_tg = (budget_tg if actual_threadgroup_bytes is None
+               else int(actual_threadgroup_bytes))
+    if actual_threadgroup_bytes is not None and want_tg > budget_tg:
+        return (f"actual threadgroup arena {want_tg} B over configured "
+                f"residency budget {budget_tg} B")
     if arena is not None and want_tg > int(arena):
-        return (f"threadgroup arena {want_tg} B over device limit "
-                f"{int(arena)} B")
+        label = ("threadgroup arena" if actual_threadgroup_bytes is None
+                 else "actual threadgroup arena")
+        return f"{label} {want_tg} B over device limit {int(arena)} B"
 
     total, largest = _pack_bytes(pack)
     working_set = probe.max_recommended_working_set_size
@@ -391,6 +399,12 @@ def portability_refusal(
             and largest > int(max_buffer)):
         return (f"weight group {largest / (1 << 30):.1f} GiB over max "
                 f"buffer length {int(max_buffer) / (1 << 30):.1f} GiB")
+    if max_buffer is not None:
+        for name, size in (individual_buffer_bytes or {}).items():
+            if int(size) > int(max_buffer):
+                return (f"{name} buffer {int(size) / (1 << 30):.1f} GiB "
+                        f"over max buffer length "
+                        f"{int(max_buffer) / (1 << 30):.1f} GiB")
 
     if require_primitives is None:
         require_primitives = _env_bool(ENV_REQUIRE_PRIMITIVES, True)
@@ -404,36 +418,56 @@ def portability_refusal(
         # one: the spike's residency ceiling is a THREAD budget, and a grid
         # that exceeds it aborts rather than completing.
         tested = primitives.get("geometry") or {}
-        if (int(tested.get("threads", 0)) * int(tested.get("groups", 0))
-                < threads * groups):
+        tested_geometry = (
+            int(tested.get("threads", 0)), int(tested.get("groups", 0))
+        )
+        if tested_geometry != (int(threads), int(groups)):
             return (f"primitives validated at "
                     f"{tested.get('threads')}x{tested.get('groups')}, "
-                    f"below {threads}x{groups}")
+                    f"not requested {threads}x{groups}")
     return None
 
 
 # ----------------------------------------------------------------- receipt
-_LAST: Optional[dict[str, Any]] = None
+_LAST: dict[bool, dict[str, Any]] = {}
 
 
-def config_receipt(*, refresh: bool = False) -> dict[str, Any]:
+def config_receipt(*, refresh: bool = False,
+                   autotune: bool = True) -> dict[str, Any]:
     """Resolved settings, their sources, the probe and the cache state.
 
     This is what makes "the geometry came from a calibration on THIS machine"
     a checkable claim rather than an assumption a reader has to make.
     """
-    global _LAST
-    if _LAST is None or refresh:
+    key = bool(autotune)
+    if key not in _LAST or refresh:
         probe = MD.probe_device()
         try:
-            resolved = resolve(probe=probe)
+            if autotune:
+                resolved = resolve(probe=probe)
+            else:
+                from . import qwen4_megakernel_tune as MT
+
+                entry, error = MT.read_entry(probe.signature)
+                resolved = resolve(
+                    probe=probe, cache_entry=entry, tune=False)
+                resolved["cache"] = {
+                    **resolved["cache"],
+                    "consulted": True,
+                    "mode": MT.tune_mode(),
+                    "autotune_allowed": False,
+                    "hit": entry is not None,
+                    "calibrated": False,
+                    "primitive_tests_run": False,
+                    "error": error,
+                    "cold_safe": True,
+                }
         except ConfigError as exc:
             resolved = {"error": str(exc), "signature": probe.signature}
-        _LAST = {"device": probe.as_dict(), **resolved}
-    return _LAST
+        _LAST[key] = {"device": probe.as_dict(), **resolved}
+    return _LAST[key]
 
 
 def invalidate() -> None:
     """Forget the resolved settings (tests, and a re-tune)."""
-    global _LAST
-    _LAST = None
+    _LAST.clear()

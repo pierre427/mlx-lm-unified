@@ -65,6 +65,8 @@ from .qwen4_megakernel import (
     HIDDEN,
     IDX_HEADS,
     IDX_HEAD_DIM,
+    IDX_COMPRESS,
+    SCORE_TILE_BLOCKS,
     KEY_DIM,
     N_KV_HEADS,
     N_Q_HEADS,
@@ -76,6 +78,7 @@ from .qwen4_megakernel import (
     SCRATCH,
     SCRATCH_FLOATS,
     SCRATCH_STRIDE,
+    score_tile_floats,
     scratch_floats,
     STEP_STRIDE,
     TOPK,
@@ -451,11 +454,13 @@ BODY_SRC = r"""
   // Plane 0.  A phase body gets its own `sc` inside the per-query loop; this
   // one serves the residual load and the phases that address plane 0 by name.
   device float* sc = scratch;
-  // Block ids for the attention phase.  ``OP_INDEX_TOPB`` writes them into
-  // scratch as floats (a block index is < 2^24, so the round trip is exact);
-  // a standalone probe hands them in through ``actl`` instead.
+  // Block ids for the attention phase. ``OP_INDEX_TOPB`` writes them into
+  // scratch through a uint view; a standalone probe hands them in through
+  // ``actl`` instead. Index scores use a separate, dynamically tile-aligned
+  // output so activation scratch no longer imposes a context ceiling.
   const device uint* sel_ids = actl + ACTLIDS;
   const uint ids_from_scratch = actl[7];
+  const uint score_stride = actl[24];
 
   threadgroup float A[TGF];
   // Routing is PER QUERY -- the M tokens of a slab pick their own top-10 --
@@ -1402,9 +1407,10 @@ BODY_SRC = r"""
         // `a0` is the attention layer's slot: the pooled ledgers of all
         // twelve live in one binding, `actl[15]` rows apart.
         const size_t pbase = (size_t)a0 * actl[15] * hd;
+        device float* score_row = score_tiles + (size_t)mq * score_stride;
         for (uint n = grow; n < nblocks; n += nrow) {
           if (n >= nvalid) {
-            if (lane == 0u) sc[dst + n] = -INFINITY;
+            if (lane == 0u) score_row[n] = -INFINITY;
             continue;
           }
           const device BFT* prow = pooled + pbase + (size_t)n * hd;
@@ -1416,7 +1422,7 @@ BODY_SRC = r"""
             d = simd_sum(d);
             acc += metal::max(d, 0.0f);
           }
-          if (lane == 0u) sc[dst + n] = acc * inv;
+          if (lane == 0u) score_row[n] = acc * inv;
         }
       }
 
@@ -1425,9 +1431,9 @@ BODY_SRC = r"""
       // radix passes over a monotone float key narrow to the exact k-th key,
       // then one order-free emit places each element at
       // `gt_before + min(eq_before, need)`.  Every threadgroup runs the whole
-      // selection for itself and writes the same answer, which is what buys
-      // the device barrier it would otherwise pay -- six sweeps of a 16,384
-      // score array against a 5.2 us barrier.
+      // selection for itself and writes the same answer. The score plane is
+      // launch-sized and tile-aligned; the selector's global histogram and
+      // final contiguous emit preserve the pre-tiling result exactly.
       else if (op == 12u) {
         threadgroup atomic_uint* hist =
             reinterpret_cast<threadgroup atomic_uint*>(A + TG_TGX);
@@ -1435,7 +1441,9 @@ BODY_SRC = r"""
             reinterpret_cast<threadgroup uint*>(A + TG_TGX) + 256u;
         threadgroup uint* eqc = gtc + NT;
         threadgroup uint* shared = eqc + NT;
-        select_top_blocks(sc + src, mc[4], a0,
+        const device float* score_row =
+            score_tiles + (size_t)mq * score_stride;
+        select_top_blocks(score_row, mc[4], a0,
                           reinterpret_cast<device uint*>(sc + dst),
                           hist, gtc, eqc, shared, tid, NT);
         // The INCOMPLETE TAIL block, appended at slot `n_sel` exactly as
@@ -1751,7 +1759,7 @@ BODY_SRC = r"""
 
 # Ten weight buffers, and the barrier's generation counter folded into `meta`.
 # Both are BINDING arithmetic, not preference.  MLX binds inputs and outputs
-# alike, so the budget is Metal's 31 for the pair: nine outputs leaves 22, and
+# alike, so the budget is Metal's 31 for the pair: ten outputs leave 21, and
 # the 63 GiB of experts needs eight groups on its own because a group is
 # uint32-indexed and so caps at 2^31 words = 8 GiB.  Ten buffers + main +
 # the remaining tables and state fit in 20 inputs.
@@ -1764,8 +1772,10 @@ BODY_SRC = r"""
 #   * ``pooled`` + ``rawk`` -> ``idxl``, the one index ledger.  Same argument.
 #   * ``meta`` -> folded into ``actl``.  A four-word uint32 control buffer was
 #     worth as much of the budget as an 8 GiB weight group.
-# 20 inputs + 9 outputs = 29 of 31.  The ninth output is the transactional PLE
-# state; keeping it separate from its input makes verify rollback real.
+# 20 inputs + 10 outputs = 30 of 31. The tenth output is the dynamically
+# tile-aligned score plane; moving it out of activation scratch removes the
+# fixed context ceiling while keeping one binding in reserve. Transactional
+# PLE state remains separate from its input so verify rollback is real.
 IN_NAMES = [
     "xin", "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9",
     "tbl", "sched", "cs_in", "rec_in",
@@ -1777,8 +1787,8 @@ IN_NAMES = [
     "kv", "idxl", "pconv",
     "actl", "ctrl",
 ]
-OUT_NAMES = ["scratch", "out", "cs_out", "rec_out", "pconv_out", "apm",
-             "apo", "logits", "status"]
+OUT_NAMES = ["scratch", "score_tiles", "out", "cs_out", "rec_out",
+             "pconv_out", "apm", "apo", "logits", "status"]
 
 MAX_GROUPS = 10
 
@@ -1863,6 +1873,7 @@ def build_body_kernel(*, threads: int = None, rdown: int = 4,
         # Pinned to the PROCESS ceiling -- see the docstring.  NOT ``mqw``.
         "ACTLIDS": ACTL_IDS, "ACTLM0": ACTL_M0, "ACTLMS": ACTL_M_STRIDE,
         "BTK": BLOCK_TOPK,
+        "SCTILE": SCORE_TILE_BLOCKS,
         "SCSTRIDE": SCRATCH_STRIDE, "MAXMW": mqw,
         "PERQMASK": "29159800u",
         "PLEK": PLE_CONV_KERNEL, "PLEN": PLE_NGRAM, "PLES": PLE_STATE_LEN,
@@ -1944,7 +1955,8 @@ class MegakernelBody:
     def __call__(self, xin, cs_in, rec_in, *, reps: int = 1,
                  steps: Optional[int] = None, kbuf=None, vbuf=None,
                  pooled=None, actl=None, total: int = 1, rawk=None,
-                 pconv=None, kv=None, idxl=None, mwidth: int = 1):
+                 pconv=None, kv=None, idxl=None, mwidth: int = 1,
+                 score_blocks: Optional[int] = None):
         """``steps`` truncates the schedule, for cumulative phase profiling.
 
         The barrier map lives in the schedule, so a prefix is a real, running
@@ -1989,10 +2001,19 @@ class MegakernelBody:
         # `meta` used to be its own binding.  Its four words now ride in the
         # `actl` header, which means they are per-LAUNCH host state written
         # into an array the caller owns -- so patch a copy, never the caller's.
+        score_blocks = (
+            max(int(total) // IDX_COMPRESS, 0)
+            if score_blocks is None else int(score_blocks)
+        )
+        score_floats = score_tile_floats(score_blocks, mwidth)
+        score_stride = score_floats // mwidth
         actl = mx.concatenate([
             actl[:ACTL["nsteps"]],
-            mx.array([nsteps, reps, width, self.phase, mwidth], mx.uint32),
-            actl[ACTL["m_width"] + 1:],
+            mx.array(
+                [nsteps, reps, width, self.phase, mwidth, score_stride],
+                mx.uint32,
+            ),
+            actl[ACTL["score_stride"] + 1:],
         ])
         outs = self.kernel(
             inputs=[xin, *self.wbufs, self.table, self.sched,
@@ -2001,7 +2022,8 @@ class MegakernelBody:
             grid=(self.groups * self.threads, 1, 1),
             threadgroup=(self.threads, 1, 1),
             output_shapes=[
-                (scratch_floats(mwidth),), (reps * mwidth, HIDDEN),
+                (scratch_floats(mwidth),), (score_floats,),
+                (reps * mwidth, HIDDEN),
                 (self.gdn_layers, CONV_KERNEL - 1, CONV_DIM),
                 (self.gdn_layers, GDN_VALUE_HEADS, GDN_VALUE_DIM, GDN_KEY_DIM),
                 (PLE_STATE_LEN, HC_HIDDEN),
@@ -2010,7 +2032,7 @@ class MegakernelBody:
                 (reps * mwidth, self.vocab),
                 (4,),
             ],
-            output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16,
+            output_dtypes=[mx.float32, mx.float32, mx.bfloat16, mx.bfloat16,
                            mx.float32, mx.bfloat16, mx.float32, mx.bfloat16,
                            mx.bfloat16, mx.uint32],
         )
@@ -2048,11 +2070,9 @@ class DualWidthMegakernelBody:
     the threadgroup arena and the register file: two different compiled
     pipelines, which is the entire point.
 
-    **Lazy wide build.**  The narrow (``max_query_width=1``) body is built
-    eagerly in ``__init__`` -- plain decode needs it on the first call.  The
-    wide (``max_query_width=MAX_QUERY_WIDTH``) body is built on first use at
-    ``mwidth > 1``, so a plain-decode deployment that never verifies never
-    pays its compile time or its larger threadgroup/register footprint.
+    **Lazy wide wrapper.** The narrow Python wrapper is built in ``__init__``;
+    the wide wrapper is prepared explicitly before verification. Metal library
+    and pipeline compilation are deferred until the first evaluated launch.
 
     **One barrier generation, shared.**  ``ctrl``'s atomic counters and the
     ``phase`` value that seeds them are a running sequence across a decode
@@ -2084,7 +2104,7 @@ class DualWidthMegakernelBody:
         self.threads = self.narrow.threads
         self.groups = self.narrow.groups
         self.spin_cap = self.narrow.spin_cap
-        self.wide_build_seconds: Optional[float] = None
+        self.wide_wrapper_prepare_seconds: Optional[float] = None
         self.calls_narrow = 0
         self.calls_wide = 0
         self.reset()
@@ -2106,7 +2126,7 @@ class DualWidthMegakernelBody:
                 self.pack, self.schedule, max_query_width=self.wide_width,
                 **self._kw)
             mx.eval(wide.wbufs, wide.table, wide.sched)
-            self.wide_build_seconds = time.perf_counter() - t0
+            self.wide_wrapper_prepare_seconds = time.perf_counter() - t0
             # Weight-pack sharing is a claim about object identity, not a
             # hope -- assert it rather than infer it from a passing gate.
             for a, b in zip(self.narrow.wbufs, wide.wbufs):
@@ -2121,6 +2141,39 @@ class DualWidthMegakernelBody:
             wide.phase = self.phase
             self._wide = wide
         return self._wide
+
+    def is_width_wrapper_prepared(self, width: int) -> bool:
+        """Whether the Python wrapper exists; not a Metal compilation check."""
+        width = int(width)
+        if width < 1 or width > self.wide_width:
+            return False
+        return width <= self.narrow_width or self._wide is not None
+
+    def prepare_width_wrapper(self, width: int) -> dict:
+        """Prepare the selected wrapper without launching the decode kernel.
+
+        The first evaluated output still compiles the Metal library/pipeline.
+        A successful receipt does not qualify that cold launch or its latency.
+        """
+        width = int(width)
+        if width < 1 or width > self.wide_width:
+            raise ValueError(
+                f"query width {width} outside 1..{self.wide_width}"
+            )
+        was_built = self._wide is not None
+        if width > self.narrow_width:
+            self._ensure_wide()
+        return {
+            **self.receipt(),
+            "requested_width": width,
+            "wrapper_prepared": self.is_width_wrapper_prepared(width),
+            "wrapper_built_now": width > self.narrow_width and not was_built,
+            "launched": False,
+        }
+
+    def prepare_width(self, width: int) -> dict:
+        """Compatibility alias; this prepares a wrapper, not a Metal pipeline."""
+        return self.prepare_width_wrapper(width)
 
     def __call__(self, *args, mwidth: int = 1, **kwargs):
         mwidth = max(int(mwidth), 1)
@@ -2142,8 +2195,9 @@ class DualWidthMegakernelBody:
         return {
             "narrow_width": self.narrow_width,
             "wide_width": self.wide_width,
-            "wide_built": self._wide is not None,
-            "wide_build_seconds": self.wide_build_seconds,
+            "wide_wrapper_prepared": self._wide is not None,
+            "wide_wrapper_prepare_seconds": self.wide_wrapper_prepare_seconds,
+            "pipeline_compilation": "deferred_to_first_evaluation",
             "calls_narrow": self.calls_narrow,
             "calls_wide": self.calls_wide,
             "last_variant": getattr(self, "last_variant", None),
