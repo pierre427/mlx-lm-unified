@@ -23,6 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm import compiled_decode as cd
+from mlx_lm.models import precise_ops
 from mlx_lm.models.cache import (
     KVCache,
     RingKVCache,
@@ -197,6 +198,69 @@ class TestRingKVCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(out_clean, out_dirty))
 
 
+class TestPreciseSigmoid(unittest.TestCase):
+    """MLX's Sigmoid struct spells an unqualified metal::exp, so a fused
+    chain gets the fast approximation while eager gets the precise one
+    (wiki research/mlx-compile-fused-sigmoid-rca-2026-09-03.md). These pin
+    both halves: the defect is real, and our replacement is immune to it."""
+
+    SWEEP = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.SWEEP = mx.linspace(-12, 12, 4001)
+
+    def test_precise_sigmoid_is_bit_identical_to_eager(self):
+        for dtype in (mx.float32, mx.bfloat16):
+            x = self.SWEEP.astype(dtype)
+            self.assertTrue(
+                mx.array_equal(mx.sigmoid(x), precise_ops.sigmoid(x)),
+                f"precise sigmoid differs from eager at {dtype}",
+            )
+
+    def test_precise_sigmoid_survives_fusion(self):
+        """The point of the custom primitive: mx.compile cannot fuse it."""
+        for dtype in (mx.float32, mx.bfloat16):
+            x = self.SWEEP.astype(dtype)
+            fused = mx.compile(lambda z: precise_ops.sigmoid(z) * 1)(x)
+            self.assertTrue(
+                mx.array_equal(mx.sigmoid(x), fused),
+                f"precise sigmoid moved inside a compiled span at {dtype}",
+            )
+
+    def test_the_defect_it_works_around_is_real(self):
+        """Assert the mechanism: a plain fused sigmoid DOES move. If this
+        ever stops failing, MLX was fixed and the workaround can go."""
+        moved = []
+        for dtype in (mx.float32, mx.bfloat16):
+            x = self.SWEEP.astype(dtype)
+            fused = mx.compile(lambda z: mx.sigmoid(z) * 1)(x)
+            moved.append(not mx.array_equal(mx.sigmoid(x), fused).item())
+        self.assertTrue(
+            any(moved),
+            "a fused mx.sigmoid no longer differs from eager -- MLX may have "
+            "qualified metal::exp; re-check precise_ops before keeping it",
+        )
+
+    def test_float16_falls_back(self):
+        """At fp16 the eager metallib sigmoid matches the FAST form, so the
+        precise kernel would be the one that diverges."""
+        x = self.SWEEP.astype(mx.float16)
+        self.assertTrue(mx.array_equal(mx.sigmoid(x), precise_ops.sigmoid(x)))
+
+    def test_gate_sigmoid_is_eager_outside_a_span(self):
+        x = self.SWEEP.astype(mx.float32)
+        self.assertFalse(precise_ops.in_precise_span())
+        self.assertTrue(
+            mx.array_equal(mx.sigmoid(x), precise_ops.gate_sigmoid(x))
+        )
+        with precise_ops.precise_span():
+            self.assertTrue(precise_ops.in_precise_span())
+            inside = precise_ops.gate_sigmoid(x)
+        self.assertFalse(precise_ops.in_precise_span())
+        self.assertTrue(mx.array_equal(mx.sigmoid(x), inside))
+
+
 def _small_hybrid(n_layers=4, hidden=256, vocab=512):
     """A tiny qwen3_5 hybrid: GDN layers plus one full-attention layer."""
     from mlx_lm.models import qwen3_5
@@ -346,6 +410,32 @@ class TestCompiledDecodeStep(unittest.TestCase):
             cd.CompiledDecodeStep(self.model, [RotatingKVCache(max_size=8)])
         with self.assertRaises(TypeError):
             cd.to_shape_stable_cache([RotatingKVCache(max_size=8)])
+
+    def test_the_trace_runs_inside_a_precise_span(self):
+        """Mechanism proof for the sigmoid cut: the flag must be set while
+        the step is traced, or every eager sigmoid the step swallows would
+        silently take the fast-exp path."""
+        model = self.model
+        cache = model.make_cache()
+        mx.eval(model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache, buckets=(64, 128))
+        step = cd.CompiledDecodeStep(model, cache)
+        seen = []
+        orig = precise_ops.gate_sigmoid
+
+        def spy(x):
+            seen.append(precise_ops.in_precise_span())
+            return orig(x)
+
+        import mlx_lm.models.qwen3_next as qn
+
+        qn.gate_sigmoid = spy
+        try:
+            mx.eval(step(mx.zeros((1, 1), mx.uint32)))
+        finally:
+            qn.gate_sigmoid = orig
+        self.assertTrue(seen, "no gated sigmoid ran during the trace")
+        self.assertTrue(all(seen), "a sigmoid was traced outside the span")
 
     def test_traced_body_has_no_host_sync(self):
         """Source gate: the traced step must not evaluate or read back.

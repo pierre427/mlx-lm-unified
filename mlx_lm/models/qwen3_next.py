@@ -13,7 +13,6 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
 from .activations import swiglu
-from .precise_ops import gate_sigmoid
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -22,6 +21,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update, normalize_gdn_qk
+from .precise_ops import gate_sigmoid
 from .qwen4_moe_router import (
     admit_qwen4_moe_router,
     probe_qwen4_moe_router,
