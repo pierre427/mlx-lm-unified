@@ -56,14 +56,24 @@ class TestModelProvider(unittest.TestCase):
         provider = self.make_provider(object())
         replacement_model = object()
         replacement_tokenizer = types.SimpleNamespace(chat_template="template")
+        cleanup_order = []
 
         with (
-            patch("mlx_lm.server.mx.clear_cache") as clear_cache,
+            patch(
+                "mlx_lm.server.gc.collect",
+                side_effect=lambda: cleanup_order.append("gc"),
+            ) as collect,
+            patch(
+                "mlx_lm.server.mx.clear_cache",
+                side_effect=lambda: cleanup_order.append("mlx"),
+            ) as clear_cache,
             patch("mlx_lm.server.make_prompt_cache", return_value=[]),
         ):
 
             def load_replacement(*args, **kwargs):
+                collect.assert_called_once_with()
                 clear_cache.assert_called_once_with()
+                self.assertEqual(cleanup_order, ["gc", "mlx"])
                 self.assertIsNone(provider.model)
                 self.assertIsNone(provider.tokenizer)
                 return replacement_model, replacement_tokenizer
@@ -80,12 +90,14 @@ class TestModelProvider(unittest.TestCase):
         tokenizer = types.SimpleNamespace(chat_template="template")
 
         with (
+            patch("mlx_lm.server.gc.collect") as collect,
             patch("mlx_lm.server.mx.clear_cache") as clear_cache,
             patch("mlx_lm.server.load", return_value=(model, tokenizer)),
             patch("mlx_lm.server.make_prompt_cache", return_value=[]),
         ):
             provider._load("model")
 
+        collect.assert_not_called()
         clear_cache.assert_not_called()
 
     def test_kv_bits_keeps_mergeable_model_batchable(self):

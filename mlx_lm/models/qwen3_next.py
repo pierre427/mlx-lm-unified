@@ -1404,7 +1404,10 @@ class Model(nn.Module):
     # speculative decoding, making the hybrid cache trimmable (see
     # Qwen3NextGatedDeltaNet.__call__ and ArraysCache.record_rollback).
     supports_speculative_rollback = True
-    supports_compiled_decode_replay = True
+    # Compiled whole-step replay is intentionally not qualified here.  The
+    # qwen3_next family needs its own real-model, production-bucket acceptance
+    # record before it can carry the qwen3_5 MoE qualification token.
+    supports_compiled_decode_replay = False
 
     def __init__(self, args: ModelArgs):
         super().__init__()

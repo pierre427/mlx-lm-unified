@@ -1230,7 +1230,10 @@ class RingKVCache(_BaseCache):
 
     def __init__(self, capacity: Optional[int] = None, buckets=None):
         resolved = tuple(buckets) if buckets is not None else _ring_buckets()
-        if not resolved or any(not isinstance(b, int) or b <= 0 for b in resolved):
+        if not resolved or any(
+            isinstance(b, bool) or not isinstance(b, int) or b <= 0
+            for b in resolved
+        ):
             raise ValueError("RingKVCache buckets must be positive integers")
         resolved = tuple(sorted(set(resolved)))
         if capacity is not None:
@@ -1290,7 +1293,18 @@ class RingKVCache(_BaseCache):
         keys. ``make_mask`` calls this, and the compiled-decode wrapper
         calls it on every cache before deciding which variant to replay.
         """
-        if self.keys is None or self._host_offset + n <= self.capacity:
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError(
+                "RingKVCache reserve size must be a non-negative integer"
+            )
+        if self.keys is None:
+            if n == 0:
+                return False
+            raise ValueError(
+                "cannot reserve an empty RingKVCache before key/value geometry "
+                "is known; fill it with a forward first"
+            )
+        if self._host_offset + n <= self.capacity:
             return False
         self._allocate(self.keys, self.values, self._host_offset + n)
         return True

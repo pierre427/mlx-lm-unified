@@ -15,6 +15,7 @@ reduction). Tests that need that property pin small capacity buckets.
 """
 
 import inspect
+import importlib
 import os
 import tempfile
 import threading
@@ -54,6 +55,13 @@ class TestRingKVCache(unittest.TestCase):
         for capacity in (0, -1, True, 1.5):
             with self.subTest(capacity=capacity), self.assertRaises(ValueError):
                 RingKVCache(capacity=capacity)
+
+    def test_invalid_buckets_and_empty_reserve_are_rejected(self):
+        with self.assertRaises(ValueError):
+            RingKVCache(buckets=(True,))
+        ring = RingKVCache(capacity=8)
+        with self.assertRaisesRegex(ValueError, "geometry is known"):
+            ring.reserve(1)
 
     def test_writes_match_kv_cache(self):
         """Same keys and values land at the same positions as KVCache."""
@@ -293,7 +301,7 @@ def _small_hybrid(n_layers=4, hidden=256, vocab=512):
     from mlx_lm.models import qwen3_5
 
     args = qwen3_5.TextModelArgs(
-        model_type="qwen3_5",
+        model_type="qwen3_5_moe",
         hidden_size=hidden,
         num_hidden_layers=n_layers,
         intermediate_size=hidden * 2,
@@ -310,6 +318,10 @@ def _small_hybrid(n_layers=4, hidden=256, vocab=512):
         full_attention_interval=n_layers,
         rope_theta=10000.0,
         tie_word_embeddings=True,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=hidden,
+        shared_expert_intermediate_size=hidden,
     )
     model = qwen3_5.TextModel(args)
     # bf16 is what the checkpoints ship; compiled-vs-eager byte equality is
@@ -323,9 +335,17 @@ def _small_hybrid(n_layers=4, hidden=256, vocab=512):
 class TestCompiledDecodeStep(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.bucket_env = mock.patch.dict(
+            os.environ, {"MLX_LM_RING_KV_BUCKETS": "64,128"}
+        )
+        cls.bucket_env.start()
         mx.random.seed(11)
         cls.model = _small_hybrid()
         cls.prompt = mx.random.randint(0, 512, (1, 12)).astype(mx.uint32)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.bucket_env.stop()
 
     def _run(self, mode, n_steps=8, buckets=(64, 128), width=1):
         model = self.model
@@ -336,14 +356,21 @@ class TestCompiledDecodeStep(unittest.TestCase):
         if mode != "kv":
             cd.to_shape_stable_cache(cache, buckets=buckets)
         if mode == "compiled":
-            step = cd.CompiledDecodeStep(model, cache)
+            bucket_text = ",".join(str(b) for b in buckets)
+            with mock.patch.dict(
+                os.environ, {"MLX_LM_RING_KV_BUCKETS": bucket_text}
+            ):
+                step = cd.CompiledDecodeStep(model, cache)
         y = mx.argmax(logits[:, -1:], axis=-1).astype(mx.uint32)
         if width > 1:
             y = mx.broadcast_to(y, (1, width)).astype(mx.uint32)
         toks, per_step = [], []
         for _ in range(n_steps):
             lg = step(y) if step is not None else model(y, cache)
-            mx.eval(lg)
+            if step is not None:
+                step.materialize_and_confirm(lg)
+            else:
+                mx.eval(lg)
             per_step.append(lg[:, -1])
             nxt = mx.argmax(lg[:, -1:], axis=-1).astype(mx.uint32)
             toks.append(int(nxt.item()))
@@ -458,7 +485,7 @@ class TestCompiledDecodeStep(unittest.TestCase):
             why = cd.model_is_compilable(model, [KVCache()])
             self.assertIn("has not been qualified", why)
 
-    def test_max_variants_is_bounded_and_eviction_clears_receipts(self):
+    def test_max_variants_is_bounded_and_eviction_preserves_receipts(self):
         for value in (0, 65, True, 1.5):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 cd.CompiledDecodeStep(self.model, [], max_variants=value)
@@ -466,11 +493,14 @@ class TestCompiledDecodeStep(unittest.TestCase):
         step = cd.CompiledDecodeStep.__new__(cd.CompiledDecodeStep)
         step._variants = {"old": object()}
         step.trace_counts = {"old": 1}
+        step.submission_counts = {"old": 9}
         step.replay_counts = {"old": 9}
+        step.failure_counts = {}
         step._evict_all()
         self.assertEqual(step._variants, {})
-        self.assertEqual(step.trace_counts, {})
-        self.assertEqual(step.replay_counts, {})
+        self.assertEqual(step.trace_counts, {"old": 1})
+        self.assertEqual(step.submission_counts, {"old": 9})
+        self.assertEqual(step.replay_counts, {"old": 9})
 
     def test_context_policy_keeps_the_16k_tradeoff_explicit(self):
         default_buckets = (2048, 4096, 8192, 16384, 32768, 65536)
@@ -507,6 +537,156 @@ class TestCompiledDecodeStep(unittest.TestCase):
         self.assertIn("must be one of", why)
         self.assertIsNone(buckets)
 
+    def test_padded_sdpa_acceptance_is_explicit_and_exact(self):
+        with mock.patch.dict(
+            os.environ, {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": ""}
+        ):
+            why, policy = cd.compiled_decode_context_policy(1, 1)
+            self.assertIsNone(why)
+            self.assertFalse(cd.compiled_decode_numerics_accepted(policy))
+        with mock.patch.dict(
+            os.environ,
+            {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": "class3-padded-sdpa-v1"},
+        ):
+            why, policy = cd.compiled_decode_context_policy(1, 1)
+            self.assertIsNone(why)
+            self.assertTrue(cd.compiled_decode_numerics_accepted(policy))
+        with mock.patch.dict(
+            os.environ, {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": "yes"}
+        ):
+            why, policy = cd.compiled_decode_context_policy(1, 1)
+            self.assertIn("must be", why)
+            self.assertIsNone(policy)
+
+    def test_forged_context_policy_is_rejected(self):
+        cache = self.model.make_cache()
+        mx.eval(self.model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache)
+        forged = cd.CompiledDecodePolicy("short", 1_000_000, cache[-1].buckets)
+        with self.assertRaisesRegex(ValueError, "limit must be"):
+            cd.CompiledDecodeStep(self.model, cache, context_policy=forged)
+
+    def test_context_policy_must_match_ring_buckets(self):
+        cache = self.model.make_cache()
+        mx.eval(self.model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache, buckets=(64, 128))
+        policy = cd.CompiledDecodePolicy("short", 4096, (32, 64))
+        with self.assertRaisesRegex(ValueError, "buckets do not match"):
+            cd.CompiledDecodeStep(self.model, cache, context_policy=policy)
+
+    def test_empty_ring_is_rejected_at_setup(self):
+        why = cd.model_is_compilable(self.model, [RingKVCache()])
+        self.assertIn("has not been filled", why)
+
+    def test_cache_batch_geometry_is_checked(self):
+        ring = RingKVCache(buckets=(16,))
+        ring.update_and_fetch(*_kv(B=2, S=3))
+        self.assertIn("not batch 1", cd.model_is_compilable(self.model, [ring]))
+
+        from mlx_lm.models.cache import ArraysCache
+
+        arrays = ArraysCache(1)
+        arrays.cache[0] = mx.zeros((2, 4), mx.float32)
+        one = RingKVCache(buckets=(16,))
+        one.update_and_fetch(*_kv(B=1, S=3))
+        self.assertIn(
+            "not batch 1", cd.model_is_compilable(self.model, [one, arrays])
+        )
+
+    def test_full_attention_positions_must_be_synchronized(self):
+        first = RingKVCache(buckets=(16,))
+        second = RingKVCache(buckets=(16,))
+        first.update_and_fetch(*_kv(S=2))
+        second.update_and_fetch(*_kv(S=3))
+        self.assertIn(
+            "not synchronized",
+            cd.model_is_compilable(self.model, [first, second]),
+        )
+
+    def test_family_and_distributed_modes_are_not_inherited_as_qualified(self):
+        from mlx_lm.models import qwen3_next
+
+        self.assertFalse(qwen3_next.Model.supports_compiled_decode_replay)
+        original_experts = self.model.args.num_experts
+        self.model.args.num_experts = 0
+        try:
+            why = cd.model_is_compilable(self.model, self.model.make_cache())
+        finally:
+            self.model.args.num_experts = original_experts
+        self.assertIn("only the qwen3_5 MoE", why)
+
+        original = self.model.model.pipeline_size
+        self.model.model.pipeline_size = 2
+        try:
+            why = cd.model_is_compilable(self.model, self.model.make_cache())
+        finally:
+            self.model.model.pipeline_size = original
+        self.assertIn("pipeline-parallel", why)
+
+    def test_completion_receipt_requires_materialized_ack(self):
+        model = self.model
+        cache = model.make_cache()
+        mx.eval(model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache, buckets=(64, 128))
+        step = cd.CompiledDecodeStep(model, cache)
+        logits = step(mx.zeros((1, 1), mx.uint32))
+        with self.assertRaisesRegex(AssertionError, "unconfirmed"):
+            step.assert_single_trace()
+        with self.assertRaisesRegex(RuntimeError, "oldest compiled submission"):
+            step.materialize_and_confirm(mx.zeros_like(logits))
+        self.assertEqual(step.materialize_and_confirm(logits), 1)
+        self.assertTrue(step.assert_single_trace())
+        receipt = step.receipt()
+        self.assertEqual(sum(receipt["submission_counts"].values()), 1)
+        self.assertEqual(sum(receipt["completed_counts"].values()), 1)
+        self.assertEqual(receipt["pending"], 0)
+
+    def test_trace_failure_restores_state_and_poisons_the_step(self):
+        model = self.model
+        cache = model.make_cache()
+        mx.eval(model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache, buckets=(64, 128))
+        step = cd.CompiledDecodeStep(model, cache)
+        ring = next(c for c in cache if isinstance(c, RingKVCache))
+        before = (ring.keys, ring.values, ring.offset, ring._host_offset)
+
+        class FailingModel:
+            def __call__(self, x, cache):
+                del x
+                target = next(c for c in cache if isinstance(c, RingKVCache))
+                target._host_offset += 1
+                raise RuntimeError("synthetic trace failure")
+
+        step.model = FailingModel()
+        with mock.patch.object(mx, "compile", side_effect=lambda fn: fn):
+            with self.assertRaises(cd.CompiledDecodePoisoned):
+                step(mx.zeros((1, 1), mx.uint32))
+        self.assertIs(ring.keys, before[0])
+        self.assertIs(ring.values, before[1])
+        self.assertIs(ring.offset, before[2])
+        self.assertEqual(ring._host_offset, before[3])
+        with self.assertRaises(cd.CompiledDecodePoisoned):
+            step(mx.zeros((1, 1), mx.uint32))
+
+    def test_materialization_failure_poisons_pending_receipts(self):
+        model = self.model
+        cache = model.make_cache()
+        mx.eval(model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache, buckets=(64, 128))
+        step = cd.CompiledDecodeStep(model, cache)
+        logits = step(mx.zeros((1, 1), mx.uint32))
+        with mock.patch.object(
+            mx, "eval", side_effect=RuntimeError("synthetic async failure")
+        ):
+            with self.assertRaises(cd.CompiledDecodePoisoned):
+                step.materialize_and_confirm(logits)
+        receipt = step.receipt()
+        self.assertTrue(receipt["poisoned"])
+        self.assertEqual(receipt["pending"], 0)
+        self.assertEqual(sum(receipt["failure_counts"].values()), 1)
+        with self.assertRaisesRegex(AssertionError, "poisoned"):
+            step.assert_single_trace()
+
     def test_the_trace_runs_inside_a_precise_span(self):
         """Mechanism proof for the sigmoid cut: the flag must be set while
         the step is traced, or every eager sigmoid the step swallows would
@@ -527,7 +707,8 @@ class TestCompiledDecodeStep(unittest.TestCase):
 
         qn.gate_sigmoid = spy
         try:
-            mx.eval(step(mx.zeros((1, 1), mx.uint32)))
+            logits = step(mx.zeros((1, 1), mx.uint32))
+            step.materialize_and_confirm(logits)
         finally:
             qn.gate_sigmoid = orig
         self.assertTrue(seen, "no gated sigmoid ran during the trace")
@@ -554,35 +735,104 @@ class TestGenerateStepIntegration(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.bucket_env = mock.patch.dict(
+            os.environ, {"MLX_LM_RING_KV_BUCKETS": "64,128"}
+        )
+        cls.bucket_env.start()
         mx.random.seed(21)
         cls.model = _small_hybrid()
         cls.prompt = mx.random.randint(0, 512, (10,)).astype(mx.uint32)
 
+    def setUp(self):
+        # These tiny-model integration tests exercise research mechanics,
+        # not a checkpoint serving approval (covered by CPU admission tests).
+        self.qualification = mock.patch(
+            "mlx_lm.generate.compiled_decode_serving_reason", return_value=None
+        )
+        self.qualification.start()
+        self.addCleanup(self.qualification.stop)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.bucket_env.stop()
+
     def _generate(self, **kw):
         from mlx_lm.generate import generate_step
 
-        return [
-            t
-            for t, _ in generate_step(self.prompt, self.model, max_tokens=8, **kw)
-        ]
+        with mock.patch.dict(
+            os.environ,
+            {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": "class3-padded-sdpa-v1"},
+        ):
+            return [
+                t
+                for t, _ in generate_step(
+                    self.prompt, self.model, max_tokens=8, **kw
+                )
+            ]
 
     def test_flag_off_and_on_agree(self):
         eager = self._generate(compiled_decode=False)
         compiled = self._generate(compiled_decode=True)
         self.assertEqual(eager, compiled)
 
-    def test_flag_actually_converts_the_cache(self):
+    def test_private_cache_path_constructs_the_compiled_step(self):
+        generate_module = importlib.import_module("mlx_lm.generate")
+
+        real = generate_module.CompiledDecodeStep
+        with mock.patch.object(
+            generate_module, "CompiledDecodeStep", wraps=real
+        ) as construct:
+            self._generate(compiled_decode=True)
+        construct.assert_called_once()
+
+    def test_caller_owned_cache_is_not_converted(self):
         from mlx_lm.generate import generate_step
         from mlx_lm.models.cache import make_prompt_cache
 
         pc = make_prompt_cache(self.model)
-        list(
-            generate_step(
-                self.prompt, self.model, max_tokens=4, prompt_cache=pc,
-                compiled_decode=True,
+        status = {}
+        with mock.patch.dict(
+            os.environ,
+            {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": "class3-padded-sdpa-v1"},
+        ):
+            list(
+                generate_step(
+                    self.prompt,
+                    self.model,
+                    max_tokens=4,
+                    prompt_cache=pc,
+                    compiled_decode=True,
+                    _compiled_decode_status=status,
+                )
             )
-        )
-        self.assertTrue(any(isinstance(c, RingKVCache) for c in pc))
+        self.assertFalse(any(isinstance(c, RingKVCache) for c in pc))
+        self.assertTrue(any(type(c) is KVCache for c in pc))
+        self.assertFalse(status["used"])
+        self.assertIn("caller-owned", status["decline_reason"])
+
+    def test_server_request_private_cache_is_eligible_but_not_implicit(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models.cache import make_prompt_cache
+
+        pc = make_prompt_cache(self.model)
+        status = {}
+        with mock.patch.dict(
+            os.environ,
+            {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": "class3-padded-sdpa-v1"},
+        ):
+            list(
+                generate_step(
+                    self.prompt,
+                    self.model,
+                    max_tokens=4,
+                    prompt_cache=pc,
+                    compiled_decode=True,
+                    _prompt_cache_is_request_private=True,
+                    _compiled_decode_status=status,
+                )
+            )
+        self.assertTrue(status["used"])
+        self.assertTrue(any(type(c) is RingKVCache for c in pc))
 
     def test_flag_declines_with_kv_bits(self):
         from mlx_lm.generate import generate_step
@@ -602,21 +852,43 @@ class TestGenerateStepIntegration(unittest.TestCase):
         from mlx_lm.models.cache import make_prompt_cache
 
         pc = make_prompt_cache(self.model)
-        with mock.patch(
-            "mlx_lm.generate.CompiledDecodeStep",
-            side_effect=ValueError("synthetic setup failure"),
+        with (
+            mock.patch("mlx_lm.generate.make_prompt_cache", return_value=pc),
+            mock.patch(
+                "mlx_lm.generate.CompiledDecodeStep",
+                side_effect=ValueError("synthetic setup failure"),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"MLX_LM_COMPILED_DECODE_ACCEPTANCE": "class3-padded-sdpa-v1"},
+            ),
         ):
             list(
                 generate_step(
-                    self.prompt,
-                    self.model,
-                    max_tokens=4,
-                    prompt_cache=pc,
-                    compiled_decode=True,
+                    self.prompt, self.model, max_tokens=4, compiled_decode=True
                 )
             )
         self.assertTrue(any(type(c) is KVCache for c in pc))
         self.assertFalse(any(isinstance(c, RingKVCache) for c in pc))
+
+    def test_zero_token_request_does_not_construct_compiled_step(self):
+        from mlx_lm.generate import generate_step
+
+        with mock.patch(
+            "mlx_lm.generate.CompiledDecodeStep",
+            side_effect=AssertionError("compiled setup must be skipped"),
+        ):
+            self.assertEqual(
+                list(
+                    generate_step(
+                        self.prompt,
+                        self.model,
+                        max_tokens=0,
+                        compiled_decode=True,
+                    )
+                ),
+                [],
+            )
 
     def test_env_flag_is_off_by_default(self):
         self.assertNotIn("MLX_LM_COMPILED_DECODE", os.environ)
