@@ -45,20 +45,39 @@ Not covered, deliberately:
 """
 
 import os
+from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence
 
 import mlx.core as mx
 
-from .models.cache import ArraysCache, KVCache, RingKVCache
+from .models.cache import ArraysCache, KVCache, RingKVCache, _ring_buckets
 from .models.precise_ops import precise_span
 
 __all__ = [
     "CompiledDecodeStep",
+    "CompiledDecodePolicy",
     "compiled_decode_step",
     "compiled_decode_enabled",
+    "compiled_decode_context_policy",
     "model_is_compilable",
     "to_shape_stable_cache",
 ]
+
+
+_QUALIFIED_MODEL_PREFIXES = ("qwen3_5", "qwen3_next")
+_CONTEXT_POLICIES = ("short", "memory", "latency")
+_SHORT_CONTEXT_LIMIT = 4096
+_EXTENDED_CONTEXT_LIMIT = 16384
+_MAX_VARIANTS_LIMIT = 64
+
+
+@dataclass(frozen=True)
+class CompiledDecodePolicy:
+    """Resolved context limit and KV bucket choice for one request."""
+
+    name: str
+    max_context: int
+    buckets: tuple
 
 
 def compiled_decode_enabled() -> bool:
@@ -72,7 +91,79 @@ def compiled_decode_enabled() -> bool:
 
 
 def _max_variants() -> int:
-    return int(os.environ.get("MLX_LM_COMPILED_DECODE_MAX_VARIANTS", "16"))
+    raw = os.environ.get("MLX_LM_COMPILED_DECODE_MAX_VARIANTS", "16")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "MLX_LM_COMPILED_DECODE_MAX_VARIANTS must be an integer"
+        ) from exc
+    return _validate_max_variants(value)
+
+
+def _validate_max_variants(value: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= _MAX_VARIANTS_LIMIT
+    ):
+        raise ValueError(
+            f"max variants must be an integer between 1 and {_MAX_VARIANTS_LIMIT}"
+        )
+    return value
+
+
+def compiled_decode_context_policy(
+    context_tokens: int,
+    max_tokens: int,
+    policy: Optional[str] = None,
+):
+    """Return ``(decline_reason, policy)`` for a replay request.
+
+    ``short`` is the qualified default and stops at 4K. ``memory`` and
+    ``latency`` are explicit 16K profiles: the first keeps the 16384 bucket;
+    the second skips it and accepts the 32768-bucket memory cost. No profile
+    admits an unbounded completion.
+    """
+    policy = (
+        os.environ.get("MLX_LM_COMPILED_DECODE_CONTEXT_POLICY", "short")
+        if policy is None
+        else policy
+    ).strip().lower()
+    if policy not in _CONTEXT_POLICIES:
+        return (
+            "MLX_LM_COMPILED_DECODE_CONTEXT_POLICY must be one of "
+            + ", ".join(_CONTEXT_POLICIES),
+            None,
+        )
+    if context_tokens < 0:
+        return "negative context length", None
+    if max_tokens < 0:
+        return "an unbounded completion", None
+
+    projected = context_tokens + max_tokens
+    limit = (
+        _SHORT_CONTEXT_LIMIT
+        if policy == "short"
+        else _EXTENDED_CONTEXT_LIMIT
+    )
+    if projected > limit:
+        return (
+            f"projected context {projected} exceeds the {policy} profile "
+            f"limit of {limit}",
+            None,
+        )
+
+    try:
+        buckets = _ring_buckets()
+    except (TypeError, ValueError) as exc:
+        return str(exc), None
+    if policy == "latency":
+        # The 16384 SDPA operating point is slow on the qualified 35B model.
+        # Make the 2x memory choice local to this request instead of changing
+        # RingKVCache's global, memory-efficient default.
+        buckets = tuple(sorted((set(buckets) - {16384}) | {32768}))
+    return None, CompiledDecodePolicy(policy, limit, buckets)
 
 
 # --------------------------------------------------------------------------
@@ -80,34 +171,70 @@ def _max_variants() -> int:
 # --------------------------------------------------------------------------
 
 
-def to_shape_stable_cache(cache: List[Any], buckets=None) -> List[Any]:
+def to_shape_stable_cache(
+    cache: List[Any], buckets=None, *, in_place: bool = True
+) -> List[Any]:
     """Return ``cache`` with every ``KVCache`` swapped for a ``RingKVCache``.
 
-    In place for the list: the caller's list object is mutated so any other
-    holder of it (a server session, a prompt-cache entry) sees the swap.
+    By default the caller's list object is mutated so any other holder of it
+    (a server session, a prompt-cache entry) sees the swap. ``in_place=False``
+    returns a candidate list without committing it, for transactional setup.
     ``ArraysCache`` entries pass through -- they are already fixed-shape.
     Raises for any other cache type, because silently leaving a growing
     cache in the list would make the compiled step wrong rather than slow.
     """
     for i, c in enumerate(cache):
         if isinstance(c, RingKVCache):
+            if buckets is not None and tuple(c.buckets) != tuple(buckets):
+                raise TypeError(
+                    f"RingKVCache at cache[{i}] uses a different bucket policy"
+                )
             continue
-        if type(c) is KVCache:
-            cache[i] = RingKVCache.from_kv_cache(c, buckets=buckets)
-        elif isinstance(c, ArraysCache):
+        if type(c) is KVCache or isinstance(c, ArraysCache):
             continue
-        else:
-            raise TypeError(
-                f"{type(c).__name__} at cache[{i}] is not shape-stable; "
-                "compiled decode supports KVCache/RingKVCache and ArraysCache"
-            )
-    return cache
+        raise TypeError(
+            f"{type(c).__name__} at cache[{i}] is not shape-stable; "
+            "compiled decode supports KVCache/RingKVCache and ArraysCache"
+        )
+
+    # Build every replacement before changing the caller's list. Allocation
+    # or conversion failure must leave an eager prompt cache untouched.
+    converted = [
+        RingKVCache.from_kv_cache(c, buckets=buckets) if type(c) is KVCache else c
+        for c in cache
+    ]
+    if in_place:
+        cache[:] = converted
+        return cache
+    return converted
 
 
-def model_is_compilable(cache: Sequence[Any]) -> Optional[str]:
-    """``None`` if this cache list can drive a compiled step, else why not."""
+def _model_type(model) -> str:
+    value = getattr(model, "model_type", None)
+    if value is None:
+        value = getattr(getattr(model, "args", None), "model_type", None)
+    return value if isinstance(value, str) else ""
+
+
+def model_is_compilable(model, cache: Sequence[Any]) -> Optional[str]:
+    """``None`` if this model/cache pair can drive a compiled step."""
+    model_type = _model_type(model)
+    qualified_family = any(
+        model_type == prefix or model_type.startswith(prefix + "_")
+        for prefix in _QUALIFIED_MODEL_PREFIXES
+    )
+    if not (
+        qualified_family
+        and getattr(model, "supports_compiled_decode_replay", False) is True
+    ):
+        return (
+            f"model type {model_type or type(model).__name__!r} has not been "
+            "qualified for compiled replay"
+        )
+    has_kv = False
     for i, c in enumerate(cache):
         if isinstance(c, RingKVCache) or type(c) is KVCache:
+            has_kv = True
             continue
         if isinstance(c, ArraysCache):
             if getattr(c, "lengths", None) is not None:
@@ -121,6 +248,8 @@ def model_is_compilable(cache: Sequence[Any]) -> Optional[str]:
                 return f"cache[{i}] has not been filled by a forward yet"
             continue
         return f"cache[{i}] is a {type(c).__name__}, which is not shape-stable"
+    if not has_kv:
+        return "model has no full-attention KV cache"
     return None
 
 
@@ -229,19 +358,42 @@ class CompiledDecodeStep:
     ``assert_single_trace``.
     """
 
-    def __init__(self, model, cache, *, max_variants: Optional[int] = None):
-        why = model_is_compilable(cache)
+    def __init__(
+        self,
+        model,
+        cache,
+        *,
+        max_variants: Optional[int] = None,
+        context_policy: Optional[CompiledDecodePolicy] = None,
+    ):
+        self.max_variants = (
+            _max_variants()
+            if max_variants is None
+            else _validate_max_variants(max_variants)
+        )
+        why = model_is_compilable(model, cache)
         if why is not None:
             raise TypeError(f"compiled decode is not available: {why}")
         self.model = model
         self.cache = cache
         self.plan = _plan(cache)
         self._ring_slots = [s for s in self.plan if isinstance(s, _RingSlot)]
+        if not self._ring_slots:
+            raise TypeError(
+                "compiled decode requires at least one full-attention KV cache"
+            )
+        if context_policy is None:
+            context_tokens = max(s.cache.size() for s in self._ring_slots)
+            why, context_policy = compiled_decode_context_policy(context_tokens, 0)
+            if why is not None:
+                raise ValueError(f"compiled decode is not available: {why}")
+        elif not isinstance(context_policy, CompiledDecodePolicy):
+            raise TypeError("context_policy must be a CompiledDecodePolicy")
+        self.context_policy = context_policy
         self._capacities = ()
         self._variants = {}
         self.trace_counts = {}
         self.replay_counts = {}
-        self.max_variants = _max_variants() if max_variants is None else max_variants
 
     # -- keying ---------------------------------------------------------
 
@@ -282,7 +434,11 @@ class CompiledDecodeStep:
             counts[key] += 1
             for slot, (lo, hi) in zip(plan, splits):
                 slot.install(state[lo:hi])
-            logits = model(x, cache=self.cache)
+            # This Python body runs only while mx.compile traces a variant.
+            # Replays call the compiled graph directly and never enter the
+            # precision-routing context.
+            with precise_span():
+                logits = model(x, cache=self.cache)
             out = []
             for slot in plan:
                 out.extend(slot.collect())
@@ -290,11 +446,29 @@ class CompiledDecodeStep:
 
         return mx.compile(fn), splits
 
+    def _evict_all(self):
+        """Drop graphs and their per-live-variant trace receipts together."""
+        stale = tuple(self._variants)
+        self._variants.clear()
+        for key in stale:
+            self.trace_counts.pop(key, None)
+            self.replay_counts.pop(key, None)
+
     # -- call -----------------------------------------------------------
 
     def __call__(self, x: mx.array) -> mx.array:
         self._guard()
+        if x.ndim != 2 or x.shape[0] != 1 or x.shape[1] != 1:
+            raise ValueError(
+                "compiled decode is qualified only for batch 1, width 1"
+            )
         width = x.shape[1]
+        position = max(s.cache.size() for s in self._ring_slots)
+        if position + width > self.context_policy.max_context:
+            raise RuntimeError(
+                f"compiled decode reached the {self.context_policy.name} "
+                f"profile limit of {self.context_policy.max_context} tokens"
+            )
         # Grow every slab *before* keying the variant: the mask is built
         # from ``capacity`` at the top of the forward, so a growth inside
         # the traced step would leave the mask narrower than the keys.
@@ -310,7 +484,7 @@ class CompiledDecodeStep:
             if len(self._variants) >= self.max_variants:
                 # Bounded: every live variant pins a compiled graph. Drop the
                 # whole table rather than guess which one is cold.
-                self._variants.clear()
+                self._evict_all()
             entry = self._build(key)
             self._variants[key] = entry
         compiled, splits = entry
@@ -320,15 +494,7 @@ class CompiledDecodeStep:
         for slot in self.plan:
             state.extend(slot.collect())
             host.append(slot.host_state())
-        # Trace inside a precise span: mx.compile emits a runtime-built
-        # kernel for every elementwise chain it fuses, and MLX's Sigmoid
-        # struct resolves its unqualified metal::exp to the FAST
-        # approximation there (precise in the offline metallib). Any eager
-        # mx.sigmoid this step swallows would be less accurate than the
-        # eager path, not merely reordered -- see models/precise_ops.py.
-        # The flag is read only while tracing, so replays pay nothing.
-        with precise_span():
-            out = compiled(x, *state)
+        out = compiled(x, *state)
         logits, new_state = out[0], out[1:]
         for slot, (lo, hi), snap in zip(self.plan, splits, host):
             slot.install(new_state[lo:hi])
@@ -362,9 +528,22 @@ def compiled_decode_step(model, cache, width=None, capacity=None):
     KV slabs that state cannot be rewound. The trace is paid on the first
     real step, once per (width, capacity) variant.
     """
+    if width not in (None, 1):
+        raise ValueError("compiled decode is qualified only for width 1")
     step = CompiledDecodeStep(model, cache)
-    del width
     if capacity is not None:
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity <= 0
+        ):
+            raise ValueError("capacity must be a positive integer")
+        if capacity > step.context_policy.max_context:
+            raise ValueError(
+                f"capacity {capacity} exceeds the "
+                f"{step.context_policy.name} profile limit of "
+                f"{step.context_policy.max_context}"
+            )
         for c in cache:
             if isinstance(c, RingKVCache):
                 c.reserve(max(0, capacity - c.size()))

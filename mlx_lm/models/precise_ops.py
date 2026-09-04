@@ -36,6 +36,9 @@ upstream, so they use the fast form in *both* arms. Making them precise would
 move the stock digest instead of matching it.
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import mlx.core as mx
 
 __all__ = ["sigmoid", "gate_sigmoid", "precise_span", "PRECISE_DTYPES"]
@@ -81,28 +84,23 @@ def sigmoid(x: mx.array) -> mx.array:
 
 # Set only while a compiled decode step is being traced. Read at trace time,
 # so the choice is baked into the replayed graph and costs nothing per step.
-_IN_PRECISE_SPAN = False
+_IN_PRECISE_SPAN = ContextVar("mlx_lm_in_precise_span", default=False)
 
 
-class precise_span:
+@contextmanager
+def precise_span():
     """Route :func:`gate_sigmoid` to the precise kernel inside this block."""
-
-    def __enter__(self):
-        global _IN_PRECISE_SPAN
-        self._prev = _IN_PRECISE_SPAN
-        _IN_PRECISE_SPAN = True
-        return self
-
-    def __exit__(self, *exc):
-        global _IN_PRECISE_SPAN
-        _IN_PRECISE_SPAN = self._prev
-        return False
+    token = _IN_PRECISE_SPAN.set(True)
+    try:
+        yield
+    finally:
+        _IN_PRECISE_SPAN.reset(token)
 
 
 def in_precise_span() -> bool:
-    return _IN_PRECISE_SPAN
+    return _IN_PRECISE_SPAN.get()
 
 
 def gate_sigmoid(x: mx.array) -> mx.array:
     """``mx.sigmoid``, except inside a traced span where it would lose bits."""
-    return sigmoid(x) if _IN_PRECISE_SPAN else mx.sigmoid(x)
+    return sigmoid(x) if _IN_PRECISE_SPAN.get() else mx.sigmoid(x)

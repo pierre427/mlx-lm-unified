@@ -22,6 +22,7 @@ from transformers import PreTrainedTokenizer
 from .batch_admission import AdmissionState, LinearStateCost, StateBudget
 from .compiled_decode import (
     CompiledDecodeStep,
+    compiled_decode_context_policy,
     compiled_decode_enabled,
     model_is_compilable,
     to_shape_stable_cache,
@@ -531,7 +532,10 @@ def generate_step(
           converted to ``RingKVCache`` after prefill. ``None`` reads
           ``MLX_LM_COMPILED_DECODE``; the default is off. Silently declined
           (decode stays eager) when the cache cannot be made shape-stable, or
-          with ``kv_bits``/``max_kv_size``/input embeddings.
+          with ``kv_bits``/``max_kv_size``/input embeddings. The default
+          context policy is limited to 4096 tokens. The explicit ``memory``
+          and ``latency`` policies extend that to 16384 while keeping or
+          skipping the 16384 KV bucket, respectively.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -605,14 +609,34 @@ def generate_step(
             return "max_kv_size (rotating caches are not shape-stable)"
         if input_embeddings is not None:
             return "input embeddings"
-        try:
-            to_shape_stable_cache(prompt_cache)
-        except TypeError as e:
-            return str(e)
-        why = model_is_compilable(prompt_cache)
+        why = model_is_compilable(model, prompt_cache)
         if why is not None:
             return why
-        compiled_step = CompiledDecodeStep(model, prompt_cache)
+        context_tokens = max(
+            (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+        )
+        why, policy = compiled_decode_context_policy(
+            context_tokens, max_tokens
+        )
+        if why is not None:
+            return why
+        try:
+            converted_cache = to_shape_stable_cache(
+                prompt_cache, buckets=policy.buckets, in_place=False
+            )
+            # Materialize the candidate before publishing it. Ring conversion
+            # is lazy in MLX, so allocation/copy failures would otherwise
+            # surface only after the caller-owned cache had been replaced.
+            mx.eval([c.state for c in converted_cache])
+            compiled_step = CompiledDecodeStep(
+                model, converted_cache, context_policy=policy
+            )
+        except (TypeError, ValueError, RuntimeError) as e:
+            return str(e)
+        prompt_cache[:] = converted_cache
+        # The slot plan holds the same cache objects. Point model calls at the
+        # caller-owned list only after the whole setup transaction succeeds.
+        compiled_step.cache = prompt_cache
         return None
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):

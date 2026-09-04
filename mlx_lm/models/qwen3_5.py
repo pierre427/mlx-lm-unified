@@ -640,6 +640,8 @@ class MTPModule(nn.Module):
 
 
 class TextModel(nn.Module):
+    supports_compiled_decode_replay = True
+
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
@@ -779,6 +781,7 @@ class Model(nn.Module):
     # speculative decoding, making the hybrid cache trimmable (see
     # GatedDeltaNet.__call__ and ArraysCache.record_rollback).
     supports_speculative_rollback = True
+    supports_compiled_decode_replay = True
 
     def __init__(self, args: ModelArgs):
         super().__init__()

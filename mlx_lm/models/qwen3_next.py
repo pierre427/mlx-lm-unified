@@ -1404,6 +1404,7 @@ class Model(nn.Module):
     # speculative decoding, making the hybrid cache trimmable (see
     # Qwen3NextGatedDeltaNet.__call__ and ArraysCache.record_rollback).
     supports_speculative_rollback = True
+    supports_compiled_decode_replay = True
 
     def __init__(self, args: ModelArgs):
         super().__init__()

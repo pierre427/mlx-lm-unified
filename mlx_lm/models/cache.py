@@ -1229,7 +1229,21 @@ class RingKVCache(_BaseCache):
     """
 
     def __init__(self, capacity: Optional[int] = None, buckets=None):
-        self.buckets = tuple(buckets) if buckets is not None else _ring_buckets()
+        resolved = tuple(buckets) if buckets is not None else _ring_buckets()
+        if not resolved or any(not isinstance(b, int) or b <= 0 for b in resolved):
+            raise ValueError("RingKVCache buckets must be positive integers")
+        resolved = tuple(sorted(set(resolved)))
+        if capacity is not None:
+            if (
+                not isinstance(capacity, int)
+                or isinstance(capacity, bool)
+                or capacity <= 0
+            ):
+                raise ValueError("RingKVCache capacity must be a positive integer")
+            resolved = tuple(
+                sorted({capacity, *(b for b in resolved if b >= capacity)})
+            )
+        self.buckets = resolved
         self.keys = None
         self.values = None
         self.capacity = 0

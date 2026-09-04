@@ -17,7 +17,9 @@ reduction). Tests that need that property pin small capacity buckets.
 import inspect
 import os
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -43,6 +45,16 @@ def _kv(B=1, H=2, S=1, D=8, dtype=mx.float32, seed=None):
 
 
 class TestRingKVCache(unittest.TestCase):
+    def test_capacity_is_the_minimum_first_bucket(self):
+        ring = RingKVCache(capacity=10, buckets=(4, 8, 16, 32))
+        self.assertEqual(ring.buckets, (10, 16, 32))
+        self.assertEqual(ring._bucket_for(1), 10)
+
+    def test_invalid_capacity_is_rejected(self):
+        for capacity in (0, -1, True, 1.5):
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                RingKVCache(capacity=capacity)
+
     def test_writes_match_kv_cache(self):
         """Same keys and values land at the same positions as KVCache."""
         mx.random.seed(3)
@@ -260,6 +272,21 @@ class TestPreciseSigmoid(unittest.TestCase):
         self.assertFalse(precise_ops.in_precise_span())
         self.assertTrue(mx.array_equal(mx.sigmoid(x), inside))
 
+    def test_span_is_nested_and_context_local(self):
+        seen = []
+        with precise_ops.precise_span():
+            self.assertTrue(precise_ops.in_precise_span())
+            with precise_ops.precise_span():
+                self.assertTrue(precise_ops.in_precise_span())
+            self.assertTrue(precise_ops.in_precise_span())
+            thread = threading.Thread(
+                target=lambda: seen.append(precise_ops.in_precise_span())
+            )
+            thread.start()
+            thread.join()
+        self.assertFalse(precise_ops.in_precise_span())
+        self.assertEqual(seen, [False])
+
 
 def _small_hybrid(n_layers=4, hidden=256, vocab=512):
     """A tiny qwen3_5 hybrid: GDN layers plus one full-attention layer."""
@@ -351,13 +378,14 @@ class TestCompiledDecodeStep(unittest.TestCase):
                 self.assertTrue(mx.array_equal(a.values, b.values))
         step.assert_single_trace()
 
-    def test_compiled_matches_eager_at_width_3(self):
-        ref_t, ref_l, _, _ = self._run("ring", width=3)
-        cmp_t, cmp_l, _, step = self._run("compiled", width=3)
-        self.assertEqual(ref_t, cmp_t)
-        for a, b in zip(ref_l, cmp_l):
-            self.assertTrue(mx.array_equal(a, b))
-        step.assert_single_trace()
+    def test_refuses_width_3(self):
+        model = self.model
+        cache = model.make_cache()
+        mx.eval(model(self.prompt, cache))
+        cd.to_shape_stable_cache(cache, buckets=(64, 128))
+        step = cd.CompiledDecodeStep(model, cache)
+        with self.assertRaisesRegex(ValueError, "batch 1, width 1"):
+            step(mx.zeros((1, 3), mx.uint32))
 
     def test_one_trace_per_variant(self):
         """The mechanism proof: N steps, one trace, N-1 replays."""
@@ -379,17 +407,14 @@ class TestCompiledDecodeStep(unittest.TestCase):
         step.assert_single_trace()
         self.assertEqual(sum(step.replay_counts.values()), n)
 
-    def test_width_change_makes_a_new_variant(self):
+    def test_refuses_batch_2(self):
         model = self.model
         cache = model.make_cache()
         mx.eval(model(self.prompt, cache))
         cd.to_shape_stable_cache(cache, buckets=(64, 128))
         step = cd.CompiledDecodeStep(model, cache)
-        mx.eval(step(mx.zeros((1, 1), mx.uint32)))
-        mx.eval(step(mx.zeros((1, 3), mx.uint32)))
-        mx.eval(step(mx.zeros((1, 1), mx.uint32)))
-        self.assertEqual(step.n_variants, 2)
-        step.assert_single_trace()
+        with self.assertRaisesRegex(ValueError, "batch 1, width 1"):
+            step(mx.zeros((2, 1), mx.uint32))
 
     def test_refuses_a_speculating_cache(self):
         model = self.model
@@ -410,6 +435,77 @@ class TestCompiledDecodeStep(unittest.TestCase):
             cd.CompiledDecodeStep(self.model, [RotatingKVCache(max_size=8)])
         with self.assertRaises(TypeError):
             cd.to_shape_stable_cache([RotatingKVCache(max_size=8)])
+
+    def test_mixed_cache_decline_is_atomic(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        kv = KVCache()
+        rotating = RotatingKVCache(max_size=8)
+        caches = [kv, rotating]
+        with self.assertRaises(TypeError):
+            cd.to_shape_stable_cache(caches)
+        self.assertIs(caches[0], kv)
+        self.assertIs(caches[1], rotating)
+
+    def test_unqualified_model_is_rejected_before_cache_conversion(self):
+        class Unsupported:
+            model_type = "gpt_oss"
+
+        class UnprovenQwen:
+            model_type = "qwen3_5"
+
+        for model in (Unsupported(), UnprovenQwen()):
+            why = cd.model_is_compilable(model, [KVCache()])
+            self.assertIn("has not been qualified", why)
+
+    def test_max_variants_is_bounded_and_eviction_clears_receipts(self):
+        for value in (0, 65, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cd.CompiledDecodeStep(self.model, [], max_variants=value)
+
+        step = cd.CompiledDecodeStep.__new__(cd.CompiledDecodeStep)
+        step._variants = {"old": object()}
+        step.trace_counts = {"old": 1}
+        step.replay_counts = {"old": 9}
+        step._evict_all()
+        self.assertEqual(step._variants, {})
+        self.assertEqual(step.trace_counts, {})
+        self.assertEqual(step.replay_counts, {})
+
+    def test_context_policy_keeps_the_16k_tradeoff_explicit(self):
+        default_buckets = (2048, 4096, 8192, 16384, 32768, 65536)
+        with mock.patch.object(cd, "_ring_buckets", return_value=default_buckets):
+            why, policy = cd.compiled_decode_context_policy(4000, 96, "short")
+            self.assertIsNone(why)
+            self.assertEqual(policy.max_context, 4096)
+            self.assertIn(4096, policy.buckets)
+
+            why, _ = cd.compiled_decode_context_policy(4000, 97, "short")
+            self.assertIn("exceeds", why)
+            why, _ = cd.compiled_decode_context_policy(1, -1, "short")
+            self.assertIn("unbounded", why)
+
+            why, memory = cd.compiled_decode_context_policy(
+                8000, 8000, "memory"
+            )
+            self.assertIsNone(why)
+            self.assertEqual(memory.max_context, 16384)
+            self.assertIn(16384, memory.buckets)
+            why, latency = cd.compiled_decode_context_policy(
+                8000, 8000, "latency"
+            )
+            self.assertIsNone(why)
+            self.assertNotIn(16384, latency.buckets)
+            self.assertIn(32768, latency.buckets)
+
+    def test_invalid_context_policy_declines(self):
+        with mock.patch.dict(
+            os.environ,
+            {"MLX_LM_COMPILED_DECODE_CONTEXT_POLICY": "surprise"},
+        ):
+            why, buckets = cd.compiled_decode_context_policy(1, 1)
+        self.assertIn("must be one of", why)
+        self.assertIsNone(buckets)
 
     def test_the_trace_runs_inside_a_precise_span(self):
         """Mechanism proof for the sigmoid cut: the flag must be set while
@@ -499,6 +595,27 @@ class TestGenerateStepIntegration(unittest.TestCase):
                 compiled_decode=True, kv_bits=8, quantized_kv_start=0,
             )
         )
+        self.assertFalse(any(isinstance(c, RingKVCache) for c in pc))
+
+    def test_setup_failure_leaves_prompt_cache_eager(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models.cache import make_prompt_cache
+
+        pc = make_prompt_cache(self.model)
+        with mock.patch(
+            "mlx_lm.generate.CompiledDecodeStep",
+            side_effect=ValueError("synthetic setup failure"),
+        ):
+            list(
+                generate_step(
+                    self.prompt,
+                    self.model,
+                    max_tokens=4,
+                    prompt_cache=pc,
+                    compiled_decode=True,
+                )
+            )
+        self.assertTrue(any(type(c) is KVCache for c in pc))
         self.assertFalse(any(isinstance(c, RingKVCache) for c in pc))
 
     def test_env_flag_is_off_by_default(self):
