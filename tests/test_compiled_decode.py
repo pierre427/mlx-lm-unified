@@ -208,7 +208,7 @@ def _small_hybrid(n_layers=4, hidden=256, vocab=512):
         intermediate_size=hidden * 2,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=32,
+        head_dim=64,
         rms_norm_eps=1e-6,
         vocab_size=vocab,
         linear_num_key_heads=2,
@@ -361,6 +361,59 @@ class TestCompiledDecodeStep(unittest.TestCase):
         )
         for banned in (".item(", ".tolist(", "mx.eval", "async_eval", "synchronize"):
             self.assertNotIn(banned, src, f"{banned} in the traced step body")
+
+
+class TestGenerateStepIntegration(unittest.TestCase):
+    """The opt-in flag on generate_step: same tokens, compiled path taken."""
+
+    @classmethod
+    def setUpClass(cls):
+        mx.random.seed(21)
+        cls.model = _small_hybrid()
+        cls.prompt = mx.random.randint(0, 512, (10,)).astype(mx.uint32)
+
+    def _generate(self, **kw):
+        from mlx_lm.generate import generate_step
+
+        return [
+            t
+            for t, _ in generate_step(self.prompt, self.model, max_tokens=8, **kw)
+        ]
+
+    def test_flag_off_and_on_agree(self):
+        eager = self._generate(compiled_decode=False)
+        compiled = self._generate(compiled_decode=True)
+        self.assertEqual(eager, compiled)
+
+    def test_flag_actually_converts_the_cache(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models.cache import make_prompt_cache
+
+        pc = make_prompt_cache(self.model)
+        list(
+            generate_step(
+                self.prompt, self.model, max_tokens=4, prompt_cache=pc,
+                compiled_decode=True,
+            )
+        )
+        self.assertTrue(any(isinstance(c, RingKVCache) for c in pc))
+
+    def test_flag_declines_with_kv_bits(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models.cache import make_prompt_cache
+
+        pc = make_prompt_cache(self.model)
+        list(
+            generate_step(
+                self.prompt, self.model, max_tokens=4, prompt_cache=pc,
+                compiled_decode=True, kv_bits=8, quantized_kv_start=0,
+            )
+        )
+        self.assertFalse(any(isinstance(c, RingKVCache) for c in pc))
+
+    def test_env_flag_is_off_by_default(self):
+        self.assertNotIn("MLX_LM_COMPILED_DECODE", os.environ)
+        self.assertFalse(cd.compiled_decode_enabled())
 
 
 if __name__ == "__main__":

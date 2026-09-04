@@ -20,6 +20,12 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .batch_admission import AdmissionState, LinearStateCost, StateBudget
+from .compiled_decode import (
+    CompiledDecodeStep,
+    compiled_decode_enabled,
+    model_is_compilable,
+    to_shape_stable_cache,
+)
 from .models import cache
 from .models.cache import (
     ArraysCache,
@@ -481,6 +487,7 @@ def generate_step(
     input_embeddings: Optional[mx.array] = None,
     kv_key_bits: Optional[int] = None,
     kv_value_bits: Optional[int] = None,
+    compiled_decode: Optional[bool] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -518,6 +525,13 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        compiled_decode (bool, optional): Trace the width-1 decode step once
+          with ``mx.compile`` and replay it, instead of rebuilding its graph
+          every token. Needs shape-stable caches, so the KV caches are
+          converted to ``RingKVCache`` after prefill. ``None`` reads
+          ``MLX_LM_COMPILED_DECODE``; the default is off. Silently declined
+          (decode stays eager) when the cache cannot be made shape-stable, or
+          with ``kv_bits``/``max_kv_size``/input embeddings.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -574,13 +588,41 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
+    if compiled_decode is None:
+        compiled_decode = compiled_decode_enabled()
+    compiled_step = None
+
+    def _try_compiled_decode():
+        """Swap the decode step for a compiled replay, or say why not.
+
+        Declining is the normal outcome for anything this does not cover; the
+        caller gets the eager path and a debug line, never an exception.
+        """
+        nonlocal compiled_step
+        if kv_bits is not None:
+            return "kv_bits (a quantized cache is not shape-stable)"
+        if max_kv_size is not None:
+            return "max_kv_size (rotating caches are not shape-stable)"
+        if input_embeddings is not None:
+            return "input embeddings"
+        try:
+            to_shape_stable_cache(prompt_cache)
+        except TypeError as e:
+            return str(e)
+        why = model_is_compilable(prompt_cache)
+        if why is not None:
+            return why
+        compiled_step = CompiledDecodeStep(model, prompt_cache)
+        return None
+
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
             )
-        else:
-            return model(input_tokens, cache=prompt_cache)
+        if compiled_step is not None:
+            return compiled_step(input_tokens)
+        return model(input_tokens, cache=prompt_cache)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
@@ -683,6 +725,12 @@ def generate_step(
             )
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+
+        if compiled_decode:
+            mx.eval([c.state for c in prompt_cache])
+            declined = _try_compiled_decode()
+            if declined:
+                logging.debug("compiled decode declined: %s", declined)
 
     mx.async_eval(y, logprobs)
     n = 0

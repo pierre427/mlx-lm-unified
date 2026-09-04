@@ -1384,6 +1384,15 @@ class RingKVCache(_BaseCache):
 
     # -- interop --------------------------------------------------------
 
+    kv_quantization_unsupported = (
+        "A quantized slab would have to be re-packed on every write, which is "
+        "what the fixed-shape layout exists to avoid. Convert back with "
+        "to_kv_cache() first, or drop kv_bits."
+    )
+
+    def to_quantized(self, *args, **kwargs):
+        raise NotImplementedError(self.kv_quantization_unsupported)
+
     @classmethod
     def from_kv_cache(cls, cache, buckets=None):
         """Adopt a stock ``KVCache``'s contents into a shape-stable slab."""
