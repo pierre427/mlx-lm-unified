@@ -640,6 +640,11 @@ class MTPModule(nn.Module):
 
 
 class TextModel(nn.Module):
+    # Exact admission token consumed by mlx_lm.compiled_decode.  Keep this
+    # scoped to the qwen3_5 MoE topology; dense and sibling families require
+    # their own production-cache numerical qualification.
+    supports_compiled_decode_replay = "qwen3_5_moe_m1_v1"
+
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
@@ -779,6 +784,7 @@ class Model(nn.Module):
     # speculative decoding, making the hybrid cache trimmable (see
     # GatedDeltaNet.__call__ and ArraysCache.record_rollback).
     supports_speculative_rollback = True
+    supports_compiled_decode_replay = "qwen3_5_moe_m1_v1"
 
     def __init__(self, args: ModelArgs):
         super().__init__()

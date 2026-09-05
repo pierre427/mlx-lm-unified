@@ -588,6 +588,22 @@ def load_model(
             except Exception:  # never let eviction block a load
                 pass
 
+    if strict:
+        from .compiled_qualification import (
+            SERVING_QUALIFICATIONS, bind_serving_qualification, runtime_identity,
+        )
+
+        if SERVING_QUALIFICATIONS or os.environ.get("MLX_LM_COMPILED_DECODE_QUALIFICATION"):
+            try:
+                bind_serving_qualification(
+                    model, config, weight_files, runtime=runtime_identity(mx),
+                    parameters=tree_flatten(model.parameters()),
+                )
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+                # Bad qualification refuses replay, not ordinary eager loading.
+                model._compiled_decode_serving_binding = None
+                model._compiled_decode_qualification_error = str(error)
+
     return model, config
 
 

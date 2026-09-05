@@ -20,6 +20,16 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .batch_admission import AdmissionState, LinearStateCost, StateBudget
+from .compiled_decode import (
+    CompiledDecodePoisoned,
+    CompiledDecodeStep,
+    compiled_decode_context_policy,
+    compiled_decode_enabled,
+    compiled_decode_numerics_accepted,
+    compiled_decode_serving_reason,
+    model_is_compilable,
+    to_shape_stable_cache,
+)
 from .models import cache
 from .models.cache import (
     ArraysCache,
@@ -481,6 +491,9 @@ def generate_step(
     input_embeddings: Optional[mx.array] = None,
     kv_key_bits: Optional[int] = None,
     kv_value_bits: Optional[int] = None,
+    compiled_decode: Optional[bool] = None,
+    _prompt_cache_is_request_private: bool = False,
+    _compiled_decode_status: Optional[dict] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -518,6 +531,23 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        compiled_decode (bool, optional): Trace the width-1 decode step once
+          with ``mx.compile`` and replay it, instead of rebuilding its graph
+          every token. Request-private KV caches are converted to
+          ``RingKVCache`` after prefill; caller-owned prompt caches are declined
+          so the numerical/performance class cannot leak into later requests.
+          ``None`` reads ``MLX_LM_COMPILED_DECODE``; the default is on for
+          width-1 decode (``0`` opts out). With the default class-1 bucket
+          ladder (1023 and 1024 present) no numerical acceptance is needed;
+          a custom ladder without them needs
+          ``MLX_LM_COMPILED_DECODE_ACCEPTANCE=class3-padded-sdpa-v1`` to
+          record explicit acceptance of the padded-SDPA reorder. The
+          loader also requires an operator-approved checkpoint manifest at
+          ``MLX_LM_COMPILED_DECODE_QUALIFICATION``; family eligibility alone
+          is only for direct ``CompiledDecodeStep`` research. The
+          default context policy is limited to 4096 tokens. Explicit ``memory``
+          and ``latency`` policies extend that to 16384 while keeping or
+          skipping the 16384 KV bucket, respectively.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -539,6 +569,22 @@ def generate_step(
         )
 
     tokens = None
+
+    # Compiled replay currently owns its shape-stable cache for the whole
+    # request.  Do not silently replace a caller-owned/session cache: doing so
+    # would leak RingKVCache's mask cost and numerical class into later eager
+    # requests.
+    if _prompt_cache_is_request_private and prompt_cache is None:
+        raise ValueError("a request-private prompt cache must be provided")
+    caller_supplied_prompt_cache = (
+        prompt_cache is not None and not _prompt_cache_is_request_private
+    )
+    if _compiled_decode_status is not None:
+        _compiled_decode_status.update(
+            used=False,
+            request_private=bool(_prompt_cache_is_request_private),
+            decline_reason=None,
+        )
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -574,13 +620,86 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
+    if compiled_decode is None:
+        compiled_decode = compiled_decode_enabled()
+    compiled_step = None
+
+    def _try_compiled_decode():
+        """Swap the decode step for a compiled replay, or say why not.
+
+        Declining is the normal outcome for anything this does not cover; the
+        caller gets the eager path and a debug line, never an exception.
+        """
+        nonlocal compiled_step
+        if kv_bits is not None:
+            return "kv_bits (a quantized cache is not shape-stable)"
+        if max_kv_size is not None:
+            return "max_kv_size (rotating caches are not shape-stable)"
+        if input_embeddings is not None:
+            return "input embeddings"
+        if caller_supplied_prompt_cache:
+            return (
+                "caller-owned prompt_cache "
+                "(compiled replay requires a private cache)"
+            )
+        why = model_is_compilable(model, prompt_cache)
+        if why is not None:
+            return why
+        context_tokens = max(
+            (c.size() for c in prompt_cache if hasattr(c, "size")), default=0
+        )
+        why, policy = compiled_decode_context_policy(
+            context_tokens, max_tokens
+        )
+        if why is not None:
+            return why
+        if not compiled_decode_numerics_accepted(policy):
+            return (
+                "this bucket ladder is not the class-1 ladder (1023 and 1024 "
+                "present) and the padded-SDPA class-3 reorder has not been "
+                "accepted; set MLX_LM_COMPILED_DECODE_ACCEPTANCE="
+                "class3-padded-sdpa-v1 only after the production-model "
+                "numerical gate passes"
+            )
+        why = compiled_decode_serving_reason(model, policy)
+        if why is not None:
+            return why
+        try:
+            converted_cache = to_shape_stable_cache(
+                prompt_cache, buckets=policy.buckets, in_place=False
+            )
+            # Materialize the candidate before publishing it. Ring conversion
+            # is lazy in MLX, so allocation/copy failures would otherwise
+            # surface only after the caller-owned cache had been replaced.
+            mx.eval([c.state for c in converted_cache])
+            compiled_step = CompiledDecodeStep(
+                model, converted_cache, context_policy=policy
+            )
+        except (TypeError, ValueError, RuntimeError) as e:
+            return str(e)
+        prompt_cache[:] = converted_cache
+        # The slot plan holds the same cache objects. Point model calls at the
+        # request-private list only after the whole setup transaction succeeds.
+        compiled_step.cache = prompt_cache
+        if _compiled_decode_status is not None:
+            _compiled_decode_status.update(
+                used=True,
+            )
+        return None
+
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
             )
-        else:
-            return model(input_tokens, cache=prompt_cache)
+        if compiled_step is not None:
+            return compiled_step(input_tokens)
+        return model(input_tokens, cache=prompt_cache)
+
+    def _compiled_failure(error, phase):
+        if compiled_step is None or isinstance(error, CompiledDecodePoisoned):
+            return error
+        return compiled_step.poison(error, phase=phase)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
@@ -593,6 +712,7 @@ def generate_step(
                 ),
             )
 
+            completion_output = logits if compiled_step is not None else None
             logits = logits[:, -1, :]
 
             if logits_processors and len(input_tokens) > 0:
@@ -608,7 +728,7 @@ def generate_step(
 
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
-            return sampled, logprobs.squeeze(0)
+            return sampled, logprobs.squeeze(0), completion_output
 
     with mx.stream(generation_stream):
         total_prompt_tokens = (
@@ -682,25 +802,89 @@ def generate_step(
                 force=True,
             )
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        y, logprobs, completion_output = _step(
+            input_tokens=prompt, input_embeddings=input_embeddings
+        )
 
-    mx.async_eval(y, logprobs)
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
-        if n == 0:
-            mx.eval(y)
-            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
-        yield y.item(), logprobs
-        if n % CACHE_STATE_EVAL_INTERVAL == 0:
+        if compiled_decode and max_tokens != 0:
             mx.eval([c.state for c in prompt_cache])
-            mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
-        n += 1
+            declined = _try_compiled_decode()
+            if declined:
+                if _compiled_decode_status is not None:
+                    _compiled_decode_status["decline_reason"] = declined
+                logging.debug("compiled decode declined: %s", declined)
+
+    n = 0
+    terminal_reason = "closed"
+    try:
+        mx.async_eval(y, logprobs)
+        while True:
+            if n != max_tokens:
+                try:
+                    next_y, next_logprobs, next_completion_output = _step(y)
+                    mx.async_eval(next_y, next_logprobs)
+                except Exception as error:
+                    poisoned = _compiled_failure(error, "decode submission")
+                    if poisoned is error:
+                        raise
+                    raise poisoned from error
+            if n == 0:
+                mx.eval(y)
+                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+            if n == max_tokens:
+                terminal_reason = "length"
+                break
+            try:
+                # The first output is eager; later outputs own FIFO receipts.
+                if compiled_step is not None and n > 0:
+                    compiled_step.materialize_and_confirm(
+                        completion_output,
+                        y,
+                        logprobs,
+                        phase="output materialization",
+                    )
+                token = y.item()
+            except Exception as error:
+                poisoned = _compiled_failure(error, "output materialization")
+                if poisoned is error:
+                    raise
+                raise poisoned from error
+            yield token, logprobs
+            if n % CACHE_STATE_EVAL_INTERVAL == 0:
+                try:
+                    mx.eval([c.state for c in prompt_cache])
+                except Exception as error:
+                    poisoned = _compiled_failure(error, "cache materialization")
+                    if poisoned is error:
+                        raise
+                    raise poisoned from error
+                mx.clear_cache()
+            y, logprobs, completion_output = (
+                next_y,
+                next_logprobs,
+                next_completion_output,
+            )
+            n += 1
+    except Exception as error:
+        terminal_reason = "error"
+        poisoned = _compiled_failure(error, "decode iteration")
+        if poisoned is error:
+            raise
+        raise poisoned from error
+    finally:
+        if compiled_step is not None:
+            try:
+                compiled_step.drain_pending()
+            except Exception:
+                terminal_reason = "error"
+                raise
+            finally:
+                if _compiled_decode_status is not None:
+                    _compiled_decode_status["receipt"] = compiled_step.receipt()
+                    _compiled_decode_status["terminal_reason"] = (
+                        "error" if terminal_reason == "error" else
+                        _compiled_decode_status.get("stop_reason", terminal_reason)
+                    )
 
 
 # Reasoning-trace channel tags used by K2-V2 style models. Each pair must
@@ -1695,6 +1879,13 @@ def prefill_prompt_cache(
     return prompt_cache
 
 
+def _non_speculative_tokens(token_generator):
+    """Forward close() to the inner generator, including early stream exits."""
+    with contextlib.closing(token_generator):
+        for token, logprobs in token_generator:
+            yield token, logprobs, False
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -1703,6 +1894,8 @@ def stream_generate(
     draft_model: Optional[nn.Module] = None,
     prompt_lookup: Optional[dict] = None,
     self_mtp: Optional[dict] = None,
+    _prompt_cache_is_request_private: bool = False,
+    _compiled_decode_status: Optional[dict] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -1848,11 +2041,15 @@ def stream_generate(
         kwargs.pop("relaxed_topk", None)
         kwargs.pop("relaxed_delta", None)
         kwargs.pop("speculative_stats", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
+        token_generator = generate_step(
+            prompt,
+            model,
+            _prompt_cache_is_request_private=_prompt_cache_is_request_private,
+            _compiled_decode_status=_compiled_decode_status,
+            **kwargs,
         )
+        # from_draft always false for non-speculative generation
+        token_generator = _non_speculative_tokens(token_generator)
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
@@ -1874,7 +2071,16 @@ def stream_generate(
         stack.enter_context(limit_context)
         close_token_generator = getattr(token_generator, "close", None)
         if close_token_generator is not None:
-            stack.callback(close_token_generator)
+            def close_with_reason(exc_type, _exc, _traceback):
+                if (
+                    _compiled_decode_status is not None
+                    and exc_type is not None
+                    and exc_type is not GeneratorExit
+                ):
+                    _compiled_decode_status["stop_reason"] = "error"
+                close_token_generator()
+
+            stack.push(close_with_reason)
         tic = time.perf_counter()
         # max_tokens=0 (or a generator that yields nothing) must not reach
         # the final response, which reads the loop variables.
@@ -1885,10 +2091,14 @@ def stream_generate(
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
             if token in tokenizer.eos_token_ids:
+                if _compiled_decode_status is not None:
+                    _compiled_decode_status["stop_reason"] = "eos"
                 break
 
             detokenizer.add_token(token)
             if (n + 1) == max_tokens:
+                if _compiled_decode_status is not None:
+                    _compiled_decode_status["stop_reason"] = "length"
                 break
 
             yield GenerationResponse(
@@ -1905,6 +2115,9 @@ def stream_generate(
                 effective_quantized_kv_start=effective_quantized_kv_start,
             )
 
+        # A final response is completion evidence: settle its lookahead first.
+        if close_token_generator is not None:
+            close_token_generator()
         detokenizer.finalize()
         if token is None:
             return

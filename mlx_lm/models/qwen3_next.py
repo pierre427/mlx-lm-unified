@@ -21,6 +21,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update, normalize_gdn_qk
+from .precise_ops import gate_sigmoid
 from .qwen4_moe_router import (
     admit_qwen4_moe_router,
     probe_qwen4_moe_router,
@@ -891,7 +892,7 @@ class Qwen3NextAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        return self.o_proj(output * gate_sigmoid(gate))
 
 
 class Qwen3NextMLP(nn.Module):
@@ -1221,7 +1222,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 y = self.switch_mlp(x, inds)
                 y = (y * scores[..., None]).sum(axis=-2)
             shared_y = self.shared_expert(x)
-        gate = mx.sigmoid(self.shared_expert_gate(x))
+        gate = gate_sigmoid(self.shared_expert_gate(x))
 
         combined = None
         if glue:
@@ -1403,6 +1404,10 @@ class Model(nn.Module):
     # speculative decoding, making the hybrid cache trimmable (see
     # Qwen3NextGatedDeltaNet.__call__ and ArraysCache.record_rollback).
     supports_speculative_rollback = True
+    # Compiled whole-step replay is intentionally not qualified here.  The
+    # qwen3_next family needs its own real-model, production-bucket acceptance
+    # record before it can carry the qwen3_5 MoE qualification token.
+    supports_compiled_decode_replay = False
 
     def __init__(self, args: ModelArgs):
         super().__init__()

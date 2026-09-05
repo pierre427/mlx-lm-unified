@@ -5,6 +5,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .precise_ops import gate_sigmoid
+
 # For the shapes it supports, the packed kernel is bitwise-identical by
 # construction to an explicit-tree comparator kernel that the tests pin it
 # against (see _make_gated_delta_packed_kernel). Every other shape (masks,
@@ -730,9 +732,9 @@ def gated_delta_update(
     # dtype before the fp32 recurrence, so expose that boundary narrowly to
     # the model adapter without changing the shared default.
     beta = (
-        mx.sigmoid(b)
+        gate_sigmoid(b)
         if beta_input_dtype
-        else mx.sigmoid(b.astype(mx.float32))
+        else gate_sigmoid(b.astype(mx.float32))
     )
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)

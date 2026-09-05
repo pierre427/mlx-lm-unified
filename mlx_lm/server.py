@@ -1,6 +1,7 @@
 # Copyright © 2023-2026 Apple Inc.
 
 import argparse
+import gc
 import hmac
 import importlib
 import json
@@ -42,6 +43,12 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .apc import AutomaticPrefixCache, MTPAPCSidecar, _walk_cache_entries
+from .compiled_decode import (
+    compiled_decode_context_policy,
+    compiled_decode_enabled,
+    compiled_decode_numerics_accepted,
+    compiled_decode_serving_reason,
+)
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
@@ -967,7 +974,9 @@ class ModelProvider:
             # Drop the int8 prefill overlay's per-module caches before the
             # freed modules' ids can be reused by the replacement model.
             _release_int8_prefill_overlay()
-            # Return buffers from the previous model before allocating its replacement.
+            # Break cycles and run finalizers while the old model is unreachable,
+            # then return its MLX buffers before allocating the replacement.
+            gc.collect()
             mx.clear_cache()
 
         # Load the model and tokenizer
@@ -2319,13 +2328,40 @@ class ResponseGenerator:
 
         return stop_matcher, text_sm
 
-    def _is_batchable(self, args):
+    def _compiled_request_selected(self, args, prompt_tokens=None):
+        """Explicit replay mode serializes eligible requests; other modes batch."""
+        if (
+            not compiled_decode_enabled()
+            or getattr(args, "n", 1) != 1
+            or prompt_tokens is None
+        ):
+            return False
+        if (
+            self.model_provider.draft_model is not None
+            or getattr(self.cli_args, "self_mtp", False)
+            or getattr(args, "prompt_lookup_ngram", 0)
+            or any(getattr(self.cli_args, name, None) is not None for name in (
+                "kv_bits", "kv_key_bits", "kv_value_bits", "max_kv_size",
+            ))
+        ):
+            return False
+        why, policy = compiled_decode_context_policy(prompt_tokens, args.max_tokens)
+        return (
+            why is None
+            and args.max_tokens > 0
+            and compiled_decode_numerics_accepted(policy)
+            and compiled_decode_serving_reason(self.model_provider.model, policy) is None
+        )
+
+    def _is_batchable(self, args, prompt_tokens=None):
         if not self.model_provider.is_batchable:
             return False
         # n>1 owns its own batch: one shared prefill replicated into n rows.
         # It runs on the dedicated parallel-sampling path, never mixed into
         # the continuous batch.
         if getattr(args, "n", 1) > 1:
+            return False
+        if self._compiled_request_selected(args, prompt_tokens):
             return False
         # Seeded ordinary batches still share the global sampler stream.  A
         # potentially eligible self-MTP request is allowed through this static
@@ -2394,17 +2430,31 @@ class ResponseGenerator:
             # We got a request
             if request is not None:
                 rqueue, request, args = request
+                tokenized = None
+                if (
+                    batch_generator is not None
+                    and current_model == args.model
+                    and compiled_decode_enabled()
+                    and getattr(args, "n", 1) == 1
+                ):
+                    try:
+                        tokenized = self._tokenize(current_tokenizer, request, args)
+                    except Exception as error:
+                        rqueue.put(error)
+                        continue
 
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args)
+                    and self._is_batchable(
+                        args, len(tokenized[0]) if tokenized is not None else None
+                    )
                 ):
                     try:
-                        prompt, segments, segment_types, initial_state = self._tokenize(
-                            current_tokenizer, request, args
-                        )
+                        if tokenized is None:
+                            tokenized = self._tokenize(current_tokenizer, request, args)
+                        prompt, segments, segment_types, initial_state = tokenized
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -2534,10 +2584,22 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
-                        self._serve_request(
-                            (rqueue, request, args), generation_stream
-                        )
+                    if compiled_decode_enabled() and getattr(args, "n", 1) == 1:
+                        try:
+                            tokenized = self._tokenize(tokenizer, request, args)
+                        except Exception as error:
+                            rqueue.put(error)
+                            continue
+                    if not self._is_batchable(
+                        args, len(tokenized[0]) if tokenized is not None else None
+                    ):
+                        if tokenized is None:
+                            self._serve_request((rqueue, request, args), generation_stream)
+                        else:
+                            self._serve_request(
+                                (rqueue, request, args), generation_stream,
+                                tokenized=tokenized,
+                            )
                         continue
 
                     # The batch kind is unknowable until tokenization and APC
@@ -2545,7 +2607,9 @@ class ResponseGenerator:
                     # generator; the request itself is re-queued below and
                     # performs a fresh owned lookup when inserted.
                     try:
-                        prompt, _, _, _ = self._tokenize(tokenizer, request, args)
+                        if tokenized is None:
+                            tokenized = self._tokenize(tokenizer, request, args)
+                        prompt, _, _, _ = tokenized
                         lookup_self_mtp = _batched_self_mtp_config(
                             args,
                             self.cli_args,
@@ -2830,12 +2894,15 @@ class ResponseGenerator:
             f"smaller n, a shorter prompt, or fewer max_tokens."
         )
 
-    def _serve_request(self, request, generation_stream=None):
+    def _serve_request(self, request, generation_stream=None, *, tokenized=None):
         """Route one non-batchable request to the single or n-way path."""
         if getattr(request[2], "n", 1) > 1:
             self._serve_parallel_samples(request, generation_stream)
         else:
-            self._serve_single(request)
+            if tokenized is None:
+                self._serve_single(request)
+            else:
+                self._serve_single(request, tokenized=tokenized)
 
     def _serve_parallel_samples(self, request, generation_stream=None):
         """Serve an OpenAI ``n>1`` request: one prefill, n independent samples.
@@ -3164,7 +3231,7 @@ class ResponseGenerator:
             if parallel is not None:
                 parallel.close()
 
-    def _serve_single(self, request):
+    def _serve_single(self, request, *, tokenized=None):
         rqueue, request, args = request
 
         # Define the progress callback
@@ -3178,7 +3245,9 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            if tokenized is None:
+                tokenized = self._tokenize(tokenizer, request, args)
+            prompt, _, _, initial_state = tokenized
             stop_matcher, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -3213,6 +3282,7 @@ class ResponseGenerator:
                 prompt,
                 external_draft=external_draft,
             )
+            cache_is_request_private = cache is None
             ctx.prompt_cache_count = len(prompt) - len(rest)
             if _discard_small_sidecarless_apc_hit_for_mtp(
                 self.cli_args,
@@ -3229,6 +3299,7 @@ class ResponseGenerator:
                 rest = prompt
                 mtp_sidecar = None
                 ctx.prompt_cache_count = 0
+                cache_is_request_private = True
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -3284,6 +3355,7 @@ class ResponseGenerator:
                 logging.info("Self-MTP bypassed: %s", reason)
             prompt_lookup_config = None
             prompt_lookup_stats = None
+            compiled_decode_status = {"used": False}
             if getattr(args, "prompt_lookup_ngram", 0):
                 from .prompt_lookup import HybridStats
 
@@ -3326,6 +3398,9 @@ class ResponseGenerator:
                     "quantized_kv_start",
                     DEFAULT_QUANTIZED_KV_START,
                 ),
+                _prompt_cache_is_request_private=cache_is_request_private,
+                _compiled_decode_status=compiled_decode_status,
+                compiled_decode=self._compiled_request_selected(args, len(prompt)),
             )
             completed = False
             try:
@@ -3353,13 +3428,18 @@ class ResponseGenerator:
                     cache_key.append(gen.token)
 
                     if ctx._should_stop:
+                        compiled_decode_status["stop_reason"] = "cancelled"
                         if self._is_distributed:
                             raise NotImplementedError()
                         break
 
                     if finish_reason is not None:
+                        compiled_decode_status.setdefault("stop_reason", finish_reason)
                         completed = True
                         break
+            except BaseException:
+                compiled_decode_status["stop_reason"] = "error"
+                raise
             finally:
                 token_stream.close()
                 if prompt_lookup_stats is not None:
@@ -3417,14 +3497,20 @@ class ResponseGenerator:
                         cache_offset,
                         len(cache_key),
                     )
-            _store_single_request_prompt_cache(
-                self.prompt_cache,
-                self.model_provider.model_key,
-                cache_key,
-                cache,
-                sidecar=sidecar,
-                external_draft=external_draft,
-            )
+            if compiled_decode_status["used"]:
+                # The Ring cache is request-private by contract. Persisting it
+                # would leak its explicit-mask path and numerical class into a
+                # later eager or speculative request.
+                logging.debug("compiled replay cache not inserted into APC")
+            else:
+                _store_single_request_prompt_cache(
+                    self.prompt_cache,
+                    self.model_provider.model_key,
+                    cache_key,
+                    cache,
+                    sidecar=sidecar,
+                    external_draft=external_draft,
+                )
 
         except Exception as e:
             rqueue.put(e)
