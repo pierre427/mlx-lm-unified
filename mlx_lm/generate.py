@@ -1618,7 +1618,14 @@ def prompt_lookup_generate_step(
     prompt_len = len(seq)
     last_snap = None  # snapshot before the most recent proposal forward
     rate_probed = False  # measured-rate gate is one-shot
-    spec_t0 = time.perf_counter()  # wall-clock window for the speculative rate
+    # Wall-clock window for the speculative rate. Armed only after the first
+    # speculative cycle: that cycle absorbs one-time costs that are not
+    # speculation (kernel warm-up, and on a prompt-cache hit the restore of the
+    # reused cache on first use). Measured 2026-09-05 on the 35B: with
+    # warmup=8 an un-armed window read 25 ms/token against a 10 ms plain probe
+    # and de-latched every cache-hit request after two cycles.
+    spec_t0 = None
+    spec_gen0 = 0
     # Begin recording recurrent/rotating rollback state only after prompt
     # prefill. Starting earlier retains prompt-sized replay closures in
     # ArraysCache and can cause a large transient memory spike.
@@ -1732,21 +1739,30 @@ def prompt_lookup_generate_step(
                 if max_tokens >= 0 and generated >= max_tokens:
                     return
 
-            # Measured never-slower-than-plain gate: after warmup, time a short
-            # plain-decode probe against the observed speculative rate and latch
-            # to the plain tail if speculation isn't actually faster. Unlike the
-            # acceptance-fraction heuristic below, this measures the real
-            # wall-clock break-even (model- and context-dependent). One-shot; its
-            # probe tokens are ordinary committed output, so the run stays lossless.
+            if spec_t0 is None:
+                spec_t0 = time.perf_counter()
+                spec_gen0 = generated
+                continue
+
+            # Measured never-slower-than-plain gate: after warmup tokens inside
+            # the armed window, time a short plain-decode probe against the
+            # observed speculative rate and latch to the plain tail if
+            # speculation isn't actually faster. Unlike the acceptance-fraction
+            # heuristic below, this measures the real wall-clock break-even
+            # (model- and context-dependent). One-shot; its probe tokens are
+            # ordinary committed output, so the run stays lossless.
             if (
                 rate_gate
                 and not rate_probed
-                and generated >= warmup
+                and generated - spec_gen0 >= warmup
                 and (max_tokens < 0 or max_tokens - generated > 1)
             ):
                 rate_probed = True
                 stats.rate_gate_probed = True
-                spec_ms = (time.perf_counter() - spec_t0) * 1000.0 / max(generated, 1)
+                spec_ms = (
+                    (time.perf_counter() - spec_t0) * 1000.0
+                    / max(generated - spec_gen0, 1)
+                )
                 budget = rate_gate_probe
                 if max_tokens >= 0:
                     budget = min(budget, max_tokens - generated)
@@ -1782,6 +1798,7 @@ def prompt_lookup_generate_step(
                     stats.rate_gate_delatched = True
                 else:
                     spec_t0 = time.perf_counter()  # reset window; keep speculating
+                    spec_gen0 = generated
 
             # One-way never-lose latch: once we have enough evidence the work
             # isn't copy-heavy, switch to a plain generate_step tail (bit-exact,

@@ -2922,8 +2922,13 @@ def _mtp_draft_verify_loop_impl(
             [token_prefix, mx.array([cur] + drafts[:n_accept], mx.uint32)]
         )
         cur = bonus
-        spec_secs += time.perf_counter() - cycle_t0
-        spec_toks += ntoks - ntoks_at_cycle_start
+        if gate_cycles > 0:
+            # The first cycle absorbs one-time costs that are not speculation
+            # (kernel warm-up; on a prompt-cache hit, the reused cache's restore
+            # on first use) — keep it out of the measured rate, as the
+            # prompt-lookup gate does (2026-09-05).
+            spec_secs += time.perf_counter() - cycle_t0
+            spec_toks += ntoks - ntoks_at_cycle_start
         gate_cycles += 1
 
 

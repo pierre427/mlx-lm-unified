@@ -7,6 +7,7 @@ correctness — including the two cache-reconciliation regressions found in revi
 cache REUSE (a non-empty incoming prompt_cache must not be trimmed) and CacheList
 models (the reconcile must not assume a flat ``.offset``).
 """
+import time
 import unittest
 
 import mlx.core as mx
@@ -397,6 +398,66 @@ class _TinyCacheListModel(nn.Module):
             for sub in cache[0].caches:
                 sub.update_and_fetch(kv, kv)     # advance both sub-caches
         return self.out(h)
+
+
+class _SlowFirstCycleCopyModel(nn.Module):
+    """Greedy argmax is ``(token + 1) % period``, so a periodic prompt is
+    retrieved with 100 % acceptance; the first forward after prefill sleeps to
+    stand in for a prompt-cache restore (or kernel warm-up) — one-time cost
+    that must not count as speculation."""
+
+    def __init__(self, period=8, vocab=16, dim=4, delay_s=0.5):
+        super().__init__()
+        self.period, self.vocab, self.dim, self.delay_s = period, vocab, dim, delay_s
+        self.calls = 0
+        self.embed = nn.Embedding(vocab, dim)
+
+    def make_cache(self):
+        return [KVCache()]
+
+    def __call__(self, x, cache=None):
+        self.calls += 1
+        if self.calls == 2:  # call 1 is the prefill; call 2 the first cycle
+            time.sleep(self.delay_s)
+        B, S = x.shape
+        if cache is not None:
+            kv = mx.zeros((B, 1, S, self.dim))
+            cache[0].update_and_fetch(kv, kv)
+        nxt = (x + 1) % self.period
+        return mx.where(
+            mx.arange(self.vocab)[None, None, :] == nxt[..., None], 1.0, 0.0
+        )
+
+
+class TestRateGateWindow(unittest.TestCase):
+    def test_first_cycle_cost_does_not_delatch_the_rate_gate(self):
+        # A 0.5 s first cycle over ~9 tokens read as ~55 ms/token under the
+        # old window (measured 25 ms vs 10 ms plain on the 35B on a cache hit)
+        # and de-latched copy-heavy work to the plain tail. The window is armed
+        # after the first cycle now.
+        from mlx_lm.prompt_lookup import HybridStats
+
+        model = _SlowFirstCycleCopyModel()
+        mx.eval(model.parameters())
+        period = model.period
+        prompt = mx.array([i % period for i in range(40)])
+        cache = make_prompt_cache(model)
+        stats = HybridStats()
+        out = [
+            int(t)
+            for t, _, _ in prompt_lookup_generate_step(
+                prompt, model, max_tokens=64, sampler=GREEDY,
+                prompt_cache=cache, backend="ngram", num_draft=8, ngram_max=3,
+                adaptive=True, warmup=8, gate=0.12,
+                rate_gate=True, rate_gate_probe=4, stats=stats,
+            )
+        ]
+        self.assertEqual(out, [(40 + i) % period for i in range(64)])
+        self.assertTrue(stats.rate_gate_probed)
+        self.assertFalse(stats.rate_gate_delatched)
+        self.assertFalse(stats.latched)
+        self.assertLess(stats.rate_gate_spec_ms_per_tok, 20.0)
+        self.assertGreater(stats.retrieval_accepted, 40)
 
 
 class TestCacheListModel(unittest.TestCase):
