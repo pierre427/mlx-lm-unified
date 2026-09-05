@@ -56,25 +56,47 @@ def _text_model(model):
     return text_model
 
 
+class MegakernelLanePoisoned(RuntimeError):
+    """The pack failed after the source rebind began: the model may be mutated
+    and must not serve eagerly either. The process has to be restarted."""
+
+
 def _decoder_for(model):
     """Pack once per process; the pack is keyed by the model object."""
     from .models import qwen4_megakernel_runtime as MR
 
+    poisoned = getattr(model, "_megakernel_lane_poisoned", None)
+    if poisoned:
+        raise MegakernelLanePoisoned(poisoned)
     decoder = getattr(model, "_megakernel_lane_decoder", None)
     if decoder is not None:
         return decoder
     text_model = _text_model(model)
     args = text_model.args
-    decoder = MR.MegakernelDecoder(
-        model, args, max_context=int(args.max_position_embeddings),
-        rebind=True, validate=False,
-    )
+    try:
+        decoder = MR.MegakernelDecoder(
+            model, args, max_context=int(args.max_position_embeddings),
+            rebind=True, validate=False,
+        )
+    except MR.MegakernelConstructionError as exc:
+        reason = f"{exc} (cause: {exc.__cause__!r})"
+        model._megakernel_lane_poisoned = reason
+        logging.exception("megakernel lane: construction failed; the model is poisoned")
+        raise MegakernelLanePoisoned(reason) from exc
     decision = decoder.admit()
     if not decision.accepted:
         raise RuntimeError(f"megakernel admission refused: {decision.reason}")
     model._megakernel_lane_decoder = decoder
-    logging.info("megakernel lane: decoder packed, %s", decoder.status_fields().get("phases"))
+    logging.info("megakernel lane: decoder packed, %s phases", decoder.status_fields().get("phases"))
     return decoder
+
+
+def preload_megakernel_lane(model):
+    """Pack at model load so a construction failure is a startup failure, not a
+    mid-request fallback onto a possibly mutated model."""
+    if not megakernel_lane_enabled() or _text_model(model) is None:
+        return None
+    return _decoder_for(model)
 
 
 class MegakernelLane:
@@ -175,7 +197,10 @@ def attach_megakernel_lane(model, prompt_cache, *, max_tokens, status: Optional[
                                      text_model.model.layers[i].self_attn.indexer)
         decoder.position = length
         lane = MegakernelLane(model, decoder, prompt_cache, status if status is not None else {})
-    except Exception as exc:  # noqa: BLE001 -- any refusal falls back to eager
+    except MegakernelLanePoisoned:
+        _LANE_LOCK.release()
+        raise
+    except Exception as exc:  # noqa: BLE001 -- any other refusal falls back to eager
         _LANE_LOCK.release()
         return None, f"{type(exc).__name__}: {exc}"
     if status is not None:

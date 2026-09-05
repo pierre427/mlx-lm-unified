@@ -11,6 +11,7 @@ import collections as _collections
 # Last decode-lane statuses (compiled replay / megakernel lane) per request,
 # read by GET /v1/status/decode-lanes; operational receipts, not qualification.
 DECODE_LANE_LOG = _collections.deque(maxlen=64)
+from .megakernel_lane import megakernel_lane_enabled, _text_model as megakernel_text_model
 import math
 import os
 import pickle
@@ -1027,6 +1028,11 @@ class ModelProvider:
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+        # Pack the megakernel lane at load (fail closed): a construction failure
+        # after the source rebind would leave a mutated model behind.
+        from .megakernel_lane import preload_megakernel_lane
+
+        preload_megakernel_lane(self.model)
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
@@ -2361,10 +2367,14 @@ class ResponseGenerator:
     def _megakernel_request_selected(self, args):
         """Width-1 plain requests on a Qwen4-Exp model take the single-request
         path so the megakernel lane can attach after prefill."""
+        lane_enabled = globals().get("megakernel_lane_enabled")
+        lane_model = globals().get("megakernel_text_model")
+        if lane_enabled is None or lane_model is None or not lane_enabled():
+            return False
         if getattr(args, "n", 1) != 1:
             return False
         if (
-            self.model_provider.draft_model is not None
+            getattr(self.model_provider, "draft_model", None) is not None
             or getattr(self.cli_args, "self_mtp", False)
             or getattr(args, "prompt_lookup_ngram", 0)
             or any(getattr(self.cli_args, name, None) is not None for name in (
@@ -2372,9 +2382,7 @@ class ResponseGenerator:
             ))
         ):
             return False
-        from .megakernel_lane import megakernel_lane_enabled, _text_model
-
-        return megakernel_lane_enabled() and _text_model(self.model_provider.model) is not None
+        return lane_model(getattr(self.model_provider, "model", None)) is not None
 
     def _is_batchable(self, args, prompt_tokens=None):
         if not self.model_provider.is_batchable:

@@ -56,6 +56,7 @@ class TestCompiledServerAdmission(unittest.TestCase):
             "mlx_lm/server.py",
             {
                 "_compiled_request_selected",
+                "_megakernel_request_selected",
                 "_is_batchable",
                 "_generate",
                 "_serve_request",
@@ -69,6 +70,7 @@ class TestCompiledServerAdmission(unittest.TestCase):
                 name: self.env[name]
                 for name in (
                     "_compiled_request_selected",
+                    "_megakernel_request_selected",
                     "_is_batchable",
                     "_generate",
                     "_serve_request",
