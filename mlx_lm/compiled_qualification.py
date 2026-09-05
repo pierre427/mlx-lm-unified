@@ -123,18 +123,200 @@ def _read_json(path, limit=64 * 1024 * 1024):
     return result
 
 
-def _numerical_evidence(record, evidence):
-    """Check the actual per-profile token/completion/capacity evidence."""
-    if evidence.get("qualification_identity") != {
-        key: record.get(key)
-        for key in (
-            "config_sha256",
-            "weights_sha256",
-            "parameter_layout",
-            "runtime",
-            "environment",
+_IDENTITY_KEYS = (
+    "config_sha256",
+    "weights_sha256",
+    "parameter_layout",
+    "runtime",
+    "environment",
+)
+
+
+def _revalidation(record):
+    """Operator-approved re-validation of prior evidence after a source change.
+
+    ``record["revalidation"]`` names the ``mlx_lm`` sources that changed since
+    the prior evidence was produced (``changed_sources``: name -> the digest
+    the evidence was produced with), the operator approval, and a spot-check
+    receipt produced on the live tree. Prior evidence is then accepted only if
+    its identity differs from the record's in exactly those sources at exactly
+    those digests; the spot check must carry the record's identity and be
+    bit-identical at every point it holds. Without this block, evidence must
+    match the record exactly (the default contract).
+    """
+    reval = record.get("revalidation")
+    if reval is None:
+        return None
+    changed = reval.get("changed_sources") if isinstance(reval, dict) else None
+    if (
+        not isinstance(changed, dict)
+        or not changed
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(digest, str)
+            or not digest
+            for name, digest in changed.items()
         )
+        or not isinstance(reval.get("approved_by"), str)
+        or not reval["approved_by"].strip()
+        or not isinstance(reval.get("spot_check"), dict)
+    ):
+        raise ValueError("compiled serving manifest revalidation is malformed")
+    return reval
+
+
+def _evidence_identity_matches(record, evidence_identity, reval):
+    identity = {key: record.get(key) for key in _IDENTITY_KEYS}
+    if evidence_identity == identity:
+        return True
+    if reval is None or not isinstance(evidence_identity, dict):
+        return False
+    if any(
+        evidence_identity.get(key) != identity.get(key)
+        for key in _IDENTITY_KEYS
+        if key != "runtime"
+    ):
+        return False
+    live_runtime = identity.get("runtime")
+    prior_runtime = evidence_identity.get("runtime")
+    if not isinstance(live_runtime, dict) or not isinstance(prior_runtime, dict):
+        return False
+    if any(
+        live_runtime.get(key) != prior_runtime.get(key)
+        for key in set(live_runtime) | set(prior_runtime)
+        if key != "sources"
+    ):
+        return False
+    live_sources = live_runtime.get("sources")
+    prior_sources = prior_runtime.get("sources")
+    if (
+        not isinstance(live_sources, dict)
+        or not isinstance(prior_sources, dict)
+        or set(live_sources) != set(prior_sources)
+    ):
+        return False
+    differing = {
+        name for name in live_sources if live_sources[name] != prior_sources[name]
+    }
+    changed = reval["changed_sources"]
+    return differing == set(changed) and all(
+        changed[name] == prior_sources[name] for name in differing
+    )
+
+
+def _validate_point(point, *, name, buckets, endpoint, seed, bound):
+    if not isinstance(point, dict):
+        raise ValueError("qualification lacks endpoint or growth evidence")
+    steps = point.get("steps")
+    if (
+        type(steps) is not int
+        or not (128 if seed is None else 2) <= steps < endpoint
+        or point.get("context_policy") != name
+        or point.get("policy_buckets") != buckets
+        or point.get("measurement_end_context") != endpoint
+        or point.get("seed_context") != endpoint - steps
+        or (seed is not None and point["seed_context"] != seed)
+    ):
+        raise ValueError("qualification numerical geometry is inconsistent")
+    tokens = point.get("digest_kv")
+    if (
+        not isinstance(tokens, list)
+        or len(tokens) != steps
+        or any(type(token) is not int or token < 0 for token in tokens)
+        or tokens != point.get("digest_ring")
+        or tokens != point.get("digest_compiled")
+    ):
+        raise ValueError("qualification greedy token evidence differs")
+    if (
+        point.get("submitted") != steps
+        or point.get("completed") != steps
+        or point.get("pending") != 0
+        or point.get("failed") != 0
+        or point.get("poisoned") is not False
+        or point.get("single_trace") is not True
+        or any(
+            type(point.get(key)) is not int
+            for key in ("submitted", "completed", "pending", "failed")
+        )
+        or not isinstance(point.get("traces"), list)
+        or not point["traces"]
+        or any(type(n) is not int or n != 1 for n in point["traces"])
+    ):
+        raise ValueError("qualification replay completion evidence is incomplete")
+    expected_caps = sorted(
+        {
+            next(b for b in buckets if b >= cursor)
+            for cursor in range(endpoint - steps + 1, endpoint + 1)
+        }
+    )
+    if (
+        point.get("capacities_observed") != expected_caps
+        or point.get("ring_capacities_observed") != expected_caps
+    ):
+        raise ValueError("qualification capacity evidence differs")
+    for field in (
+        "logits_compiled_vs_ring",
+        "logits_ring_vs_kv",
+        "logits_compiled_vs_kv",
+    ):
+        comparison = point.get(field, {})
+        if not isinstance(comparison, dict):
+            raise ValueError("qualification logit comparison must be an object")
+        delta = comparison.get("maxdelta")
+        allowed = 0 if field == "logits_compiled_vs_ring" else bound
+        if (
+            isinstance(delta, bool)
+            or not isinstance(delta, (int, float))
+            or not math.isfinite(delta)
+            or not 0 <= delta <= allowed
+            or (
+                field == "logits_compiled_vs_ring"
+                and comparison.get("bitidentical") is not True
+            )
+        ):
+            raise ValueError("qualification logits exceed accepted numerical class")
+
+
+def _spot_check_evidence(record, evidence):
+    """A receipt produced on the live tree after a source change: it must carry
+    the record's exact identity and bound, and every point it holds must pass
+    the same checks as qualification evidence for its profile."""
+    if evidence.get("qualification_identity") != {
+        key: record.get(key) for key in _IDENTITY_KEYS
     }:
+        raise ValueError("spot-check evidence was not produced on the live runtime")
+    if evidence.get("class3_maxdelta_bound") != record.get("class3_maxdelta_bound"):
+        raise ValueError("spot-check numerical bound differs")
+    points = evidence.get("numerical_operating_points", {})
+    growth = evidence.get("numerical_growth_boundaries", {})
+    if not isinstance(points, dict) or not points or not isinstance(growth, dict):
+        raise ValueError("spot-check evidence has no operating points")
+    bound = record["class3_maxdelta_bound"]
+    checked = 0
+    for key, point in list(points.items()) + list(growth.items()):
+        name = key.rsplit("_", 1)[-1] if key in points else key.split("_boundary", 1)[0]
+        profile = record["profiles"].get(name)
+        if not isinstance(profile, dict):
+            raise ValueError("spot-check evidence names an unqualified profile")
+        buckets = profile["buckets"]
+        if key in points:
+            endpoint, seed = int(key[len("ctx"):].split("_", 1)[0]), None
+        else:
+            boundary = int(key.split("_boundary", 1)[1])
+            endpoint, seed = boundary + 1, boundary - 1
+        _validate_point(
+            point, name=name, buckets=buckets, endpoint=endpoint, seed=seed, bound=bound
+        )
+        checked += 1
+    return checked
+
+
+def _numerical_evidence(record, evidence, reval=None):
+    """Check the actual per-profile token/completion/capacity evidence."""
+    if not _evidence_identity_matches(
+        record, evidence.get("qualification_identity"), reval
+    ):
         raise ValueError("qualification evidence belongs to another model/runtime")
     bound = evidence.get("class3_maxdelta_bound")
     if (
@@ -173,80 +355,9 @@ def _numerical_evidence(record, evidence):
             if 1 < b < end
         ]
         for point, endpoint, seed in required:
-            if not isinstance(point, dict):
-                raise ValueError("qualification lacks endpoint or growth evidence")
-            steps = point.get("steps")
-            if (
-                type(steps) is not int
-                or not (128 if seed is None else 2) <= steps < endpoint
-                or point.get("context_policy") != name
-                or point.get("policy_buckets") != buckets
-                or point.get("measurement_end_context") != endpoint
-                or point.get("seed_context") != endpoint - steps
-                or (seed is not None and point["seed_context"] != seed)
-            ):
-                raise ValueError("qualification numerical geometry is inconsistent")
-            tokens = point.get("digest_kv")
-            if (
-                not isinstance(tokens, list)
-                or len(tokens) != steps
-                or any(type(token) is not int or token < 0 for token in tokens)
-                or tokens != point.get("digest_ring")
-                or tokens != point.get("digest_compiled")
-            ):
-                raise ValueError("qualification greedy token evidence differs")
-            if (
-                point.get("submitted") != steps
-                or point.get("completed") != steps
-                or point.get("pending") != 0
-                or point.get("failed") != 0
-                or point.get("poisoned") is not False
-                or point.get("single_trace") is not True
-                or any(
-                    type(point.get(key)) is not int
-                    for key in ("submitted", "completed", "pending", "failed")
-                )
-                or not isinstance(point.get("traces"), list)
-                or not point["traces"]
-                or any(type(n) is not int or n != 1 for n in point["traces"])
-            ):
-                raise ValueError(
-                    "qualification replay completion evidence is incomplete"
-                )
-            expected_caps = sorted(
-                {
-                    next(b for b in buckets if b >= cursor)
-                    for cursor in range(endpoint - steps + 1, endpoint + 1)
-                }
+            _validate_point(
+                point, name=name, buckets=buckets, endpoint=endpoint, seed=seed, bound=bound
             )
-            if (
-                point.get("capacities_observed") != expected_caps
-                or point.get("ring_capacities_observed") != expected_caps
-            ):
-                raise ValueError("qualification capacity evidence differs")
-            for field in (
-                "logits_compiled_vs_ring",
-                "logits_ring_vs_kv",
-                "logits_compiled_vs_kv",
-            ):
-                comparison = point.get(field, {})
-                if not isinstance(comparison, dict):
-                    raise ValueError("qualification logit comparison must be an object")
-                delta = comparison.get("maxdelta")
-                allowed = 0 if field == "logits_compiled_vs_ring" else bound
-                if (
-                    isinstance(delta, bool)
-                    or not isinstance(delta, (int, float))
-                    or not math.isfinite(delta)
-                    or not 0 <= delta <= allowed
-                    or (
-                        field == "logits_compiled_vs_ring"
-                        and comparison.get("bitidentical") is not True
-                    )
-                ):
-                    raise ValueError(
-                        "qualification logits exceed accepted numerical class"
-                    )
 
 
 def qualification_records():
@@ -274,7 +385,8 @@ def qualification_records():
         "sha256"
     ):
         raise ValueError("compiled serving evidence digest mismatch")
-    _numerical_evidence(record, _read_json(evidence_path))
+    reval = _revalidation(record)
+    _numerical_evidence(record, _read_json(evidence_path), reval)
     reference = record.get("serving_evidence", {})
     if not isinstance(reference, dict):
         raise ValueError("serving evidence reference must be an object")
@@ -283,24 +395,19 @@ def qualification_records():
         "sha256"
     ):
         raise ValueError("compiled serving end-to-end evidence digest mismatch")
-    _serving_evidence(record, _read_json(serving_path))
+    _serving_evidence(record, _read_json(serving_path), reval)
+    if reval is not None:
+        spot = reval["spot_check"]
+        spot_path = Path(spot.get("path", ""))
+        if not spot_path.is_absolute() or _file_digest(spot_path) != spot.get("sha256"):
+            raise ValueError("compiled serving spot-check evidence digest mismatch")
+        _spot_check_evidence(record, _read_json(spot_path))
     return {record["qualification_id"]: record}
 
 
-def _serving_evidence(record, evidence):
-    identity = {
-        key: record.get(key)
-        for key in (
-            "config_sha256",
-            "weights_sha256",
-            "parameter_layout",
-            "runtime",
-            "environment",
-        )
-    }
-    if (
-        evidence.get("schema") != "compiled-serving-e2e-v1"
-        or evidence.get("qualification_identity") != identity
+def _serving_evidence(record, evidence, reval=None):
+    if evidence.get("schema") != "compiled-serving-e2e-v1" or not (
+        _evidence_identity_matches(record, evidence.get("qualification_identity"), reval)
     ):
         raise ValueError("serving evidence belongs to another model/runtime")
     cases = evidence.get("cases")

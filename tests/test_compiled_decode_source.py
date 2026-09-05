@@ -615,6 +615,75 @@ class TestCheckpointQualification(unittest.TestCase):
                 moved.write_text("{}")
                 self.assertIn("manifest changed", self._reason())
 
+    def _revalidated_fixture(self, temporary, *, list_change=True, spot_identity_live=True,
+                             spot_bitidentical=True, extra_change=False):
+        """Prior evidence from a tree whose ``model`` source differed, plus a
+        spot-check receipt from the live tree (the fixture runtime has two
+        sources: ``model`` and ``other``)."""
+        self.runtime["sources"]["other"] = "def"
+        weights, manifest_path, manifest, numerical_path, numerical = self._manifest_fixture(temporary)
+        live_sources = manifest["runtime"]["sources"]
+        prior_runtime = json.loads(json.dumps(manifest["runtime"]))
+        prior_runtime["sources"]["model"] = "prior-model-digest"
+        if extra_change:
+            prior_runtime["sources"]["other"] = "prior-other-digest"
+        prior_identity = {**{k: manifest[k] for k in self.q._IDENTITY_KEYS}, "runtime": prior_runtime}
+        # Prior numerical + serving evidence carry the prior identity.
+        numerical["qualification_identity"] = prior_identity
+        numerical_path.write_text(json.dumps(numerical))
+        serving_path = Path(temporary) / "serving.json"
+        serving = json.loads(serving_path.read_text())
+        serving["qualification_identity"] = prior_identity
+        serving_path.write_text(json.dumps(serving))
+        # Spot check on the live (or not) tree.
+        spot = json.loads(json.dumps(numerical))
+        spot["qualification_identity"] = {k: manifest[k] for k in self.q._IDENTITY_KEYS} if spot_identity_live else prior_identity
+        if not spot_bitidentical:
+            spot["numerical_operating_points"]["ctx4096_M1_short"]["digest_compiled"][5] += 1
+        spot_path = Path(temporary) / "spot.json"
+        spot_path.write_text(json.dumps(spot))
+        manifest["evidence"] = {"path": str(numerical_path), "sha256": self.q._file_digest(numerical_path)}
+        manifest["serving_evidence"] = {"path": str(serving_path), "sha256": self.q._file_digest(serving_path)}
+        manifest["revalidation"] = {
+            "approved_by": "test operator: spot check once",
+            "changed_sources": {"model": "prior-model-digest"} if list_change else {"other": live_sources["other"]},
+            "spot_check": {"path": str(spot_path), "sha256": self.q._file_digest(spot_path)},
+        }
+        manifest_path.write_text(json.dumps(manifest))
+        return weights, manifest_path
+
+    def test_revalidation_accepts_prior_evidence_only_for_listed_sources_with_live_spot_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            weights, manifest_path = self._revalidated_fixture(temporary)
+            with mock.patch.dict(self.q.os.environ, {self.q._MANIFEST_ENV: str(manifest_path)}):
+                records = self.q.qualification_records()
+                self.assertIn("operator-fixture", records)
+                self._bind([weights])
+                self.assertIsNone(self._reason())
+
+    def test_revalidation_refuses_unlisted_change_stale_spot_check_or_divergence(self):
+        for kwargs, message in (
+            (dict(list_change=False), "belongs to another model/runtime"),
+            (dict(extra_change=True), "belongs to another model/runtime"),
+            (dict(spot_identity_live=False), "not produced on the live runtime"),
+            (dict(spot_bitidentical=False), "greedy token evidence differs"),
+        ):
+            with tempfile.TemporaryDirectory() as temporary:
+                weights, manifest_path = self._revalidated_fixture(temporary, **kwargs)
+                with mock.patch.dict(self.q.os.environ, {self.q._MANIFEST_ENV: str(manifest_path)}):
+                    with self.assertRaises(ValueError) as caught:
+                        self.q.qualification_records()
+                    self.assertIn(message, str(caught.exception))
+
+    def test_prior_evidence_without_revalidation_block_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            weights, manifest_path = self._revalidated_fixture(temporary)
+            manifest = json.loads(manifest_path.read_text()); manifest.pop("revalidation")
+            manifest_path.write_text(json.dumps(manifest))
+            with mock.patch.dict(self.q.os.environ, {self.q._MANIFEST_ENV: str(manifest_path)}):
+                with self.assertRaises(ValueError):
+                    self.q.qualification_records()
+
     def test_operator_manifest_rejects_missing_approval_and_false_numerics(self):
         with tempfile.TemporaryDirectory() as temporary:
             weights, manifest_path, manifest, numerical_path, numerical = (
