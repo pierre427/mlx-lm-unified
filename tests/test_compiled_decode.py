@@ -528,6 +528,26 @@ class TestCompiledDecodeStep(unittest.TestCase):
             self.assertNotIn(16384, latency.buckets)
             self.assertIn(32768, latency.buckets)
 
+    def test_long_profile_extends_the_memory_ladder_to_the_window(self):
+        default_buckets = (1023, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
+        with mock.patch.object(cd, "_ring_buckets", return_value=default_buckets):
+            why, memory = cd.compiled_decode_context_policy(8000, 8000, "memory")
+            self.assertIsNone(why)
+            self.assertEqual(memory.buckets, default_buckets)
+            why, _ = cd.compiled_decode_context_policy(16000, 1000, "memory")
+            self.assertIn("exceeds the memory profile", why)
+
+            why, long_ = cd.compiled_decode_context_policy(200000, 62144, "long")
+            self.assertIsNone(why)
+            self.assertEqual(long_.max_context, 262144)
+            self.assertEqual(long_.buckets, default_buckets + (131072, 262144))
+            self.assertEqual(long_.numerical_acceptance, "class1-bucketed-v1")
+            why, _ = cd.compiled_decode_context_policy(200000, 62145, "long")
+            self.assertIn("exceeds the long profile limit of 262144", why)
+        # the qualification loader's table must agree with the policy table
+        from mlx_lm import compiled_qualification as cq
+        self.assertEqual(cq._PROFILE_LIMITS, cd._PROFILE_LIMITS)
+
     def test_invalid_context_policy_declines(self):
         with mock.patch.dict(
             os.environ,

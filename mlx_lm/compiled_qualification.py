@@ -41,6 +41,11 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+# Context limit per compiled profile; mirrors ``compiled_decode._PROFILE_LIMITS``
+# (that module imports this one, so the table lives here and is asserted equal
+# by the source-contract tests).
+_PROFILE_LIMITS = {"short": 4096, "memory": 16384, "latency": 16384, "long": 262144}
+
 SERVING_QUALIFICATIONS = {}
 _MANIFEST_ENV = "MLX_LM_COMPILED_DECODE_QUALIFICATION"
 
@@ -150,8 +155,8 @@ def _numerical_evidence(record, evidence):
         end = policy.get("max_context")
         buckets = policy.get("buckets")
         if (
-            name not in ("short", "memory", "latency")
-            or end != (4096 if name == "short" else 16384)
+            name not in _PROFILE_LIMITS
+            or end != _PROFILE_LIMITS[name]
             or not isinstance(buckets, list)
             or not buckets
             or any(type(x) is not int or x <= 0 for x in buckets)

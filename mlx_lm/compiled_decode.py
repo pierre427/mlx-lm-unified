@@ -78,9 +78,20 @@ _QUALIFIED_MODEL_CLASSES = (
 _QUALIFICATION_TOKEN = "qwen3_5_moe_m1_v1"
 _PADDED_SDPA_ACCEPTANCE = "class3-padded-sdpa-v1"
 _CLASS1_BUCKET_ACCEPTANCE = "class1-bucketed-v1"
-_CONTEXT_POLICIES = ("short", "memory", "latency")
 _SHORT_CONTEXT_LIMIT = 4096
 _EXTENDED_CONTEXT_LIMIT = 16384
+_LONG_CONTEXT_LIMIT = 262144
+# Context limit per profile. ``long`` (2026-09-05, operator request) extends
+# replay to the model's full window on its own ladder; the three original
+# profiles and their qualified ladders are unchanged.
+_PROFILE_LIMITS = {
+    "short": _SHORT_CONTEXT_LIMIT,
+    "memory": _EXTENDED_CONTEXT_LIMIT,
+    "latency": _EXTENDED_CONTEXT_LIMIT,
+    "long": _LONG_CONTEXT_LIMIT,
+}
+_CONTEXT_POLICIES = tuple(_PROFILE_LIMITS)
+_LONG_LADDER_EXTENSION = (131072, 262144)
 _MAX_VARIANTS_LIMIT = 64
 
 
@@ -150,8 +161,10 @@ def compiled_decode_context_policy(
 
     ``short`` is the qualified default and stops at 4K. ``memory`` and
     ``latency`` are explicit 16K profiles: the first keeps the 16384 bucket;
-    the second skips it and accepts the 32768-bucket memory cost. No profile
-    admits an unbounded completion.
+    the second skips it and accepts the 32768-bucket memory cost. ``long``
+    admits the full 256K window on the memory ladder extended geometrically
+    (131072, 262144) so a long context costs O(log n) traces rather than one
+    per 65536 columns. No profile admits an unbounded completion.
     """
     policy = (
         os.environ.get("MLX_LM_COMPILED_DECODE_CONTEXT_POLICY", "short")
@@ -170,11 +183,7 @@ def compiled_decode_context_policy(
         return "an unbounded completion", None
 
     projected = context_tokens + max_tokens
-    limit = (
-        _SHORT_CONTEXT_LIMIT
-        if policy == "short"
-        else _EXTENDED_CONTEXT_LIMIT
-    )
+    limit = _PROFILE_LIMITS[policy]
     if projected > limit:
         return (
             f"projected context {projected} exceeds the {policy} profile "
@@ -212,6 +221,10 @@ def _resolved_policy_buckets(policy_name: str) -> tuple:
         # Make the 2x memory choice local to this request instead of changing
         # RingKVCache's global, memory-efficient default.
         buckets = tuple(sorted((set(buckets) - {16384}) | {32768}))
+    elif policy_name == "long":
+        # Extend the memory ladder to the full window without touching the
+        # global default the three qualified profiles bind.
+        buckets = tuple(sorted(set(buckets) | set(_LONG_LADDER_EXTENSION)))
     return buckets
 
 
@@ -220,11 +233,7 @@ def _validate_context_policy(policy: CompiledDecodePolicy) -> CompiledDecodePoli
         raise TypeError("context_policy must be a CompiledDecodePolicy")
     if policy.name not in _CONTEXT_POLICIES:
         raise ValueError(f"unknown compiled decode context policy {policy.name!r}")
-    expected_limit = (
-        _SHORT_CONTEXT_LIMIT
-        if policy.name == "short"
-        else _EXTENDED_CONTEXT_LIMIT
-    )
+    expected_limit = _PROFILE_LIMITS[policy.name]
     if policy.max_context != expected_limit:
         raise ValueError(
             f"{policy.name} policy limit must be {expected_limit}, "
