@@ -890,9 +890,33 @@ class TestGenerateStepIntegration(unittest.TestCase):
                 [],
             )
 
-    def test_env_flag_is_off_by_default(self):
+    def test_env_flag_is_on_by_default_and_zero_opts_out(self):
         self.assertNotIn("MLX_LM_COMPILED_DECODE", os.environ)
-        self.assertFalse(cd.compiled_decode_enabled())
+        self.assertTrue(cd.compiled_decode_enabled())
+        for off in ("0", "false", "no", "off", ""):
+            with mock.patch.dict(os.environ, {"MLX_LM_COMPILED_DECODE": off}):
+                self.assertFalse(cd.compiled_decode_enabled(), off)
+        with mock.patch.dict(os.environ, {"MLX_LM_COMPILED_DECODE": "1"}):
+            self.assertTrue(cd.compiled_decode_enabled())
+
+    def test_default_ladder_is_class1_and_needs_no_acceptance(self):
+        with mock.patch.dict(os.environ):
+            # The class fixture pins a tiny test ladder; the default ladder is
+            # what production resolves when nothing is set.
+            os.environ.pop("MLX_LM_RING_KV_BUCKETS", None)
+            os.environ.pop("MLX_LM_COMPILED_DECODE_ACCEPTANCE", None)
+            why, policy = cd.compiled_decode_context_policy(11, 128, "short")
+            self.assertIsNone(why)
+            self.assertIn(1023, policy.buckets)
+            self.assertIn(1024, policy.buckets)
+            self.assertEqual(policy.numerical_acceptance, "class1-bucketed-v1")
+            self.assertTrue(cd.compiled_decode_numerics_accepted(policy))
+        with mock.patch.dict(os.environ, {"MLX_LM_RING_KV_BUCKETS": "2048,4096"}):
+            os.environ.pop("MLX_LM_COMPILED_DECODE_ACCEPTANCE", None)
+            why, policy = cd.compiled_decode_context_policy(11, 128, "short")
+            self.assertIsNone(why)
+            self.assertIsNone(policy.numerical_acceptance)
+            self.assertFalse(cd.compiled_decode_numerics_accepted(policy))
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ _QUALIFIED_MODEL_CLASSES = (
 )
 _QUALIFICATION_TOKEN = "qwen3_5_moe_m1_v1"
 _PADDED_SDPA_ACCEPTANCE = "class3-padded-sdpa-v1"
+_CLASS1_BUCKET_ACCEPTANCE = "class1-bucketed-v1"
 _CONTEXT_POLICIES = ("short", "memory", "latency")
 _SHORT_CONTEXT_LIMIT = 4096
 _EXTENDED_CONTEXT_LIMIT = 16384
@@ -108,13 +109,13 @@ def _numerical_acceptance() -> Optional[str]:
 
 
 def compiled_decode_enabled() -> bool:
-    """Default-off opt-in via ``MLX_LM_COMPILED_DECODE=1``."""
-    return os.environ.get("MLX_LM_COMPILED_DECODE", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """Default ON for width-1 decode (operator decision 2026-09-05, after the
+    class-1 bucket ladder made every qualified operating point bit-identical to
+    stock); ``MLX_LM_COMPILED_DECODE=0`` opts out. Enablement is still gated per
+    request by the context policy, the numerical acceptance, and the reviewed
+    serving qualification bound at model load."""
+    value = os.environ.get("MLX_LM_COMPILED_DECODE", "1").strip().lower()
+    return value not in ("0", "false", "no", "off", "")
 
 
 def _max_variants() -> int:
@@ -192,6 +193,10 @@ def compiled_decode_context_policy(
             f"{_PADDED_SDPA_ACCEPTANCE!r}",
             None,
         )
+    if acceptance is None and _class1_bucket_ladder(buckets):
+        # No reorder exists on this ladder, so there is nothing to accept; the
+        # policy carries the class-1 marker that the serving manifest binds.
+        acceptance = _CLASS1_BUCKET_ACCEPTANCE
     return None, CompiledDecodePolicy(
         policy,
         limit,
@@ -243,7 +248,9 @@ def _validate_context_policy(policy: CompiledDecodePolicy) -> CompiledDecodePoli
         raise ValueError(
             f"context policy buckets do not match the resolved {policy.name} profile"
         )
-    if policy.numerical_acceptance not in (None, _PADDED_SDPA_ACCEPTANCE):
+    if policy.numerical_acceptance not in (
+        None, _PADDED_SDPA_ACCEPTANCE, _CLASS1_BUCKET_ACCEPTANCE
+    ):
         raise ValueError(
             "unknown compiled decode numerical acceptance token "
             f"{policy.numerical_acceptance!r}"
@@ -251,11 +258,21 @@ def _validate_context_policy(policy: CompiledDecodePolicy) -> CompiledDecodePoli
     return policy
 
 
+def _class1_bucket_ladder(buckets) -> bool:
+    """The ladder measured bit-identical to stock at every operating point and
+    growth boundary (2026-09-04): it carries both the 1023 bucket (sub-1,024 live
+    lengths stay on SDPA's single-pass kernel, as stock does) and the 1024 bucket
+    (a cache of exactly 1,024 keys is not padded into a 2,048 slab)."""
+    return 1023 in buckets and 1024 in buckets
+
+
 def compiled_decode_numerics_accepted(policy: CompiledDecodePolicy) -> bool:
-    """Whether the known padded-SDPA reduction reorder was accepted explicitly."""
-    return (
-        _validate_context_policy(policy).numerical_acceptance
-        == _PADDED_SDPA_ACCEPTANCE
+    """Whether this policy's numerical class is accepted: either the bucket
+    ladder is the class-1 ladder, or the padded-SDPA reorder (class 3) was
+    accepted explicitly through ``MLX_LM_COMPILED_DECODE_ACCEPTANCE``."""
+    return _validate_context_policy(policy).numerical_acceptance in (
+        _CLASS1_BUCKET_ACCEPTANCE,
+        _PADDED_SDPA_ACCEPTANCE,
     )
 
 

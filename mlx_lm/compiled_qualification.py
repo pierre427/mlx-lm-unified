@@ -157,7 +157,8 @@ def _numerical_evidence(record, evidence):
             or any(type(x) is not int or x <= 0 for x in buckets)
             or buckets != sorted(set(buckets))
             or buckets[-1] < end
-            or policy.get("numerical_acceptance") != "class3-padded-sdpa-v1"
+            or policy.get("numerical_acceptance")
+            not in ("class3-padded-sdpa-v1", "class1-bucketed-v1")
         ):
             raise ValueError("qualification profile is malformed")
         required = [(points.get(f"ctx{end}_M1_{name}"), end, None)]

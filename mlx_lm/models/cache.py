@@ -1172,7 +1172,13 @@ class KVCache(_BaseCache):
 # ladder keeps the number of traces per completion at O(log n) while bounding
 # the padded columns attention reads to < 2x the live ones. Override per
 # instance, or globally with MLX_LM_RING_KV_BUCKETS (comma-separated).
-_RING_KV_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536)
+# 2026-09-04: mx.fast.sdpa switches from its single-pass to its two-pass kernel
+# at 1,024 keys, so a sub-1,024 live length padded into a >=1,024 slab reorders
+# the softmax reduction relative to a growing KVCache, and a cache of exactly
+# 1,024 keys inside a 2,048 slab is a second special case. Buckets 1023 and
+# 1024 remove both: with this ladder every measured operating point and bucket
+# growth boundary on the qualified 35B was bit-identical to stock (class 1).
+_RING_KV_BUCKETS = (1023, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
 
 
 def _ring_buckets() -> tuple:

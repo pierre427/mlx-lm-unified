@@ -536,9 +536,12 @@ def generate_step(
           every token. Request-private KV caches are converted to
           ``RingKVCache`` after prefill; caller-owned prompt caches are declined
           so the numerical/performance class cannot leak into later requests.
-          ``None`` reads ``MLX_LM_COMPILED_DECODE``; the default is off.
-          ``MLX_LM_COMPILED_DECODE_ACCEPTANCE=class3-padded-sdpa-v1`` must also
-          record explicit acceptance of the known padded-SDPA reorder. The
+          ``None`` reads ``MLX_LM_COMPILED_DECODE``; the default is on for
+          width-1 decode (``0`` opts out). With the default class-1 bucket
+          ladder (1023 and 1024 present) no numerical acceptance is needed;
+          a custom ladder without them needs
+          ``MLX_LM_COMPILED_DECODE_ACCEPTANCE=class3-padded-sdpa-v1`` to
+          record explicit acceptance of the padded-SDPA reorder. The
           loader also requires an operator-approved checkpoint manifest at
           ``MLX_LM_COMPILED_DECODE_QUALIFICATION``; family eligibility alone
           is only for direct ``CompiledDecodeStep`` research. The
@@ -652,9 +655,11 @@ def generate_step(
             return why
         if not compiled_decode_numerics_accepted(policy):
             return (
-                "the padded-SDPA class-3 reorder has not been accepted; set "
-                "MLX_LM_COMPILED_DECODE_ACCEPTANCE=class3-padded-sdpa-v1 "
-                "only after the production-model numerical gate passes"
+                "this bucket ladder is not the class-1 ladder (1023 and 1024 "
+                "present) and the padded-SDPA class-3 reorder has not been "
+                "accepted; set MLX_LM_COMPILED_DECODE_ACCEPTANCE="
+                "class3-padded-sdpa-v1 only after the production-model "
+                "numerical gate passes"
             )
         why = compiled_decode_serving_reason(model, policy)
         if why is not None:
