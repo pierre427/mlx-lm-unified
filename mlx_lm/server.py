@@ -3499,9 +3499,14 @@ class ResponseGenerator:
                         cache_offset,
                         len(cache_key),
                     )
-            if compiled_decode_status["used"] or megakernel_status["used"]:
-                # The Ring cache is request-private by contract, and a megakernel
-                # lane leaves the stock cache at the prefill boundary. Persisting it
+            if megakernel_status["used"]:
+                # A megakernel lane leaves the stock cache at the prefill
+                # boundary; the generated tokens live only in its ledgers.
+                logging.debug("megakernel lane cache not inserted into APC")
+            elif compiled_decode_status["used"]:
+                # The Ring cache is request-private by contract. Persisting it
+                # would leak its explicit-mask path and numerical class into a
+                # later eager or speculative request. Persisting it
                 # would leak its explicit-mask path and numerical class into a
                 # later eager or speculative request.
                 logging.debug("compiled replay cache not inserted into APC")

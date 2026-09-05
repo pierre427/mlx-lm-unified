@@ -625,7 +625,6 @@ def generate_step(
     if compiled_decode is None:
         compiled_decode = compiled_decode_enabled()
     compiled_step = None
-    megakernel_lane = None
 
     def _try_compiled_decode():
         """Swap the decode step for a compiled replay, or say why not.
@@ -695,8 +694,6 @@ def generate_step(
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
             )
-        if megakernel_lane is not None:
-            return megakernel_lane(input_tokens)
         if compiled_step is not None:
             return compiled_step(input_tokens)
         return model(input_tokens, cache=prompt_cache)
@@ -828,9 +825,13 @@ def generate_step(
             and megakernel_lane_enabled()
         ):
             mx.eval([c.state for c in prompt_cache])
-            megakernel_lane, declined = attach_megakernel_lane(
+            lane, declined = attach_megakernel_lane(
                 model, prompt_cache, max_tokens=max_tokens, status=_megakernel_status
             )
+            if lane is not None:
+                # The lane speaks CompiledDecodeStep's step interface, so the
+                # decode loop drives it unchanged.
+                compiled_step = lane
             if declined:
                 if _megakernel_status is not None:
                     _megakernel_status["decline_reason"] = declined
@@ -894,8 +895,6 @@ def generate_step(
             raise
         raise poisoned from error
     finally:
-        if megakernel_lane is not None:
-            megakernel_lane.close(error=(terminal_reason == "error"))
         if compiled_step is not None:
             try:
                 compiled_step.drain_pending()
@@ -2039,7 +2038,7 @@ def stream_generate(
         for k in (
             "num_draft_tokens", "relaxed_topk", "relaxed_delta", "speculative_stats",
             "kv_bits", "kv_group_size", "quantized_kv_start",
-            "input_embeddings", "max_kv_size",
+            "input_embeddings", "max_kv_size", "compiled_decode",
         ):
             kwargs.pop(k, None)
         token_generator = prompt_lookup_generate_step(
@@ -2079,6 +2078,8 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        # Compiled replay and the megakernel lane are width-1 paths.
+        kwargs.pop("compiled_decode", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, tokenizer=tokenizer, **kwargs
         )

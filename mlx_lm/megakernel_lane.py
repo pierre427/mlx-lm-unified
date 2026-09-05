@@ -117,6 +117,23 @@ class MegakernelLane:
         self.tokens += 1
         return logits.reshape(1, 1, -1)
 
+    # -- CompiledDecodeStep-compatible surface for generate_step's loop -------
+    def materialize_and_confirm(self, completion_output, y, logprobs, *, phase=""):
+        return None  # every step is already synchronous and committed
+
+    def poison(self, error, *, phase=""):
+        self.close(error=True)
+        return error
+
+    def drain_pending(self):
+        self.close(error=False)
+
+    def receipt(self):
+        return {
+            "kind": "megakernel_lane", "tokens": self.tokens,
+            "final_position": self.decoder.position, "closed": self.closed,
+        }
+
     def close(self, error: bool = False):
         if self.closed:
             return
