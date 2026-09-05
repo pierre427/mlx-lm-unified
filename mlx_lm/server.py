@@ -6,6 +6,11 @@ import hmac
 import importlib
 import json
 import logging
+import collections as _collections
+
+# Last decode-lane statuses (compiled replay / megakernel lane) per request,
+# read by GET /v1/status/decode-lanes; operational receipts, not qualification.
+DECODE_LANE_LOG = _collections.deque(maxlen=64)
 import math
 import os
 import pickle
@@ -3357,6 +3362,7 @@ class ResponseGenerator:
             prompt_lookup_stats = None
             compiled_decode_status = {"used": False}
             megakernel_status = {"used": False}
+            lane_started_at = time.time()
             if getattr(args, "prompt_lookup_ngram", 0):
                 from .prompt_lookup import HybridStats
 
@@ -3499,6 +3505,12 @@ class ResponseGenerator:
                         cache_offset,
                         len(cache_key),
                     )
+            DECODE_LANE_LOG.append({
+                "ts": time.time(), "wall_s": round(time.time() - lane_started_at, 3),
+                "prompt_tokens": len(prompt), "generated_tokens": max(0, len(cache_key) - len(prompt)),
+                "completed": completed, "compiled": dict(compiled_decode_status),
+                "megakernel": dict(megakernel_status),
+            })
             if megakernel_status["used"]:
                 # A megakernel lane leaves the stock cache at the prefill
                 # boundary; the generated tokens live only in its ledgers.
@@ -4581,6 +4593,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_qwen4_qsa_indexed_status()
         elif self.path == "/v1/status/qwen4-ple-compile":
             self.handle_qwen4_ple_compile_status()
+        elif self.path == "/v1/status/decode-lanes":
+            payload = json.dumps({"requests": list(DECODE_LANE_LOG)}, default=str).encode()
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(payload)
         else:
             self._set_completion_headers(404)
             self.end_headers()
