@@ -405,13 +405,36 @@ def qualification_records():
     return {record["qualification_id"]: record}
 
 
+# Serving-evidence schemas. v1: compiled must decline a prompt-cache hit
+# (caller-owned cache). v2 (2026-09-05, compiled replay on APC hits): the hit
+# engages compiled with tokens identical to the eager hit; ``apc_publish_hit``
+# restores a cache a *compiled* turn published; ``apc_hit_pld_declines`` is a
+# prompt-lookup request on the same prefix that still serves and still
+# declines compiled.
+_SERVING_SCHEMAS = {
+    "compiled-serving-e2e-v1": {
+        "required": ("cold", "apc_hit", "eos", "length", "cancel", "concurrent"),
+        "compiled_used": lambda name: name != "apc_hit",
+    },
+    "compiled-serving-e2e-v2": {
+        "required": (
+            "cold", "apc_hit", "apc_publish_hit", "apc_hit_pld_declines",
+            "eos", "length", "cancel", "concurrent",
+        ),
+        "compiled_used": lambda name: name != "apc_hit_pld_declines",
+    },
+}
+
+
 def _serving_evidence(record, evidence, reval=None):
-    if evidence.get("schema") != "compiled-serving-e2e-v1" or not (
+    schema = _SERVING_SCHEMAS.get(evidence.get("schema"))
+    if schema is None or not (
         _evidence_identity_matches(record, evidence.get("qualification_identity"), reval)
     ):
         raise ValueError("serving evidence belongs to another model/runtime")
     cases = evidence.get("cases")
-    required = {"cold", "apc_hit", "eos", "length", "cancel", "concurrent"}
+    required = set(schema["required"])
+    expect_compiled = schema["compiled_used"]
     if (
         not isinstance(cases, dict)
         or not required.issubset(cases)
@@ -428,7 +451,7 @@ def _serving_evidence(record, evidence, reval=None):
             or not stock
             or stock != candidate
             or any(type(token) is not int or token < 0 for token in stock)
-            or case.get("compiled_used") is not (name != "apc_hit")
+            or case.get("compiled_used") is not expect_compiled(name)
             or case.get("pending") != 0
             or case.get("failed") != 0
             or case.get("poisoned") is not False

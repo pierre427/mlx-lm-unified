@@ -7,6 +7,7 @@ run while Metal is unavailable or a host is awaiting reboot.
 """
 
 import ast
+import mlx.core as mx
 import contextlib
 import copy
 import importlib.util
@@ -684,6 +685,38 @@ class TestCheckpointQualification(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.q.qualification_records()
 
+    def test_serving_evidence_v2_engages_compiled_on_apc_hits(self):
+        # v1: the APC hit must decline. v2 (compiled replay on hits): the hit
+        # engages, a hit on a compiled-published cache engages, and a
+        # prompt-lookup request on the prefix still declines.
+        with tempfile.TemporaryDirectory() as temporary:
+            weights, manifest_path, manifest, _, _ = self._manifest_fixture(temporary)
+            serving_path = Path(temporary) / "serving.json"
+            serving = json.loads(serving_path.read_text())
+            base = dict(serving["cases"]["cold"])
+            v2_cases = {name: dict(base) for name in (
+                "cold", "apc_hit", "apc_publish_hit", "apc_hit_pld_declines",
+                "eos", "length", "cancel", "concurrent",
+            )}
+            v2_cases["apc_hit_pld_declines"]["compiled_used"] = False
+            v2_cases["concurrent"].update(requests=2, serialized=True)
+            serving.update(schema="compiled-serving-e2e-v2", cases=v2_cases)
+            serving_path.write_text(json.dumps(serving))
+            manifest["serving_evidence"] = {"path": str(serving_path), "sha256": self.q._file_digest(serving_path)}
+            manifest_path.write_text(json.dumps(manifest))
+            with mock.patch.dict(self.q.os.environ, {self.q._MANIFEST_ENV: str(manifest_path)}):
+                self.assertIn("operator-fixture", self.q.qualification_records())
+            # v2 with a declined hit, or v1 with an engaged hit, is refused.
+            for schema, hit_used in (("compiled-serving-e2e-v2", False), ("compiled-serving-e2e-v1", True)):
+                bad = json.loads(json.dumps(serving)); bad["schema"] = schema
+                bad["cases"]["apc_hit"]["compiled_used"] = hit_used
+                serving_path.write_text(json.dumps(bad))
+                manifest["serving_evidence"]["sha256"] = self.q._file_digest(serving_path)
+                manifest_path.write_text(json.dumps(manifest))
+                with mock.patch.dict(self.q.os.environ, {self.q._MANIFEST_ENV: str(manifest_path)}):
+                    with self.assertRaises(ValueError):
+                        self.q.qualification_records()
+
     def test_operator_manifest_rejects_missing_approval_and_false_numerics(self):
         with tempfile.TemporaryDirectory() as temporary:
             weights, manifest_path, manifest, numerical_path, numerical = (
@@ -837,12 +870,16 @@ class TestCompiledDecodeSourceContracts(unittest.TestCase):
         self.assertIn("if compiled_decode and max_tokens != 0:", generate)
         self.assertIn("compiled_step.materialize_and_confirm(", generate)
 
-    def test_server_private_cache_contract_is_explicit_and_not_persisted(self):
+    def test_server_private_cache_contract_and_kv_form_publication(self):
+        # 2026-09-05: an APC hit is a deep copy, hence request-private; a
+        # compiled request publishes the stock KV form of its ring slots, and
+        # only after a clean completion. The ring never enters the APC.
         generate = _source("mlx_lm/generate.py")
         server = _source("mlx_lm/server.py")
         self.assertIn("_prompt_cache_is_request_private", generate)
         self.assertIn("_compiled_decode_status", generate)
-        self.assertIn("cache_is_request_private = cache is None", server)
+        self.assertIn("cache_is_request_private = True", server)
+        self.assertNotIn("cache_is_request_private = cache is None", server)
         self.assertIn(
             "_prompt_cache_is_request_private=cache_is_request_private", server
         )
@@ -859,14 +896,47 @@ class TestCompiledDecodeSourceContracts(unittest.TestCase):
             for node in ast.walk(statement)
             if isinstance(node, ast.Call)
         }
-        else_calls = {
-            ast.unparse(node.func)
-            for statement in guard.orelse
+        self.assertIn("_compiled_cache_publishable", body_calls)
+        self.assertIn("_compiled_cache_for_publication", body_calls)
+        self.assertIn("_store_single_request_prompt_cache", body_calls)
+        # The publish call is guarded by the publishability check.
+        publish_if = next(
+            node
+            for statement in guard.body
             for node in ast.walk(statement)
-            if isinstance(node, ast.Call)
-        }
-        self.assertNotIn("_store_single_request_prompt_cache", body_calls)
-        self.assertIn("_store_single_request_prompt_cache", else_calls)
+            if isinstance(node, ast.If)
+            and "publishable is None" in ast.unparse(node.test)
+        )
+        self.assertIn("_store_single_request_prompt_cache", ast.unparse(publish_if.body[0]))
+
+    def test_compiled_cache_publication_helpers(self):
+        from mlx_lm import server as S
+        from mlx_lm.models.cache import KVCache, RingKVCache
+
+        self.assertIsNone(S._compiled_cache_publishable(
+            {"terminal_reason": "eos", "receipt": {"poisoned": False, "pending": 0, "failure_counts": {}}}
+        ))
+        for status, why in (
+            ({"terminal_reason": "error", "receipt": {"poisoned": False, "pending": 0, "failure_counts": {}}}, "error"),
+            ({"terminal_reason": "eos"}, "no compiled receipt"),
+            ({"terminal_reason": "eos", "receipt": {"poisoned": True, "pending": 0, "failure_counts": {}}}, "poisoned"),
+            ({"terminal_reason": "eos", "receipt": {"poisoned": False, "pending": 2, "failure_counts": {}}}, "unconfirmed"),
+            ({"terminal_reason": "eos", "receipt": {"poisoned": False, "pending": 0, "failure_counts": {"k": 1}}}, "failures"),
+        ):
+            self.assertIn(why, S._compiled_cache_publishable(status))
+
+        kv = KVCache()
+        keys = mx.arange(2 * 1 * 5 * 3, dtype=mx.float32).reshape(1, 1, 10, 3)[..., :5, :]
+        kv.update_and_fetch(keys, keys * 2)
+        ring = RingKVCache.from_kv_cache(kv, buckets=(8, 16))
+        other = object()
+        published = S._compiled_cache_for_publication([ring, other])
+        self.assertIs(published[1], other)
+        self.assertIsInstance(published[0], KVCache)
+        self.assertNotIsInstance(published[0], RingKVCache)
+        self.assertEqual(published[0].offset, 5)
+        self.assertTrue(mx.array_equal(published[0].keys, kv.keys[..., :5, :]))
+        self.assertTrue(mx.array_equal(published[0].values, kv.values[..., :5, :]))
 
     def test_model_swap_collects_python_cycles_before_mlx_cache(self):
         tree = ast.parse(_source("mlx_lm/server.py"))

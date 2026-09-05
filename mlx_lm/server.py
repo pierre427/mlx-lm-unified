@@ -69,6 +69,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, RotatingKVCache, make_prompt_cache
+from .models.cache import RingKVCache
 from .sample_utils import LaneRNG, make_logits_processors, make_sampler
 from .spec_policy import MAX_DRAFT_TOKENS
 from .speculation_router import DepthCeilingController
@@ -2031,6 +2032,38 @@ def _fetch_single_request_prompt_cache(
     return cache, rest, None
 
 
+def _compiled_cache_publishable(status):
+    """Why a compiled request's cache must not be published, or ``None``.
+
+    Only a request whose compiled step drained every submitted call with no
+    failure and no poison describes prompt + emitted tokens exactly.
+    """
+    if status.get("terminal_reason") == "error":
+        return "the request ended in error"
+    receipt = status.get("receipt")
+    if not isinstance(receipt, dict):
+        return "no compiled receipt"
+    if receipt.get("poisoned") is not False:
+        return "the compiled step was poisoned"
+    if receipt.get("pending") != 0:
+        return f"{receipt.get('pending')} unconfirmed compiled calls"
+    if any(receipt.get("failure_counts", {}).values()):
+        return "the compiled step recorded failures"
+    return None
+
+
+def _compiled_cache_for_publication(cache):
+    """The stock-cache form of a compiled request's cache list.
+
+    Ring slots become ``KVCache`` (live region only); every other slot is the
+    same object. The APC never holds a ``RingKVCache``.
+    """
+    published = [c.to_kv_cache() if isinstance(c, RingKVCache) else c for c in cache]
+    if any(isinstance(c, RingKVCache) for c in published):
+        raise RuntimeError("a RingKVCache must never be published to the prompt cache")
+    return published
+
+
 def _store_single_request_prompt_cache(
     prompt_cache,
     model_key,
@@ -3315,7 +3348,12 @@ class ResponseGenerator:
                 prompt,
                 external_draft=external_draft,
             )
-            cache_is_request_private = cache is None
+            # Both fetch paths hand the request a deep copy
+            # (_copy_prompt_cache_for_restore); nothing else holds it, so an
+            # APC hit is request-private in fact. Compiled replay may convert
+            # it to ring state like a fresh prompt; publication at the end is
+            # a fresh insert of the KV form, never of the ring (2026-09-05).
+            cache_is_request_private = True
             ctx.prompt_cache_count = len(prompt) - len(rest)
             if _discard_small_sidecarless_apc_hit_for_mtp(
                 self.cli_args,
@@ -3544,12 +3582,24 @@ class ResponseGenerator:
                 # boundary; the generated tokens live only in its ledgers.
                 logging.debug("megakernel lane cache not inserted into APC")
             elif compiled_decode_status["used"]:
-                # The Ring cache is request-private by contract. Persisting it
-                # would leak its explicit-mask path and numerical class into a
-                # later eager or speculative request. Persisting it
-                # would leak its explicit-mask path and numerical class into a
-                # later eager or speculative request.
-                logging.debug("compiled replay cache not inserted into APC")
+                # A compiled request publishes the stock KV form of its ring
+                # slots (one contiguous copy of the live region) and only after
+                # a clean completion: the ring itself never enters the APC
+                # (padded slab bytes; refuses KV quantization).
+                publishable = _compiled_cache_publishable(compiled_decode_status)
+                if publishable is None:
+                    _store_single_request_prompt_cache(
+                        self.prompt_cache,
+                        self.model_provider.model_key,
+                        cache_key,
+                        _compiled_cache_for_publication(cache),
+                        sidecar=sidecar,
+                        external_draft=external_draft,
+                    )
+                else:
+                    logging.debug(
+                        "compiled replay cache not inserted into APC: %s", publishable
+                    )
             else:
                 _store_single_request_prompt_cache(
                     self.prompt_cache,
