@@ -3356,6 +3356,7 @@ class ResponseGenerator:
             prompt_lookup_config = None
             prompt_lookup_stats = None
             compiled_decode_status = {"used": False}
+            megakernel_status = {"used": False}
             if getattr(args, "prompt_lookup_ngram", 0):
                 from .prompt_lookup import HybridStats
 
@@ -3400,6 +3401,7 @@ class ResponseGenerator:
                 ),
                 _prompt_cache_is_request_private=cache_is_request_private,
                 _compiled_decode_status=compiled_decode_status,
+                _megakernel_status=megakernel_status,
                 compiled_decode=self._compiled_request_selected(args, len(prompt)),
             )
             completed = False
@@ -3497,8 +3499,9 @@ class ResponseGenerator:
                         cache_offset,
                         len(cache_key),
                     )
-            if compiled_decode_status["used"]:
-                # The Ring cache is request-private by contract. Persisting it
+            if compiled_decode_status["used"] or megakernel_status["used"]:
+                # The Ring cache is request-private by contract, and a megakernel
+                # lane leaves the stock cache at the prefill boundary. Persisting it
                 # would leak its explicit-mask path and numerical class into a
                 # later eager or speculative request.
                 logging.debug("compiled replay cache not inserted into APC")

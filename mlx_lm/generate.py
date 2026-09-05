@@ -20,6 +20,7 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .batch_admission import AdmissionState, LinearStateCost, StateBudget
+from .megakernel_lane import attach_megakernel_lane, megakernel_lane_enabled
 from .compiled_decode import (
     CompiledDecodePoisoned,
     CompiledDecodeStep,
@@ -494,6 +495,7 @@ def generate_step(
     compiled_decode: Optional[bool] = None,
     _prompt_cache_is_request_private: bool = False,
     _compiled_decode_status: Optional[dict] = None,
+    _megakernel_status: Optional[dict] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -623,6 +625,7 @@ def generate_step(
     if compiled_decode is None:
         compiled_decode = compiled_decode_enabled()
     compiled_step = None
+    megakernel_lane = None
 
     def _try_compiled_decode():
         """Swap the decode step for a compiled replay, or say why not.
@@ -692,6 +695,8 @@ def generate_step(
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
             )
+        if megakernel_lane is not None:
+            return megakernel_lane(input_tokens)
         if compiled_step is not None:
             return compiled_step(input_tokens)
         return model(input_tokens, cache=prompt_cache)
@@ -813,6 +818,23 @@ def generate_step(
                 if _compiled_decode_status is not None:
                     _compiled_decode_status["decline_reason"] = declined
                 logging.debug("compiled decode declined: %s", declined)
+        if (
+            compiled_step is None
+            and max_tokens != 0
+            and kv_bits is None
+            and max_kv_size is None
+            and input_embeddings is None
+            and not caller_supplied_prompt_cache
+            and megakernel_lane_enabled()
+        ):
+            mx.eval([c.state for c in prompt_cache])
+            megakernel_lane, declined = attach_megakernel_lane(
+                model, prompt_cache, max_tokens=max_tokens, status=_megakernel_status
+            )
+            if declined:
+                if _megakernel_status is not None:
+                    _megakernel_status["decline_reason"] = declined
+                logging.debug("megakernel lane declined: %s", declined)
 
     n = 0
     terminal_reason = "closed"
@@ -872,6 +894,8 @@ def generate_step(
             raise
         raise poisoned from error
     finally:
+        if megakernel_lane is not None:
+            megakernel_lane.close(error=(terminal_reason == "error"))
         if compiled_step is not None:
             try:
                 compiled_step.drain_pending()
@@ -1896,6 +1920,7 @@ def stream_generate(
     self_mtp: Optional[dict] = None,
     _prompt_cache_is_request_private: bool = False,
     _compiled_decode_status: Optional[dict] = None,
+    _megakernel_status: Optional[dict] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -2046,6 +2071,7 @@ def stream_generate(
             model,
             _prompt_cache_is_request_private=_prompt_cache_is_request_private,
             _compiled_decode_status=_compiled_decode_status,
+            _megakernel_status=_megakernel_status,
             **kwargs,
         )
         # from_draft always false for non-speculative generation
