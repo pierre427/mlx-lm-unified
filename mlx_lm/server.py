@@ -2358,6 +2358,24 @@ class ResponseGenerator:
             and compiled_decode_serving_reason(self.model_provider.model, policy) is None
         )
 
+    def _megakernel_request_selected(self, args):
+        """Width-1 plain requests on a Qwen4-Exp model take the single-request
+        path so the megakernel lane can attach after prefill."""
+        if getattr(args, "n", 1) != 1:
+            return False
+        if (
+            self.model_provider.draft_model is not None
+            or getattr(self.cli_args, "self_mtp", False)
+            or getattr(args, "prompt_lookup_ngram", 0)
+            or any(getattr(self.cli_args, name, None) is not None for name in (
+                "kv_bits", "kv_key_bits", "kv_value_bits", "max_kv_size",
+            ))
+        ):
+            return False
+        from .megakernel_lane import megakernel_lane_enabled, _text_model
+
+        return megakernel_lane_enabled() and _text_model(self.model_provider.model) is not None
+
     def _is_batchable(self, args, prompt_tokens=None):
         if not self.model_provider.is_batchable:
             return False
@@ -2367,6 +2385,8 @@ class ResponseGenerator:
         if getattr(args, "n", 1) > 1:
             return False
         if self._compiled_request_selected(args, prompt_tokens):
+            return False
+        if self._megakernel_request_selected(args):
             return False
         # Seeded ordinary batches still share the global sampler stream.  A
         # potentially eligible self-MTP request is allowed through this static
