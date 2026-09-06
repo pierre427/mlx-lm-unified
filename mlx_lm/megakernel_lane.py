@@ -20,9 +20,9 @@ QSA KV columns, raw index keys, pooled block summaries, GDN conv / recurrent
 states and PLE conv + n-gram state back into the request's stock cache objects
 (``MegakernelDecoder.commit_to_caches``), so the server inserts the stock form
 into the prefix cache and a later turn warm-restores the shared prefix instead
-of re-prefilling it.  Publish-back is opt-in via ``MLX_QWEN4_MEGAKERNEL_PUBLISH``
-(default off, so the deployed lane still stops at the prefill boundary); a
-poisoned or failed close never publishes.
+of re-prefilling it.  Publish-back is on by default (2026-09-06, GPU-proven
+multi-turn 33.5->14.0 s = 2.39x); set ``MLX_QWEN4_MEGAKERNEL_PUBLISH=0`` to stop
+the lane at the prefill boundary.  A poisoned or failed close never publishes.
 
 One decoder is packed per process (about 4 s and ~7 GiB on the 4-bit
 Flash-Next) and reused across requests; a process-wide lock serializes lanes.
@@ -61,7 +61,7 @@ def megakernel_publish_enabled() -> bool:
     state back into the request's stock cache objects so a later turn
     warm-restores the shared prefix instead of re-prefilling it.
     """
-    return os.environ.get("MLX_QWEN4_MEGAKERNEL_PUBLISH", "0").strip().lower() in (
+    return os.environ.get("MLX_QWEN4_MEGAKERNEL_PUBLISH", "1").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
