@@ -323,7 +323,15 @@ def _concat_tables(tables, axis):
     concatenation along N (axis -2) or along the expert axis (0) preserves
     every group, scale, and bias byte-for-byte; re-fusing the split
     [gate|up] quantized tensors reproduces the checkpoint's fused layout.
+
+    This is the choke point every fusion site funnels through, so the
+    quant-parameter check lives here: parts that differ in mode, bits,
+    group_size, or dtype cannot be re-fused without silently corrupting the
+    scales, and ``mx.concatenate`` would not object. A future caller that
+    forgets to pre-validate inherits this guard by construction (arXiv
+    2609.04098 re-derives the fused-scale bug class).
     """
+    _assert_concat_compatible(tables)
     weight = mx.concatenate([t[0] for t in tables], axis=axis)
     scales = biases = None
     if tables[0][1] is not None:
@@ -331,6 +339,58 @@ def _concat_tables(tables, axis):
         if tables[0][2] is not None:
             biases = mx.concatenate([t[2] for t in tables], axis=axis)
     return (weight, scales, biases, *tables[0][3:])
+
+
+def _assert_concat_compatible(tables):
+    """Fail loudly before fusing projection tables that do not match.
+
+    A projection table is ``(weight, scales, biases, group_size, bits, mode)``.
+    The valid (all-matching) case is untouched; a mismatch raises ValueError.
+    Callers pre-validate today, so this never fires for them -- it exists to
+    keep FUTURE fusion sites from concatenating incompatible quantized parts.
+    """
+    if not tables:
+        raise ValueError("_concat_tables: no tables to concatenate")
+    head = tables[0]
+    head_quant = head[1] is not None
+    for i, t in enumerate(tables[1:], start=1):
+        if (t[1] is not None) != head_quant:
+            raise ValueError(
+                "_concat_tables: cannot fuse quantized and non-quantized "
+                f"projection parts (part 0 quantized={head_quant}, "
+                f"part {i} quantized={t[1] is not None})"
+            )
+        if t[0].dtype != head[0].dtype:
+            raise ValueError(
+                "_concat_tables: weight dtype mismatch "
+                f"(part 0 {head[0].dtype}, part {i} {t[0].dtype})"
+            )
+        if not head_quant:
+            continue
+        # group_size (3), bits (4), mode (5) define the quant grid; scales and
+        # biases dtypes must match or the fused scale bytes are meaningless.
+        if (t[3], t[4], t[5]) != (head[3], head[4], head[5]):
+            raise ValueError(
+                "_concat_tables: quant parameter mismatch "
+                f"(part 0 group_size/bits/mode={head[3]}/{head[4]}/{head[5]}, "
+                f"part {i}={t[3]}/{t[4]}/{t[5]})"
+            )
+        if t[1].dtype != head[1].dtype:
+            raise ValueError(
+                "_concat_tables: scales dtype mismatch "
+                f"(part 0 {head[1].dtype}, part {i} {t[1].dtype})"
+            )
+        if (t[2] is None) != (head[2] is None):
+            raise ValueError(
+                "_concat_tables: biases present on some parts but not others "
+                f"(part 0 has_biases={head[2] is not None}, "
+                f"part {i} has_biases={t[2] is not None})"
+            )
+        if t[2] is not None and t[2].dtype != head[2].dtype:
+            raise ValueError(
+                "_concat_tables: biases dtype mismatch "
+                f"(part 0 {head[2].dtype}, part {i} {t[2].dtype})"
+            )
 
 
 def table_bytes(table) -> int:
