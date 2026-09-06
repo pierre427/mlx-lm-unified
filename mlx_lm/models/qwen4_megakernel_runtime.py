@@ -779,6 +779,140 @@ class MegakernelDecoder:
                 "position": target_position,
             }
 
+    def commit_to_caches(self, caches, *, indexer_of=None,
+                         ple_embedding_cache=None) -> dict[str, Any]:
+        """Write the kernel's live ledgers back into the request's stock caches.
+
+        The reverse of ``seed_from_caches``: after a width-1 completion the
+        ledgers hold prompt + emitted columns, so this appends the emitted
+        span into the stock QSA / GDN / PLE cache objects through their own
+        update path.  The result is the stock form a plain decode of the same
+        tokens would have left, so the server can publish it to the prefix
+        cache and a later request warm-restores it instead of re-prefilling.
+
+        Only a CLEAN close may publish: no launch pending, none in flight, and
+        not poisoned.  Nothing is written until every payload validates, so a
+        refusal leaves every cache object untouched.
+        """
+        from .qwen4_exp import _qsa_summary_with_coverage
+
+        with self._state_lock:
+            if self._in_flight or self._pending is not None:
+                raise RuntimeError("cannot publish during a megakernel transaction")
+            if self._poisoned_reason is not None:
+                raise MegakernelDeviceAbort(
+                    "cannot publish a poisoned megakernel decoder")
+            required = max(self.layers, default=-1) + 1
+            if len(caches) < required:
+                raise ValueError(
+                    f"cache list has {len(caches)} entries; need {required}")
+            position = int(self.position)
+            if position < 0 or position > self.total:
+                raise ValueError(
+                    f"publish position {position} outside 0..{self.total}")
+
+            # Validate and derive every payload before the first cache write.
+            attn_writes = []
+            for slot, index in enumerate(self.attn_layers):
+                cache = caches[index]
+                length = int(getattr(cache, "offset", 0))
+                if length > position:
+                    raise ValueError(
+                        f"attention layer {index} offset {length} exceeds "
+                        f"publish position {position}")
+                raw_ledger = getattr(cache, "index_keys", None)
+                if raw_ledger is not None and raw_ledger.shape[1] != length:
+                    raise ValueError(
+                        f"attention layer {index} raw-key ledger width "
+                        f"{raw_ledger.shape[1]} != offset {length}; refuse to "
+                        "publish a desynced cache")
+                base = slot * N_KV_HEADS
+                keys = self.kv[0, base:base + N_KV_HEADS, length:position][None]
+                values = self.kv[1, base:base + N_KV_HEADS, length:position][None]
+                rbase = slot * self.total
+                new_raw = self.idxl[rbase + length:rbase + position][None]
+                full_raw = self.idxl[rbase:rbase + position][None]
+                n_blocks = position // IDX_COMPRESS
+                pooled = None
+                identity = None
+                if n_blocks:
+                    indexer = None if indexer_of is None else indexer_of(index)
+                    if indexer is None:
+                        raise ValueError(
+                            f"attention layer {index} needs an indexer to pool "
+                            f"{n_blocks} blocks for the published summary")
+                    starts = mx.arange(n_blocks) * IDX_COMPRESS
+                    pooled = indexer._pool_blocks(
+                        full_raw[:, :n_blocks * IDX_COMPRESS], starts)
+                    if tuple(pooled.shape) != (1, n_blocks, IDX_HEAD_DIM):
+                        raise ValueError(
+                            f"attention layer {index} pooler returned "
+                            f"{tuple(pooled.shape)}")
+                    identity = _qsa_summary_with_coverage(
+                        indexer.summary_identity, n_blocks)
+                attn_writes.append(
+                    (cache, length, keys, values, new_raw, pooled, identity,
+                     n_blocks))
+
+            gdn_writes = [
+                (caches[index], self.cs[slot][None], self.rec[slot][None])
+                for slot, index in enumerate(self.gdn_layers)
+            ]
+            ple_writes = [(caches[index], self.pconv[None])
+                          for index in self.ple_layers]
+            ple_embedding_writes = []
+            if ple_embedding_cache is not None:
+                for index in self.ple_layers:
+                    ple_embedding_writes.append(
+                        (caches[index], ple_embedding_cache[3]))
+
+            pooled_count = 0
+            try:
+                for (cache, length, keys, values, new_raw, pooled, identity,
+                     n_blocks) in attn_writes:
+                    cache.update_index_keys(mx.contiguous(new_raw))
+                    cache.update_and_fetch(
+                        mx.contiguous(keys), mx.contiguous(values))
+                    cache._mtp_share_topk = False
+                    cache._mtp_shared_topk = None
+                    if pooled is not None:
+                        cache._qsa_pooled_keys = mx.contiguous(pooled)
+                        cache._qsa_pooled_ratio = IDX_COMPRESS
+                        cache._qsa_summary_identity = identity
+                        cache._qsa_summary_restored = False
+                        pooled_count += n_blocks
+                    else:
+                        cache._qsa_pooled_keys = None
+                        cache._qsa_pooled_ratio = None
+                        cache._qsa_summary_identity = _qsa_summary_with_coverage(
+                            getattr(cache, "_qsa_summary_identity", None), 0)
+                        cache._qsa_summary_restored = False
+                for cache, cs, rec in gdn_writes:
+                    cache[0] = cs.astype(cache[0].dtype) if cache[0] is not None \
+                        else cs
+                    cache[1] = rec.astype(cache[1].dtype) if cache[1] is not None \
+                        else rec
+                for cache, pconv in ple_writes:
+                    cache[2] = pconv.astype(cache[2].dtype) \
+                        if cache[2] is not None else pconv
+                for cache, ngram_state in ple_embedding_writes:
+                    cache[3] = ngram_state
+                mx.eval(*[c.keys for c, *_ in attn_writes if c.keys is not None],
+                        *[c.values for c, *_ in attn_writes
+                          if c.values is not None])
+            except Exception as exc:
+                self._poisoned_reason = (
+                    f"partial cache publish: {type(exc).__name__}")
+                raise MegakernelDeviceAbort(self._poisoned_reason) from exc
+            return {
+                "attention": len(attn_writes),
+                "gdn": len(gdn_writes),
+                "ple": len(ple_writes),
+                "ple_embedding": len(ple_embedding_writes),
+                "pooled_blocks": pooled_count,
+                "position": position,
+            }
+
     # ------------------------------------------------------------ admission
     def admit(self, *, width: int = 1, batch: int = 1, dtype=mx.bfloat16,
               speculating: bool = False, training: bool = False,

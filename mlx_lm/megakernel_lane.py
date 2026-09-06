@@ -13,8 +13,16 @@ The lane is exact at the token level under the recorded class-2 contract: the
 kernel's logits are closer to fp32 than stock at every boundary but not
 bit-identical, and a greedy near-tie can resolve differently from the eager
 path. It is therefore never combined with speculation, quantized KV, rotating
-caches, caller-owned caches, or batching, and the request's stock cache is not
-published to the prefix cache afterwards (it stops at the prefill boundary).
+caches, caller-owned caches, or batching.
+
+At a clean close the lane can PUBLISH its state: it copies the kernel's live
+QSA KV columns, raw index keys, pooled block summaries, GDN conv / recurrent
+states and PLE conv + n-gram state back into the request's stock cache objects
+(``MegakernelDecoder.commit_to_caches``), so the server inserts the stock form
+into the prefix cache and a later turn warm-restores the shared prefix instead
+of re-prefilling it.  Publish-back is opt-in via ``MLX_QWEN4_MEGAKERNEL_PUBLISH``
+(default off, so the deployed lane still stops at the prefill boundary); a
+poisoned or failed close never publishes.
 
 One decoder is packed per process (about 4 s and ~7 GiB on the 4-bit
 Flash-Next) and reused across requests; a process-wide lock serializes lanes.
@@ -41,6 +49,20 @@ def megakernel_lane_enabled() -> bool:
         return False
     return os.environ.get("MLX_QWEN4_MEGAKERNEL_LANE", "1").strip().lower() not in (
         "0", "false", "no", "off",
+    )
+
+
+def megakernel_publish_enabled() -> bool:
+    """Whether a clean lane close publishes its cache to the prefix cache.
+
+    Default OFF: the deployed lane stops at the prefill boundary until the
+    publish-back has been measured.  On, a clean close copies the kernel's KV
+    columns, index keys, pooled summaries, GDN conv / recurrent states and PLE
+    state back into the request's stock cache objects so a later turn
+    warm-restores the shared prefix instead of re-prefilling it.
+    """
+    return os.environ.get("MLX_QWEN4_MEGAKERNEL_PUBLISH", "0").strip().lower() in (
+        "1", "true", "yes", "on",
     )
 
 
@@ -107,6 +129,7 @@ class MegakernelLane:
 
         self.decoder = decoder
         self.status = status
+        self.prompt_cache = prompt_cache
         text_model = _text_model(model)
         self.embed = text_model.model.embed_tokens
         self.indexer_of = lambda i: text_model.model.layers[i].self_attn.indexer
@@ -117,8 +140,15 @@ class MegakernelLane:
             self.ple_fn = text_model.model.layers[index].ple.ple_embedding
             self.ple_cache = QE.Qwen4ArraysCache(size=4)
             self.ple_cache[3] = prompt_cache[index][3]
+        self.publish = megakernel_publish_enabled()
         self.tokens = 0
         self.closed = False
+        self._publish_receipt = {
+            "published": False,
+            "reason": ("publish-back disabled"
+                       if not self.publish else "close not reached"),
+        }
+        self.status["publish_back"] = dict(self._publish_receipt)
 
     def __call__(self, input_tokens: mx.array) -> mx.array:
         ids = input_tokens.reshape(1, -1)
@@ -154,7 +184,28 @@ class MegakernelLane:
         return {
             "kind": "megakernel_lane", "tokens": self.tokens,
             "final_position": self.decoder.position, "closed": self.closed,
+            "publish_back": dict(self._publish_receipt),
         }
+
+    def _publish_back(self):
+        """Copy the kernel's live state into the request's stock caches.
+
+        Only reached from a clean close. Any refusal is recorded in the
+        receipt so the server declines to insert the cache, and never raised:
+        a close must not throw.
+        """
+        try:
+            with mx.stream(mx.default_stream(mx.default_device())):
+                info = self.decoder.commit_to_caches(
+                    self.prompt_cache, indexer_of=self.indexer_of,
+                    ple_embedding_cache=self.ple_cache)
+            self._publish_receipt = {"published": True, **info}
+        except Exception as exc:  # noqa: BLE001 -- a failed publish must not throw
+            self._publish_receipt = {
+                "published": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            logging.exception("megakernel lane: publish-back failed")
 
     def close(self, error: bool = False):
         if self.closed:
@@ -163,9 +214,23 @@ class MegakernelLane:
         try:
             if error and getattr(self.decoder, "_pending", None) is not None:
                 self.decoder.rollback()
+            clean = (
+                not error
+                and getattr(self.decoder, "_pending", None) is None
+                and getattr(self.decoder, "_poisoned_reason", None) is None
+            )
+            if not self.publish:
+                self._publish_receipt = {
+                    "published": False, "reason": "publish-back disabled"}
+            elif not clean:
+                self._publish_receipt = {
+                    "published": False, "reason": "close was not clean"}
+            else:
+                self._publish_back()
         finally:
             self.status["tokens"] = self.tokens
             self.status["final_position"] = self.decoder.position
+            self.status["publish_back"] = dict(self._publish_receipt)
             _LANE_LOCK.release()
 
 

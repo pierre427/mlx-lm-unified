@@ -2052,6 +2052,23 @@ def _compiled_cache_publishable(status):
     return None
 
 
+def _megakernel_cache_publishable(status):
+    """Why a megakernel-lane request's cache must not be published, or ``None``.
+
+    The lane publishes its KV columns, index keys, pooled summaries, GDN and
+    PLE state back into the request's stock cache objects only at a clean close
+    (``MegakernelLane.close`` -> ``MegakernelDecoder.commit_to_caches``); only
+    then does the cache list describe prompt + emitted tokens.  Publish-back is
+    off by default, and a poisoned or failed close never publishes.
+    """
+    receipt = status.get("publish_back")
+    if not isinstance(receipt, dict):
+        return "the lane recorded no publish-back"
+    if receipt.get("published") is not True:
+        return str(receipt.get("reason") or "the lane did not publish")
+    return None
+
+
 def _compiled_cache_for_publication(cache):
     """The stock-cache form of a compiled request's cache list.
 
@@ -3578,9 +3595,26 @@ class ResponseGenerator:
                 "megakernel": dict(megakernel_status),
             })
             if megakernel_status["used"]:
-                # A megakernel lane leaves the stock cache at the prefill
-                # boundary; the generated tokens live only in its ledgers.
-                logging.debug("megakernel lane cache not inserted into APC")
+                # The lane publishes the kernel's KV columns, index keys,
+                # pooled summaries, GDN and PLE state back into the stock
+                # cache objects at a clean close, and only then is the cache
+                # the stock form of prompt + emitted tokens.  With publish-back
+                # off it stops at the prefill boundary.
+                publishable = _megakernel_cache_publishable(megakernel_status)
+                if publishable is None:
+                    _store_single_request_prompt_cache(
+                        self.prompt_cache,
+                        self.model_provider.model_key,
+                        cache_key,
+                        cache,
+                        sidecar=sidecar,
+                        external_draft=external_draft,
+                    )
+                else:
+                    logging.debug(
+                        "megakernel lane cache not inserted into APC: %s",
+                        publishable,
+                    )
             elif compiled_decode_status["used"]:
                 # A compiled request publishes the stock KV form of its ring
                 # slots (one contiguous copy of the live region) and only after
