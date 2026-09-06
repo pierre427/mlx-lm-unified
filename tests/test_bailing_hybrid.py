@@ -679,5 +679,31 @@ class TestBailingHybridLoader(unittest.TestCase):
             self.assertIn("trust_remote_code", str(ctx.exception))
 
 
+class TestBailingHybridEagerDispatch(unittest.TestCase):
+    """MLX_LING_EAGER_DISPATCH is pure scheduling (async_eval) and must not
+    change any value. The flag is a module global, resolved at import."""
+
+    def _run(self, model):
+        mx.random.seed(3)
+        cache = make_prompt_cache(model)
+        outs = [model(mx.random.randint(0, TINY_CONFIG["vocab_size"], (1, 6)), cache=cache)]
+        for w in (1, 3):
+            step = mx.random.randint(0, TINY_CONFIG["vocab_size"], (1, w))
+            outs.append(model(step, cache=cache))
+        mx.eval(outs)
+        return outs
+
+    def test_eager_dispatch_bit_identical(self):
+        base = self._run(_build_native())
+        saved = bailing_hybrid._EAGER_DISPATCH
+        try:
+            bailing_hybrid._EAGER_DISPATCH = True
+            got = self._run(_build_native())
+        finally:
+            bailing_hybrid._EAGER_DISPATCH = saved
+        for i, (a, b) in enumerate(zip(base, got)):
+            self.assertTrue(mx.array_equal(a, b).item(), f"run {i}: logits differ")
+
+
 if __name__ == "__main__":
     unittest.main()

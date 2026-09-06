@@ -69,6 +69,25 @@ def _kda_gate_mode_from_env() -> str:
 KDA_GATE_MODE = _kda_gate_mode_from_env()
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read one performance flag once, at import time (qwen3_next convention)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+# MLX_LING_EAGER_DISPATCH: after each decoder layer, `mx.async_eval` the running
+# hidden so the GPU runs layer i while Python builds layer i+1. Pure scheduling,
+# bit-identical. Gated to small row counts (decode / verify slabs only). The MoE
+# router (group_expert_select) and the MLA absorbed-path gate are already
+# compiled / shape-aware, so this is the one general scheduling lever to add.
+_EAGER_DISPATCH = _env_flag("MLX_LING_EAGER_DISPATCH")
+_EAGER_DISPATCH_MAX_ROWS = max(
+    1, int(os.environ.get("MLX_LING_EAGER_DISPATCH_MAX_ROWS", "64"))
+)
+
+
 def set_kda_gate_mode(mode: Optional[str]):
     """Set (``None`` restores the environment value) the KDA gate mode."""
     global KDA_GATE_MODE
@@ -700,9 +719,14 @@ class LanguageModel(nn.Module):
         if self._kda_idx is not None:
             kda_mask = create_ssm_mask(h, cache[self._kda_idx])
 
+        eager = _EAGER_DISPATCH and (
+            h.shape[0] * h.shape[1] <= _EAGER_DISPATCH_MAX_ROWS
+        )
         for layer, layer_cache in zip(self.layers, cache):
             mask = attention_mask if layer.is_global else kda_mask
             h = layer(h, mask=mask, cache=layer_cache)
+            if eager:
+                mx.async_eval(h)
         return self.norm(h)
 
 

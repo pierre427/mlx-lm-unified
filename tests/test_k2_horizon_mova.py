@@ -345,5 +345,52 @@ class TestK2HorizonMoVALoader(unittest.TestCase):
             self.assertIn("trust_remote_code", str(ctx.exception))
 
 
+class TestK2HorizonMoVACompiledLevers(unittest.TestCase):
+    """CPU bit-identity of the opt-in perf levers (MLX_K2_ROUTE_COMPILE,
+    MLX_K2_EAGER_DISPATCH) against the default eager path. The flags are
+    resolved into module globals at import, so the test flips those globals."""
+
+    def _run(self, model):
+        # One cache threaded through prefill + decode + verify-width chunks; the
+        # widths (1, 3, 8) take the compiled route, 16 exercises the eager
+        # fallback (n_tokens > _ROUTE_COMPILE_MAX_TOKENS).
+        mx.random.seed(3)
+        cache = make_prompt_cache(model)
+        outs = [model(mx.random.randint(0, TINY_CONFIG["vocab_size"], (1, 5)), cache=cache)]
+        for w in (1, 3, 8, 16):
+            step = mx.random.randint(0, TINY_CONFIG["vocab_size"], (1, w))
+            outs.append(model(step, cache=cache))
+        mx.eval(outs)
+        return outs
+
+    def _assert_identical(self, route_compile, eager_dispatch):
+        base = self._run(_build_native())
+        saved = (
+            k2_horizon_mova._K2_ROUTE_COMPILE,
+            k2_horizon_mova._K2_EAGER_DISPATCH,
+        )
+        try:
+            k2_horizon_mova._K2_ROUTE_COMPILE = route_compile
+            k2_horizon_mova._K2_EAGER_DISPATCH = eager_dispatch
+            got = self._run(_build_native())
+        finally:
+            (
+                k2_horizon_mova._K2_ROUTE_COMPILE,
+                k2_horizon_mova._K2_EAGER_DISPATCH,
+            ) = saved
+        for i, (a, b) in enumerate(zip(base, got)):
+            self.assertEqual(a.shape, b.shape, f"run {i}")
+            self.assertTrue(mx.array_equal(a, b).item(), f"run {i}: logits differ")
+
+    def test_route_compile_bit_identical(self):
+        self._assert_identical(route_compile=True, eager_dispatch=False)
+
+    def test_eager_dispatch_bit_identical(self):
+        self._assert_identical(route_compile=False, eager_dispatch=True)
+
+    def test_both_levers_bit_identical(self):
+        self._assert_identical(route_compile=True, eager_dispatch=True)
+
+
 if __name__ == "__main__":
     unittest.main()

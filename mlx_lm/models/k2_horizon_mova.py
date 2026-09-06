@@ -18,6 +18,7 @@
 # reference (`k2_horizon_mova_mlx.py`) op for op; tests assert bit identity.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -29,6 +30,31 @@ from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU, SwitchLinear, _gather_sort, _scatter_unsort
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read one performance flag once, at import time (qwen3_next convention)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+# MLX_K2_ROUTE_COMPILE: mx.compile the array tail of `sigmoid_route` (sigmoid,
+# top-k, normalize). It fires twice per sparse layer -- the MoE gate and the
+# MoVA v_router -- so it is the model's biggest uncompiled decode cost. Only the
+# stable narrow widths (decode + PLD-verify) take it; prefill stays eager to
+# avoid unbounded traces. Pure op reorder -> gated by a CPU bit-identity test.
+_K2_ROUTE_COMPILE = _env_flag("MLX_K2_ROUTE_COMPILE")
+_ROUTE_COMPILE_MAX_TOKENS = 8
+
+# MLX_K2_EAGER_DISPATCH: after each decoder layer, `mx.async_eval` the running
+# hidden so the GPU runs layer i while Python builds layer i+1. Pure scheduling,
+# bit-identical. Gated to small row counts (decode / verify slabs only).
+_K2_EAGER_DISPATCH = _env_flag("MLX_K2_EAGER_DISPATCH")
+_K2_EAGER_DISPATCH_MAX_ROWS = max(
+    1, int(os.environ.get("MLX_K2_EAGER_DISPATCH_MAX_ROWS", "64"))
+)
 
 
 @dataclass
@@ -112,23 +138,41 @@ class GroupRMSNorm(nn.Module):
         return self.weight * mx.flatten(x, -2)
 
 
+def _sigmoid_route_core(
+    logits: mx.array, bias: mx.array, top_k: int, normalize: bool, has_bias: bool
+):
+    """Array-only tail of `sigmoid_route`, safe to mx.compile. `has_bias` is a
+    Python constant so the compiled trace omits the bias ops when there is none;
+    `bias` is then an unused placeholder."""
+    if has_bias:
+        logits = logits - bias
+    scores = mx.sigmoid(logits.astype(mx.float32))
+    choice = scores + bias.astype(scores.dtype) if has_bias else scores
+    indices = mx.argpartition(choice, kth=-top_k, axis=-1)[..., -top_k:]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    if normalize:
+        weights = weights / mx.sum(weights, axis=-1, keepdims=True)
+    return weights, indices
+
+
+_sigmoid_route_core_compiled = mx.compile(_sigmoid_route_core)
+
+
 def sigmoid_route(
     x: mx.array, gate: nn.Module, top_k: int, normalize: bool, scale: float
 ):
     """K2 sigmoid router. The gate bias only affects top-k selection."""
     # Call the module so this also works once `gate` is a QuantizedLinear.
     logits = gate(x)
-    if "bias" in gate:
-        logits = logits - gate.bias
-    scores = mx.sigmoid(logits.astype(mx.float32))
-    if "bias" in gate:
-        choice = scores + gate.bias.astype(scores.dtype)
-    else:
-        choice = scores
-    indices = mx.argpartition(choice, kth=-top_k, axis=-1)[..., -top_k:]
-    weights = mx.take_along_axis(scores, indices, axis=-1)
-    if normalize:
-        weights = weights / mx.sum(weights, axis=-1, keepdims=True)
+    has_bias = "bias" in gate
+    bias = gate.bias if has_bias else logits  # placeholder when bias-free
+    n_tokens = logits.size // logits.shape[-1]
+    core = (
+        _sigmoid_route_core_compiled
+        if (_K2_ROUTE_COMPILE and n_tokens <= _ROUTE_COMPILE_MAX_TOKENS)
+        else _sigmoid_route_core
+    )
+    weights, indices = core(logits, bias, top_k, normalize, has_bias)
     return weights.astype(x.dtype) * scale, indices
 
 
@@ -318,8 +362,13 @@ class K2HorizonModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(h, cache[0])
+        eager = _K2_EAGER_DISPATCH and (
+            h.shape[0] * h.shape[1] <= _K2_EAGER_DISPATCH_MAX_ROWS
+        )
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
+            if eager:
+                mx.async_eval(h)
         return self.norm(h)
 
 
