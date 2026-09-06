@@ -49,6 +49,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .. import host_timing as _ht  # uncommitted lab host-stall attribution (default off)
+
 MANIFEST_FORMAT = "qwen4-ple-rows"
 MANIFEST_VERSION = 1
 
@@ -621,6 +623,14 @@ class FileBackedShardedEmbedding(nn.Module):
         return mx.dequantize(w, s, b, group_size=32, bits=4, mode="affine")
 
     def lookup_numpy(self, indices: np.ndarray) -> mx.array:
+        # STUB (MLXUAG_STUB_PLE=1): skip the pread+dequant and return a
+        # correctly-shaped zeros tensor. The GPU graph shape downstream is
+        # unchanged, so the harness round-wall delta vs the real lookup is the
+        # EXPOSED host cost of the PLE read. CHANGES OUTPUT (garbage embeddings)
+        # -- a timing ablation, never a correctness run.
+        if _ht.STUB_PLE:
+            return mx.zeros((*indices.shape, self.dims), dtype=mx.bfloat16)
+        _ht_t0 = _ht.tic() if _ht.ENABLED else 0.0  # ple span (serial CPU read)
         started = time.perf_counter() if self.stats_timing else None
         shape = indices.shape
         flat = np.asarray(indices, dtype=np.int64).reshape(-1)
@@ -635,6 +645,8 @@ class FileBackedShardedEmbedding(nn.Module):
         self._stat_unique_rows += unique.size
         if started is not None:
             self._stat_elapsed += time.perf_counter() - started
+        if _ht.ENABLED:
+            _ht.toc("ple", _ht_t0)
         return result
 
     @property

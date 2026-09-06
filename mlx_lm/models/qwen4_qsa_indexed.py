@@ -15,6 +15,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from .. import host_timing as _ht  # uncommitted lab host-stall attribution (default off)
 from .qwen4_qsa_indexed_merge import (
     combine_indexed_partials,
     fused_merge_enabled,
@@ -390,6 +391,13 @@ def record_qsa_indexed_receipt(
 ) -> None:
     """Record bounded process evidence without evaluating device arrays."""
 
+    # STUB (MLXUAG_STUB_RECEIPTS=1): skip per-step receipt bookkeeping. Pure
+    # host globals -- nothing feeds the graph -- so the stub is OUTPUT- AND
+    # GPU-SHAPE-PRESERVING; the harness round-wall delta is the exposed host
+    # cost of receipt recording. Status endpoints read stale counts under it.
+    if _ht.STUB_RECEIPTS:
+        return
+    _ht_t0 = _ht.tic() if _ht.ENABLED else 0.0  # receipts span (off-path host)
     global _STATUS_CANDIDATE, _STATUS_FALLBACKS, _STATUS_LAST
     outcome = "engaged" if engaged else "declined"
     receipt = {
@@ -433,6 +441,8 @@ def record_qsa_indexed_receipt(
                     "candidate_timings_ms": receipt["candidate_timings_ms"],
                 }
         _STATUS_LAST = receipt
+    if _ht.ENABLED:
+        _ht.toc("receipts", _ht_t0)
 
 
 def _device_attest_output(

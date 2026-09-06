@@ -66,6 +66,7 @@ from .verify_sync import (
     verify_sync_round,
     verify_sync_status,
 )
+from . import host_timing as _ht  # uncommitted lab host-stall attribution (default off)
 
 _GREEDY = make_sampler(temp=0.0)
 
@@ -2729,6 +2730,7 @@ def _mtp_draft_verify_loop_impl(
                 )
             continue
         cycle_t0 = time.perf_counter()
+        _ht.start_round()  # host-stall attribution: open per-round accumulator
         ntoks_at_cycle_start = ntoks
         configured_k = num_draft if routed_k is None else routed_k
         k = draft_tokens_for_budget(configured_k, max_tokens - ntoks)
@@ -2750,6 +2752,7 @@ def _mtp_draft_verify_loop_impl(
             draft_tokens: List[mx.array] = []
             draft_logprobs: List[mx.array] = []
             h, tok = seed_h, mx.array([[cur]], mx.uint32)
+            _ht_draft_t0 = _ht.tic() if _ht.ENABLED else 0.0  # mtp_draft span
             with mx.stream(generation_stream):
                 for i in range(k):
                     if i == 0 and pending_hs is not None:
@@ -2772,6 +2775,8 @@ def _mtp_draft_verify_loop_impl(
                         drafts.append(draft)
                         tok = mx.array([[draft]], mx.uint32)
                     draft_logprobs.append(d_lp)
+            if _ht.ENABLED:
+                _ht.toc("mtp_draft", _ht_draft_t0)
 
             # ---- verify: trunk over [cur, drafts...] in one forward ----------
             verify_in = (
@@ -2805,6 +2810,12 @@ def _mtp_draft_verify_loop_impl(
                     logprobs = _logprobs(mx.stack(processed_logits))
                 targets = mx.argmax(logprobs, axis=-1).astype(mx.uint32)
 
+            # accept span: verify-boundary host sync + longest-accepted-prefix
+            # scan + commit/rollback trims. The first mx.eval after the async
+            # draft dispatch also drains the (GPU-bound) verify forward, so this
+            # span is an UPPER BOUND on accept host cost; subtract the forward
+            # GPU floor from the launchbound probe for the pure host share.
+            _ht_accept_t0 = _ht.tic() if _ht.ENABLED else 0.0
             if greedy_device:
                 padded_drafts = mx.concatenate(
                     [mx.stack(draft_tokens), mx.zeros((1,), mx.uint32)]
@@ -2812,10 +2823,16 @@ def _mtp_draft_verify_loop_impl(
                 accept_payload = mx.stack([targets, padded_drafts])
                 record_verify_sync("hybrid.greedy.accept_boundary")
                 mx.eval(accept_payload, vhidden)
+                if _ht.ENABLED:
+                    _ht.toc("verify_wait", _ht_accept_t0)  # GPU verify drain
+                    _ht_accept_t0 = _ht.tic()  # accept = pure host from here
                 targets, hosted_drafts = accept_payload.tolist()
                 drafts = hosted_drafts[:k]
             else:
                 mx.eval(targets, vhidden)
+                if _ht.ENABLED:
+                    _ht.toc("verify_wait", _ht_accept_t0)  # GPU verify drain
+                    _ht_accept_t0 = _ht.tic()  # accept = pure host from here
 
             n_accept = 0
             if sampling_temp and sampling_temp > 0:
@@ -2900,6 +2917,9 @@ def _mtp_draft_verify_loop_impl(
                 pending_ts=pending_ts,
                 seed_h=seed_h,
             )
+        if _ht.ENABLED:
+            _ht.toc("accept", _ht_accept_t0)
+            _ht.end_round()  # flush this round's buckets before the yields
         stats.draft_proposed += k
         stats.draft_cycles += 1
         if speculation_router is not None:
