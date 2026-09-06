@@ -1,3 +1,4 @@
+import copy
 import importlib
 import json
 import warnings
@@ -451,7 +452,16 @@ class TokenizerWrapper:
         """
         Get a stateful streaming detokenizer.
         """
-        return self._detokenizer_class(self)
+        # Build the detokenizer once; its tokenmap is an O(vocab) construction.
+        # Each access returns a shallow copy that shares the immutable tokenmap
+        # but gets independent streaming state.
+        prototype = self.__dict__.get("_detokenizer_prototype")
+        if prototype is None:
+            prototype = self._detokenizer_class(self)
+            self.__dict__["_detokenizer_prototype"] = prototype
+        detokenizer = copy.copy(prototype)
+        detokenizer.reset()
+        return detokenizer
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
