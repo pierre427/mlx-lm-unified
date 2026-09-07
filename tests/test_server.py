@@ -317,6 +317,35 @@ class TestThinkingServingProfiles(unittest.TestCase):
         self.assertEqual(messages[0]["reasoning_content"], "trace")
         self.assertEqual(messages[0]["reasoning"], "trace")
 
+    def test_tool_arguments_accept_openai_json_strings(self):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "probe", "arguments": '{"ok": true}'}}
+                ],
+            }
+        ]
+        process_message_content(messages)
+        self.assertEqual(
+            messages[0]["tool_calls"][0]["function"]["arguments"], {"ok": True}
+        )
+
+    def test_tool_arguments_accept_already_parsed_objects(self):
+        arguments = {"job_id": "video_123", "options": {"wait": False}}
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "get_media_job", "arguments": arguments}}
+                ],
+            }
+        ]
+        process_message_content(messages)
+        self.assertEqual(
+            messages[0]["tool_calls"][0]["function"]["arguments"], arguments
+        )
+
 
 class DummyModelProvider:
     def __init__(self, with_draft=False):

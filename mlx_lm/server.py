@@ -219,7 +219,7 @@ def process_message_content(messages):
         if tool_calls := message.get("tool_calls"):
             for tool_call in tool_calls:
                 if func := tool_call.get("function"):
-                    if args := func.get("arguments"):
+                    if isinstance(args := func.get("arguments"), str) and args:
                         func["arguments"] = json.loads(args)
 
 
