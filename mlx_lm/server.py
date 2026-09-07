@@ -2652,6 +2652,7 @@ class ResponseGenerator:
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
+                        "prompt_tokens": len(prompt),
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
@@ -2917,14 +2918,8 @@ class ResponseGenerator:
                                 receipt.update(
                                     {
                                         "ts": time.time(),
-                                        "prompt_tokens": max(
-                                            0,
-                                            len(r.all_tokens)
-                                            - int(
-                                                receipt.get("stats", {}).get(
-                                                    "total_emitted", 0
-                                                )
-                                            ),
+                                        "prompt_tokens": int(
+                                            result["prompt_tokens"]
                                         ),
                                         "cached_prompt_tokens": int(
                                             result["ctx"].prompt_cache_count
