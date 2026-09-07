@@ -2326,6 +2326,11 @@ class TestQSANAXAdmission(unittest.TestCase):
             (self.selection(length=63), {}, "query_below_min"),
             (self.selection(kind="mask_only"), {}, "selection_mask_only"),
             (self.selection(), {"training": True}, "training"),
+            (
+                self.selection(),
+                {"cache_layout_ok": False},
+                "unsupported_cache_layout",
+            ),
             (self.selection(), {"layout_ok": False}, "unsupported_layout"),
             (
                 self.selection(),

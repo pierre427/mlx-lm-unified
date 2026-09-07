@@ -660,6 +660,7 @@ def decide_qsa_nax_admission(
     *,
     training: bool,
     layout_ok: bool,
+    cache_layout_ok: bool = True,
     device_supported: bool | None = None,
     kernel_available: bool | None = None,
 ) -> QSANAXAdmission:
@@ -670,6 +671,8 @@ def decide_qsa_nax_admission(
         return QSANAXAdmission(False, "explicit_off")
     if training:
         return QSANAXAdmission(False, "training")
+    if not cache_layout_ok:
+        return QSANAXAdmission(False, "unsupported_cache_layout")
     if selection.kind != "explicit":
         return QSANAXAdmission(False, f"selection_{selection.kind}")
     if selection.length < _QSA_NAX_MIN_QUERY:
@@ -5215,6 +5218,11 @@ class Attention(nn.Module):
             selection,
             training=self.training,
             layout_ok=self._nax_layout_ok,
+            # NAX currently consumes dense K/V arrays. Quantized QSA caches
+            # return (packed, scales, biases) tuples and must route through
+            # the indexed quantized kernel instead of reaching CustomKernel
+            # array initialization (64K auto-admission exposed this crash).
+            cache_layout_ok=quantized_indexed is None,
         )
         # Never add a Python lock/counter to M=1 decode or M=3 verification.
         # The receipt is for the prefill admission boundary.
@@ -5225,6 +5233,7 @@ class Attention(nn.Module):
         direct_nax = (
             _QSA_NAX_DECODE
             and length == 1
+            and quantized_indexed is None
             # Do not replace the dense-by-construction operating point.  The
             # direct kernel is for genuinely sparse selection only.
             and selection.n_blocks > self.indexer.block_topk
@@ -5251,6 +5260,8 @@ class Attention(nn.Module):
                 reason = "unsupported_layout"
             elif self.training:
                 reason = "training"
+            elif quantized_indexed is not None:
+                reason = "unsupported_cache_layout"
             else:
                 reason = "kernel_unavailable"
             _record_qsa_nax_decode(

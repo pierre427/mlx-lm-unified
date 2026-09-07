@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-#
 # NAX (Metal Performance Primitives matmul2d) block-sparse QSA attention for
 # Qwen4-Exp / Qwen3.8-Flash-Next.  This is the "variant B" prototype kernel
 # (1 query token x 12 query heads per NAX tile) validated at the true 24-head
