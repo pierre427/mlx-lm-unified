@@ -4187,6 +4187,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     "bytes": int(
                         getattr(self.response_generator.prompt_cache, "nbytes", 0)
                     ),
+                    "apc_stats": getattr(
+                        self.response_generator.prompt_cache, "apc_stats", {}
+                    ),
                 },
                 "inflight": self.response_generator.inflight,
             }
