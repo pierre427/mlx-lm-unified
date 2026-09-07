@@ -286,6 +286,7 @@ class TestBatchedSelfMTPRouting(unittest.TestCase):
             self_mtp_share_qsa_indices=False,
             self_mtp_share_qsa_indices_min_prompt_tokens=0,
             self_mtp_adaptive_depth_ceiling=None,
+            self_mtp_max_prompt_tokens=None,
             self_mtp_window_size=0,
             self_mtp_window_min_prompt_tokens=0,
             kv_bits=None,

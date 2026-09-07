@@ -196,6 +196,19 @@ class TestSelfMTPAdmission(unittest.TestCase):
         )
         self.assertEqual(config["sampling_temp"], 0.7)
 
+    def test_prompt_ceiling_fails_closed_before_prefill(self):
+        self.cli.self_mtp_max_prompt_tokens = 65536
+        self.assertIsNotNone(
+            _self_mtp_config(
+                self.args(), self.cli, self.model, prompt_tokens=65536
+            )
+        )
+        self.assertIsNone(
+            _self_mtp_config(
+                self.args(), self.cli, self.model, prompt_tokens=65537
+            )
+        )
+
     def test_transformed_sampling_fails_closed(self):
         for kwargs in (
             {"temperature": 0.7, "top_p": 0.8},

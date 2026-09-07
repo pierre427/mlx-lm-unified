@@ -2840,6 +2840,7 @@ class GenerationBatch:
         mtp_state: Optional[Tuple[List[Any], mx.array]] = None
         lane_rng: Optional[LaneRNG] = None
         rng_draws: int = 0
+        mtp_receipt: Optional[dict] = None
 
     def __init__(
         self,
@@ -3422,6 +3423,19 @@ class MTPGenerationBatch:
             response.mtp_state = (package.detached.caches.draft, lane.seed_h)
             response.lane_rng = lane.rng
             response.rng_draws = lane.rng.draws if lane.rng is not None else 0
+            stats = dict(vars(lane.stats))
+            stats["total_emitted"] = int(lane.stats.total_emitted)
+            stats["draft_acceptance"] = (
+                float(lane.stats.draft_accepted)
+                / max(int(lane.stats.draft_proposed), 1)
+            )
+            response.mtp_receipt = {
+                "route": "continuous_batched_self_mtp",
+                "num_draft": int(lane.num_draft),
+                "accept_rule": str(lane.accept_rule),
+                "sampling_temperature": float(lane.sampling_temp),
+                "stats": stats,
+            }
 
     def _emit_initial(self):
         responses = []

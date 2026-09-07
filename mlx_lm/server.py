@@ -11,6 +11,9 @@ import collections as _collections
 # Last decode-lane statuses (compiled replay / megakernel lane) per request,
 # read by GET /v1/status/decode-lanes; operational receipts, not qualification.
 DECODE_LANE_LOG = _collections.deque(maxlen=64)
+# Completed continuous self-MTP requests, exposed read-only for operators.
+# A configured flag is not proof of engagement; these receipts are.
+SELF_MTP_RECEIPTS = _collections.deque(maxlen=64)
 from .megakernel_lane import megakernel_lane_enabled, _text_model as megakernel_text_model
 import math
 import os
@@ -640,6 +643,11 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
     "self_mtp_num_draft": MutableKey(
         "cli_args", "self_mtp_num_draft", _reload_int(1, MAX_DRAFT_TOKENS)
     ),
+    "self_mtp_max_prompt_tokens": MutableKey(
+        "cli_args",
+        "self_mtp_max_prompt_tokens",
+        _reload_int(1, 1 << 22, allow_none=True),
+    ),
     "self_mtp_adaptive_depth_ceiling": MutableKey(
         "cli_args",
         "self_mtp_adaptive_depth_ceiling",
@@ -1195,6 +1203,9 @@ def _self_mtp_config(
     the valuable prefix hit and decodes plainly.
     """
     if not getattr(cli_args, "self_mtp", False):
+        return None
+    max_prompt_tokens = getattr(cli_args, "self_mtp_max_prompt_tokens", None)
+    if max_prompt_tokens is not None and prompt_tokens > max_prompt_tokens:
         return None
     if getattr(model, "mtp", None) is None or (
         cached_prompt_tokens and mtp_state is None
@@ -2900,6 +2911,32 @@ class ResponseGenerator:
                         )
 
                         if r.finish_reason is not None:
+                            receipt = getattr(r, "mtp_receipt", None)
+                            if receipt is not None:
+                                receipt = dict(receipt)
+                                receipt.update(
+                                    {
+                                        "ts": time.time(),
+                                        "prompt_tokens": max(
+                                            0,
+                                            len(r.all_tokens)
+                                            - int(
+                                                receipt.get("stats", {}).get(
+                                                    "total_emitted", 0
+                                                )
+                                            ),
+                                        ),
+                                        "cached_prompt_tokens": int(
+                                            result["ctx"].prompt_cache_count
+                                        ),
+                                        "completed": True,
+                                    }
+                                )
+                                SELF_MTP_RECEIPTS.append(receipt)
+                                logging.info(
+                                    "Continuous self-MTP receipt: %s",
+                                    json.dumps(receipt, sort_keys=True),
+                                )
                             result["rqueue"].put(None)
                             sidecar = None
                             if result.get("mtp") and getattr(r, "mtp_state", None):
@@ -4710,6 +4747,39 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             self.end_headers()
             self.wfile.write(payload)
+        elif self.path == "/v1/status/self-mtp":
+            cli = self.response_generator.cli_args
+            receipts = list(SELF_MTP_RECEIPTS)
+            payload = {
+                "configured": {
+                    "enabled": bool(getattr(cli, "self_mtp", False)),
+                    "persistent": bool(getattr(cli, "self_mtp_persistent", False)),
+                    "transformed_verifier": bool(
+                        getattr(cli, "self_mtp_transformed_verifier", False)
+                    ),
+                    "rate_gate": bool(getattr(cli, "self_mtp_rate_gate", False)),
+                    "num_draft": int(getattr(cli, "self_mtp_num_draft", 0)),
+                    "max_lanes": int(getattr(cli, "self_mtp_max_lanes", 0)),
+                    "lane_transient_gib": getattr(
+                        cli, "self_mtp_lane_transient_gib", None
+                    ),
+                    "max_prompt_tokens": getattr(
+                        cli, "self_mtp_max_prompt_tokens", None
+                    ),
+                },
+                "prompt_cache": {
+                    "entries": len(self.response_generator.prompt_cache),
+                    "bytes": int(
+                        getattr(self.response_generator.prompt_cache, "nbytes", 0)
+                    ),
+                },
+                "receipts": receipts,
+                "engaged_requests": len(receipts),
+            }
+            encoded = json.dumps(payload, default=str).encode()
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(encoded)
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -5016,6 +5086,18 @@ def setup_arg_parser():
             "permits more. Measured knee for the dense Qwen3.8-27B is 16 "
             "(N=16: 270 t/s agg vs N=40: 52). Default: 16. Raise for lighter "
             "(MoE) models that saturate later; the memory envelope still caps."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-max-prompt-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum prompt length admitted to continuous self-MTP. Longer "
+            "requests fail closed to ordinary continuous batching before "
+            "prefill, avoiding a post-prefill lane that cannot fit the MTP "
+            "verify transient. Default: unset."
         ),
     )
     parser.add_argument(
@@ -5417,8 +5499,9 @@ def main():
         "self_mtp_window_sink_size",
         "self_mtp_window_min_prompt_tokens",
         "self_mtp_share_qsa_indices_min_prompt_tokens",
+        "self_mtp_max_prompt_tokens",
     ):
-        if getattr(args, name) < 0:
+        if getattr(args, name, None) is not None and getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
     if args.self_mtp_window_size and not args.self_mtp_persistent:
         parser.error("--self-mtp-window-size requires --self-mtp-persistent")
