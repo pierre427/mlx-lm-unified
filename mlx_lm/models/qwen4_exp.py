@@ -479,6 +479,18 @@ _SHAPE_STABLE_SHORT_FORWARD = _env_flag(
     "MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD"
 )
 
+# MLX_QWEN4_EAGER_DISPATCH (2026-09-06, jundot/omlx #3469 phase 2): within-token
+# pipelining.  After each decoder layer, ``mx.async_eval`` the running hidden
+# state so the GPU executes layer i while Python builds layer i+1's graph.
+# Pure scheduling: async_eval only forces the layer's work to be submitted, it
+# does not change any array's value, so the path stays bit-identical.  Gated to
+# small row counts (batch*seq <= 64) so it fires on decode and self-MTP verify
+# slabs only -- prefill's wide slabs are already GPU-bound and gain nothing.
+_EAGER_DISPATCH = _env_flag("MLX_QWEN4_EAGER_DISPATCH")
+_EAGER_DISPATCH_MAX_ROWS = max(
+    1, int(os.environ.get("MLX_QWEN4_EAGER_DISPATCH_MAX_ROWS", "64"))
+)
+
 # MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT (2026-08-27): skip the whole indexer
 # selection while the QSA mask is dense BY CONSTRUCTION, i.e. while
 # ``n_blocks <= block_topk`` (block_topk = indexer_budget // compress_ratio =
@@ -4296,53 +4308,47 @@ def _gather_qsa_attention(
     _, _, _, _, _, _, _, physical, valid = compact_token_validity(compact)
     physical = physical.reshape(batch, length, -1)
     valid = valid.reshape(batch, length, -1)
-
-    rows = batch * length
     width = physical.shape[-1]
-    row_batch = mx.broadcast_to(
-        mx.arange(batch, dtype=mx.int32)[:, None], (batch, length)
-    ).reshape(-1)
-    q_rows = q.transpose(0, 2, 1, 3).reshape(rows, heads, dim)
-    physical = physical.reshape(rows, width)
-    valid = valid.reshape(rows, width)
-    # Put the gather axis next to batch so one take_along_axis covers all KV
-    # heads and channels for a row.
-    k_by_token = k.transpose(0, 2, 1, 3)
-    v_by_token = v.transpose(0, 2, 1, 3)
-    outputs = []
-    for start in range(0, rows, tile_rows):
-        stop = min(rows, start + tile_rows)
-        source_rows = row_batch[start:stop]
-        token_rows = physical[start:stop]
-        gather_index = token_rows[..., None, None]
-        gathered_k = mx.take_along_axis(
-            k_by_token[source_rows], gather_index, axis=1
-        ).transpose(0, 2, 1, 3)
-        gathered_v = mx.take_along_axis(
-            v_by_token[source_rows], gather_index, axis=1
-        ).transpose(0, 2, 1, 3)
-        tile_q = q_rows[start:stop, :, None, :]
-        tile_mask = valid[start:stop, None, None, :]
-        tile_out = mx.fast.scaled_dot_product_attention(
-            tile_q,
-            gathered_k,
-            gathered_v,
-            scale=scale,
-            mask=tile_mask,
-        )[:, :, 0]
-        # MLX SDPA does not define an all-false boolean-mask row. Keep the
-        # compact contract explicit: no attended token produces zero.
-        tile_out = mx.where(
-            mx.any(valid[start:stop], axis=-1)[:, None, None],
-            tile_out,
-            mx.zeros_like(tile_out),
-        )
-        outputs.append(tile_out)
-    return (
-        mx.concatenate(outputs, axis=0)
-        .reshape(batch, length, heads, dim)
-        .transpose(0, 2, 1, 3)
+    total = k.shape[2]
+    hkv = k.shape[1]
+    rows = batch * length
+
+    # Gather the selected window straight out of the stored [B,HKV,T,D] cache
+    # along the token axis, so cost scales with the window, not the context.
+    # The old route transposed the whole cache to token-major first, an O(T)
+    # copy every call; broadcast views make no token-major slab of width T.
+    gather_index = mx.broadcast_to(
+        physical[:, None, :, :, None], (batch, hkv, length, width, dim)
+    ).astype(mx.uint32)
+    gathered_k = mx.take_along_axis(
+        mx.broadcast_to(k[:, :, None, :, :], (batch, hkv, length, total, dim)),
+        gather_index,
+        axis=3,
     )
+    gathered_v = mx.take_along_axis(
+        mx.broadcast_to(v[:, :, None, :, :], (batch, hkv, length, total, dim)),
+        gather_index,
+        axis=3,
+    )
+    gathered_k = gathered_k.transpose(0, 2, 1, 3, 4).reshape(rows, hkv, width, dim)
+    gathered_v = gathered_v.transpose(0, 2, 1, 3, 4).reshape(rows, hkv, width, dim)
+    q_rows = q.transpose(0, 2, 1, 3).reshape(rows, heads, 1, dim)
+    row_valid = valid.reshape(rows, width)
+    out = mx.fast.scaled_dot_product_attention(
+        q_rows,
+        gathered_k,
+        gathered_v,
+        scale=scale,
+        mask=row_valid[:, None, None, :],
+    )[:, :, 0]
+    # MLX SDPA does not define an all-false boolean-mask row. Keep the compact
+    # contract explicit: no attended token produces zero.
+    out = mx.where(
+        mx.any(row_valid, axis=-1)[:, None, None],
+        out,
+        mx.zeros_like(out),
+    )
+    return out.reshape(batch, length, heads, dim).transpose(0, 2, 1, 3)
 
 
 def _gather_qsa_quantized_attention(
@@ -5513,8 +5519,13 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
             if fa_mask is not None and fa_mask.ndim == 2:
                 fa_mask = fa_mask[None, None, :, :]
         ssm_mask = create_ssm_mask(hidden, cache[self.ssm_idx]) if self.ssm_idx is not None else None
+        eager = _EAGER_DISPATCH and (
+            hidden.shape[0] * hidden.shape[1] <= _EAGER_DISPATCH_MAX_ROWS
+        )
         for layer, layer_cache in zip(self.layers, cache):
             hidden = layer(hidden, inputs, fa_mask, layer_cache, ssm_mask)
+            if eager:
+                mx.async_eval(hidden)
         mixed = self.hyper_connection_mixer(hidden)
         return (mixed, hidden) if return_hyper else mixed
 
