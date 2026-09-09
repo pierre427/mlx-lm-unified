@@ -1404,9 +1404,24 @@ class SelfMTPLaneAdmissionController:
         return self.service_reserve_gib + self.driver_allowance_gib
 
     def lane_gib(
-        self, context_tokens: int, draft_depth: int, cache_gib: float = 0.0
+        self,
+        context_tokens: int,
+        draft_depth: int,
+        cache_gib: float = 0.0,
+        *,
+        resident_cache: bool = False,
     ) -> float:
-        """Conservative cache plus transient cost for one lane."""
+        """Conservative incremental cost for one lane.
+
+        Before preparation, ``cache_gib`` is a projected/retained cache floor
+        and the full cache plus transient must fit in currently free memory.
+        At a cycle boundary an active lane's cache is already resident and is
+        therefore already absent from the live free-memory measurement.  In
+        that case only any uncovered envelope growth plus the next verify
+        transient is incremental.  Charging the resident cache a second time
+        can queue the sole lane after prefill, where it can never release the
+        allocation required to admit itself again.
+        """
         if isinstance(context_tokens, bool) or not isinstance(context_tokens, int):
             raise ValueError("context_tokens must be an integer")
         if context_tokens < 0:
@@ -1418,9 +1433,16 @@ class SelfMTPLaneAdmissionController:
         cache_gib = float(cache_gib)
         if not math.isfinite(cache_gib) or cache_gib < 0:
             raise ValueError("cache_gib must be finite and non-negative")
-        context_gib = max(
+        if not isinstance(resident_cache, bool):
+            raise ValueError("resident_cache must be a boolean")
+        projected_context_gib = max(
             self.CACHE_GIB_PER_1K_TOKENS * (context_tokens / 1024.0),
             cache_gib,
+        )
+        context_gib = (
+            max(projected_context_gib - cache_gib, 0.0)
+            if resident_cache
+            else projected_context_gib
         )
         transient_scale = self.TRANSIENT_SCALE[draft_depth]
         return context_gib + self.transient_gib_per_lane * transient_scale
@@ -1430,6 +1452,7 @@ class SelfMTPLaneAdmissionController:
         indices: Sequence[int],
         contexts: Sequence[int],
         cache_gib: Sequence[float],
+        resident_cache: Sequence[bool],
         draft_depth: int,
         usable_gib: float,
         max_lanes: Optional[int] = None,
@@ -1443,7 +1466,12 @@ class SelfMTPLaneAdmissionController:
         ranked = sorted(
             indices,
             key=lambda i: (
-                self.lane_gib(contexts[i], draft_depth, cache_gib[i]),
+                self.lane_gib(
+                    contexts[i],
+                    draft_depth,
+                    cache_gib[i],
+                    resident_cache=resident_cache[i],
+                ),
                 i,
             ),
         )
@@ -1452,7 +1480,12 @@ class SelfMTPLaneAdmissionController:
         for i in ranked:
             if max_lanes is not None and len(chosen) >= max_lanes:
                 break
-            cost = self.lane_gib(contexts[i], draft_depth, cache_gib[i])
+            cost = self.lane_gib(
+                contexts[i],
+                draft_depth,
+                cache_gib[i],
+                resident_cache=resident_cache[i],
+            )
             if used + cost <= usable_gib:
                 chosen.append(i)
                 used += cost
@@ -1465,6 +1498,7 @@ class SelfMTPLaneAdmissionController:
         *,
         eligible: Optional[Sequence[bool]] = None,
         cache_gib: Optional[Sequence[float]] = None,
+        resident_cache: Optional[Sequence[bool]] = None,
         max_draft: int = 2,
     ) -> SelfMTPLaneAdmission:
         """Return the next-cycle plan in the frozen degradation order.
@@ -1488,6 +1522,12 @@ class SelfMTPLaneAdmissionController:
             cache_gib = tuple(cache_gib)
         if len(cache_gib) != len(contexts):
             raise ValueError("cache_gib must align with context_tokens")
+        if resident_cache is None:
+            resident_cache = (False,) * len(contexts)
+        else:
+            resident_cache = tuple(resident_cache)
+        if len(resident_cache) != len(contexts):
+            raise ValueError("resident_cache must align with context_tokens")
         if max_draft < 1 or max_draft not in self.TRANSIENT_SCALE:
             raise ValueError(
                 "max_draft must be a calibrated depth: "
@@ -1511,7 +1551,12 @@ class SelfMTPLaneAdmissionController:
             # trusting a malformed context vector would make the estimate
             # lane-order-dependent and is not fail closed.
             for i in mtp_candidates:
-                self.lane_gib(contexts[i], max_draft, cache_gib[i])
+                self.lane_gib(
+                    contexts[i],
+                    max_draft,
+                    cache_gib[i],
+                    resident_cache=resident_cache[i],
+                )
         except (TypeError, ValueError, OverflowError):
             valid = False
             free = 0.0
@@ -1528,7 +1573,12 @@ class SelfMTPLaneAdmissionController:
         # form encoded and the loop preserves.
         for depth in range(max_draft, 0, -1):
             chosen, used = self._fit(
-                mtp_candidates, contexts, cache_gib, depth, usable,
+                mtp_candidates,
+                contexts,
+                cache_gib,
+                resident_cache,
+                depth,
+                usable,
                 self.saturation_lane_cap,
             )
             if not chosen:
@@ -1546,7 +1596,9 @@ class SelfMTPLaneAdmissionController:
                 tuple(modes), tuple(depths), stage, used, usable
             )
 
-        chosen, used = self._fit(mtp_candidates, contexts, cache_gib, 0, usable)
+        chosen, used = self._fit(
+            mtp_candidates, contexts, cache_gib, resident_cache, 0, usable
+        )
         if chosen:
             # The degradation contract says "drop a lane to plain" before
             # queue/reject.  Admit only the cheapest lane here; the remainder
@@ -1555,7 +1607,12 @@ class SelfMTPLaneAdmissionController:
             i = chosen[0]
             modes[i] = "plain"
             depths[i] = 0
-            used = self.lane_gib(contexts[i], 0, cache_gib[i])
+            used = self.lane_gib(
+                contexts[i],
+                0,
+                cache_gib[i],
+                resident_cache=resident_cache[i],
+            )
             return SelfMTPLaneAdmission(
                 tuple(modes), tuple(depths), "plain", used, usable
             )
@@ -1629,6 +1686,9 @@ def _make_self_mtp_admission_callback(
     the policy and the live memory measurement.  Rows are
     ``(uid, logical_context_len, current_k, active, cache_gib)`` and include
     paused or joining lanes, so retained cache rows participate before merge.
+    Only active rows are charged incrementally: their cache is already absent
+    from the live free-memory reading.  Paused/joining rows keep the full-cost
+    admission rule because they may require a reattach/merge allocation.
     """
     controller = controller or SelfMTPLaneAdmissionController()
 
@@ -1641,6 +1701,7 @@ def _make_self_mtp_admission_callback(
             [int(row[1]) for row in rows],
             math.nan if current_free is None else current_free,
             cache_gib=[float(row[4]) if len(row) > 4 else 0.0 for row in rows],
+            resident_cache=[bool(row[3]) for row in rows],
             max_draft=max_draft() if callable(max_draft) else max_draft,
         )
         actions: Dict[int, Union[int, str]] = {}

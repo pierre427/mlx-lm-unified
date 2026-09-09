@@ -264,6 +264,20 @@ class TestSelfMTPLaneAdmissionController(unittest.TestCase):
         # Missing live memory is never converted into optimistic capacity.
         self.assertEqual(callback(grown), {101: "queue", 102: "queue"})
 
+    def test_active_long_lane_does_not_recharge_its_resident_cache(self):
+        # A 64.7K Hermes prompt was admitted with enough free memory, then
+        # permanently queued itself after prefill because the cycle callback
+        # charged its now-resident ~28 GiB cache against the already-reduced
+        # free-memory reading.  The active lane needs only the next transient;
+        # a joining lane with the same projected cache still pays full cost.
+        callback = _make_self_mtp_admission_callback(
+            self.controller, lambda: 44.0
+        )
+        active = [(101, 64680, 2, True, 28.0)]
+        joining = [(102, 64680, 2, False, 28.0)]
+        self.assertEqual(callback(active), {101: 2})
+        self.assertEqual(callback(joining), {102: "queue"})
+
 
 class TestBatchedSelfMTPRouting(unittest.TestCase):
     def args(self, **overrides):
