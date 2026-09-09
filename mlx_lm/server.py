@@ -1350,6 +1350,27 @@ class SelfMTPLaneAdmissionController:
     SERVICE_RESERVE_GIB = 16.0
     DRIVER_ALLOWANCE_GIB = 4.0
     CACHE_GIB_PER_1K_TOKENS = 0.44
+
+    # Verify transient per lane, relative to k=2. Measured 2026-09-09 on
+    # Flash-Next at 1K and 16K (results/fn-verify-transient-by-depth-20260909):
+    # peak minus steady active memory across a fixed decode window, so resident
+    # weights and the KV/PLE caches are excluded. The transient is essentially
+    # context-independent (5.14 vs 5.19 GiB when context grows 16x), which is
+    # why it sits beside the context term rather than inside it.
+    #
+    #   k   1K GiB   16K GiB   measured   was
+    #   0    0.017     0.036     ~0.00    0.333   over-reserved ~100x
+    #   1    5.144     5.187      0.76    0.500   UNDER-reserved by ~50%
+    #   2    6.832     6.804      1.00    1.000
+    #   3    8.360     7.819      1.19    none
+    #   4   10.502     9.895      1.50    none
+    #
+    # Entries round UP from the larger of the two contexts: this is a
+    # fail-closed reserve, so erring high costs admission and erring low costs
+    # an out-of-memory. k=0 keeps its old over-conservative 1/3 in this pass --
+    # correcting it downward would ADMIT more plain lanes, which is a separate
+    # change needing its own multi-lane measurement.
+    TRANSIENT_SCALE = {0: 1.0 / 3.0, 1: 0.80, 2: 1.0, 3: 1.25, 4: 1.55}
     K2_TRANSIENT_GIB_PER_LANE = 1.76
     SATURATION_LANE_CAP = 16
 
@@ -1390,8 +1411,10 @@ class SelfMTPLaneAdmissionController:
             raise ValueError("context_tokens must be an integer")
         if context_tokens < 0:
             raise ValueError("context_tokens must be non-negative")
-        if draft_depth not in (0, 1, 2):
-            raise ValueError("draft_depth must be 0, 1, or 2")
+        if draft_depth not in self.TRANSIENT_SCALE:
+            raise ValueError(
+                f"draft_depth must be one of {sorted(self.TRANSIENT_SCALE)}"
+            )
         cache_gib = float(cache_gib)
         if not math.isfinite(cache_gib) or cache_gib < 0:
             raise ValueError("cache_gib must be finite and non-negative")
@@ -1399,7 +1422,7 @@ class SelfMTPLaneAdmissionController:
             self.CACHE_GIB_PER_1K_TOKENS * (context_tokens / 1024.0),
             cache_gib,
         )
-        transient_scale = {0: 1.0 / 3.0, 1: 0.5, 2: 1.0}[draft_depth]
+        transient_scale = self.TRANSIENT_SCALE[draft_depth]
         return context_gib + self.transient_gib_per_lane * transient_scale
 
     def _fit(
@@ -1465,8 +1488,11 @@ class SelfMTPLaneAdmissionController:
             cache_gib = tuple(cache_gib)
         if len(cache_gib) != len(contexts):
             raise ValueError("cache_gib must align with context_tokens")
-        if max_draft not in (1, 2):
-            raise ValueError("max_draft must be 1 or 2")
+        if max_draft < 1 or max_draft not in self.TRANSIENT_SCALE:
+            raise ValueError(
+                "max_draft must be a calibrated depth: "
+                f"{sorted(d for d in self.TRANSIENT_SCALE if d >= 1)}"
+            )
 
         modes: List[Literal["self_mtp", "plain", "queue"]] = [
             "plain" if not ok else "queue" for ok in eligible
@@ -1485,7 +1511,7 @@ class SelfMTPLaneAdmissionController:
             # trusting a malformed context vector would make the estimate
             # lane-order-dependent and is not fail closed.
             for i in mtp_candidates:
-                self.lane_gib(contexts[i], 2, cache_gib[i])
+                self.lane_gib(contexts[i], max_draft, cache_gib[i])
         except (TypeError, ValueError, OverflowError):
             valid = False
             free = 0.0
@@ -1495,38 +1521,30 @@ class SelfMTPLaneAdmissionController:
                 tuple(modes), tuple(depths), "queue", 0.0, usable
             )
 
-        if max_draft == 2:
+        # The frozen degradation order, generalized over depth: try the largest
+        # safe subset at the requested depth, then at each shallower depth in
+        # turn, then one plain lane, then queue. Lowering k never jumps ahead of
+        # admitting fewer full-depth lanes, which is the invariant the two-rung
+        # form encoded and the loop preserves.
+        for depth in range(max_draft, 0, -1):
             chosen, used = self._fit(
-                mtp_candidates, contexts, cache_gib, 2, usable,
+                mtp_candidates, contexts, cache_gib, depth, usable,
                 self.saturation_lane_cap,
             )
-            if chosen:
-                for i in chosen:
-                    modes[i] = "self_mtp"
-                    depths[i] = 2
-                stage = (
-                    "full"
-                    if len(chosen) == len(mtp_candidates)
-                    else "fewer_lanes"
-                )
-                return SelfMTPLaneAdmission(
-                    tuple(modes), tuple(depths), stage, used, usable
-                )
-
-        chosen, used = self._fit(
-            mtp_candidates, contexts, cache_gib, 1, usable,
-            self.saturation_lane_cap,
-        )
-        if chosen:
+            if not chosen:
+                continue
             for i in chosen:
                 modes[i] = "self_mtp"
-                depths[i] = 1
-            stage = (
-                "lower_k"
-                if max_draft == 2
-                else "full" if len(chosen) == len(mtp_candidates) else "fewer_lanes"
+                depths[i] = depth
+            if depth < max_draft:
+                stage = "lower_k"
+            elif len(chosen) == len(mtp_candidates):
+                stage = "full"
+            else:
+                stage = "fewer_lanes"
+            return SelfMTPLaneAdmission(
+                tuple(modes), tuple(depths), stage, used, usable
             )
-            return SelfMTPLaneAdmission(tuple(modes), tuple(depths), stage, used, usable)
 
         chosen, used = self._fit(mtp_candidates, contexts, cache_gib, 0, usable)
         if chosen:
@@ -1599,7 +1617,7 @@ def _make_self_mtp_admission_callback(
     controller: Optional[SelfMTPLaneAdmissionController] = None,
     free_memory: Callable[[], Optional[float]] = _current_self_mtp_free_memory_gib,
     *,
-    max_draft: int = 2,
+    max_draft: Union[int, Callable[[], int]] = 2,
 ) -> Callable[
     [Sequence[Tuple[int, int, int, bool, float]]],
     Mapping[int, Union[int, str]],
@@ -1623,7 +1641,7 @@ def _make_self_mtp_admission_callback(
             [int(row[1]) for row in rows],
             math.nan if current_free is None else current_free,
             cache_gib=[float(row[4]) if len(row) > 4 else 0.0 for row in rows],
-            max_draft=max_draft,
+            max_draft=max_draft() if callable(max_draft) else max_draft,
         )
         actions: Dict[int, Union[int, str]] = {}
         for row, mode, depth in zip(rows, decision.modes, decision.draft_depths):
@@ -1672,7 +1690,12 @@ def _batched_self_mtp_config(
         return None
     if config.get("share_qsa_indices"):
         return None
-    if config.get("num_draft") not in (1, 2):
+    if config.get("num_draft") not in SelfMTPLaneAdmissionController.TRANSIENT_SCALE:
+        # Admission is bounded by the memory envelope's CALIBRATED depths, not
+        # by a literal. The old (1, 2) was the table's domain; it now covers
+        # depth 3 and 4 from measurement (see TRANSIENT_SCALE), which is what
+        # lets k=3 -- worth +6.1% at 1K and +4.2% at 16K in-process -- reach
+        # the served path at all.
         return None
     return config
 
@@ -2136,11 +2159,16 @@ class ResponseGenerator:
                 else SelfMTPLaneAdmissionController.K2_TRANSIENT_GIB_PER_LANE
             ),
         )
+        # Read the depth at admission time, not at construction: it is a
+        # soft-reloadable key, and capturing it here made a reload silently
+        # ineffective. The old `min(..., 2)` clamp is gone -- admissible depth
+        # is now bounded by the memory envelope's calibrated table
+        # (SelfMTPLaneAdmissionController.TRANSIENT_SCALE), which covers 3 and
+        # 4 from measurement, instead of by a literal.
         self._self_mtp_admission = _make_self_mtp_admission_callback(
             self._self_mtp_admission_controller,
-            max_draft=min(
-                int(getattr(self.model_provider.cli_args, "self_mtp_num_draft", 2)),
-                2,
+            max_draft=lambda: int(
+                getattr(self.model_provider.cli_args, "self_mtp_num_draft", 2)
             ),
         )
 

@@ -112,7 +112,11 @@ class TestSelfMTPLaneAdmissionController(unittest.TestCase):
         self.assertEqual(first.draft_depths, (2, 2, 2, 2))
 
         # Same controller, later boundary: contexts grew and free memory fell.
-        second = self.controller.decide([16 * 1024] * 4, 28.0)
+        # 28.6 GiB free leaves 8.6 usable: a k=2 lane needs 8.80 and does not
+        # fit, a k=1 lane needs 8.448 and does. The figure moved with the
+        # 2026-09-09 transient recalibration (k=1 reserve 0.50 -> 0.80 of k=2,
+        # measured); what this test pins is the ladder ORDER, not the constant.
+        second = self.controller.decide([16 * 1024] * 4, 28.6)
         self.assertEqual(second.stage, "lower_k")
         self.assertEqual(second.mtp_indices, (0,))
         self.assertEqual(second.draft_depths[0], 1)
@@ -245,7 +249,9 @@ class TestSelfMTPLaneAdmissionController(unittest.TestCase):
         self.assertEqual(_parallel_prompt_cache_key(prompt, cache, None), prompt[:-1])
 
     def test_generator_callback_rechecks_every_cycle_boundary(self):
-        samples = iter((55.5, 28.0, None))
+        # See the note on the reserve recalibration above: 28.6 is the figure
+        # at which exactly one k=1 lane still fits at 16K.
+        samples = iter((55.5, 28.6, None))
         callback = _make_self_mtp_admission_callback(
             self.controller, lambda: next(samples)
         )

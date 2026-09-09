@@ -168,6 +168,11 @@ class TestGreedyDigestDiagnostic(_CPUCase):
 
 
 class TestBatchedCoreLifecycle(_CPUCase):
+    # Draft depth under test. The batched engine was built and validated at
+    # width 3 (k=2); the subclass below re-runs this entire oracle suite at
+    # k=3, which is the gate for admitting depth 3 to the batched server path.
+    NUM_DRAFT = 2
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -184,7 +189,7 @@ class TestBatchedCoreLifecycle(_CPUCase):
             prompt_cache=None,
             mtp_state=None,
             lane_rng=LaneRNG(100 + uid),
-            num_draft=2,
+            num_draft=self.NUM_DRAFT,
             sampling_temp=temperature,
             sampling_top_p=1.0,
             sampling_top_k=top_k,
@@ -235,7 +240,7 @@ class TestBatchedCoreLifecycle(_CPUCase):
         for token, logprobs, _from_draft in self_mtp_generate_step(
             mx.array(prompt, mx.uint32),
             self.model,
-            num_draft=2,
+            num_draft=self.NUM_DRAFT,
             max_tokens=maximum,
             prefill_step_size=4,
             sampling_temp=0.0,
@@ -373,7 +378,7 @@ class TestBatchedCoreLifecycle(_CPUCase):
         batch = attach_self_mtp_lanes(self.model, None, [lane0, lane1])
         proposal = propose_batched_self_mtp(self.model, batch)
         self.assertEqual(proposal.lane_uids, (10, 20))
-        self.assertEqual(proposal.draft_depths, (2, 2))
+        self.assertEqual(proposal.draft_depths, (self.NUM_DRAFT,) * 2)
         self.assertEqual(
             tuple(len(row) for row in proposal.outputs),
             tuple(value + 1 for value in proposal.accepted_lengths),
@@ -477,7 +482,7 @@ class TestBatchedCoreLifecycle(_CPUCase):
         self.assertEqual(len(batch.lanes), 4)
         proposal = propose_batched_self_mtp(self.model, batch)
         # N=4 at k=2: this cycle's verify forward is the M=12 shape.
-        self.assertEqual(proposal.draft_depths, (2, 2, 2, 2))
+        self.assertEqual(proposal.draft_depths, (self.NUM_DRAFT,) * 4)
         for lane, outputs in zip(batch.lanes, proposal.outputs):
             traces[lane.uid].extend((output.token, output.logprobs) for output in outputs)
         commit_batched_self_mtp(
@@ -505,10 +510,28 @@ class TestBatchedCoreLifecycle(_CPUCase):
             self.note_single_lane_compat(uid, prompts_by_uid[uid], traces[uid])
 
 
+class TestBatchedCoreLifecycleDepth3(TestBatchedCoreLifecycle):
+    """The whole batched oracle suite at draft depth 3.
+
+    The batched engine shipped with the server admitting num_draft in (1, 2)
+    only -- a validation boundary, not a structural one: MAX_VERIFY_WIDTH is 8
+    and the round code carries lane.num_draft generically. Depth 3 measured
+    +6.1% at 1K and +4.2% at 16K over depth 2 in-process, so it is worth
+    admitting, but only behind the same digest contract depth 2 has: every
+    batched lane must reproduce the single-lane ``self_mtp_generate_step``
+    trace, and per-lane ragged rollback must stay exact across all four Qwen4
+    cache slots.
+    """
+
+    NUM_DRAFT = 3
+
+
 @unittest.skipUnless(
     os.environ.get("MLX_BATCHED_MTP_GATE_MODEL"),
     "set MLX_BATCHED_MTP_GATE_MODEL to the production Qwen3.8 artifact",
 )
+
+
 class TestProductionQwen38DigestGate(unittest.TestCase):
     """Real-M5 digest battery; near-tie-only flips remain diagnostic."""
 
