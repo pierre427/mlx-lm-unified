@@ -21,6 +21,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .. import round_levers as _lv  # lab round levers (default off)
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask, scaled_dot_product_attention
 from .cache import (
     ArraysCache,
@@ -490,6 +491,29 @@ _EAGER_DISPATCH = _env_flag("MLX_QWEN4_EAGER_DISPATCH")
 _EAGER_DISPATCH_MAX_ROWS = max(
     1, int(os.environ.get("MLX_QWEN4_EAGER_DISPATCH_MAX_ROWS", "64"))
 )
+# MLX_QWEN4_EAGER_DISPATCH_STRIDE (2026-09-08 hardening): submit every N-th
+# layer instead of every layer, to test whether the plain-decode long-context
+# regression is command-buffer count. 1 reproduces the #3469 behaviour; the
+# last layer is always submitted so the forward's tail is not left lazy.
+_EAGER_DISPATCH_STRIDE = max(
+    1, int(os.environ.get("MLX_QWEN4_EAGER_DISPATCH_STRIDE", "1"))
+)
+
+
+def set_qwen4_eager_dispatch(enabled: bool) -> bool:
+    """Flip MLX_QWEN4_EAGER_DISPATCH at runtime; returns the previous value."""
+    global _EAGER_DISPATCH
+    previous = bool(_EAGER_DISPATCH)
+    _EAGER_DISPATCH = bool(enabled)
+    return previous
+
+
+def set_qwen4_eager_dispatch_stride(stride: int) -> int:
+    """Set the eager-dispatch submit stride (>= 1); returns the previous value."""
+    global _EAGER_DISPATCH_STRIDE
+    previous = int(_EAGER_DISPATCH_STRIDE)
+    _EAGER_DISPATCH_STRIDE = max(1, int(stride))
+    return previous
 
 # MLX_QWEN4_QSA_DENSE_SHORTCIRCUIT (2026-08-27): skip the whole indexer
 # selection while the QSA mask is dense BY CONSTRUCTION, i.e. while
@@ -2100,8 +2124,10 @@ class NGramEmbedding(nn.Module):
         cache: Optional[ArraysCache] = None,
         mask: Optional[mx.array] = None,
         previous: Optional[np.ndarray] = None,
+        record_sync: bool = True,
     ) -> np.ndarray:
-        record_verify_sync("qwen4.ple.ids_eval")
+        if record_sync:
+            record_verify_sync("qwen4.ple.ids_eval")
         mx.eval(input_ids, mask)
         tokens = np.asarray(input_ids, dtype=np.int64)
         batch, seq_len = tokens.shape
@@ -2307,6 +2333,33 @@ class NGramEmbedding(nn.Module):
             self.ngram_embedding.prefetch_rows(ids)
 
         self.ngram_embedding.submit_prefetch(hash_and_warm)
+
+    def prefetch_positions(self, previous_tokens, tokens) -> bool:
+        """Lever (a): hash ``tokens`` (host ints: the verify slab positions
+        whose ids are already known, following ``previous_tokens``) and read
+        + dequantize their rows on the prefetch pool. The foreground lookup
+        consumes staged rows and falls back to its normal read for anything
+        not staged, so the result never depends on the prefetch landing.
+        No-op for resident tables."""
+        if not self.file_backed:
+            return False
+        prefetch = getattr(self.ngram_embedding, "prefetch_dequant_rows", None)
+        if prefetch is None:
+            return False
+        toks = np.asarray(tokens, dtype=np.int64).reshape(1, -1)
+        prev = np.asarray(previous_tokens, dtype=np.int64).reshape(1, -1)
+        if toks.size == 0:
+            return False
+
+        def hash_and_dequant():
+            ids = self._ngram_ids_numpy(
+                mx.array(toks), None, previous=prev, record_sync=False
+            )
+            prefetch(ids)
+
+        self.ngram_embedding.submit_prefetch(hash_and_dequant)
+        _lv.bump("ple_prefetch_submitted")
+        return True
 
     def __call__(
         self,
@@ -5522,10 +5575,13 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
         eager = _EAGER_DISPATCH and (
             hidden.shape[0] * hidden.shape[1] <= _EAGER_DISPATCH_MAX_ROWS
         )
-        for layer, layer_cache in zip(self.layers, cache):
+        stride = _EAGER_DISPATCH_STRIDE
+        last = len(self.layers) - 1
+        for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             hidden = layer(hidden, inputs, fa_mask, layer_cache, ssm_mask)
-            if eager:
+            if eager and (index == last or (index + 1) % stride == 0):
                 mx.async_eval(hidden)
+                _lv.bump("eager_async_evals")
         mixed = self.hyper_connection_mixer(hidden)
         return (mixed, hidden) if return_hyper else mixed
 
@@ -5830,6 +5886,21 @@ class Model(nn.Module):
 
         hook.context_len = max(e.context_len for e in embeddings)
         return hook
+
+    def ple_prefetch_verify(self, previous_tokens, tokens) -> int:
+        """Lever (a): stage the PLE rows the verify slab positions ``tokens``
+        will gather, given the committed tail ``previous_tokens`` (host ints).
+        Returns how many file-backed tables accepted the request."""
+        count = 0
+        for layer in self.language_model.model.layers:
+            ple = layer.ple
+            if ple is None or not ple.ple_embedding.file_backed:
+                continue
+            context_len = ple.ple_embedding.context_len
+            prev = list(previous_tokens)[-context_len:] if context_len > 0 else []
+            if ple.ple_embedding.prefetch_positions(prev, list(tokens)):
+                count += 1
+        return count
 
     def make_mtp_cache(self, window_size: Optional[int] = None, sink_size: int = 4):
         if window_size is None:

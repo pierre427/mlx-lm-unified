@@ -50,6 +50,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .. import host_timing as _ht  # uncommitted lab host-stall attribution (default off)
+from .. import round_levers as _lv  # lab round levers (default off)
 
 MANIFEST_FORMAT = "qwen4-ple-rows"
 MANIFEST_VERSION = 1
@@ -435,6 +436,10 @@ class FileBackedShardedEmbedding(nn.Module):
         # and pools, so a lock held by a dead parent thread cannot leak in.
         self._lru = OrderedDict()
         self._lru_lock = threading.Lock()
+        # Lever (a): dequantized rows staged by ``prefetch_dequant_rows``
+        # for the next foreground lookup; popped on hit, bounded.
+        self._dq_cache = {}
+        self._dq_lock = threading.Lock()
         self._fd = os.open(self.sidecar_path, os.O_RDONLY)
         self._pool = ThreadPoolExecutor(
             max_workers=max(self.decode_workers, self.prefill_workers),
@@ -635,8 +640,35 @@ class FileBackedShardedEmbedding(nn.Module):
         shape = indices.shape
         flat = np.asarray(indices, dtype=np.int64).reshape(-1)
         unique, inverse = np.unique(flat, return_inverse=True)
-        rows = self._read_rows(unique, self._workers_for(flat.size))
-        values = self._dequant(rows)
+        staged = None
+        dq_cache = getattr(self, "_dq_cache", None)
+        if dq_cache and self.dequant_backend == "numpy":
+            with self._dq_lock:
+                staged = [dq_cache.pop(int(i), None) for i in unique.tolist()]
+            hits = sum(1 for s in staged if s is not None)
+            _lv.bump("ple_dq_hits", hits)
+            _lv.bump("ple_dq_misses", int(unique.size) - hits)
+            if hits == 0:
+                staged = None
+        if staged is None:
+            rows = self._read_rows(unique, self._workers_for(flat.size))
+            values = self._dequant(rows)
+        else:
+            # Lever (a): staged rows were dequantized by the same
+            # ``dequant_rows_numpy`` the foreground applies; misses take
+            # the normal read, so the result is bit-identical either way.
+            bits = np.empty((unique.size, self.dims), dtype=np.uint16)
+            miss = [j for j, s in enumerate(staged) if s is None]
+            for j, s in enumerate(staged):
+                if s is not None:
+                    bits[j] = s
+            if miss:
+                miss_idx = np.asarray(miss, dtype=np.int64)
+                rows = self._read_rows(
+                    unique[miss_idx], self._workers_for(len(miss))
+                )
+                bits[miss_idx] = dequant_rows_numpy(rows, self.dims)
+            values = mx.array(bits).view(mx.bfloat16)
         result = values[mx.array(inverse.astype(np.int64))].reshape(
             *shape, self.dims
         )
@@ -788,6 +820,66 @@ class FileBackedShardedEmbedding(nn.Module):
             ],
             required=False,
         )
+
+    _DQ_CACHE_MAX_ROWS = 8192
+
+    def prefetch_dequant_rows(self, indices: np.ndarray) -> int:
+        """Lever (a): read + dequantize ``indices`` on the prefetch pool.
+
+        Rows already staged are skipped. Reads go through the packed LRU
+        (and populate it) like ``prefetch_rows``; the dequantization is
+        ``dequant_rows_numpy``, the function the foreground applies, so a
+        staged row is bit-identical to the one it replaces. Only the numpy
+        dequant backend is supported (the ``mx`` backend is not bit-exact
+        with it and stays foreground-only). Returns the rows submitted.
+        """
+        if self.dequant_backend != "numpy":
+            return 0
+        flat = np.unique(np.asarray(indices, dtype=np.int64).reshape(-1))
+        if flat.size == 0:
+            return 0
+        self._check_owner()
+        with self._dq_lock:
+            missing = [i for i in flat.tolist() if i not in self._dq_cache]
+        if not missing:
+            return 0
+        ids = np.asarray(missing, dtype=np.int64)
+        row_bytes, base, dims = self.row_bytes, self.data_offset, self.dims
+        lru = self.lru_capacity_rows > 0
+
+        def task(fd):
+            rows = np.empty((ids.size, row_bytes), dtype=np.uint8)
+            need = []
+            if lru:
+                with self._lru_lock:
+                    for j, row_id in enumerate(ids.tolist()):
+                        cached = self._lru.get(row_id)
+                        if cached is None:
+                            need.append(j)
+                        else:
+                            rows[j] = np.frombuffer(cached, dtype=np.uint8)
+            else:
+                need = list(range(ids.size))
+            fresh_ids, fresh_rows = [], []
+            for j in need:
+                data = os.pread(fd, row_bytes, base + int(ids[j]) * row_bytes)
+                if len(data) != row_bytes:
+                    return  # short read: leave these rows to the foreground
+                rows[j] = np.frombuffer(data, dtype=np.uint8)
+                fresh_ids.append(int(ids[j]))
+                fresh_rows.append(rows[j])
+            if lru and fresh_ids:
+                self._cache_put(fresh_ids, fresh_rows)
+            bits = dequant_rows_numpy(rows, dims)
+            with self._dq_lock:
+                if len(self._dq_cache) >= self._DQ_CACHE_MAX_ROWS:
+                    self._dq_cache.clear()
+                for j, row_id in enumerate(ids.tolist()):
+                    self._dq_cache[row_id] = bits[j]
+            _lv.bump("ple_prefetch_rows", int(ids.size))
+
+        self._submit(True, [task], required=False)
+        return int(ids.size)
 
     def submit_prefetch(self, fn) -> None:
         """Run ``fn`` (id hashing + ``prefetch_rows``) on the prefetch pool.

@@ -67,6 +67,7 @@ from .verify_sync import (
     verify_sync_status,
 )
 from . import host_timing as _ht  # uncommitted lab host-stall attribution (default off)
+from . import round_levers as _lv  # lab round levers (default off)
 
 _GREEDY = make_sampler(temp=0.0)
 
@@ -2539,6 +2540,20 @@ def detach_self_mtp_lanes(
     return batch, detached
 
 
+
+def _discard_hedge(model, mtp_cache, hedge) -> None:
+    """Rewind a queued hedge chain's k speculative head entries.
+
+    Host offsets only: the chain's GPU work completes and is ignored. Used
+    when a hit is not consumed (budget change, plain step, generator exit).
+    """
+    trim_prompt_cache(mtp_cache, hedge[3])
+    end_cycle = getattr(model, "mtp_end_cycle", None)
+    if end_cycle is not None:
+        end_cycle(mtp_cache)
+    _lv.bump("hedge_discarded")
+
+
 def _mtp_draft_verify_loop_impl(
     model,
     cache,
@@ -2559,6 +2574,7 @@ def _mtp_draft_verify_loop_impl(
     share_qsa_indices: bool = False,
     rng: Optional[LaneRNG] = None,
     mtp_state_tracker: Optional[dict] = None,
+    lever_state: Optional[dict] = None,
 ):
     """Shared MTP tail: the head drafts, the trunk verifies, GDN rollback trims
     rejects. Assumes cache speculation is already ON; ``cur`` is the last
@@ -2596,6 +2612,18 @@ def _mtp_draft_verify_loop_impl(
     (``sampling_temp == 0``) takes no draw and consumes no key."""
     persistent = mtp_cache is not None
 
+    # ---- round levers (2026-09-08, default off; see round_levers.py) ------
+    # (a) PLE verify-row prefetch: needs a file-backed PLE table on the model.
+    # (c) hedge: greedy, persistent head only (checked per round below).
+    lever_state = lever_state if lever_state is not None else {}
+    lever_ple = _lv.PLE_VERIFY_PREFETCH and hasattr(model, "ple_prefetch_verify")
+    lever_hedge = _lv.HEDGE_DRAFT and persistent
+    end_cycle_hook = getattr(model, "mtp_end_cycle", None)
+    recent_tokens: deque = deque(maxlen=8)  # host mirror of the committed tail
+    prebuilt = None  # (c): (tokens, logprobs, h, k, appended) for the next round
+    if persistent:
+        lever_state["mtp_cache"] = mtp_cache
+
     def _logprobs(logits):
         # ``logprob_transform`` is the shared draft/target transformed
         # distribution; ``None`` is the incumbent temperature-only path.
@@ -2630,11 +2658,54 @@ def _mtp_draft_verify_loop_impl(
         else mx.array([], mx.uint32)
     )
 
+    if lever_ple and token_prefix.size:
+        recent_tokens.extend(int(t) for t in token_prefix[-8:].tolist())
+
+    def _discard_prebuilt():
+        nonlocal prebuilt
+        if prebuilt is None:
+            return
+        _discard_hedge(model, mtp_cache, prebuilt)
+        prebuilt = None
+        lever_state["prebuilt"] = None
+
+    def _build_hedge(k, cur, seed_h, vhidden, targets, draft_tokens):
+        # Lever (c): assume every draft lands. Rewind this round's k head
+        # entries now (host offsets only) and queue the NEXT round's first
+        # draft call -- the pending pairs (seed_h, cur), (h_1, d_1)..(h_k, d_k)
+        # plus (h_{k+1}, bonus) -- and its k-1 chained steps behind the verify.
+        # A miss rewinds ``appended`` entries; a hit hands the chain over.
+        trim_prompt_cache(mtp_cache, k)
+        if end_cycle_hook is not None:
+            end_cycle_hook(mtp_cache)
+        if hasattr(model, "mtp_start_cycle"):
+            model.mtp_start_cycle(mtp_cache, share_qsa_indices and k > 1)
+        hs = mx.concatenate([seed_h, vhidden[:, : k + 1, :]], axis=1)
+        ts = mx.concatenate(
+            [mx.array([[cur]], mx.uint32)]
+            + [mx.reshape(t, (1, 1)) for t in draft_tokens]
+            + [mx.reshape(targets[k], (1, 1))],
+            axis=1,
+        )
+        tokens, lps, hh = [], [], None
+        for _ in range(k):
+            d_logits, post = model.mtp_step(hs, ts, mtp_cache)
+            hh = post[:, -1:, :]
+            d_lp = _logprobs(d_logits[0, -1])
+            t_i = mx.argmax(d_lp).astype(mx.uint32)
+            tokens.append(t_i)
+            lps.append(d_lp)
+            mx.async_eval(t_i, hh)
+            hs, ts = hh, mx.reshape(t_i, (1, 1))
+        _lv.bump("hedge_built")
+        return (tokens, lps, hh, k, (k + 2) + (k - 1))
+
     def _plain_step():
         # One width-1 trunk forward: commits `cur`, samples the next token.
         # Keeps the pending-pair protocol intact so persistent drafting can
         # resume seamlessly after a probe.
         nonlocal cur, seed_h, pending_hs, pending_ts, token_prefix
+        _discard_prebuilt()
         with mx.stream(generation_stream):
             logit_h, h = _mtp_backbone(
                 model, mx.array([[cur]], mx.uint32), cache
@@ -2656,6 +2727,8 @@ def _mtp_draft_verify_loop_impl(
             )
             pending_ts.append(cur)
         token_prefix = proc_tokens
+        if lever_ple:
+            recent_tokens.append(cur)
         seed_h, cur = h[:, -1:, :], nxt
         if mtp_state_tracker is not None:
             mtp_state_tracker.update(
@@ -2745,53 +2818,97 @@ def _mtp_draft_verify_loop_impl(
             # ---- draft k tokens with the MTP head (chained) ------------------
             if not persistent:
                 mtp_cache = model.make_mtp_cache()
-            if hasattr(model, "mtp_start_cycle"):
-                model.mtp_start_cycle(mtp_cache, share_qsa_indices and k > 1)
             greedy_device = not sampling_temp and not logits_processors
+            # Lever (b): temperature-only drafts stay on device too -- the same
+            # categorical draw ``_sample_from_logprobs`` makes, minus its
+            # ``.item()`` -- so the chain has no per-draft host sync.
+            device_sampled = (
+                not greedy_device
+                and _lv.DEVICE_SAMPLING
+                and bool(sampling_temp and sampling_temp > 0)
+                and not logits_processors
+            )
+            device_draft = greedy_device or device_sampled
             drafts: List[int] = []
             draft_tokens: List[mx.array] = []
             draft_logprobs: List[mx.array] = []
             h, tok = seed_h, mx.array([[cur]], mx.uint32)
             _ht_draft_t0 = _ht.tic() if _ht.ENABLED else 0.0  # mtp_draft span
-            with mx.stream(generation_stream):
-                for i in range(k):
-                    if i == 0 and pending_hs is not None:
-                        hs = mx.concatenate([pending_hs, h], axis=1)
-                        ts = mx.array([pending_ts + [cur]], mx.uint32)
-                    else:
-                        hs, ts = h, tok
-                    d_logits, post = model.mtp_step(hs, ts, mtp_cache)
-                    h = post[:, -1:, :]
-                    d_lp = _logprobs(d_logits[0, -1])
-                    if greedy_device:
-                        draft_token = mx.argmax(d_lp).astype(mx.uint32)
-                        draft_tokens.append(draft_token)
-                        tok = mx.reshape(draft_token, (1, 1))
-                        mx.async_eval(draft_token, h)
-                    else:
-                        draft = _sample_from_logprobs(
-                            d_lp, sampling_temp, rng=rng
-                        )
-                        drafts.append(draft)
-                        tok = mx.array([[draft]], mx.uint32)
-                    draft_logprobs.append(d_lp)
+            landed_drafts: List[int] = []  # lever (a): draft ids as they land
+            if prebuilt is not None and prebuilt[3] == k and greedy_device:
+                # Lever (c) hit: the chain was built and queued under the
+                # previous verify and its cycle is still armed (no start_cycle).
+                draft_tokens, draft_logprobs, h = prebuilt[0], prebuilt[1], prebuilt[2]
+                prebuilt = None
+                lever_state["prebuilt"] = None
+                _lv.bump("hedge_consumed")
+            else:
+                _discard_prebuilt()
+                if hasattr(model, "mtp_start_cycle"):
+                    model.mtp_start_cycle(mtp_cache, share_qsa_indices and k > 1)
+                if lever_ple:
+                    # Slab position 0 hashes host-known tokens only.
+                    model.ple_prefetch_verify(list(recent_tokens), [cur])
+                with mx.stream(generation_stream):
+                    for i in range(k):
+                        if i == 0 and pending_hs is not None:
+                            hs = mx.concatenate([pending_hs, h], axis=1)
+                            ts = mx.array([pending_ts + [cur]], mx.uint32)
+                        else:
+                            hs, ts = h, tok
+                        d_logits, post = model.mtp_step(hs, ts, mtp_cache)
+                        h = post[:, -1:, :]
+                        d_lp = _logprobs(d_logits[0, -1])
+                        if greedy_device:
+                            draft_token = mx.argmax(d_lp).astype(mx.uint32)
+                            draft_tokens.append(draft_token)
+                            tok = mx.reshape(draft_token, (1, 1))
+                            mx.async_eval(draft_token, h)
+                        elif device_sampled:
+                            draft_token = mx.random.categorical(
+                                d_lp, key=draw_key(rng)
+                            ).astype(mx.uint32)
+                            draft_tokens.append(draft_token)
+                            tok = mx.reshape(draft_token, (1, 1))
+                            mx.async_eval(draft_token, h)
+                            _lv.bump("device_sampled_drafts")
+                        else:
+                            draft = _sample_from_logprobs(
+                                d_lp, sampling_temp, rng=rng
+                            )
+                            drafts.append(draft)
+                            tok = mx.array([[draft]], mx.uint32)
+                        draft_logprobs.append(d_lp)
+                        if lever_ple and device_draft and i >= 1:
+                            # CLOSED 2026-09-08 (measured -1.5%..+2.1%, sign
+                            # flipping by cell: the lever's own ceiling is
+                            # ~1.0-1.2 ms of a ~46 ms round, smaller than this
+                            # lane's run-to-run spread). The block is kept for
+                            # the record but its timing counter was removed: it
+                            # wrapped an ``.item()``, i.e. a device sync on the
+                            # hot path, measuring the thing it perturbs.
+                            landed_drafts.append(int(draft_tokens[i - 1].item()))
+                            model.ple_prefetch_verify(
+                                list(recent_tokens), [cur] + landed_drafts
+                            )
             if _ht.ENABLED:
                 _ht.toc("mtp_draft", _ht_draft_t0)
 
             # ---- verify: trunk over [cur, drafts...] in one forward ----------
+            hedge = None
             verify_in = (
                 mx.concatenate(
                     [mx.array([[cur]], mx.uint32)]
                     + [mx.reshape(token, (1, 1)) for token in draft_tokens],
                     axis=1,
                 )
-                if greedy_device
+                if device_draft
                 else mx.array([[cur] + drafts], mx.uint32)
             )
             with mx.stream(generation_stream):
                 vlogit_hidden, vhidden = _mtp_backbone(model, verify_in, cache)
                 vlogits = model.logits(vlogit_hidden)
-                if greedy_device:
+                if device_draft:
                     logprobs = _logprobs(vlogits[0])
                 else:
                     processed_logits = []
@@ -2809,6 +2926,23 @@ def _mtp_draft_verify_loop_impl(
                         )
                     logprobs = _logprobs(mx.stack(processed_logits))
                 targets = mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+                if (
+                    lever_hedge
+                    and greedy_device
+                    and speculation_router is None
+                    and (not rate_gate or stats.rate_gate_probed)
+                ):
+                    # Lever (c): only when the next round would draft the same
+                    # width (a budget-clamped tail would mis-size the chain).
+                    k_next = draft_tokens_for_budget(
+                        configured_k, max_tokens - (ntoks + k + 1)
+                    )
+                    if k_next == k:
+                        hedge = _build_hedge(
+                            k, cur, seed_h, vhidden, targets, draft_tokens
+                        )
+                    else:
+                        _lv.bump("hedge_skipped")
 
             # accept span: verify-boundary host sync + longest-accepted-prefix
             # scan + commit/rollback trims. The first mx.eval after the async
@@ -2828,6 +2962,14 @@ def _mtp_draft_verify_loop_impl(
                     _ht_accept_t0 = _ht.tic()  # accept = pure host from here
                 targets, hosted_drafts = accept_payload.tolist()
                 drafts = hosted_drafts[:k]
+            elif device_sampled:
+                sampled_payload = mx.stack(draft_tokens)
+                record_verify_sync("hybrid.sampled.accept_boundary")
+                mx.eval(sampled_payload, vhidden)
+                if _ht.ENABLED:
+                    _ht.toc("verify_wait", _ht_accept_t0)  # GPU verify drain
+                    _ht_accept_t0 = _ht.tic()  # accept = pure host from here
+                drafts = [int(t) for t in sampled_payload.tolist()]
             else:
                 mx.eval(targets, vhidden)
                 if _ht.ENABLED:
@@ -2886,14 +3028,28 @@ def _mtp_draft_verify_loop_impl(
 
         # Trunk cache advanced by k+1 (cur + k drafts); keep cur + n_accept.
         trim_prompt_cache(cache, k - n_accept)
-        if persistent:
-            # Rewind the k speculative entries: (h_p, cur) plus the k-1
-            # chained pairs built from MTP (not trunk) hiddens. The committed
-            # span — (h_p, cur), (h_{p+1}, d_1) .. (h_{p+n_accept}, d_na) with
-            # TRUNK hiddens — is carried as pending pairs and re-fed as the
-            # prefix of the next cycle's first draft call. The bonus token
-            # stays out: it becomes the next cycle's cur.
-            trim_prompt_cache(mtp_cache, k)
+        if persistent and hedge is not None and n_accept == k:
+            # Lever (c) hit: the head already holds the committed pairs and
+            # the next round's k speculative entries; nothing is pending and
+            # the queued chain is handed to the next round as ``prebuilt``.
+            prebuilt = hedge
+            lever_state["prebuilt"] = hedge
+            pending_hs, pending_ts = None, []
+            _lv.bump("hedge_hit")
+        elif persistent:
+            if hedge is not None:
+                # Lever (c) miss: drop the optimistic first call and its
+                # chained steps; this round's k entries were rewound already.
+                trim_prompt_cache(mtp_cache, hedge[4])
+                _lv.bump("hedge_miss")
+            else:
+                # Rewind the k speculative entries: (h_p, cur) plus the k-1
+                # chained pairs built from MTP (not trunk) hiddens. The committed
+                # span — (h_p, cur), (h_{p+1}, d_1) .. (h_{p+n_accept}, d_na) with
+                # TRUNK hiddens — is carried as pending pairs and re-fed as the
+                # prefix of the next cycle's first draft call. The bonus token
+                # stays out: it becomes the next cycle's cur.
+                trim_prompt_cache(mtp_cache, k)
             # Pair the cycle's arming with its exit, AFTER the rewind: called
             # before it, the hook reports the drafted span the rewind is about
             # to remove. The loop owns this exit -- a head cache whose own
@@ -2910,6 +3066,8 @@ def _mtp_draft_verify_loop_impl(
             else:
                 pending_hs = seed_h
             pending_ts = [cur] + drafts[:n_accept]
+        if lever_ple:
+            recent_tokens.extend([cur] + drafts[:n_accept])
         seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
         if mtp_state_tracker is not None:
             mtp_state_tracker.update(
@@ -2961,11 +3119,22 @@ def _mtp_draft_verify_loop(*args, mtp_state_out=None, **kwargs):
     are structurally exact.
     """
     tracker = {} if mtp_state_out is not None else None
+    lever_state: dict = {}
     try:
         yield from _mtp_draft_verify_loop_impl(
-            *args, mtp_state_tracker=tracker, **kwargs
+            *args, mtp_state_tracker=tracker, lever_state=lever_state, **kwargs
         )
     finally:
+        prebuilt = lever_state.get("prebuilt")
+        if prebuilt is not None and lever_state.get("mtp_cache") is not None:
+            # Lever (c): a hedge chain queued for a round that never ran must
+            # be rewound before the sidecar offsets are validated.
+            _discard_hedge(
+                args[0] if args else kwargs["model"],
+                lever_state["mtp_cache"],
+                prebuilt,
+            )
+            lever_state["prebuilt"] = None
         if tracker is not None and tracker.get("mtp_cache") is not None:
             mtp_cache = tracker["mtp_cache"]
             pending_hs = tracker.get("pending_hs")
