@@ -68,3 +68,28 @@ def test_summary_requires_exact_and_adaptive_engagement_receipts():
     summary = MODULE.summarize(rows, [16384])["16384"]
     assert summary["exact_matches"] == 2
     assert summary["adaptive_engaged_trials"] == 1
+
+
+def test_token_id_padding_preserves_stable_suffix():
+    class FakeTokenizer:
+        @staticmethod
+        def encode(_text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [7]
+
+    result = MODULE.fill_ids_before_stable_suffix(
+        FakeTokenizer(), [1, 2, 10, 11], [1, 2, 3, 10, 11], 6
+    )
+    assert result == [1, 2, 7, 7, 10, 11]
+
+
+@pytest.mark.skipif(
+    not Path(MODULE.DEFAULT_MODEL).is_dir(), reason="local Flash-Next tokenizer absent"
+)
+def test_actual_flash_next_tokenizer_builds_exact_gate_contexts():
+    from mlx_lm.utils import load_tokenizer
+
+    tokenizer = load_tokenizer(Path(MODULE.DEFAULT_MODEL))
+    for context in (256, 16384, 65536):
+        ids = MODULE.exact_prompt(tokenizer, context, f"test-{context}")
+        assert len(ids) == context

@@ -96,3 +96,16 @@ def test_first_divergence_handles_content_and_length():
     assert MODULE.first_divergence([1, 2, 3], [1, 9, 3]) == 1
     assert MODULE.first_divergence([1, 2], [1, 2, 3]) == 2
     assert MODULE.first_divergence([1, 2], [1, 2]) is None
+
+
+def test_token_id_padding_preserves_stable_suffix():
+    class FakeTokenizer:
+        @staticmethod
+        def encode(_text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [7]
+
+    result = MODULE.fill_ids_before_stable_suffix(
+        FakeTokenizer(), [1, 2, 10, 11], [1, 2, 3, 10, 11], 6
+    )
+    assert result == [1, 2, 7, 7, 10, 11]

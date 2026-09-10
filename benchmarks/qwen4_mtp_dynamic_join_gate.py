@@ -167,6 +167,43 @@ def template_ids(tokenizer: Any, text: str) -> list[int]:
     )
 
 
+def fill_ids_before_stable_suffix(
+    tokenizer: Any,
+    current: list[int],
+    one_unit_longer: list[int],
+    target: int,
+) -> list[int]:
+    """Insert inert filler IDs before the unchanged chat suffix.
+
+    Text-level padding is not exact because BPE can merge the last filler with
+    the first suffix token. Comparing adjacent rendered fillers identifies the
+    stable suffix/generation-prompt tail; inserting already-tokenized ``x`` IDs
+    immediately before it leaves every tail ID unchanged by construction.
+    """
+    if len(current) > target:
+        raise ValueError("current token sequence already exceeds target")
+    missing = target - len(current)
+    if not missing:
+        return list(current)
+    common_suffix = 0
+    limit = min(len(current), len(one_unit_longer))
+    while (
+        common_suffix < limit
+        and current[-common_suffix - 1] == one_unit_longer[-common_suffix - 1]
+    ):
+        common_suffix += 1
+    if common_suffix == 0 or common_suffix == len(current):
+        raise RuntimeError("could not isolate a stable chat-template suffix")
+    filler = list(tokenizer.encode("x", add_special_tokens=False))
+    if not filler:
+        raise RuntimeError("tokenizer produced no ordinary filler token")
+    insertion = len(current) - common_suffix
+    result = current[:insertion] + [int(filler[0])] * missing + current[insertion:]
+    if result[-common_suffix:] != current[-common_suffix:]:
+        raise RuntimeError("exact padding changed the chat-template suffix")
+    return result
+
+
 def exact_prompt(tokenizer: Any, target: int, marker: str) -> list[int]:
     prefix = f"Benchmark marker {marker}. Context data follows.\n"
     suffix = (
@@ -189,12 +226,13 @@ def exact_prompt(tokenizer: Any, target: int, marker: str) -> list[int]:
             low = middle
         else:
             high = middle
-    text = render(low)
-    remaining = target - len(template_ids(tokenizer, text))
-    # Qwen's leading-space `` x`` is one token. Refuse the run if that artifact
-    # contract changes rather than silently measuring the wrong context.
-    text = text.removesuffix(suffix) + (" x" * remaining) + suffix
-    ids = template_ids(tokenizer, text)
+    ids = template_ids(tokenizer, render(low))
+    ids = fill_ids_before_stable_suffix(
+        tokenizer,
+        ids,
+        template_ids(tokenizer, render(low + 1)),
+        target,
+    )
     if len(ids) != target:
         raise RuntimeError(f"exact prompt construction failed: {len(ids)} != {target}")
     return ids
