@@ -55,12 +55,18 @@ def _eval_result(result):
     mx.eval(output, *[value for cache in caches for value in _arrays(cache.cache)])
 
 
-def _time_once(fn):
+def _time_once(fn, inner):
     started = time.perf_counter_ns()
-    result = fn()
-    _eval_result(result)
+    results = [fn() for _ in range(inner)]
+    arrays = []
+    for output, caches in results:
+        arrays.append(output)
+        arrays.extend(
+            value for cache in caches for value in _arrays(cache.cache)
+        )
+    mx.eval(*arrays)
     mx.synchronize()
-    return (time.perf_counter_ns() - started) / 1e6
+    return (time.perf_counter_ns() - started) / 1e6 / inner
 
 
 def _timing(samples):
@@ -71,15 +77,15 @@ def _timing(samples):
     }
 
 
-def _abba(serial, fanout, blocks):
+def _abba(serial, fanout, blocks, inner):
     rows = []
     serial_samples = []
     fanout_samples = []
     for index in range(blocks):
-        a1 = _time_once(serial)
-        b1 = _time_once(fanout)
-        b2 = _time_once(fanout)
-        a2 = _time_once(serial)
+        a1 = _time_once(serial, inner)
+        b1 = _time_once(fanout, inner)
+        b2 = _time_once(fanout, inner)
+        a2 = _time_once(serial, inner)
         a_ms = (a1 + a2) / 2.0
         b_ms = (b1 + b2) / 2.0
         drift = abs(a2 - a1) / max(min(a1, a2), 1e-12)
@@ -142,11 +148,14 @@ def main():
     parser.add_argument("--suffix", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--reps", type=int, default=15)
+    parser.add_argument("--inner", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if not 0 <= args.boundary <= args.ring:
         parser.error("--boundary must be in 0..--ring")
+    if args.inner < 1:
+        parser.error("--inner must be positive")
     mx.set_default_device(mx.cpu if args.device == "cpu" else mx.gpu)
     mx.random.seed(args.seed)
 
@@ -205,7 +214,9 @@ def main():
         _eval_result(serial())
     mx.synchronize()
 
-    blocks, serial_timing, fanout_timing = _abba(serial, fanout, args.reps)
+    blocks, serial_timing, fanout_timing = _abba(
+        serial, fanout, args.reps, args.inner
+    )
     speedups = [row["speedup"] for row in blocks]
     speedup = statistics.median(speedups)
     serial_memory = _memory(serial)
@@ -249,6 +260,12 @@ def main():
     payload = {
         "scope": "one-layer component gate; no full-model claim",
         "device": args.device,
+        "timing": {
+            "design": "ABBA",
+            "blocks": args.reps,
+            "inner_transactions_per_sample": args.inner,
+            "reported_ms": "per transaction",
+        },
         "geometry": {
             "hidden": args.hidden,
             "key_heads": args.key_heads,
