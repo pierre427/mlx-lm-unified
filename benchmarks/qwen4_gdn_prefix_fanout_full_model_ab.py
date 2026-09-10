@@ -327,7 +327,15 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--max-relative-error", type=float, default=3e-3)
+    parser.add_argument(
+        "--max-relative-error",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum serial-vs-fanout cache/logit relative error. Default 0 "
+            "keeps the promotion gate lossless; any relaxation is explicit."
+        ),
+    )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if args.prompt_tokens < 2 or args.suffix_tokens < 1:
