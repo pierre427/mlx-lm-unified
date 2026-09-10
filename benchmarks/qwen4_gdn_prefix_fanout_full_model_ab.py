@@ -28,6 +28,7 @@ import mlx.core as mx
 
 from mlx_lm.gdn_prefix_fanout import (
     HybridCachePrefixFanout,
+    _clone_cache as _clone_cache_entry,
     gdn_prefix_fanout_stats,
 )
 from mlx_lm.generate import ParallelSampleGenerator, StopSequenceMatcher
@@ -62,7 +63,7 @@ def _eval_cache(cache) -> None:
 
 
 def _clone_cache(cache):
-    clones = [entry.extract(0) for entry in cache]
+    clones = [_clone_cache_entry(entry) for entry in cache]
     _eval_cache(clones)
     return clones
 
@@ -71,6 +72,15 @@ def _relative_max(left: mx.array, right: mx.array) -> float:
     delta = mx.max(mx.abs(left.astype(mx.float32) - right.astype(mx.float32)))
     scale = mx.maximum(mx.max(mx.abs(right.astype(mx.float32))), 1e-8)
     return float((delta / scale).item())
+
+
+def _logical_cache_array(cache, value: mx.array) -> mx.array:
+    """Ignore allocator tail capacity while preserving the live KV prefix."""
+
+    offset = getattr(cache, "offset", None)
+    if isinstance(offset, int) and value.ndim >= 2 and value.shape[-2] >= offset:
+        return value[..., :offset, :]
+    return value
 
 
 def _cache_error(left, right) -> tuple[bool, float]:
@@ -84,8 +94,19 @@ def _cache_error(left, right) -> tuple[bool, float]:
                 f"cache types differ: {type(actual).__name__} != "
                 f"{type(expected).__name__}"
             )
-        actual_arrays = list(_arrays(actual.state))
-        expected_arrays = list(_arrays(expected.state))
+        actual_offset = getattr(actual, "offset", None)
+        expected_offset = getattr(expected, "offset", None)
+        if actual_offset != expected_offset:
+            raise AssertionError(
+                f"cache offsets differ: {actual_offset} != {expected_offset}"
+            )
+        actual_arrays = [
+            _logical_cache_array(actual, value) for value in _arrays(actual.state)
+        ]
+        expected_arrays = [
+            _logical_cache_array(expected, value)
+            for value in _arrays(expected.state)
+        ]
         if len(actual_arrays) != len(expected_arrays):
             raise AssertionError("cache state widths differ")
         for lhs, rhs in zip(actual_arrays, expected_arrays):
