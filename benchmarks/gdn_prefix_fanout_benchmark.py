@@ -77,34 +77,47 @@ def _timing(samples):
     }
 
 
-def _abba(serial, fanout, blocks, inner):
+def _abba(duplicate, serial, fanout, blocks, inner):
     rows = []
+    duplicate_samples = []
     serial_samples = []
     fanout_samples = []
     for index in range(blocks):
+        d1 = _time_once(duplicate, inner)
         a1 = _time_once(serial, inner)
         b1 = _time_once(fanout, inner)
         b2 = _time_once(fanout, inner)
         a2 = _time_once(serial, inner)
+        d2 = _time_once(duplicate, inner)
+        d_ms = (d1 + d2) / 2.0
         a_ms = (a1 + a2) / 2.0
         b_ms = (b1 + b2) / 2.0
         drift = abs(a2 - a1) / max(min(a1, a2), 1e-12)
         rows.append(
             {
                 "block": index,
-                "a1_serial_ms": a1,
+                "d1_duplicate_replay_ms": d1,
+                "a1_shared_materialize_serial_ms": a1,
                 "b1_fanout_ms": b1,
                 "b2_fanout_ms": b2,
-                "a2_serial_ms": a2,
-                "serial_bracket_ms": a_ms,
+                "a2_shared_materialize_serial_ms": a2,
+                "d2_duplicate_replay_ms": d2,
+                "duplicate_replay_pair_ms": d_ms,
+                "shared_materialize_serial_bracket_ms": a_ms,
                 "fanout_pair_ms": b_ms,
                 "speedup": a_ms / b_ms,
                 "a_bracket_drift_fraction": drift,
             }
         )
+        duplicate_samples.extend((d1, d2))
         serial_samples.extend((a1, a2))
         fanout_samples.extend((b1, b2))
-    return rows, _timing(serial_samples), _timing(fanout_samples)
+    return (
+        rows,
+        _timing(duplicate_samples),
+        _timing(serial_samples),
+        _timing(fanout_samples),
+    )
 
 
 def _relative_max(left, right):
@@ -184,45 +197,107 @@ def main():
         None if value is None else mx.array(value) for value in owner._parent
     ]
     mx.eval(*_arrays(parent_before))
+    arm_counters = {
+        "duplicate_replay_serial": {
+            "transactions": 0,
+            "materializations": 0,
+            "replay_tokens": 0,
+            "copied_state_bytes": 0,
+        },
+        "shared_materialize_serial": {
+            "transactions": 0,
+            "materializations": 0,
+            "replay_tokens": 0,
+            "copied_state_bytes": 0,
+        },
+        "batched_fanout": {
+            "transactions": 0,
+            "materializations": 0,
+            "replay_tokens": 0,
+            "copied_state_bytes": 0,
+        },
+    }
 
-    def serial():
+    def materialized_boundary():
+        return (
+            list(record.snapshot)
+            if args.boundary == 0
+            else list(record.fn(args.boundary))
+        )
+
+    def duplicate_replay_serial():
         outputs = []
         caches = []
         for row in range(2):
-            state = (
-                list(record.snapshot)
-                if args.boundary == 0
-                else list(record.fn(args.boundary))
-            )
+            state = materialized_boundary()
             cache = ArraysCache(len(state))
             cache.cache = state
             outputs.append(layer(suffix[row : row + 1], cache=cache))
             caches.append(cache)
+        counters = arm_counters["duplicate_replay_serial"]
+        counters["transactions"] += 1
+        counters["materializations"] += 2
+        counters["replay_tokens"] += 2 * args.boundary
+        return mx.concatenate(outputs, axis=0), caches
+
+    def shared_materialize_serial():
+        state = materialized_boundary()
+        outputs = []
+        caches = []
+        copied = 0
+        for row in range(2):
+            private = [
+                None if value is None else mx.array(value) for value in state
+            ]
+            copied += sum(value.nbytes for value in private if value is not None)
+            cache = ArraysCache(len(private))
+            cache.cache = private
+            outputs.append(layer(suffix[row : row + 1], cache=cache))
+            caches.append(cache)
+        counters = arm_counters["shared_materialize_serial"]
+        counters["transactions"] += 1
+        counters["materializations"] += 1
+        counters["replay_tokens"] += args.boundary
+        counters["copied_state_bytes"] += copied
         return mx.concatenate(outputs, axis=0), caches
 
     def fanout():
         lease = owner.fork(args.boundary)
         output = layer(suffix, cache=lease.cache)
         caches = [lease.cache.extract(row) for row in range(2)]
+        counters = arm_counters["batched_fanout"]
+        counters["transactions"] += 1
+        counters["materializations"] += 1
+        counters["replay_tokens"] += args.boundary
+        counters["copied_state_bytes"] += lease.copied_state_bytes
         lease.abort()
         return output, caches
 
     for _ in range(args.warmup):
-        _eval_result(serial())
+        _eval_result(duplicate_replay_serial())
+        _eval_result(shared_materialize_serial())
         _eval_result(fanout())
         _eval_result(fanout())
-        _eval_result(serial())
+        _eval_result(shared_materialize_serial())
+        _eval_result(duplicate_replay_serial())
     mx.synchronize()
 
-    blocks, serial_timing, fanout_timing = _abba(
-        serial, fanout, args.reps, args.inner
+    blocks, duplicate_timing, serial_timing, fanout_timing = _abba(
+        duplicate_replay_serial,
+        shared_materialize_serial,
+        fanout,
+        args.reps,
+        args.inner,
     )
     speedups = [row["speedup"] for row in blocks]
     speedup = statistics.median(speedups)
-    serial_memory = _memory(serial)
+    duplicate_memory = _memory(duplicate_replay_serial)
+    serial_memory = _memory(shared_materialize_serial)
     fanout_memory = _memory(fanout)
-    serial_result = serial()
+    duplicate_result = duplicate_replay_serial()
+    serial_result = shared_materialize_serial()
     fanout_result = fanout()
+    _eval_result(duplicate_result)
     _eval_result(serial_result)
     _eval_result(fanout_result)
     output_rel = _relative_max(fanout_result[0], serial_result[0])
@@ -241,11 +316,7 @@ def main():
         for before, after in zip(parent_before, owner._parent)
     )
     proof = owner.fork(args.boundary)
-    boundary_state = (
-        list(record.snapshot)
-        if args.boundary == 0
-        else list(record.fn(args.boundary))
-    )
+    boundary_state = materialized_boundary()
     mx.eval(*_arrays(boundary_state))
     boundary_rows_bit_exact = all(
         bool(mx.array_equal(value[row : row + 1], reference))
@@ -256,12 +327,21 @@ def main():
     copied_state_bytes_per_fanout = proof.copied_state_bytes
     proof.abort()
     stats = gdn_prefix_fanout_stats()
+    per_transaction = {}
+    for name, counters in arm_counters.items():
+        transactions = counters["transactions"]
+        per_transaction[name] = {
+            key: value / transactions
+            for key, value in counters.items()
+            if key != "transactions"
+        }
     row_tokens = 2 * args.suffix
     payload = {
         "scope": "one-layer component gate; no full-model claim",
         "device": args.device,
         "timing": {
-            "design": "ABBA",
+            "design": "duplicate - shared - fanout - fanout - shared - duplicate",
+            "promotion_comparison": "shared-materialize serial vs batched fanout (ABBA core)",
             "blocks": args.reps,
             "inner_transactions_per_sample": args.inner,
             "reported_ms": "per transaction",
@@ -277,7 +357,8 @@ def main():
             "suffix": args.suffix,
             "rows": 2,
         },
-        "serial": serial_timing,
+        "duplicate_replay_serial": duplicate_timing,
+        "shared_materialize_serial": serial_timing,
         "fanout": fanout_timing,
         "abba_blocks": blocks,
         "speedup": speedup,
@@ -285,12 +366,31 @@ def main():
         "max_a_bracket_drift_fraction": max(
             row["a_bracket_drift_fraction"] for row in blocks
         ),
-        "serial_row_tokens_per_second": row_tokens
+        "duplicate_replay_serial_row_tokens_per_second": row_tokens
+        / (duplicate_timing["median_ms"] / 1000.0),
+        "shared_materialize_serial_row_tokens_per_second": row_tokens
         / (serial_timing["median_ms"] / 1000.0),
         "fanout_row_tokens_per_second": row_tokens
         / (fanout_timing["median_ms"] / 1000.0),
-        "memory": {"serial": serial_memory, "fanout": fanout_memory},
+        "memory": {
+            "duplicate_replay_serial": duplicate_memory,
+            "shared_materialize_serial": serial_memory,
+            "fanout": fanout_memory,
+        },
         "boundary_rows_bit_exact": boundary_rows_bit_exact,
+        "duplicate_vs_shared_output_bit_exact": bool(
+            mx.array_equal(duplicate_result[0], serial_result[0])
+        ),
+        "duplicate_vs_shared_state_bit_exact": all(
+            bool(mx.array_equal(candidate, reference))
+            for candidate_cache, reference_cache in zip(
+                duplicate_result[1], serial_result[1]
+            )
+            for candidate, reference in zip(
+                candidate_cache.cache, reference_cache.cache
+            )
+            if candidate is not None
+        ),
         "descendant_output_bit_exact": bool(
             mx.array_equal(fanout_result[0], serial_result[0])
         ),
@@ -311,6 +411,8 @@ def main():
         "copied_state_bytes_per_fanout": copied_state_bytes_per_fanout,
         "replay_tokens_per_fanout": args.boundary,
         "counters": stats,
+        "arm_counters": arm_counters,
+        "arm_counters_per_transaction": per_transaction,
         "engaged": stats["fanout_batches"] > 0,
         "component_gate": (
             parent_unchanged
