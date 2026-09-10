@@ -10,6 +10,7 @@ from mlx_lm.generate import (
     StopSequenceMatcher,
 )
 from mlx_lm.hybrid_speculative import MTPToken
+from mlx_lm.hybrid_speculative import HybridStats
 
 
 class _Lane:
@@ -23,8 +24,10 @@ class _Lane:
         self.max_tokens = maximum
         self.num_draft = depth
         self.sampling_temp = 0.0
+        self.accept_rule = "residual"
         self.logprob_transform = None
         self.logits_processors = []
+        self.stats = HybridStats()
 
 
 class _Detached:

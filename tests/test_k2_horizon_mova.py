@@ -21,7 +21,18 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 from mlx_lm.utils import _get_classes, load_model
 
-mx.set_default_device(mx.cpu)
+_DEFAULT_DEVICE = None
+
+
+def setUpModule():
+    global _DEFAULT_DEVICE
+    _DEFAULT_DEVICE = mx.default_device()
+    mx.set_default_device(mx.cpu)
+
+
+def tearDownModule():
+    mx.clear_cache()
+    mx.set_default_device(_DEFAULT_DEVICE)
 
 CHECKPOINT = Path(
     os.environ.get(

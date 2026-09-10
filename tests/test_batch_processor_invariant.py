@@ -112,6 +112,7 @@ class TestBatchProcessorInvariant(unittest.TestCase):
             self.model,
             max_tokens=3,
             prompt_cache=[cache],
+            compiled_decode=False,
         )
 
         with patch.object(generate_module, "CACHE_STATE_EVAL_INTERVAL", 2):

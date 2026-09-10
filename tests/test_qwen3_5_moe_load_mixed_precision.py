@@ -46,8 +46,13 @@ def _write_checkpoint(tmp: Path):
 
 class TestQwen35MoeLoadMixedPrecision(unittest.TestCase):
     def setUp(self):
+        self._previous_device = mx.default_device()
         mx.set_default_device(mx.cpu)
         mx.random.seed(1)
+
+    def tearDown(self):
+        mx.clear_cache()
+        mx.set_default_device(self._previous_device)
 
     def test_helper_carries_and_refuses(self):
         weights = {"a.switch_mlp.gate_up_proj.weight": 0, "b.switch_mlp.gate_up_proj.weight": 0}

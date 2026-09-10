@@ -20,11 +20,22 @@ import unittest
 
 import mlx.core as mx
 
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+_HERE = os.path.abspath(os.path.dirname(__file__))
+_RUNAWAY_ROOT = next(
+    (
+        parent
+        for parent in (
+            os.path.abspath(os.path.join(_HERE, *([os.pardir] * depth)))
+            for depth in range(1, 5)
+        )
+        if os.path.isfile(os.path.join(parent, "runaway_guard.py"))
+    ),
+    None,
 )
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+if _RUNAWAY_ROOT is None:
+    raise RuntimeError("could not locate the superproject runaway_guard.py")
+if _RUNAWAY_ROOT not in sys.path:
+    sys.path.insert(0, _RUNAWAY_ROOT)
 
 from mlx_lm.sample_utils import make_reasoning_budget  # noqa: E402
 from runaway_guard import (  # noqa: E402

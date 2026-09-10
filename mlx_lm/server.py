@@ -2495,10 +2495,12 @@ class ResponseGenerator:
 
     def _compiled_request_selected(self, args, prompt_tokens=None):
         """Explicit replay mode serializes eligible requests; other modes batch."""
+        max_tokens = getattr(args, "max_tokens", None)
         if (
             not compiled_decode_enabled()
             or getattr(args, "n", 1) != 1
             or prompt_tokens is None
+            or max_tokens is None
         ):
             return False
         if (
@@ -2510,10 +2512,10 @@ class ResponseGenerator:
             ))
         ):
             return False
-        why, policy = compiled_decode_context_policy(prompt_tokens, args.max_tokens)
+        why, policy = compiled_decode_context_policy(prompt_tokens, max_tokens)
         return (
             why is None
-            and args.max_tokens > 0
+            and max_tokens > 0
             and compiled_decode_numerics_accepted(policy)
             and compiled_decode_serving_reason(self.model_provider.model, policy) is None
         )

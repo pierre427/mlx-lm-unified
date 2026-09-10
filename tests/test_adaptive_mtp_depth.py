@@ -252,8 +252,8 @@ class TestServerAdmission(unittest.TestCase):
         config = _self_mtp_config(self.args(), self.cli(), self.model)
         self.assertNotIn("speculation_router", config)
         self.assertEqual(config["num_draft"], 2)
-        # Exactly the pre-change key set: generate.py then passes
-        # speculation_router=None and the engine path is HEAD's.
+        # The default keeps every optional route disabled: generate.py then
+        # passes speculation_router=None and the engine path is HEAD's.
         self.assertEqual(
             set(config),
             {
@@ -261,6 +261,7 @@ class TestServerAdmission(unittest.TestCase):
                 "persistent",
                 "rate_gate",
                 "share_qsa_indices",
+                "gdn_prefix_fanout",
                 "sampling_temp",
                 "accept_rule",
                 "state_out",

@@ -59,8 +59,13 @@ def _build(fused: bool):
 
 class TestQwen35MoeSanitizeFusedGateUp(unittest.TestCase):
     def setUp(self):
+        self._previous_device = mx.default_device()
         mx.set_default_device(mx.cpu)
         mx.random.seed(0)
+
+    def tearDown(self):
+        mx.clear_cache()
+        mx.set_default_device(self._previous_device)
 
     def _checkpoint_with_separate_tables(self):
         # An MLX checkpoint: separate gate/up, quantized triplets, 4-bit g32.
