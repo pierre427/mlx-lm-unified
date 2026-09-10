@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import math
+import operator
 import os
 import sys
 from collections import deque
@@ -2377,7 +2378,12 @@ class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         if left_padding:
-            self.left_padding = mx.array(left_padding)
+            host_left_padding = [int(v) for v in left_padding]
+            self.left_padding = mx.array(host_left_padding)
+            self._host_left_padding = (
+                self.left_padding,
+                host_left_padding,
+            )
 
     def start_speculation(self, rollback_window: Optional[int] = None):
         self.speculating = True
@@ -2801,11 +2807,55 @@ class ArraysCache(_BaseCache):
         In-place filter to keep just the given indices in the cache.
         """
         self._invalidate_rollbacks("filter() changed the batch membership")
+
+        # Preserve only scheduler-owned host indices. Reading a device index
+        # array here would recreate the synchronization this avoids.
+        host_indices = None
+        if isinstance(batch_indices, (list, tuple, range)):
+            try:
+                host_indices = [operator.index(i) for i in batch_indices]
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        old_batch = self.batch_size
+        old_left_padding = self.left_padding
+        old_lengths = self.lengths
+        old_host_left_padding = self._host_left_padding
+        old_host_lengths = self._host_lengths
+
         self.cache = [c[batch_indices] if c is not None else None for c in self.cache]
         if self.left_padding is not None:
             self.left_padding = self.left_padding[batch_indices]
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
+
+        def filtered_mirror(value, old_value, cached):
+            if value is None:
+                return None
+            if (
+                host_indices is None
+                or cached is None
+                or cached[0] is not old_value
+            ):
+                return None
+            try:
+                if len(cached[1]) != old_batch:
+                    return None
+                host = [cached[1][i] for i in host_indices]
+            except (IndexError, TypeError):
+                return None
+            return value, host
+
+        self._host_left_padding = filtered_mirror(
+            self.left_padding,
+            old_left_padding,
+            old_host_left_padding,
+        )
+        self._host_lengths = filtered_mirror(
+            self.lengths,
+            old_lengths,
+            old_host_lengths,
+        )
         if self._checkpoints:
             self._checkpoints = [self._checkpoints[i] for i in batch_indices]
 
@@ -2817,6 +2867,15 @@ class ArraysCache(_BaseCache):
         self._invalidate_rollbacks("extend() changed the batch membership")
         a_batch = self.batch_size
         b_batch = other.batch_size
+
+        old_left_padding = self.left_padding
+        old_lengths = self.lengths
+        old_host_left_padding = self._host_left_padding
+        old_host_lengths = self._host_lengths
+        other_left_padding = other.left_padding
+        other_lengths = other.lengths
+        other_host_left_padding = other._host_left_padding
+        other_host_lengths = other._host_lengths
 
         def cat(a, b):
             shape = dtype = None
@@ -2840,6 +2899,53 @@ class ArraysCache(_BaseCache):
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
         self.left_padding = cat(self.left_padding, other.left_padding)
         self.lengths = cat(self.lengths, other.lengths)
+
+        def extended_mirror(
+            value,
+            a_value,
+            a_cached,
+            b_value,
+            b_cached,
+        ):
+            if value is None:
+                return None
+
+            def source_host(source, cached, batch):
+                # ``cat`` fills a missing side with zeros. Those values are
+                # host-known without consulting an array.
+                if source is None:
+                    return [0] * batch
+                if cached is None or cached[0] is not source:
+                    return None
+                host = cached[1]
+                try:
+                    valid_size = len(host) == batch
+                except TypeError:
+                    return None
+                if not valid_size:
+                    return None
+                return list(host)
+
+            a_host = source_host(a_value, a_cached, a_batch)
+            b_host = source_host(b_value, b_cached, b_batch)
+            if a_host is None or b_host is None:
+                return None
+            return value, a_host + b_host
+
+        self._host_left_padding = extended_mirror(
+            self.left_padding,
+            old_left_padding,
+            old_host_left_padding,
+            other_left_padding,
+            other_host_left_padding,
+        )
+        self._host_lengths = extended_mirror(
+            self.lengths,
+            old_lengths,
+            old_host_lengths,
+            other_lengths,
+            other_host_lengths,
+        )
         a_lanes = self._checkpoints or [[] for _ in range(a_batch)]
         b_lanes = other._checkpoints or [[] for _ in range(b_batch)]
         self._checkpoints = [list(l) for l in a_lanes] + [list(l) for l in b_lanes]
@@ -2925,7 +3031,12 @@ class ArraysCache(_BaseCache):
         # real padding — ``make_mask`` conjoins both bounds so they cannot
         # suppress a later ``prepare(lengths=...)``.
         if all(c.empty() for c in caches):
-            cache.left_padding = mx.array([0] * B)
+            host_left_padding = [0] * B
+            cache.left_padding = mx.array(host_left_padding)
+            cache._host_left_padding = (
+                cache.left_padding,
+                host_left_padding,
+            )
             return cache
 
         for e in range(n_state):
