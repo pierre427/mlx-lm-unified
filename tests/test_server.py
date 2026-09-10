@@ -131,6 +131,7 @@ class TestSelfMTPAdmission(unittest.TestCase):
             self_mtp_rate_gate=True,
             self_mtp_share_qsa_indices=True,
             self_mtp_share_qsa_indices_min_prompt_tokens=16384,
+            gdn_prefix_fanout=False,
             self_mtp_window_size=2048,
             self_mtp_window_sink_size=4,
             self_mtp_window_min_prompt_tokens=32768,
@@ -189,6 +190,13 @@ class TestSelfMTPAdmission(unittest.TestCase):
         )
         self.assertFalse(below["share_qsa_indices"])
         self.assertTrue(admitted["share_qsa_indices"])
+
+    def test_gdn_prefix_fanout_knob_reaches_parallel_mtp_config(self):
+        disabled = _self_mtp_config(self.args(), self.cli, self.model)
+        self.cli.gdn_prefix_fanout = True
+        enabled = _self_mtp_config(self.args(), self.cli, self.model)
+        self.assertFalse(disabled["gdn_prefix_fanout"])
+        self.assertTrue(enabled["gdn_prefix_fanout"])
 
     def test_temperature_only_sampling_is_exact_and_admitted(self):
         config = _self_mtp_config(

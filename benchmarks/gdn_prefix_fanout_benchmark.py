@@ -183,12 +183,8 @@ def main():
     mx.eval(layer(prefix, cache=source))
     source.start_speculation()
     mx.eval(layer(ring, cache=source))
-    record = source._rollbacks[-1]
-    defaults = record.fn.__defaults__
-    retained = sum(
-        int(getattr(value, "nbytes", 0))
-        for value in list(defaults[:5]) + [defaults[6]]
-    )
+    boundary_handle = source.latest_exact_rollback_boundary()
+    retained = boundary_handle.nbytes
     gdn_prefix_fanout_stats(reset=True)
     owner = GDNPrefixFanout.from_latest_record(
         source, enabled=True, retained_input_bytes=retained
@@ -219,11 +215,7 @@ def main():
     }
 
     def materialized_boundary():
-        return (
-            list(record.snapshot)
-            if args.boundary == 0
-            else list(record.fn(args.boundary))
-        )
+        return boundary_handle.materialize(args.boundary).cache
 
     def duplicate_replay_serial():
         outputs = []

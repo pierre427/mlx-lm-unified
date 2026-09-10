@@ -680,6 +680,9 @@ SOFT_RELOAD_KEYS: Dict[str, MutableKey] = {
     "self_mtp_apc_retain_min_prompt_tokens": MutableKey(
         "cli_args", "self_mtp_apc_retain_min_prompt_tokens", _reload_int(0, 1 << 22)
     ),
+    "gdn_prefix_fanout": MutableKey(
+        "cli_args", "gdn_prefix_fanout", _reload_flag
+    ),
     # Draft-model and prompt-lookup speculation, read per request in do_POST.
     "num_draft_tokens": MutableKey(
         "cli_args", "num_draft_tokens", _reload_int(0, MAX_DRAFT_TOKENS)
@@ -1250,6 +1253,7 @@ def _self_mtp_config(
             getattr(cli_args, "self_mtp_share_qsa_indices", False)
             and prompt_tokens >= share_qsa_minimum
         ),
+        "gdn_prefix_fanout": bool(getattr(cli_args, "gdn_prefix_fanout", False)),
         "sampling_temp": sampling.temperature,
         "accept_rule": "residual",
         "state_out": {},
@@ -4829,6 +4833,18 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_qwen4_qsa_indexed_status()
         elif self.path == "/v1/status/qwen4-ple-compile":
             self.handle_qwen4_ple_compile_status()
+        elif self.path == "/v1/status/gdn-prefix-fanout":
+            from mlx_lm.gdn_prefix_fanout import gdn_prefix_fanout_stats
+
+            cli = self.response_generator.cli_args
+            payload = {
+                "configured": bool(getattr(cli, "gdn_prefix_fanout", False)),
+                "rows": 2,
+                "stats": gdn_prefix_fanout_stats(),
+            }
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
         elif self.path == "/v1/status/decode-lanes":
             payload = json.dumps({"requests": list(DECODE_LANE_LOG)}, default=str).encode()
             self._set_completion_headers(200)
@@ -5078,6 +5094,8 @@ def run(
 
 
 def setup_arg_parser():
+    from mlx_lm.gdn_prefix_fanout import gdn_prefix_fanout_enabled
+
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -5289,6 +5307,17 @@ def setup_arg_parser():
             "Retain a sidecar-less APC hit only when it saves at least this "
             "many prompt tokens; smaller hits are discarded so self-MTP can "
             "run (default: 64)."
+        ),
+    )
+    parser.add_argument(
+        "--gdn-prefix-fanout",
+        action=argparse.BooleanOptionalAction,
+        default=gdn_prefix_fanout_enabled(),
+        help=(
+            "Use the exact two-row GDN/QSA/PLE prefix fan-out when serving "
+            "OpenAI n=2 through persistent self-MTP. Default: off unless "
+            "MLX_LM_GDN_PREFIX_FANOUT=1. An unsupported cache falls back to "
+            "the ordinary merge."
         ),
     )
     parser.add_argument(

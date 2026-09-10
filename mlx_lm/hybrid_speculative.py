@@ -1788,6 +1788,7 @@ def prepare_self_mtp_lane(
     logits_processors: List[Callable],
     prefill_step_size: int,
     share_qsa_indices: bool,
+    record_prefix_fanout: bool = False,
 ) -> Tuple[DetachedSelfMTPLane, MTPToken]:
     """Prefill one canonical persistent self-MTP lane without attaching it."""
     if getattr(model, "mtp", None) is None:
@@ -1844,14 +1845,29 @@ def prepare_self_mtp_lane(
             mx.clear_cache()
         if prev_h is not None:
             model.mtp_step(prev_h, y[None], draft_cache)
-        logit_hidden, hidden = _mtp_backbone(model, y[None], target_cache)
-        seed_h = hidden[:, -1:, :]
-        logits = model.logits(logit_hidden[:, -1:, :])[0, -1]
-        logits = _apply_logits_processors(logits_processors, processor_prompt, logits)
-        first_lp = transform(logits) if transform is not None else _temperature_logprobs(
-            logits, sampling_temp
-        )
-        cur = _sample_from_logprobs(first_lp, sampling_temp, rng=lane_rng)
+        if record_prefix_fanout:
+            _start_speculation_or_cleanup(
+                target_cache,
+                target_cache,
+                "GDN prefix fan-out requires exact target-cache rollback",
+            )
+        try:
+            logit_hidden, hidden = _mtp_backbone(model, y[None], target_cache)
+            seed_h = hidden[:, -1:, :]
+            logits = model.logits(logit_hidden[:, -1:, :])[0, -1]
+            logits = _apply_logits_processors(
+                logits_processors, processor_prompt, logits
+            )
+            first_lp = (
+                transform(logits)
+                if transform is not None
+                else _temperature_logprobs(logits, sampling_temp)
+            )
+            cur = _sample_from_logprobs(first_lp, sampling_temp, rng=lane_rng)
+        except BaseException:
+            if record_prefix_fanout:
+                _stop_all_speculation(target_cache)
+            raise
 
     stats = HybridStats()
     stats.plain_tokens = 1
@@ -1955,6 +1971,89 @@ def attach_self_mtp_lanes(
             result.caches.target,
             "batched self-MTP requires ragged-trimmable target caches",
         )
+    return result
+
+
+def attach_prebatched_self_mtp_lanes(
+    model: nn.Module,
+    detached_lanes: Sequence[DetachedSelfMTPLane],
+    caches: SelfMTPCachePair,
+) -> BatchedSelfMTPState:
+    """Publish a fully built cache batch and start its rollback transaction.
+
+    Prefix fan-out builds every target and draft layer before this call.  This
+    admission boundary performs the same invariants as ``attach_self_mtp_lanes``
+    without extracting and re-merging those already batched rows.
+    """
+
+    detached_lanes = list(detached_lanes)
+    if not detached_lanes:
+        raise ValueError("a prebatched self-MTP cache needs at least one lane")
+    for detached in detached_lanes:
+        _validate_detached_self_mtp(detached)
+    lanes = [detached.lane for detached in detached_lanes]
+    if len({lane.uid for lane in lanes}) != len(lanes):
+        raise ValueError("self-MTP lane uid values must be unique")
+    if len({lane.num_draft for lane in lanes}) != 1:
+        raise ValueError("adaptive per-lane self-MTP depth is excluded")
+    if len({lane.share_qsa_indices for lane in lanes}) != 1:
+        raise ValueError("mixed shared-QSA modes cannot enter one self-MTP batch")
+    if not caches.target or not caches.draft:
+        raise ValueError("prebatched self-MTP needs target and draft cache groups")
+    _reject_unsupported_self_mtp_caches(caches.target)
+    _reject_unsupported_self_mtp_caches(caches.draft)
+    rows = len(lanes)
+    for cache in [*caches.target, *caches.draft]:
+        batch_size = getattr(cache, "batch_size", None)
+        if batch_size is None:
+            offset = getattr(cache, "offset", None)
+            if isinstance(offset, mx.array) and offset.ndim == 1:
+                batch_size = int(offset.size)
+            elif isinstance(offset, (list, tuple)):
+                batch_size = len(offset)
+            else:
+                raise ValueError(
+                    f"{type(cache).__name__} does not expose batched row count"
+                )
+        if batch_size != rows:
+            raise ValueError(
+                f"{type(cache).__name__} has {batch_size} rows, expected {rows}"
+            )
+
+    def batched_group_offset(group):
+        offsets = []
+        for cache in group:
+            offset = getattr(cache, "offset", None)
+            if isinstance(offset, mx.array):
+                values = [int(value) for value in offset.tolist()]
+                if len(set(values)) != 1:
+                    raise ValueError(
+                        "a freshly attached prebatched cache must have uniform offsets"
+                    )
+                offsets.append(values[0])
+            elif isinstance(offset, int):
+                offsets.append(offset)
+            elif callable(getattr(cache, "size", None)):
+                offsets.append(int(cache.size()))
+            else:
+                raise ValueError(
+                    f"{type(cache).__name__} does not expose a cache offset"
+                )
+        return max(offsets, default=0)
+
+    covered = batched_group_offset(caches.target)
+    draft_offset = batched_group_offset(caches.draft)
+    if covered <= 0 or draft_offset != covered - 1:
+        raise ValueError(
+            "prebatched self-MTP cache mismatch: target covers "
+            f"{covered} tokens but draft covers {draft_offset} pairs"
+        )
+    result = BatchedSelfMTPState(lanes, caches, 1)
+    _start_speculation_or_cleanup(
+        result.caches.target,
+        result.caches.target,
+        "prebatched self-MTP requires ragged-trimmable target caches",
+    )
     return result
 
 

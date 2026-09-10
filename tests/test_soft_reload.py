@@ -56,6 +56,7 @@ def make_cli_args(**overrides):
         self_mtp_transformed_verifier=False,
         self_mtp_share_qsa_indices=False,
         self_mtp_share_qsa_indices_min_prompt_tokens=0,
+        gdn_prefix_fanout=False,
         self_mtp_window_size=0,
         self_mtp_window_sink_size=4,
         self_mtp_window_min_prompt_tokens=0,
@@ -226,6 +227,16 @@ class TestWhitelist(unittest.TestCase):
         changes = apply_soft_reload(cli_args, plan)
         self.assertEqual(changes, {"self_mtp_num_draft": {"old": 1, "new": 4}})
         self.assertEqual(cli_args.self_mtp_num_draft, 4)
+
+    def test_gdn_prefix_fanout_is_a_default_off_soft_lever(self):
+        cli_args = make_cli_args()
+        self.assertFalse(cli_args.gdn_prefix_fanout)
+        plan = plan_soft_reload(cli_args, {"gdn_prefix_fanout": True})
+        changes = apply_soft_reload(cli_args, plan)
+        self.assertEqual(
+            changes, {"gdn_prefix_fanout": {"old": False, "new": True}}
+        )
+        self.assertTrue(cli_args.gdn_prefix_fanout)
 
     def test_module_lever_targets_the_registered_module_only(self):
         fake = types.ModuleType("fake_model_module")

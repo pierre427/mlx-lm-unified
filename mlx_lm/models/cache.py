@@ -10,7 +10,7 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -407,6 +407,81 @@ class _RollbackRecord(tuple):
 
     def exhausted(self) -> bool:
         return self.depths is not None and max(self.depths, default=0) == 0
+
+
+class ExactRollbackBoundary:
+    """Public, immutable handle for one exact recurrent rollback record.
+
+    The cache owns the rollback stack and exports only the operations a caller
+    can safely use.  Consumers do not depend on ``ArraysCache._rollbacks`` or
+    on the private ``_RollbackRecord`` representation.
+    """
+
+    def __init__(
+        self,
+        cache_type: type,
+        state_size: int,
+        num_tokens: int,
+        replay: Callable[[int], List[Any]],
+        snapshot: List[Any],
+        live_state: List[Any],
+    ):
+        self._cache_type = cache_type
+        self._state_size = int(state_size)
+        self._num_tokens = int(num_tokens)
+        self._replay = replay
+        self._snapshot = tuple(snapshot)
+        self._live_state = tuple(live_state)
+
+    @property
+    def num_tokens(self) -> int:
+        return self._num_tokens
+
+    @property
+    def snapshot(self) -> tuple:
+        """The frozen pre-forward state, for inspection only."""
+
+        return self._snapshot
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            int(getattr(value, "nbytes", 0))
+            for value in (*self._snapshot, *self._live_state)
+        )
+
+    def materialize(self, accepted_tokens: int) -> "ArraysCache":
+        """Build a private cache at one exact point inside the record."""
+
+        if isinstance(accepted_tokens, bool) or not isinstance(
+            accepted_tokens, int
+        ):
+            raise TypeError("accepted_tokens must be an integer")
+        if not 0 <= accepted_tokens <= self._num_tokens:
+            raise ValueError(
+                f"accepted_tokens {accepted_tokens} is outside 0..{self._num_tokens}"
+            )
+        if accepted_tokens == 0:
+            state = list(self._snapshot)
+        elif accepted_tokens == self._num_tokens:
+            # The fully accepted boundary is already available.  Copying the
+            # live state avoids replaying the retained window on the serving
+            # hot path.
+            state = list(self._live_state)
+        else:
+            state = list(self._replay(accepted_tokens))
+        if len(state) != self._state_size:
+            raise RuntimeError(
+                f"rollback materialized {len(state)} entries, expected "
+                f"{self._state_size}"
+            )
+        state = [None if value is None else mx.array(value) for value in state]
+        values = [value for value in state if value is not None]
+        if values:
+            mx.eval(*values)
+        cache = self._cache_type(self._state_size)
+        cache.cache = state
+        return cache
 
 
 def _row_vector(n, batch_size: int, who: str) -> List[int]:
@@ -2495,6 +2570,36 @@ class ArraysCache(_BaseCache):
             and total - self._rollbacks[0].span >= self._rollback_window
         ):
             total -= self._rollbacks.popleft().span
+
+    def latest_exact_rollback_boundary(self) -> ExactRollbackBoundary:
+        """Export the newest uniform single-row rollback as a safe handle.
+
+        Prefix fan-out needs to retain and materialize an exact recurrent
+        boundary without learning the rollback stack's private representation.
+        Ragged records are refused because they no longer describe one shared
+        parent, and a staged Qwen4 PLE half is refused by the subclass through
+        ``is_trimmable``.
+        """
+
+        if not self.speculating or not self._rollbacks:
+            raise RuntimeError("the cache has no live exact rollback record")
+        if not self.is_trimmable():
+            raise RuntimeError("the cache has an incomplete staged rollback")
+        if self.batch_size != 1:
+            raise ValueError("an exact shared-prefix boundary needs one cache row")
+        record = self._rollbacks[-1]
+        if record.depths is not None:
+            raise ValueError("a ragged rollback record is not one shared prefix")
+        if len(record.snapshot) != len(self.cache):
+            raise RuntimeError("rollback record does not cover the full cache")
+        return ExactRollbackBoundary(
+            type(self),
+            len(self.cache),
+            record.num_tokens,
+            record.fn,
+            list(record.snapshot),
+            list(self.cache),
+        )
 
     def is_trimmable(self):
         # While speculating, every forward records an exact rollback, so the

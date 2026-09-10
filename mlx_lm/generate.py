@@ -3137,6 +3137,7 @@ class MTPGenerationBatch:
         initial_outputs: Sequence[Any],
         stop_matchers: Sequence[StopSequenceMatcher],
         *,
+        prepared_caches: Optional[Any] = None,
         mtp_admission: Optional[
             Callable[
                 [Sequence[Tuple[int, int, int, bool, float]]],
@@ -3152,11 +3153,18 @@ class MTPGenerationBatch:
         from .hybrid_speculative import (
             BatchedSelfMTPState,
             SelfMTPCachePair,
+            attach_prebatched_self_mtp_lanes,
             attach_self_mtp_lanes,
         )
 
         self.model = model
-        if detached_lanes:
+        if prepared_caches is not None:
+            if not isinstance(prepared_caches, SelfMTPCachePair):
+                raise TypeError("prepared_caches must be a SelfMTPCachePair")
+            self.state = attach_prebatched_self_mtp_lanes(
+                model, detached_lanes, prepared_caches
+            )
+        elif detached_lanes:
             self.state = attach_self_mtp_lanes(model, None, list(detached_lanes))
         else:
             self.state = BatchedSelfMTPState([], SelfMTPCachePair([], []), 0)
@@ -4803,7 +4811,21 @@ class ParallelSampleGenerator:
             matchers = stop_matchers or [StopSequenceMatcher() for _ in range(n)]
             prompt_tail = list(mtp_prompt) if mtp_prompt is not None else [seed_token]
 
-            from .hybrid_speculative import MTPToken, prepare_self_mtp_lane
+            from .hybrid_speculative import (
+                DetachedSelfMTPLane,
+                MTPToken,
+                SelfMTPCachePair,
+                prepare_self_mtp_lane,
+            )
+
+            fanout_requested = bool(config.get("gdn_prefix_fanout", False))
+            fanout_candidate = fanout_requested and n == 2
+            if fanout_requested:
+                from .gdn_prefix_fanout import _note_serving_event
+
+                _note_serving_event("requests")
+                if not fanout_candidate:
+                    _note_serving_event("declined_not_n2")
 
             canonical, first = prepare_self_mtp_lane(
                 mx.array(prompt_tail, dtype=mx.uint32),
@@ -4822,14 +4844,65 @@ class ParallelSampleGenerator:
                 logits_processors=processors[0],
                 prefill_step_size=prefill_step_size,
                 share_qsa_indices=bool(config.get("share_qsa_indices", False)),
+                record_prefix_fanout=fanout_candidate,
             )
             canonical.lane.token_prefix = mx.array(
                 history + prompt_tail, dtype=mx.uint32
             )
+            prepared_caches = None
+            if fanout_candidate:
+                owner = None
+                try:
+                    from .gdn_prefix_fanout import HybridCachePrefixFanout
+
+                    owner = HybridCachePrefixFanout.from_prompt_cache(
+                        canonical.caches.target,
+                        enabled=True,
+                        strict=False,
+                    )
+                    if owner is not None:
+                        lease = owner.fork(owner.span)
+                        target_batch = lease.take_batch()
+                        draft_batch = [
+                            type(cache).merge([cache, cache])
+                            for cache in canonical.caches.draft
+                        ]
+                        mx.eval(
+                            [cache.state for cache in target_batch],
+                            [cache.state for cache in draft_batch],
+                        )
+                        prepared_caches = SelfMTPCachePair(
+                            target=target_batch,
+                            draft=draft_batch,
+                        )
+                    else:
+                        _note_serving_event("declined_cache")
+                except Exception as error:
+                    logging.warning(
+                        "GDN prefix fan-out declined; using the ordinary "
+                        "self-MTP cache merge: %s",
+                        error,
+                    )
+                    prepared_caches = None
+                    _note_serving_event("declined_error")
+                finally:
+                    if owner is not None:
+                        owner.close()
+                    for cache in canonical.caches.target:
+                        cache.stop_speculation()
+                    _note_serving_event("cleanups")
+
             lanes = [canonical]
             first_outputs = [first]
             for uid in range(1, n):
-                lane = copy.deepcopy(canonical)
+                lane = (
+                    DetachedSelfMTPLane(
+                        lane=copy.deepcopy(canonical.lane),
+                        caches=canonical.caches,
+                    )
+                    if prepared_caches is not None
+                    else copy.deepcopy(canonical)
+                )
                 lane.lane.uid = uid
                 lane.lane.rng = lane_rngs[uid]
                 lane.lane.logits_processors = processors[uid]
@@ -4858,13 +4931,42 @@ class ParallelSampleGenerator:
             )
             # The admission callback re-budgets at every cycle boundary, so the
             # lanes can drop k, migrate to plain, or pause under pressure.
-            self._generator._generation_batch = MTPGenerationBatch(
-                model,
-                lanes,
-                first_outputs,
-                matchers,
-                mtp_admission=mtp_admission,
-            )
+            try:
+                generation_batch = MTPGenerationBatch(
+                    model,
+                    lanes,
+                    first_outputs,
+                    matchers,
+                    prepared_caches=prepared_caches,
+                    mtp_admission=mtp_admission,
+                )
+                if prepared_caches is not None:
+                    _note_serving_event("engaged")
+            except Exception as error:
+                if prepared_caches is None:
+                    raise
+                logging.warning(
+                    "GDN prefix fan-out attach declined; rebuilding through "
+                    "the ordinary self-MTP merge: %s",
+                    error,
+                )
+                _note_serving_event("declined_error")
+                fallback_lanes = [canonical]
+                for lane in lanes[1:]:
+                    fallback_lanes.append(
+                        DetachedSelfMTPLane(
+                            lane=lane.lane,
+                            caches=copy.deepcopy(canonical.caches),
+                        )
+                    )
+                generation_batch = MTPGenerationBatch(
+                    model,
+                    fallback_lanes,
+                    first_outputs,
+                    matchers,
+                    mtp_admission=mtp_admission,
+                )
+            self._generator._generation_batch = generation_batch
             uids = list(range(n))
         self._index = {uid: i for i, uid in enumerate(uids)}
         self._active = set(uids)
