@@ -9,7 +9,11 @@ import mlx.core as mx
 
 from benchmarks.qwen4_gdn_prefix_fanout_full_model_ab import (
     _cached_serving_once,
+    _cool_until_stable,
+    _parse_pmset_therm,
     _prepare_cached_prefix,
+    _run_serving_blocks,
+    _serving_row,
 )
 
 from mlx_lm.gdn_prefix_fanout import (
@@ -29,10 +33,150 @@ from mlx_lm.models.qwen4_exp import (
 )
 from mlx_lm.sample_utils import LaneRNG
 
-
 _DEVICE = None
 HIDDEN = 128
 WINDOW = 3
+
+
+class TestThermalBenchmarkGate(unittest.TestCase):
+    def test_pmset_parser_requires_explicit_clear_state(self):
+        healthy = _parse_pmset_therm(
+            "Note: No thermal warning level has been recorded\n"
+            "Note: No performance warning level has been recorded\n"
+        )
+        self.assertTrue(healthy["healthy"])
+
+        limited = _parse_pmset_therm("CPU_Speed_Limit = 80\nGPU_Speed_Limit = 100\n")
+        self.assertFalse(limited["healthy"])
+        self.assertIn("cpu_speed_limit_80", limited["reasons"])
+
+        warned = _parse_pmset_therm("Performance warning level: 1\n")
+        self.assertFalse(warned["healthy"])
+        self.assertIn("performance_warning_reported", warned["reasons"])
+
+        unknown = _parse_pmset_therm("No useful thermal fields here\n")
+        self.assertFalse(unknown["healthy"])
+        self.assertIn("thermal_state_unverified", unknown["reasons"])
+
+    def test_cooldown_counts_clear_snapshots_only_after_minimum(self):
+        args = types.SimpleNamespace(
+            minimum_cooldown_seconds=2.0,
+            thermal_poll_seconds=1.0,
+            thermal_max_cooldown_seconds=10.0,
+            thermal_stable_snapshots=2,
+        )
+        clock = [0.0]
+        health = iter((True, False, True, True))
+
+        def monotonic():
+            return clock[0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def snapshot(*_args):
+            clear = next(health)
+            return {"healthy": clear, "warning": not clear, "reasons": []}
+
+        result = _cool_until_stable(
+            args,
+            "test",
+            0,
+            0,
+            0,
+            snapshot_fn=snapshot,
+            sleep_fn=sleep,
+            monotonic_fn=monotonic,
+        )
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["stable_snapshots"], 2)
+        self.assertEqual(result["elapsed_s"], 3.0)
+        self.assertEqual(len(result["snapshots"]), 4)
+
+    def test_cooldown_times_out_while_warning_persists(self):
+        args = types.SimpleNamespace(
+            minimum_cooldown_seconds=1.0,
+            thermal_poll_seconds=1.0,
+            thermal_max_cooldown_seconds=2.0,
+            thermal_stable_snapshots=2,
+        )
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        result = _cool_until_stable(
+            args,
+            "test",
+            0,
+            0,
+            0,
+            snapshot_fn=lambda *_args: {
+                "healthy": False,
+                "warning": True,
+                "reasons": ["thermal_warning_reported"],
+            },
+            sleep_fn=sleep,
+            monotonic_fn=lambda: clock[0],
+        )
+        self.assertFalse(result["recovered"])
+        self.assertEqual(result["elapsed_s"], 2.0)
+        self.assertEqual(len(result["snapshots"]), 3)
+
+    def test_drifted_block_is_retained_and_retried(self):
+        args = types.SimpleNamespace(max_bracket_drift=0.05, max_block_retries=1)
+        timings = iter((100.0, 80.0, 80.0, 110.0, 100.0, 80.0, 80.0, 104.0))
+
+        def fake_thermal_arm(_args, _gate, _block, _attempt, _slot, enabled, _run):
+            total_ms = next(timings)
+            counters = {
+                "serving_requests": int(enabled),
+                "serving_engaged": int(enabled),
+                "serving_declined_not_n2": 0,
+                "serving_declined_cache": 0,
+                "serving_declined_error": 0,
+                "serving_cleanups": int(enabled),
+            }
+            arm = {
+                "enabled": enabled,
+                "prepare_ms": 10.0,
+                "prepare_tokens_per_second": 100.0,
+                "decode_ms": total_ms - 10.0,
+                "total_ms": total_ms,
+                "aggregate_decode_tokens_per_second": 10.0,
+                "aggregate_total_tokens_per_second": 11.0,
+                "tokens": [[1, 2], [1, 2]],
+                "token_sha256": ["a", "a"],
+                "counter_delta": counters,
+            }
+            thermal = {
+                "cooldown": {"recovered": True, "snapshots": []},
+                "before": {"healthy": True},
+                "after": {"healthy": True},
+            }
+            arm["thermal"] = thermal
+            return arm, thermal
+
+        with patch(
+            "benchmarks.qwen4_gdn_prefix_fanout_full_model_ab._thermal_arm",
+            side_effect=fake_thermal_arm,
+        ):
+            result = _run_serving_blocks(
+                "test",
+                "test",
+                1,
+                args,
+                lambda _enabled: None,
+                _serving_row,
+            )
+        self.assertTrue(result["passed"])
+        self.assertEqual(len(result["discarded_blocks"]), 1)
+        self.assertEqual(
+            result["discarded_blocks"][0]["discard_reasons"],
+            ["closing_baseline_drift"],
+        )
+        self.assertEqual(result["blocks"][0]["attempt"], 1)
+        self.assertLess(result["blocks"][0]["closing_baseline_drift_fraction"], 0.05)
 
 
 def setUpModule():
@@ -69,9 +213,12 @@ def _layer():
 
 
 def _inputs(batch, steps, seed):
-    return mx.random.normal(
-        (batch, steps, HIDDEN), key=mx.random.key(seed)
-    ).astype(mx.float32) * 0.25
+    return (
+        mx.random.normal((batch, steps, HIDDEN), key=mx.random.key(seed)).astype(
+            mx.float32
+        )
+        * 0.25
+    )
 
 
 def _state_copy(cache):
@@ -205,8 +352,7 @@ class TestGDNPrefixFanout(unittest.TestCase):
         mx.eval(self.layer(self.window, cache=self.source))
         boundary = self.source.latest_exact_rollback_boundary()
         self.parent_before = [
-            None if value is None else mx.array(value)
-            for value in boundary.snapshot
+            None if value is None else mx.array(value) for value in boundary.snapshot
         ]
         mx.eval(*(value for value in self.parent_before if value is not None))
 
@@ -231,9 +377,7 @@ class TestGDNPrefixFanout(unittest.TestCase):
         for boundary in (0, 1, WINDOW):
             with self.subTest(boundary=boundary):
                 lease = owner.fork(boundary)
-                reference = _reference(
-                    self.layer, self.prefix, self.window, boundary
-                )
+                reference = _reference(self.layer, self.prefix, self.window, boundary)
                 for row in range(2):
                     _assert_state_close(
                         self,
@@ -263,9 +407,7 @@ class TestGDNPrefixFanout(unittest.TestCase):
     def test_descendants_accept_zero_partial_all_and_match_solo(self):
         cases = ((0, 0), (1, 2), (WINDOW, WINDOW))
         owner = self._owner()
-        parent = _state_copy(
-            _reference(self.layer, self.prefix, self.window, 1)
-        )
+        parent = _state_copy(_reference(self.layer, self.prefix, self.window, 1))
 
         for case_index, accepted in enumerate(cases):
             with self.subTest(accepted=accepted):
@@ -285,13 +427,13 @@ class TestGDNPrefixFanout(unittest.TestCase):
                         1,
                         suffix[row : row + 1, :keep],
                     )
-                    _assert_state_close(
-                        self, descendants[row].cache, reference.cache
-                    )
+                    _assert_state_close(self, descendants[row].cache, reference.cache)
                 _assert_state_equal(self, list(owner._parent), self.parent_before)
-                _assert_state_equal(self, parent, _state_copy(
-                    _reference(self.layer, self.prefix, self.window, 1)
-                ))
+                _assert_state_equal(
+                    self,
+                    parent,
+                    _state_copy(_reference(self.layer, self.prefix, self.window, 1)),
+                )
 
         stats = gdn_prefix_fanout_stats()
         self.assertEqual(stats["committed_rows"], 6)
@@ -324,9 +466,7 @@ class TestGDNPrefixFanout(unittest.TestCase):
 
     def test_qwen4_record_materializes_paired_ple_state(self):
         cache = Qwen4ArraysCache(4)
-        cache.cache = [
-            mx.full((1, 2), index, dtype=mx.float32) for index in range(4)
-        ]
+        cache.cache = [mx.full((1, 2), index, dtype=mx.float32) for index in range(4)]
         cache.start_speculation()
 
         def ple_replay(m):
@@ -385,7 +525,9 @@ class TestHybridCachePrefixFanout(unittest.TestCase):
         output = None
         if suffix is not None and suffix.shape[1]:
             output = self.model(suffix, cache=cache)
-            mx.eval(output, *[array for item in cache for array in _tree_arrays(item.state)])
+            mx.eval(
+                output, *[array for item in cache for array in _tree_arrays(item.state)]
+            )
         return output, cache
 
     def test_full_boundary_carries_qsa_gdn_and_paired_ple(self):
@@ -420,9 +562,7 @@ class TestHybridCachePrefixFanout(unittest.TestCase):
                 mx.eval(output)
                 descendants = lease.commit(3, accepted)
                 for row, keep in enumerate(accepted):
-                    _, reference = self._reference(
-                        2, suffix[row : row + 1, :keep]
-                    )
+                    _, reference = self._reference(2, suffix[row : row + 1, :keep])
                     _assert_cache_groups_close(self, descendants[row], reference)
                 self.assertTrue(lease.closed)
         stats = gdn_prefix_fanout_stats()
@@ -629,17 +769,11 @@ class TestServingComposition(unittest.TestCase):
         )
         cached = _prepare_cached_prefix(self.model, [1, 2, 3, 4, 5], args)
         gdn_prefix_fanout_stats(reset=True)
-        baseline = _cached_serving_once(
-            self.model, cached, [6, 7], args, False
-        )
-        candidate = _cached_serving_once(
-            self.model, cached, [6, 7], args, True
-        )
+        baseline = _cached_serving_once(self.model, cached, [6, 7], args, False)
+        candidate = _cached_serving_once(self.model, cached, [6, 7], args, True)
         self.assertEqual(candidate["tokens"], baseline["tokens"])
         self.assertEqual(candidate["counter_delta"]["serving_engaged"], 1)
-        self.assertEqual(
-            candidate["counter_delta"]["serving_declined_error"], 0
-        )
+        self.assertEqual(candidate["counter_delta"]["serving_declined_error"], 0)
         self.assertEqual(cached["tokens"], [1, 2, 3, 4, 5])
 
 
