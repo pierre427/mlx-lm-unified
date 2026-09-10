@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Unit tests for KVarN variance-normalized KV quantization (A2a) and the
 MLA absorbed-path latent-slice rotation (A2c).
 

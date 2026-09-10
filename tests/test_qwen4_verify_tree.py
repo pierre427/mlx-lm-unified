@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """CPU-only unit tests for the shallow-wide MTP verify tree.
 
 Pure topology / mask / positions / acceptance only -- no model load, no Metal.

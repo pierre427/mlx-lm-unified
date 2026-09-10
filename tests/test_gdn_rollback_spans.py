@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """GDN rollback staging under a right-padded speculative slab.
 
 Qwen3.5 and Qwen3-Next run GatedDeltaNet on a bare ``ArraysCache``. The old

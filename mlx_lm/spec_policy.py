@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Per-batch-size draft-depth policy for speculative decoding.
 
 Speculative paths in this tree (adaptive PLD's MTP tail, MTP self-spec) use a

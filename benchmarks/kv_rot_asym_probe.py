@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Compose PR #1555 (Hadamard-rotated K quantization) with asymmetric K/V bits
 and KVarN variance normalization (vLLM RFC #46613 / arXiv 2606.03458).
 

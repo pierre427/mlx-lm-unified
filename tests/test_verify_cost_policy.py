@@ -1,5 +1,3 @@
-# Copyright © 2025-2026 Apple Inc.
-
 """CPU-only tests for the verify-cost-aware speculative-decoding policy.
 
 No model, no MLX arrays, no GPU — the policy is a pure-Python cost/benefit

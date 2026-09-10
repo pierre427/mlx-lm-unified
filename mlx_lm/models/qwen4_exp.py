@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-#
 # Qwen4-Exp / Qwen3.8-Flash-Next text-core support.  The architecture was
 # derived from the Apache-2.0 Transformers Qwen4Exp implementation and the
 # release checkpoint at Qwen/Qwen3.8-Flash-Next.

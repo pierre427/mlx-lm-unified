@@ -1,5 +1,3 @@
-# Copyright © 2025-2026 Apple Inc.
-
 """Invariant tests for batched generation (CPU-only, no model).
 
 These cover four foundational bugs in continuous batching:

@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-#
 # The radix-selection design is adapted from MTPLX PR #397 (Apache-2.0).
 
 """Fused Metal scorer and exact selector for Qwen4 QSA stage one."""

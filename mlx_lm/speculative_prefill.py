@@ -1,5 +1,3 @@
-# Copyright © 2025-2026 Apple Inc.
-
 """Speculative (PFlash-style) prefill for MLX.
 
 This module implements a **lossy** prefill approximation that trades answer

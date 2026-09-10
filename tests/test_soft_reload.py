@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Tests for in-place serving reconfiguration (soft reload).
 
 Soft reload keeps the loaded weights resident, so it must not be used for

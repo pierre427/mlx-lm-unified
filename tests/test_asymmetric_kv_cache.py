@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import os
 import tempfile
 import unittest

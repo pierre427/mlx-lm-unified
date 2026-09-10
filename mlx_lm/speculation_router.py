@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Pure-Python request-local router for measured speculative decoding.
 
 The router composes the static verify-cost recommendation with marginal

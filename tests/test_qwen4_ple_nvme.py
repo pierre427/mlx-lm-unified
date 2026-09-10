@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import importlib.util
 import json
 import shutil

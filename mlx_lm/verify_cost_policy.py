@@ -1,5 +1,3 @@
-# Copyright © 2025-2026 Apple Inc.
-
 """Verify-cost-aware speculative-decoding policy (EVICT / BASTION style).
 
 This is a *policy layer* prototype: it decides **how long a draft chain is worth

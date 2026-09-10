@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Deterministic evidence probe for asymmetric KV-cache quantization.
 
 The runner writes its JSON only after every arm completes. It intentionally

@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Per-lane RNG keys for the self-MTP loop.
 
 Batched decode shares one process. With every draw taken from the global

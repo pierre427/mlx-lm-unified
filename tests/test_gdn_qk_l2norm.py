@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """GDN q/k l2norm parity against the HF/FLA reference.
 
 The reference (transformers ``models/qwen3_5``, ``qwen3_next``, ``qwen4_exp``,

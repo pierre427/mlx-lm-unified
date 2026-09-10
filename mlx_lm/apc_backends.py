@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Adapters from specialized prefix-cache engines to the shared APC contract.
 
 The adapters intentionally retain each backend's native result. Snapshot

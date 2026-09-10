@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Unit tests for the ``proof_battery`` anti-rigging checks.
 
 Exit criterion: every detector must FAIL CLOSED on a deliberately rigged input

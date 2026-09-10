@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Model-family-neutral state-budget admission primitives.
 
 The continuous text generator uses these primitives for attention KV caches and

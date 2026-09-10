@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Contracts a merged batch cache owes its rows.
 
 1. ``make_mask`` must exclude both the left pad prefix and the right pad tail.

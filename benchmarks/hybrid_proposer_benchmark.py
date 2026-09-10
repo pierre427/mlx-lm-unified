@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Interleaved throughput A/B for the hybrid prompt-lookup proposer.
 
 This is a model-loading benchmark and must only be run by the current GPU owner.

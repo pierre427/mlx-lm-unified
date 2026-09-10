@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Quantized KV batched self-MTP (opt-in via allow_quantized_kv).
 
 The batched self-MTP transaction (merge -> start_speculation -> per-row ragged

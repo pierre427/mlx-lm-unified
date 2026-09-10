@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Transcendentals that keep their precision inside an ``mx.compile`` span.
 
 MLX's ``Sigmoid`` operator struct spells an **unqualified** ``metal::exp``

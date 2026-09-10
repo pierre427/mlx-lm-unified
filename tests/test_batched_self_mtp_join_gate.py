@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Mid-flight JOIN contracts for the batched persistent self-MTP engine.
 
 The forced-acceptance cache gate (test_batched_self_mtp_qwen4.py) only ever

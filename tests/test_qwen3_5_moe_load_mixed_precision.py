@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Load-path test: a qwen3_5_moe MLX checkpoint with per-table quantization
 overrides (6-bit expert tables in one layer, 4-bit default) must load through
 ``load_model`` under the fused gate-up lever and produce the same logits as

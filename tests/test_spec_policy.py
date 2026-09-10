@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Per-batch-size draft-depth policy (spec_policy).
 
 Covers table parsing (valid/invalid, loudly), depth selection at each band,

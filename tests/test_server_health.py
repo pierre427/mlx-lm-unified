@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Server-lifecycle tests for /health.
 
 /health used to answer 200 unconditionally. On 2026-08-27 a wiring bug broke

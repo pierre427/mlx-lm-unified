@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-#
 # Tests for the 2026-08-26 model-code micro-lever bundle.  Every lever is an
 # import-time env flag whose module-level constant is toggled directly here.
 #

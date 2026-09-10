@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import io
 import itertools
 import json

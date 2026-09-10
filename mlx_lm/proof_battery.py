@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Composable, model-agnostic anti-rigging checks — the ``proof_battery``.
 
 Background

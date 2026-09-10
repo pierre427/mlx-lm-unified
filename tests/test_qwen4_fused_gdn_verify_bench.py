@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Pure-helper tests for benchmarks/qwen4_fused_gdn_verify.py (no Metal)."""
 
 import importlib.util

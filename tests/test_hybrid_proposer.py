@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """CPU-only tests for the hybrid retrieval-proposer prototype.
 
 Pure token-id logic: no model is loaded and mlx is never imported. The proto and

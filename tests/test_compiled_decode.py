@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """RingKVCache and the compiled/replayed decode step.
 
 Two levels: the cache on its own (writes, mask, trim, growth, save/load),

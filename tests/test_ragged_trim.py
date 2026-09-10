@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Per-row (ragged) speculative rollback on the batch caches.
 
 CPU-only by construction: the shapes are tiny and the assertions are on

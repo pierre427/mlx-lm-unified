@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """CPU guard tests for ``_concat_tables`` (qwen3_next fused-scale choke point).
 
 The choke point re-fuses split quantized projection tables. Parts that differ

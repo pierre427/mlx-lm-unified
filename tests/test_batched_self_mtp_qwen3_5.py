@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Batched self-MTP seam for the qwen3_5 architecture (Qwen3.8-27B).
 
 Mirrors tests/test_batched_self_mtp_qwen4.py minus every QSA/PLE part:

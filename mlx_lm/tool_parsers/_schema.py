@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Shared JSON-schema helpers for tool-call parsers.
 
 Model tool schemas frequently express optional / union-typed parameters with

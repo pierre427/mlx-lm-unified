@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Exact self-MTP speculative verification under transformed sampling.
 
 ``transformed_logprobs`` must induce exactly the distribution

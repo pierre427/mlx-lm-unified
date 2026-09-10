@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-#
 # Tests for the 2026-08-27 decode-decomposition MoE levers
 # (results/qwen38-decode-decomposition-20260827.json: decode GPU window 86%
 # of the step at 22% bandwidth — occupancy-bound, so tile aggregation is

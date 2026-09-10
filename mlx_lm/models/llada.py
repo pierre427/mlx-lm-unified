@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 # LLaDA-8B: masked-diffusion language model (MDM).
 #
 # Structurally OLMo-derived (pre-norm RMSNorm + SwiGLU MLP), but with two

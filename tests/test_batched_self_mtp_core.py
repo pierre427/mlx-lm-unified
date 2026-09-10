@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """CPU contracts for the batched persistent self-MTP transaction core.
 
 The ship gate is distributional: transformed residual verification must emit

@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Tests for OpenAI ``n>1`` parallel sampling (CPU-only, no model weights).
 
 Covers the things the feature has to get right:

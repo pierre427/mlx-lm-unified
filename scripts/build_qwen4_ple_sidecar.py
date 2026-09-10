@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Copyright © 2026 Apple Inc.
 """Build the row-interleaved NVMe PLE sidecar for Qwen4-Exp artifacts.
 
 Streams the ``ple.ple_embedding.ngram_embedding.shard_*`` tensors

@@ -1,5 +1,3 @@
-# Copyright © 2024-2026 Apple Inc.
-
 import unittest
 
 import mlx.core as mx

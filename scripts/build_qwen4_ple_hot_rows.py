@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Copyright © 2026 Apple Inc.
 """Build a hot-rows manifest for the Qwen4 PLE NVMe LRU preheat.
 
 Tokenizes a text corpus with the model tokenizer, runs the model's exact

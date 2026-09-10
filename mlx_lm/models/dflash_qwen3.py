@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-#
 # DFlash block-diffusion speculator for Qwen3-Coder-30B-A3B (z-lab/Qwen3-Coder-
 # 30B-A3B-DFlash) — MLX port of the authoritative torch `dflash.py`.
 #

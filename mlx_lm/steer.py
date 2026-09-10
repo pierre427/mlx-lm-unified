@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Commit-steering: a content-blind controller for reasoning run-on.
 
 Reasoning models often *have* the answer well before they stop deliberating —

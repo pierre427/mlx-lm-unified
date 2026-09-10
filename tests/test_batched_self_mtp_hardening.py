@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Regression contracts adopted from Rapid-MLX continuous MTP hardening."""
 
 import types

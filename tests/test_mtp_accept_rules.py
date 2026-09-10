@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Speculative-verify acceptance math at temperature > 0 (``accept_rule``).
 
 Kernel tests drive the rule helpers directly with constructed distributions

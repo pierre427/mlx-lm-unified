@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Adaptive MTP draft-depth ceiling (--self-mtp-adaptive-depth-ceiling).
 
 Three layers, all on tiny synthetic models (no checkpoints):

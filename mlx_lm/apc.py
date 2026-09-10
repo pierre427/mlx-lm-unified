@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Automatic prefix caching shared by MLX language-model serving paths.
 
 This module gives the existing radix-backed prompt cache a model-independent

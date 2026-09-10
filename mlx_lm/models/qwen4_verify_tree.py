@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Shallow-wide MTP tree proposer + verifier for the Flash-Next VERIFY path.
 
 The Qwen3-Next / Qwen4 MTP head is structurally depth-1: it predicts token

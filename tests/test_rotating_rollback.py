@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Exact speculative rollback for RotatingKVCache (sliding-window KV).
 
 The sibling of the ArraysCache (GDN) exact-replay rollback: once a rotating

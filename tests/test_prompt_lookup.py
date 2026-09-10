@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 """Tests for draft-free prompt-lookup (PLD) speculative decoding.
 
 Covers the proposer backends, the cache-lifecycle helpers, and end-to-end

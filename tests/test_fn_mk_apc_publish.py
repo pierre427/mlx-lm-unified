@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Publish-back for the Flash-Next megakernel lane (CPU only).
 
 ``MegakernelDecoder.commit_to_caches`` is the reverse of ``seed_from_caches``:

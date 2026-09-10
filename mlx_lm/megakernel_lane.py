@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Plain-decode lane on the whole-token persistent megakernel (Qwen4-Exp).
 
 After a stock prefill, every further token of a width-1 completion is one

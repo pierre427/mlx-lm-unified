@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import unittest
 
 from mlx_lm.tool_parsers.pythonic import parse_tool_call

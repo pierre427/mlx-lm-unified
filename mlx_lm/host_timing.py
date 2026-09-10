@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Opt-in host-side stall attribution for the FN self-MTP decode round.
 
 UNCOMMITTED LAB INSTRUMENTATION (mlx-uag, 2026-09-06). Default OFF and

@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """
 Tool parser for Tencent Hy3 (HYV3).
 

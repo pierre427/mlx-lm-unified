@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """persistent_mtp wiring through adaptive_pld_generate_step.
 
 The PLD phase must be value-identical with persistence on (it only reroutes

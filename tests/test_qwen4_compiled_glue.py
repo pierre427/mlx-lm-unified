@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import unittest
 from contextlib import contextmanager
 from os import environ

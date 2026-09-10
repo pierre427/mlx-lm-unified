@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Regression tests for tool-parser hygiene bugs (H3, L2, L4, M7, M8).
 
 Each test targets one confirmed bug from the parser audit:

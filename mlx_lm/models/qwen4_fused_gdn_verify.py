@@ -1,4 +1,3 @@
-# Copyright © 2025 Apple Inc.
 # Metal reduction and precision structure adapted from mlx-vlm #2105
 # (Copyright © 2025 Prince Canuma, MIT).
 

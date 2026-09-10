@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """The per-lane random key as the product actually uses it (CPU-only).
 
 ``tests/test_lane_rng.py`` proves the primitive and the engine. This file

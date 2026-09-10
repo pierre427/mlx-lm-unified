@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """The MTP draft cycle has one exit, and the loop takes it (CPU-only).
 
 ``Model.mtp_start_cycle`` arms QSA top-k sharing for one draft cycle;

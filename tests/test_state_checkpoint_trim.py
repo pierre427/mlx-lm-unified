@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """Prefix-cache trim for linear-attention hybrid caches.
 
 Hybrid models (Qwen3-Next / Kimi-Linear class) mix ArraysCache (recurrent

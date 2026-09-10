@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Focused lifecycle checks for adaptive-PLD verify-cliff span routing."""
 
 import unittest

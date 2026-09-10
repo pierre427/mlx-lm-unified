@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """qwen3_5_moe must load MLX checkpoints that ship separate
 ``switch_mlp.gate_proj`` / ``up_proj`` expert tables under the fused
 gate-up lever (``MLX_QWEN4_MOE_FUSED_GATE_UP``, default on), the same way

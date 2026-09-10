@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Opt-in host synchronization tracing for self-MTP verification."""
 
 from __future__ import annotations

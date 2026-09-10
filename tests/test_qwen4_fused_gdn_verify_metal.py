@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 """Real-Metal gates for the fused Qwen4 GDN speculative-verify kernel."""
 
 import os

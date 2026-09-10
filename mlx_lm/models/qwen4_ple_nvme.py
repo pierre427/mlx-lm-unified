@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """NVMe-backed Engram PLE tables for Qwen4-Exp (Qwen3.8-Flash-Next).
 
 The 128 q4/g32 PLE shards are ~30% of the release artifact. This module

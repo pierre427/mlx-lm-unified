@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """End-to-end example: extract a commit direction, then steer generation.
 
 Step 1 (offline, once per model) records a handful of greedy reasoning traces on

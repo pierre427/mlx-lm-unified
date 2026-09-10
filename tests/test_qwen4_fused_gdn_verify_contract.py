@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 """Contracts for the default-off fused Qwen4 GDN speculative-verify path."""
 
 import hashlib

@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """CPU-only source contracts for compiled replay's fail-closed boundary.
 
 This module deliberately does not import ``mlx`` or ``mlx_lm``.  It is safe to

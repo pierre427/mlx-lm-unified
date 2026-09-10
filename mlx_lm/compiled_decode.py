@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 """Trace the decode step once, replay it every token.
 
 The stock decode loop rebuilds the token's MLX graph in Python on every

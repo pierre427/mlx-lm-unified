@@ -1,5 +1,3 @@
-# Copyright © 2023-2024 Apple Inc.
-
 """Hybrid speculative decoding: retrieval-first + confidence-gated draft chain.
 
 Greedy / temperature-0, same-tokenizer only. Per cycle the proposer picks the

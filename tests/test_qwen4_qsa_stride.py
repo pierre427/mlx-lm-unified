@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import os
 import unittest
 from unittest import mock

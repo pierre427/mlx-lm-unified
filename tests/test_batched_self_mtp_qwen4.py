@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 import unittest
 import os
 from itertools import product

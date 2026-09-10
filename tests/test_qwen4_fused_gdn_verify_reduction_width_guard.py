@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 """Class-C reduction-width guard for the fused Qwen4 GDN speculative-verify kernel.
 
 Background (vllm#54506, memory ``qwen38-k2-divergence-is-near-tie-numeric``): on

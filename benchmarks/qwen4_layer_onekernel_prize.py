@@ -1,4 +1,3 @@
-# Copyright © 2026 Apple Inc.
 """The per-layer megakernel prize, measured with zero kernel code.
 
 A decode step on Qwen3.8-Flash-Next issues hundreds of small kernels and runs
