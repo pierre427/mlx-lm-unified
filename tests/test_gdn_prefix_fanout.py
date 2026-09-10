@@ -1,10 +1,16 @@
 """CPU proof for exact N=2 recurrent-prefix fan-out."""
 
 import copy
+import types
 import unittest
 from unittest.mock import patch
 
 import mlx.core as mx
+
+from benchmarks.qwen4_gdn_prefix_fanout_full_model_ab import (
+    _cached_serving_once,
+    _prepare_cached_prefix,
+)
 
 from mlx_lm.gdn_prefix_fanout import (
     GDNPrefixFanout,
@@ -612,6 +618,29 @@ class TestServingComposition(unittest.TestCase):
         stats = gdn_prefix_fanout_stats()
         self.assertEqual(stats["serving_engaged"], 1)
         self.assertEqual(stats["serving_declined_error"], 0)
+
+    def test_cached_full_model_harness_clones_sidecar_per_arm(self):
+        args = types.SimpleNamespace(
+            max_tokens=4,
+            seed=20260910,
+            num_draft=2,
+            prefill_step_size=4,
+            share_qsa_indices=True,
+        )
+        cached = _prepare_cached_prefix(self.model, [1, 2, 3, 4, 5], args)
+        gdn_prefix_fanout_stats(reset=True)
+        baseline = _cached_serving_once(
+            self.model, cached, [6, 7], args, False
+        )
+        candidate = _cached_serving_once(
+            self.model, cached, [6, 7], args, True
+        )
+        self.assertEqual(candidate["tokens"], baseline["tokens"])
+        self.assertEqual(candidate["counter_delta"]["serving_engaged"], 1)
+        self.assertEqual(
+            candidate["counter_delta"]["serving_declined_error"], 0
+        )
+        self.assertEqual(cached["tokens"], [1, 2, 3, 4, 5])
 
 
 if __name__ == "__main__":

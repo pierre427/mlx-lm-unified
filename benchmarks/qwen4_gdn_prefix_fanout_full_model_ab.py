@@ -139,6 +139,79 @@ def _time_ms(fn):
     return (time.perf_counter_ns() - started) / 1e6, result
 
 
+def _counter_delta(before, after):
+    return {key: int(after[key] - before.get(key, 0)) for key in after}
+
+
+def _require_candidate_engaged(result, gate):
+    counters = result["counter_delta"]
+    if counters["serving_requests"] != 1:
+        raise AssertionError(
+            f"{gate} candidate request counter was "
+            f"{counters['serving_requests']}, expected 1"
+        )
+    if counters["serving_engaged"] != 1:
+        raise AssertionError(
+            f"{gate} candidate serving engagement was "
+            f"{counters['serving_engaged']}, expected 1"
+        )
+    if (
+        counters["serving_declined_not_n2"]
+        or counters["serving_declined_cache"]
+        or counters["serving_declined_error"]
+    ):
+        raise AssertionError(f"{gate} candidate silently declined fan-out")
+    if counters["serving_cleanups"] != 1:
+        raise AssertionError(
+            f"{gate} candidate cleanup counter was "
+            f"{counters['serving_cleanups']}, expected 1"
+        )
+
+
+def _print_arm(gate, block, slot, result):
+    print(
+        json.dumps(
+            {
+                "event": "gdn_prefix_fanout_arm",
+                "gate": gate,
+                "block": block,
+                "slot": slot,
+                "enabled": result["enabled"],
+                "prepare_ms": result["prepare_ms"],
+                "prepare_tokens_per_second": result[
+                    "prepare_tokens_per_second"
+                ],
+                "decode_ms": result["decode_ms"],
+                "decode_tokens_per_second": result[
+                    "aggregate_decode_tokens_per_second"
+                ],
+                "total_ms": result["total_ms"],
+                "total_tokens_per_second": result[
+                    "aggregate_total_tokens_per_second"
+                ],
+                "token_sha256": result["token_sha256"],
+                "counter_delta": result["counter_delta"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def _print_block(gate, result):
+    print(
+        json.dumps(
+            {
+                "event": "gdn_prefix_fanout_block",
+                "gate": gate,
+                **{key: value for key, value in result.items() if key != "arms"},
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
 def _component_gate(model, prompt, suffix, args):
     detached, _ = prepare_self_mtp_lane(
         mx.array(prompt, mx.uint32),
@@ -244,6 +317,7 @@ def _serving_once(model, prompt, args, enabled):
         "accept_rule": "residual",
         "gdn_prefix_fanout": enabled,
     }
+    counters_before = gdn_prefix_fanout_stats()
     started = time.perf_counter_ns()
     parallel = ParallelSampleGenerator(
         model,
@@ -273,17 +347,25 @@ def _serving_once(model, prompt, args, enabled):
     decode_ms = (finished - decode_started) / 1e6
     total_ms = (finished - started) / 1e6
     count = sum(len(row) for row in rows)
+    prepare_tokens = len(prompt)
     return {
         "enabled": enabled,
         "prepare_ms": prepared_ms,
+        "prepare_tokens": prepare_tokens,
+        "prepare_tokens_per_second": prepare_tokens / (prepared_ms / 1000.0),
         "decode_ms": decode_ms,
         "total_ms": total_ms,
         "aggregate_decode_tokens_per_second": count / (decode_ms / 1000.0),
         "aggregate_request_tokens_per_second": count / (total_ms / 1000.0),
+        "aggregate_total_tokens_per_second": (prepare_tokens + count)
+        / (total_ms / 1000.0),
         "tokens": rows,
         "token_sha256": [
             hashlib.sha256(json.dumps(row).encode()).hexdigest() for row in rows
         ],
+        "counter_delta": _counter_delta(
+            counters_before, gdn_prefix_fanout_stats()
+        ),
     }
 
 
@@ -291,30 +373,52 @@ def _serving_gate(model, prompt, args):
     blocks = []
     for block in range(args.serving_reps):
         arms = []
-        for enabled in (False, True, True, False):
+        for slot, enabled in enumerate((False, True, True, False)):
             if args.cool_seconds:
                 time.sleep(args.cool_seconds)
-            arms.append(_serving_once(model, prompt, args, enabled))
+            arm = _serving_once(model, prompt, args, enabled)
+            arms.append(arm)
+            _print_arm("fresh_prompt", block, slot, arm)
         baseline = [arms[0], arms[3]]
         candidate = [arms[1], arms[2]]
+        for arm in candidate:
+            _require_candidate_engaged(arm, "fresh-prompt")
         if any(item["tokens"] != baseline[0]["tokens"] for item in arms[1:]):
             raise AssertionError("candidate and interleaved baseline token traces differ")
         base_total = statistics.mean(item["total_ms"] for item in baseline)
         cand_total = statistics.mean(item["total_ms"] for item in candidate)
         base_decode = statistics.mean(item["decode_ms"] for item in baseline)
         cand_decode = statistics.mean(item["decode_ms"] for item in candidate)
-        blocks.append(
-            {
-                "block": block,
-                "baseline_total_ms": base_total,
-                "candidate_total_ms": cand_total,
-                "total_wall_speedup": base_total / cand_total,
-                "baseline_decode_ms": base_decode,
-                "candidate_decode_ms": cand_decode,
-                "decode_speedup": base_decode / cand_decode,
-                "arms": arms,
-            }
-        )
+        row = {
+            "block": block,
+            "baseline_total_ms": base_total,
+            "candidate_total_ms": cand_total,
+            "total_wall_speedup": base_total / cand_total,
+            "baseline_prepare_tokens_per_second": statistics.mean(
+                item["prepare_tokens_per_second"] for item in baseline
+            ),
+            "candidate_prepare_tokens_per_second": statistics.mean(
+                item["prepare_tokens_per_second"] for item in candidate
+            ),
+            "baseline_decode_ms": base_decode,
+            "candidate_decode_ms": cand_decode,
+            "decode_speedup": base_decode / cand_decode,
+            "baseline_decode_tokens_per_second": statistics.mean(
+                item["aggregate_decode_tokens_per_second"] for item in baseline
+            ),
+            "candidate_decode_tokens_per_second": statistics.mean(
+                item["aggregate_decode_tokens_per_second"] for item in candidate
+            ),
+            "baseline_total_tokens_per_second": statistics.mean(
+                item["aggregate_total_tokens_per_second"] for item in baseline
+            ),
+            "candidate_total_tokens_per_second": statistics.mean(
+                item["aggregate_total_tokens_per_second"] for item in candidate
+            ),
+            "arms": arms,
+        }
+        blocks.append(row)
+        _print_block("fresh_prompt", row)
     return {
         "token_exact": True,
         "median_total_wall_speedup": statistics.median(
@@ -322,6 +426,210 @@ def _serving_gate(model, prompt, args):
         ),
         "median_decode_speedup": statistics.median(
             row["decode_speedup"] for row in blocks
+        ),
+        "blocks": blocks,
+    }
+
+
+def _prepare_cached_prefix(model, prefix, args):
+    """Capture one exact target-cache plus persistent-MTP APC sidecar."""
+
+    started = time.perf_counter_ns()
+    detached, _ = prepare_self_mtp_lane(
+        mx.array(prefix, mx.uint32),
+        model,
+        uid=0,
+        max_tokens=max(2, args.max_tokens),
+        prompt_cache=None,
+        mtp_state=None,
+        lane_rng=LaneRNG(args.seed),
+        num_draft=args.num_draft,
+        sampling_temp=0.0,
+        sampling_top_p=1.0,
+        sampling_top_k=0,
+        sampling_min_p=0.0,
+        accept_rule="residual",
+        logits_processors=[],
+        prefill_step_size=args.prefill_step_size,
+        share_qsa_indices=args.share_qsa_indices,
+    )
+    _eval_cache(detached.caches.target)
+    _eval_cache(detached.caches.draft)
+    mx.eval(detached.lane.seed_h)
+    mx.synchronize()
+    elapsed_ms = (time.perf_counter_ns() - started) / 1e6
+    return {
+        "target": detached.caches.target,
+        "draft": detached.caches.draft,
+        "seed_h": detached.lane.seed_h,
+        "tokens": list(prefix),
+        "build_ms": elapsed_ms,
+        "build_tokens_per_second": len(prefix) / (elapsed_ms / 1000.0),
+    }
+
+
+def _cached_serving_once(model, cached, tail, args, enabled):
+    """Run one serving arm from a cloned APC-style target and MTP sidecar."""
+
+    config = {
+        "num_draft": args.num_draft,
+        "persistent": True,
+        "rate_gate": False,
+        "share_qsa_indices": args.share_qsa_indices,
+        "sampling_temp": 0.0,
+        "accept_rule": "residual",
+        "gdn_prefix_fanout": enabled,
+    }
+    counters_before = gdn_prefix_fanout_stats()
+    started = time.perf_counter_ns()
+    target = _clone_cache(cached["target"])
+    draft = _clone_cache(cached["draft"])
+    seed_h = mx.array(cached["seed_h"])
+    mx.eval(seed_h)
+    parallel = ParallelSampleGenerator(
+        model,
+        target,
+        tail[-1],
+        2,
+        max_tokens=args.max_tokens,
+        stop_matchers=[StopSequenceMatcher(), StopSequenceMatcher()],
+        all_tokens=cached["tokens"],
+        self_mtp=config,
+        mtp_state=(draft, seed_h),
+        lane_rng=LaneRNG(args.seed),
+        mtp_prompt=tail,
+        prefill_step_size=args.prefill_step_size,
+    )
+    mx.synchronize()
+    prepared_ms = (time.perf_counter_ns() - started) / 1e6
+    rows = [[], []]
+    decode_started = time.perf_counter_ns()
+    try:
+        while len(parallel):
+            for row, response in parallel.next():
+                rows[row].append(int(response.token))
+    finally:
+        parallel.close()
+    mx.synchronize()
+    finished = time.perf_counter_ns()
+    decode_ms = (finished - decode_started) / 1e6
+    total_ms = (finished - started) / 1e6
+    count = sum(len(row) for row in rows)
+    prepare_tokens = len(tail)
+    return {
+        "enabled": enabled,
+        "prepare_ms": prepared_ms,
+        "prepare_tokens": prepare_tokens,
+        "prepare_tokens_per_second": prepare_tokens / (prepared_ms / 1000.0),
+        "decode_ms": decode_ms,
+        "total_ms": total_ms,
+        "aggregate_decode_tokens_per_second": count / (decode_ms / 1000.0),
+        "aggregate_request_tokens_per_second": count / (total_ms / 1000.0),
+        "aggregate_total_tokens_per_second": (prepare_tokens + count)
+        / (total_ms / 1000.0),
+        "tokens": rows,
+        "token_sha256": [
+            hashlib.sha256(json.dumps(row).encode()).hexdigest() for row in rows
+        ],
+        "counter_delta": _counter_delta(
+            counters_before, gdn_prefix_fanout_stats()
+        ),
+    }
+
+
+def _cached_serving_gate(model, prompt, args):
+    prefix_tokens = args.cached_prefix_tokens
+    if prefix_tokens == 0:
+        prefix_tokens = len(prompt) - args.cached_tail_tokens
+    if not 1 <= prefix_tokens < len(prompt):
+        raise ValueError(
+            "cached prefix must retain at least one token and leave a non-empty tail"
+        )
+    prefix = prompt[:prefix_tokens]
+    tail = prompt[prefix_tokens:]
+    cached = _prepare_cached_prefix(model, prefix, args)
+    print(
+        json.dumps(
+            {
+                "event": "gdn_prefix_fanout_cached_snapshot",
+                "prefix_tokens": len(prefix),
+                "tail_tokens": len(tail),
+                "build_ms": cached["build_ms"],
+                "build_tokens_per_second": cached["build_tokens_per_second"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    blocks = []
+    for block in range(args.cached_serving_reps):
+        arms = []
+        for slot, enabled in enumerate((False, True, True, False)):
+            if args.cool_seconds:
+                time.sleep(args.cool_seconds)
+            arm = _cached_serving_once(model, cached, tail, args, enabled)
+            arms.append(arm)
+            _print_arm("cached_prefix", block, slot, arm)
+        baseline = [arms[0], arms[3]]
+        candidate = [arms[1], arms[2]]
+        for arm in candidate:
+            _require_candidate_engaged(arm, "cached-prefix")
+        if any(item["tokens"] != baseline[0]["tokens"] for item in arms[1:]):
+            raise AssertionError("cached-prefix candidate token traces differ")
+        base_prepare = statistics.mean(item["prepare_ms"] for item in baseline)
+        cand_prepare = statistics.mean(item["prepare_ms"] for item in candidate)
+        base_decode = statistics.mean(item["decode_ms"] for item in baseline)
+        cand_decode = statistics.mean(item["decode_ms"] for item in candidate)
+        base_total = statistics.mean(item["total_ms"] for item in baseline)
+        cand_total = statistics.mean(item["total_ms"] for item in candidate)
+        row = {
+            "block": block,
+            "baseline_prepare_ms": base_prepare,
+            "candidate_prepare_ms": cand_prepare,
+            "prepare_wall_speedup": base_prepare / cand_prepare,
+            "baseline_prepare_tokens_per_second": statistics.mean(
+                item["prepare_tokens_per_second"] for item in baseline
+            ),
+            "candidate_prepare_tokens_per_second": statistics.mean(
+                item["prepare_tokens_per_second"] for item in candidate
+            ),
+            "baseline_decode_ms": base_decode,
+            "candidate_decode_ms": cand_decode,
+            "decode_wall_speedup": base_decode / cand_decode,
+            "baseline_decode_tokens_per_second": statistics.mean(
+                item["aggregate_decode_tokens_per_second"] for item in baseline
+            ),
+            "candidate_decode_tokens_per_second": statistics.mean(
+                item["aggregate_decode_tokens_per_second"] for item in candidate
+            ),
+            "baseline_total_ms": base_total,
+            "candidate_total_ms": cand_total,
+            "total_wall_speedup": base_total / cand_total,
+            "baseline_total_tokens_per_second": statistics.mean(
+                item["aggregate_total_tokens_per_second"] for item in baseline
+            ),
+            "candidate_total_tokens_per_second": statistics.mean(
+                item["aggregate_total_tokens_per_second"] for item in candidate
+            ),
+            "arms": arms,
+        }
+        blocks.append(row)
+        _print_block("cached_prefix", row)
+    return {
+        "token_exact": True,
+        "prefix_tokens": len(prefix),
+        "tail_tokens": len(tail),
+        "snapshot_build_ms": cached["build_ms"],
+        "snapshot_build_tokens_per_second": cached["build_tokens_per_second"],
+        "median_prepare_wall_speedup": statistics.median(
+            row["prepare_wall_speedup"] for row in blocks
+        ),
+        "median_decode_wall_speedup": statistics.median(
+            row["decode_wall_speedup"] for row in blocks
+        ),
+        "median_total_wall_speedup": statistics.median(
+            row["total_wall_speedup"] for row in blocks
         ),
         "blocks": blocks,
     }
@@ -341,6 +649,17 @@ def main():
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--component-reps", type=int, default=3)
     parser.add_argument("--serving-reps", type=int, default=2)
+    parser.add_argument(
+        "--cached-prefix-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Tokens retained in the target+MTP sidecar snapshot. Zero uses "
+            "--prompt-tokens minus --cached-tail-tokens."
+        ),
+    )
+    parser.add_argument("--cached-tail-tokens", type=int, default=8)
+    parser.add_argument("--cached-serving-reps", type=int, default=2)
     parser.add_argument("--cool-seconds", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument(
@@ -361,8 +680,21 @@ def main():
     args = parser.parse_args()
     if args.prompt_tokens < 2 or args.suffix_tokens < 1:
         parser.error("prompt tokens must be >=2 and suffix tokens must be positive")
-    if args.component_reps < 1 or args.serving_reps < 1:
-        parser.error("component and serving reps must be positive")
+    if (
+        args.component_reps < 1
+        or args.serving_reps < 1
+        or args.cached_serving_reps < 1
+    ):
+        parser.error("component, serving, and cached-serving reps must be positive")
+    if args.cached_prefix_tokens < 0 or args.cached_tail_tokens < 1:
+        parser.error("cached prefix must be non-negative and cached tail positive")
+    resolved_cached_prefix = args.cached_prefix_tokens or (
+        args.prompt_tokens - args.cached_tail_tokens
+    )
+    if not 1 <= resolved_cached_prefix < args.prompt_tokens:
+        parser.error(
+            "cached prefix must retain at least one token and leave a non-empty tail"
+        )
 
     model, tokenizer = load(args.model)
     model.eval()
@@ -379,6 +711,7 @@ def main():
     gdn_prefix_fanout_stats(reset=True)
     component = _component_gate(model, prompt, suffix, args)
     serving = _serving_gate(model, prompt, args)
+    cached_serving = _cached_serving_gate(model, prompt, args)
     counters = gdn_prefix_fanout_stats()
     result = {
         "model": str(Path(args.model).resolve()),
@@ -394,7 +727,7 @@ def main():
             "persistent_mtp": True,
             "share_qsa_indices": args.share_qsa_indices,
             "ple": "model-configured",
-            "apc": "not exercised; this gate starts from a fresh prompt",
+            "apc": "target cache plus exact persistent-MTP sidecar exercised",
             "environment": {
                 key: value
                 for key, value in sorted(os.environ.items())
@@ -403,11 +736,14 @@ def main():
         },
         "component": component,
         "serving": serving,
+        "cached_serving": cached_serving,
         "counters": counters,
     }
     if counters["hybrid_fanout_batches"] < 1:
         raise AssertionError("GDN prefix fan-out did not engage")
-    expected_serving_engagements = args.serving_reps * 2
+    expected_serving_engagements = (
+        args.serving_reps + args.cached_serving_reps
+    ) * 2
     if counters["serving_engaged"] != expected_serving_engagements:
         raise AssertionError(
             "serving fan-out engagement mismatch: "
