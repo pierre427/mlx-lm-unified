@@ -75,6 +75,7 @@ def _valid_arrays(cache):
 
 class TestTinyQwen4Join(unittest.TestCase):
     tolerance = dict(rtol=0.0, atol=0.0)
+    share_qsa_indices = False
 
     @classmethod
     def setUpClass(cls):
@@ -104,7 +105,7 @@ class TestTinyQwen4Join(unittest.TestCase):
             accept_rule="residual",
             logits_processors=[],
             prefill_step_size=4,
-            share_qsa_indices=False,
+            share_qsa_indices=self.share_qsa_indices,
         )
 
     def _active_batch(self, traces=None):
@@ -320,6 +321,103 @@ class TestTinyQwen4Join(unittest.TestCase):
                 f"uid {uid}: joined-lane divergence is outside the near-tie "
                 "band",
             )
+
+
+class TestTinyQwen4SharedQSAJoin(TestTinyQwen4Join):
+    """Run both mid-flight join contracts with cycle-local QSA sharing on."""
+
+    share_qsa_indices = True
+
+    def test_first_post_join_cycle_rearms_shared_qsa(self):
+        batch, _ntoks = self._active_batch()
+        joining, _first = self._lane(_JOIN_UID, list(_JOIN_PROMPT))
+        batch = attach_self_mtp_lanes(self.model, batch, [joining])
+        qsa_caches = [
+            cache
+            for cache in batch.caches.draft
+            if hasattr(cache, "_mtp_shared_topk")
+        ]
+        self.assertTrue(qsa_caches)
+
+        original = self.model.mtp_step
+        calls = 0
+
+        def checked_mtp_step(hidden, tokens, cache):
+            nonlocal calls
+            if calls == 1:
+                self.assertTrue(
+                    all(item._mtp_shared_topk is not None for item in qsa_caches)
+                )
+                self.assertTrue(
+                    all(
+                        item._mtp_shared_topk.shape[0] == len(batch.lanes)
+                        for item in qsa_caches
+                    )
+                )
+            result = original(hidden, tokens, cache)
+            calls += 1
+            return result
+
+        self.model.mtp_step = checked_mtp_step
+        try:
+            proposal = propose_batched_self_mtp(self.model, batch)
+        finally:
+            self.model.mtp_step = original
+        self.assertEqual(calls, 2)
+        self.assertTrue(
+            all(item._mtp_shared_topk is None for item in qsa_caches)
+        )
+        self.assertTrue(all(not item._mtp_share_topk for item in qsa_caches))
+        commit_batched_self_mtp(
+            batch,
+            proposal,
+            emitted_counts=[len(row) for row in proposal.outputs],
+            terminal=[False] * len(batch.lanes),
+        )
+        detach_self_mtp_lanes(
+            self.model, batch, list(range(len(batch.lanes)))
+        )
+
+    def test_ragged_terminal_cycle_falls_back_from_sharing(self):
+        shorter, first_short = self._lane(70, [2, 4, 6, 8], maximum=5)
+        longer, first_long = self._lane(80, [1, 3, 5, 7], maximum=8)
+        traces = {70: [int(first_short.token)], 80: [int(first_long.token)]}
+        batch = attach_self_mtp_lanes(self.model, None, [shorter, longer])
+        share_modes = []
+        original = self.model.mtp_start_cycle
+
+        def counted_start(cache, share_qsa_indices=False):
+            share_modes.append(bool(share_qsa_indices))
+            return original(cache, share_qsa_indices)
+
+        self.model.mtp_start_cycle = counted_start
+        try:
+            while batch.lanes:
+                proposal = propose_batched_self_mtp(self.model, batch)
+                terminal = []
+                emitted = []
+                for lane, outputs in zip(batch.lanes, proposal.outputs):
+                    remaining = lane.max_tokens - len(traces[lane.uid])
+                    delivered = outputs[:remaining]
+                    traces[lane.uid].extend(int(item.token) for item in delivered)
+                    emitted.append(len(delivered))
+                    terminal.append(len(traces[lane.uid]) >= lane.max_tokens)
+                commit_batched_self_mtp(
+                    batch,
+                    proposal,
+                    emitted_counts=emitted,
+                    terminal=terminal,
+                )
+                leaving = [i for i, done in enumerate(terminal) if done]
+                if leaving:
+                    batch, _ = detach_self_mtp_lanes(self.model, batch, leaving)
+        finally:
+            self.model.mtp_start_cycle = original
+
+        self.assertIn(True, share_modes)
+        self.assertIn(False, share_modes)
+        self.assertEqual(len(traces[70]), 5)
+        self.assertEqual(len(traces[80]), 8)
 
 
 @unittest.skipUnless(

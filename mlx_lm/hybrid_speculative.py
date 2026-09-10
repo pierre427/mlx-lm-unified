@@ -2002,9 +2002,19 @@ def _propose_batched_self_mtp_round(
     if max_k > 0:
         start_cycle = getattr(model, "mtp_start_cycle", None)
         if start_cycle is not None:
+            # Shared QSA deliberately omits raw-index keys after the first
+            # draft step, which is safe only when the whole batch rewinds the
+            # same drafted span. A lane at its terminal budget makes the tail
+            # rewind ragged even though configured depths are homogeneous;
+            # keep that cycle exact by recomputing QSA normally.
+            share_qsa_this_cycle = bool(
+                active_share_modes
+                and next(iter(active_share_modes))
+                and len(set(k_vector)) == 1
+            )
             start_cycle(
                 batch.caches.draft,
-                bool(active_share_modes and next(iter(active_share_modes))),
+                share_qsa_this_cycle,
             )
         try:
             first_lengths = [
