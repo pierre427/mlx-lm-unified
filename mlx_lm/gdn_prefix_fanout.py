@@ -40,6 +40,8 @@ _STAT_KEYS = (
     "hybrid_materializations",
     "hybrid_fanout_batches",
     "hybrid_fanout_rows",
+    "hybrid_tip_fanout_batches",
+    "hybrid_tip_fanout_rows",
     "hybrid_committed_rows",
     "hybrid_aborts",
     "serving_requests",
@@ -488,6 +490,47 @@ class HybridCachePrefixFanout:
         self._active_lease = lease
         _STATS["hybrid_fanout_batches"] += 1
         _STATS["hybrid_fanout_rows"] += rows
+        return lease
+
+    def fork_live_tip(self, rows: int = 2) -> "HybridCacheFanoutLease":
+        """Build two rows directly from an exclusively owned live tip.
+
+        ``fork`` preserves a reusable immutable parent, which requires cloning
+        every non-recurrent cache before the batch merge. Serving has already
+        cloned the APC entry into a request-private canonical lane and
+        transfers the result immediately, so that second full-prefix clone is
+        unnecessary. This one-shot path merges the live tip itself and marks
+        the owner consumed. The ordinary immutable path remains the fallback.
+        """
+
+        self._require_open()
+        if rows != 2:
+            raise ValueError("hybrid GDN tip fan-out is qualified only for rows=2")
+        if self._active_lease is not None and not self._active_lease.closed:
+            raise RuntimeError("close the active hybrid fan-out lease first")
+        if not self._source:
+            raise RuntimeError("hybrid GDN tip fan-out source was already consumed")
+
+        batched = []
+        for index, source in enumerate(self._source):
+            merge = getattr(type(source), "merge", None)
+            if not callable(merge):
+                _STATS["declined_unsupported_cache"] += 1
+                raise TypeError(
+                    f"cache entry {index} ({type(source).__name__}) cannot merge"
+                )
+            batched.append(merge([source, source]))
+        arrays = [array for cache in batched for array in _tree_arrays(cache.state)]
+        if arrays:
+            mx.eval(*arrays)
+        lease = HybridCacheFanoutLease(self, batched, rows, self._span)
+        self._active_lease = lease
+        self._source = ()
+        self._recurrent = {}
+        _STATS["hybrid_fanout_batches"] += 1
+        _STATS["hybrid_fanout_rows"] += rows
+        _STATS["hybrid_tip_fanout_batches"] += 1
+        _STATS["hybrid_tip_fanout_rows"] += rows
         return lease
 
     def close(self):

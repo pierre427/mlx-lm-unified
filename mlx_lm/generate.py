@@ -4861,7 +4861,10 @@ class ParallelSampleGenerator:
                         strict=False,
                     )
                     if owner is not None:
-                        lease = owner.fork(owner.span)
+                        if bool(config.get("gdn_prefix_fanout_consume", False)):
+                            lease = owner.fork_live_tip()
+                        else:
+                            lease = owner.fork(owner.span)
                         target_batch = lease.take_batch()
                         draft_batch = [
                             type(cache).merge([cache, cache])

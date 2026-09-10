@@ -549,6 +549,26 @@ class TestHybridCachePrefixFanout(unittest.TestCase):
                 )
         owner.close()
 
+    def test_live_tip_fanout_matches_immutable_tip_and_is_one_shot(self):
+        immutable = HybridCachePrefixFanout.from_prompt_cache(
+            self.source, enabled=True, strict=True
+        )
+        consuming = HybridCachePrefixFanout.from_prompt_cache(
+            self.source, enabled=True, strict=True
+        )
+        expected = immutable.fork(immutable.span)
+        actual = consuming.fork_live_tip()
+        _assert_cache_groups_close(self, actual.caches, expected.caches)
+        actual.abort()
+        with self.assertRaisesRegex(RuntimeError, "consumed"):
+            consuming.fork_live_tip()
+        stats = gdn_prefix_fanout_stats()
+        self.assertEqual(stats["hybrid_tip_fanout_batches"], 1)
+        self.assertEqual(stats["hybrid_tip_fanout_rows"], 2)
+        expected.abort()
+        consuming.close()
+        immutable.close()
+
     def test_full_transaction_zero_partial_all_matches_solo(self):
         owner = HybridCachePrefixFanout.from_prompt_cache(
             self.source, enabled=True, strict=True
@@ -622,7 +642,7 @@ class TestServingComposition(unittest.TestCase):
         mx.random.seed(59)
         self.model = _tiny_hybrid_model()
 
-    def _run(self, enabled, *, rows=2):
+    def _run(self, enabled, *, rows=2, consume=False):
         parallel = ParallelSampleGenerator(
             self.model,
             None,
@@ -639,6 +659,7 @@ class TestServingComposition(unittest.TestCase):
                 "sampling_temp": 0.0,
                 "accept_rule": "residual",
                 "gdn_prefix_fanout": enabled,
+                "gdn_prefix_fanout_consume": consume,
             },
             lane_rng=LaneRNG(20260910),
             mtp_prompt=[1, 2, 3, 4, 5],
@@ -677,6 +698,17 @@ class TestServingComposition(unittest.TestCase):
         self.assertEqual(stats["serving_declined_error"], 0)
         self.assertEqual(stats["serving_cleanups"], 1)
         self.assertGreaterEqual(stats["cleanups"], 2)
+
+    def test_consuming_serving_path_is_exact_and_engages(self):
+        baseline, _ = self._run(False)
+        gdn_prefix_fanout_stats(reset=True)
+        candidate, _ = self._run(True, consume=True)
+        self.assertEqual(candidate, baseline)
+        stats = gdn_prefix_fanout_stats()
+        self.assertEqual(stats["hybrid_tip_fanout_batches"], 1)
+        self.assertEqual(stats["hybrid_tip_fanout_rows"], 2)
+        self.assertEqual(stats["serving_engaged"], 1)
+        self.assertEqual(stats["serving_declined_error"], 0)
 
     def test_non_n2_declines_without_recording_or_mutating(self):
         gdn_prefix_fanout_stats(reset=True)
