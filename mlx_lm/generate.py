@@ -4921,18 +4921,41 @@ class ParallelSampleGenerator:
                 matchers = stop_matchers or [StopSequenceMatcher()] * n
                 row_samplers = samplers or [None] * n
                 processors = logits_processors or [[] for _ in range(n)]
-                self._generator._generation_batch = GenerationBatch(
-                    model,
-                    uids,
-                    mx.array([int(seed_token)] * n, dtype=mx.uint32),
-                    prepared_prompt_cache,
-                    [list(history) for _ in range(n)],
-                    row_samplers,
-                    self._generator.sampler,
-                    processors,
-                    matchers,
-                    [max_tokens] * n,
-                )
+                try:
+                    with mx.stream(self._generator.stream):
+                        self._generator._generation_batch = GenerationBatch(
+                            model,
+                            uids,
+                            mx.array([int(seed_token)] * n, dtype=mx.uint32),
+                            prepared_prompt_cache,
+                            [list(history) for _ in range(n)],
+                            row_samplers,
+                            self._generator.sampler,
+                            processors,
+                            matchers,
+                            [max_tokens] * n,
+                        )
+                except BaseException:
+                    owner = self._prepared_prompt_cache_owner
+                    self._prepared_prompt_cache_owner = None
+                    if owner is not None:
+                        try:
+                            mx.synchronize(self._generator.stream)
+                        except BaseException as cleanup_error:
+                            logging.warning(
+                                "Failed to drain prepared-cache stream after "
+                                "constructor error: %s",
+                                cleanup_error,
+                            )
+                        try:
+                            owner.close(synchronize=False)
+                        except BaseException as cleanup_error:
+                            logging.warning(
+                                "Failed to release prepared cache after "
+                                "constructor error: %s",
+                                cleanup_error,
+                            )
+                    raise
                 self._generator._uid_count = n
         else:
             if prepared_prompt_cache is not None:
@@ -5201,15 +5224,30 @@ class ParallelSampleGenerator:
         return results
 
     def close(self):
-        self._generator.close()
+        first_error = None
+        try:
+            self._generator.close()
+        except BaseException as error:
+            first_error = error
         owner = self._prepared_prompt_cache_owner
         if owner is not None:
-            self._prepared_prompt_cache_owner = None
-            mx.synchronize(self._generator.stream)
-            batch = getattr(self._generator, "_generation_batch", None)
-            if batch is not None:
-                batch.prompt_cache = []
-            owner.close(synchronize=False)
+            try:
+                mx.synchronize(self._generator.stream)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                batch = getattr(self._generator, "_generation_batch", None)
+                if batch is not None:
+                    batch.prompt_cache = []
+                self._prepared_prompt_cache_owner = None
+                try:
+                    owner.close(synchronize=False)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 @dataclass

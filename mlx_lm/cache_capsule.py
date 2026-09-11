@@ -128,15 +128,26 @@ class PreparedPromptCacheCapsules:
         receipts: Sequence[CacheCapsuleReceipt],
         leases: Sequence["CacheCapsuleLease"],
         *,
-        backend: str,
+        requested_backend: str,
         ordinary_planes: int,
     ):
         self.prompt_cache = prompt_cache
         self.receipts = tuple(receipts)
         self.leases = tuple(leases)
-        self.backend = str(backend)
+        self.requested_backend = str(requested_backend)
+        self.actual_backends = tuple(receipt.backend for receipt in receipts)
+        self.fallback_reasons = tuple(
+            receipt.fallback_reason for receipt in receipts
+        )
         self.ordinary_planes = int(ordinary_planes)
         self._closed = False
+
+    @property
+    def backend(self) -> str:
+        """Actual backend label, or ``mixed`` when planes took different paths."""
+
+        backends = set(self.actual_backends)
+        return next(iter(backends)) if len(backends) == 1 else "mixed"
 
     @property
     def capsule_planes(self) -> int:
@@ -291,7 +302,7 @@ def prepare_prompt_cache_capsules(
         batched,
         receipts,
         leases,
-        backend=str(backend),
+        requested_backend=str(backend),
         ordinary_planes=ordinary,
     )
 

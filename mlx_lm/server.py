@@ -3421,7 +3421,16 @@ class ResponseGenerator:
                         CACHE_CAPSULE_LOG.append(
                             {
                                 "engaged": True,
+                                "requested_backend": (
+                                    prepared_capsules.requested_backend
+                                ),
                                 "backend": prepared_capsules.backend,
+                                "actual_backends": (
+                                    prepared_capsules.actual_backends
+                                ),
+                                "fallback_reasons": (
+                                    prepared_capsules.fallback_reasons
+                                ),
                                 "capsule_planes": prepared_capsules.capsule_planes,
                                 "ordinary_planes": prepared_capsules.ordinary_planes,
                                 "n": n,

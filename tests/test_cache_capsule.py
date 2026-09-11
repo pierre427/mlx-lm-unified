@@ -335,6 +335,40 @@ class TestCacheCapsule(unittest.TestCase):
             release.set()
             pool.close()
 
+    def test_prepared_cache_reports_requested_and_actual_fallback_backends(self):
+        clock = CacheCapsuleGeneration()
+        release = threading.Event()
+        cache = _cache()
+        source = capture_kv_cache_plane(
+            cache,
+            generation=clock.current,
+            source_id="apc:plane:0",
+            target_batch=2,
+        )
+        pool = CacheCapsulePool(
+            clock,
+            e5rt_adapter=_SlowAdapter(release, _e5rt_product(source)),
+            enabled=True,
+        )
+        try:
+            prepared = prepare_prompt_cache_capsules(
+                [cache],
+                target_batch=2,
+                generation=clock.current,
+                pool=pool,
+                backend="e5rt",
+                fallback="cpu",
+                timeout_s=0,
+            )
+            self.assertEqual(prepared.requested_backend, "e5rt")
+            self.assertEqual(prepared.backend, "cpu")
+            self.assertEqual(prepared.actual_backends, ("cpu",))
+            self.assertEqual(prepared.fallback_reasons, ("e5rt_timeout",))
+            prepared.close()
+        finally:
+            release.set()
+            pool.close()
+
     def test_adapter_error_uses_named_cpu_fallback(self):
         clock = CacheCapsuleGeneration()
         with CacheCapsulePool(

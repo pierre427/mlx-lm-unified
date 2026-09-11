@@ -210,6 +210,70 @@ class TestParallelSampleGenerator(unittest.TestCase):
             pool.close()
         self.assertTrue(all(r.owner.released for r in prepared.receipts))
 
+    def test_prepared_cache_constructor_uses_requested_stream(self):
+        cache = KVCache()
+        prefix = mx.ones((1, 1, 3, 4), dtype=mx.bfloat16)
+        cache.update_and_fetch(prefix, prefix)
+        mx.eval(cache.state)
+        clock = CacheCapsuleGeneration()
+        pool = CacheCapsulePool(clock, enabled=True)
+        prepared = prepare_prompt_cache_capsules(
+            [cache],
+            target_batch=2,
+            generation=clock.current,
+            pool=pool,
+            backend="gpu",
+        )
+        requested_stream = mx.new_stream(mx.cpu)
+        seen_streams = []
+
+        class StreamModel(CoinModel):
+            def __call__(self, inputs, cache=None):
+                seen_streams.append(mx.default_stream(mx.cpu))
+                return super().__call__(inputs, cache=cache)
+
+        parallel = ParallelSampleGenerator(
+            StreamModel(),
+            [cache],
+            4,
+            2,
+            max_tokens=1,
+            stop_matchers=[StopSequenceMatcher()] * 2,
+            prepared_prompt_cache=prepared.prompt_cache,
+            prepared_prompt_cache_owner=prepared,
+            stream=requested_stream,
+        )
+        try:
+            self.assertEqual(seen_streams, [requested_stream])
+        finally:
+            parallel.close()
+            pool.close()
+
+    def test_prepared_cache_close_releases_owner_when_drain_fails(self):
+        batch = types.SimpleNamespace(prompt_cache=[object()])
+        generator = types.SimpleNamespace(
+            close=mock.Mock(side_effect=RuntimeError("generator close failed")),
+            stream=mx.default_stream(mx.cpu),
+            _generation_batch=batch,
+        )
+        owner = mock.Mock()
+        parallel = ParallelSampleGenerator.__new__(ParallelSampleGenerator)
+        parallel._generator = generator
+        parallel._prepared_prompt_cache_owner = owner
+
+        with (
+            mock.patch(
+                "mlx_lm.generate.mx.synchronize",
+                side_effect=RuntimeError("drain failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "generator close failed"),
+        ):
+            parallel.close()
+
+        self.assertEqual(batch.prompt_cache, [])
+        self.assertIsNone(parallel._prepared_prompt_cache_owner)
+        owner.close.assert_called_once_with(synchronize=False)
+
     def test_samples_are_distinct_and_two_sided(self):
         sequences, _ = self._run(n=4, steps=32)
         self.assertEqual(len(sequences), 4)
