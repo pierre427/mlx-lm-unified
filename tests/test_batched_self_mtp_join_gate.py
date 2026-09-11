@@ -25,6 +25,7 @@ class reruns both bodies against the artifact named by
 ``MLX_BATCHED_MTP_GATE_MODEL`` on real hardware.
 """
 
+import gc
 import os
 import unittest
 
@@ -312,6 +313,9 @@ class TestTinyQwen4Join(unittest.TestCase):
                         for _, logprobs in candidate[: first_flip + 1]
                     ]
                 ),
+                shape_noise_band=getattr(
+                    self, "batch_shape_noise_band", 3e-3
+                ),
             )
             self.assertEqual(
                 diagnostic.near_tie_flip_positions, (first_flip,), f"uid {uid}"
@@ -431,6 +435,10 @@ class TestProductionQwen38Join(TestTinyQwen4Join):
     movement); the trace body already admits only documented near-tie flips.
     """
 
+    # Same measured bf16 N-lane operating band as the production digest gate.
+    # The tiny fp32 fixture retains the helper's strict 0.003 default.
+    batch_shape_noise_band = 0.15
+
     @classmethod
     def setUpClass(cls):
         cls._previous_device = mx.default_device()
@@ -440,6 +448,10 @@ class TestProductionQwen38Join(TestTinyQwen4Join):
 
     @classmethod
     def tearDownClass(cls):
+        cls.model = None
+        gc.collect()
+        mx.clear_cache()
+        mx.synchronize()
         mx.set_default_device(cls._previous_device)
 
 

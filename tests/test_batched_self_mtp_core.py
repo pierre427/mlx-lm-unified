@@ -6,6 +6,7 @@ real-hardware diagnostic; documented near-tie flips are recorded, while every
 non-near-tie flip remains a hard failure.
 """
 
+import gc
 import unittest
 import hashlib
 import os
@@ -533,6 +534,7 @@ class TestBatchedCoreLifecycleDepth3(TestBatchedCoreLifecycle):
 class TestProductionQwen38DigestGate(unittest.TestCase):
     """Real-M5 digest battery; near-tie-only flips remain diagnostic."""
 
+    NUM_DRAFT = TestBatchedCoreLifecycle.NUM_DRAFT
     _digest = staticmethod(TestBatchedCoreLifecycle._digest)
     _lane = TestBatchedCoreLifecycle._lane
     _finish = TestBatchedCoreLifecycle._finish
@@ -553,6 +555,13 @@ class TestProductionQwen38DigestGate(unittest.TestCase):
         cls.model, _ = load(os.environ["MLX_BATCHED_MTP_GATE_MODEL"])
         if getattr(cls.model, "mtp", None) is None:
             raise AssertionError("production digest gate model has no MTP head")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model = None
+        gc.collect()
+        mx.clear_cache()
+        mx.synchronize()
 
 
 if __name__ == "__main__":
