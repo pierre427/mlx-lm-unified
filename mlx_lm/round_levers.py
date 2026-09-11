@@ -49,6 +49,11 @@ _LEVER_ATTRS = {
 }
 
 COUNTER_NAMES = (
+    # Cached-prefix lane preparation: known uncached tail prefetch.
+    "ple_tail_prefetch_requests",
+    "ple_tail_prefetch_tables",
+    "ple_tail_prefetch_declined",
+    "ple_tail_prefetch_failures",
     # lever a
     "ple_prefetch_submitted",
     "ple_prefetch_rows",

@@ -3137,6 +3137,36 @@ def _segment_aware_live_tip_enabled(config: Optional[Mapping[str, Any]]) -> bool
     return segmented_self_mtp_enabled(explicit)
 
 
+def _prefetch_known_mtp_tail(model, history, prompt, config) -> int:
+    """Asynchronously stage file-backed PLE rows for a known MTP tail.
+
+    APC gives lane preparation both the committed prefix and its uncached tail.
+    Qwen4 can therefore hash and stage those PLE rows before the target catch-up
+    starts. This is a performance hint only: unsupported models, empty tails,
+    and submission failures all fall back to the ordinary foreground lookup.
+    """
+    if not config.get("prefetch_known_tail_ple", False) or not prompt:
+        return 0
+    from . import round_levers as _lv
+
+    _lv.bump("ple_tail_prefetch_requests")
+    prefetch = getattr(model, "ple_prefetch_verify", None)
+    if not callable(prefetch):
+        _lv.bump("ple_tail_prefetch_declined")
+        return 0
+    try:
+        tables = int(prefetch(list(history), list(prompt)))
+    except Exception as error:
+        _lv.bump("ple_tail_prefetch_failures")
+        logging.warning("Known-tail PLE prefetch declined: %s", error)
+        return 0
+    if tables <= 0:
+        _lv.bump("ple_tail_prefetch_declined")
+        return 0
+    _lv.bump("ple_tail_prefetch_tables", tables)
+    return tables
+
+
 def _close_segmented_detached(detached: Any, *, release_cache: bool) -> None:
     """Release a detached lane's ledger and, when discarded, COW owner pin."""
 
@@ -4191,6 +4221,7 @@ class BatchGenerator:
                 )
                 for processor in processors
             ]
+            _prefetch_known_mtp_tail(self.model, history, prompt, config)
             lane, first = prepare_self_mtp_lane(
                 mx.array(prompt, dtype=mx.uint32),
                 self.model,
@@ -5029,6 +5060,8 @@ class ParallelSampleGenerator:
                 _note_serving_event("requests")
                 if not fanout_candidate:
                     _note_serving_event("declined_not_n2")
+
+            _prefetch_known_mtp_tail(model, history, prompt_tail, config)
 
             canonical, first = prepare_self_mtp_lane(
                 mx.array(prompt_tail, dtype=mx.uint32),

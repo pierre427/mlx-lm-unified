@@ -48,6 +48,7 @@ except ModuleNotFoundError:  # Direct ``python benchmarks/this_file.py``.
         _thermal_arm,
     )
 from mlx_lm.gdn_prefix_fanout import gdn_prefix_fanout_stats
+from mlx_lm import round_levers as _round_levers
 from mlx_lm.generate import ParallelSampleGenerator, StopSequenceMatcher
 from mlx_lm.sample_utils import LaneRNG
 from mlx_lm.segmented_self_mtp import (
@@ -63,6 +64,7 @@ from mlx_lm.models.qwen4_ple_nvme import has_file_backed_ple
 
 VARIANTS = {
     "ordinary": {},
+    "tail_ple_prefetch": {"prefetch_known_tail_ple": True},
     "immutable": {"gdn_prefix_fanout": True},
     "consume": {
         "gdn_prefix_fanout": True,
@@ -174,6 +176,7 @@ def _once(model, cached, tail, args, variant):
         )
     fanout_before = gdn_prefix_fanout_stats()
     segmented_before = segmented_self_mtp_stats()
+    round_levers_before = _round_levers.counters()
     started = time.perf_counter_ns()
     stages = {}
     memory = {"before_clone": _mlx_memory()}
@@ -249,6 +252,9 @@ def _once(model, cached, tail, args, variant):
             "segmented_delta": _numeric_counter_delta(
                 segmented_before, segmented_self_mtp_stats()
             ),
+            "round_levers_delta": _numeric_counter_delta(
+                round_levers_before, _round_levers.counters()
+            ),
             "expects_qsa_private_delta": (
                 variant in {"segmented", "segmented_exact_set"}
                 and args.prompt_tokens // 4 * 4
@@ -297,6 +303,7 @@ def _require_receipts(arm):
     wants_fanout = switches.get("gdn_prefix_fanout", False)
     wants_consume = switches.get("gdn_prefix_fanout_consume", False)
     wants_segmented = switches.get("segment_aware_live_tip", False)
+    wants_tail_ple = switches.get("prefetch_known_tail_ple", False)
     if bool(fanout["serving_engaged"]) != wants_fanout:
         raise AssertionError(f"{variant}: fan-out engagement receipt mismatch")
     if bool(fanout["hybrid_tip_fanout_batches"]) != wants_consume:
@@ -316,6 +323,18 @@ def _require_receipts(arm):
             require_qsa_exact_set_fold_engagement(segmented)
     elif segmented["requests"] or segmented["engaged"]:
         raise AssertionError(f"{variant}: segmented self-MTP unexpectedly engaged")
+    tail_ple = arm["round_levers_delta"]
+    if wants_tail_ple:
+        if tail_ple["ple_tail_prefetch_requests"] != 1:
+            raise AssertionError(f"{variant}: known-tail PLE prefetch did not run once")
+        if tail_ple["ple_tail_prefetch_tables"] <= 0:
+            raise AssertionError(f"{variant}: no PLE table accepted the known tail")
+        if tail_ple["ple_dq_hits"] <= 0:
+            raise AssertionError(f"{variant}: prefetched PLE rows were not consumed")
+        if tail_ple["ple_tail_prefetch_failures"]:
+            raise AssertionError(f"{variant}: known-tail PLE prefetch failed")
+    elif tail_ple["ple_tail_prefetch_requests"]:
+        raise AssertionError(f"{variant}: known-tail PLE prefetch unexpectedly ran")
 
 
 def _summarize(block, candidate, attempt, arms, baseline="ordinary"):
@@ -639,6 +658,7 @@ def main():
 
     gdn_prefix_fanout_stats(reset=True)
     segmented_self_mtp_stats(reset=True)
+    _round_levers.reset_counters()
     candidates = {
         name: _candidate_gate(model, cached, tail, args, name)
         for name in args.candidates
