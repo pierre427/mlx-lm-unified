@@ -2,7 +2,12 @@ from argparse import Namespace
 
 import pytest
 
-from benchmarks.qwen4_live_tip_branch_gate import ARMS, arm_order, build_plan
+from benchmarks.qwen4_live_tip_branch_gate import (
+    ARMS,
+    BRANCH_MODES,
+    arm_order,
+    build_plan,
+)
 
 
 def _args(**updates):
@@ -17,6 +22,10 @@ def _args(**updates):
         "reps": 2,
         "idle_seconds": 60.0,
         "cooldown_seconds": 30.0,
+        "branch_mode": "physical",
+        "qsa_private_delta": "default",
+        "qsa_exact_set_fold": "default",
+        "qsa_private_delta_min_context": None,
     }
     values.update(updates)
     return Namespace(**values)
@@ -28,6 +37,25 @@ def test_plan_keeps_the_live_boundary_warm():
     assert "no sleep, mx.clear_cache" in plan["warm_invariant"]
     assert "detach canonicalization is measured" in plan["warm_invariant"]
     assert plan["orders"] == [list(ARMS), list(reversed(ARMS))]
+    assert plan["branch_mode"] == "physical"
+
+
+@pytest.mark.parametrize("mode", BRANCH_MODES)
+def test_plan_records_composition_mode(mode):
+    plan = build_plan(
+        _args(
+            branch_mode=mode,
+            qsa_private_delta="on",
+            qsa_exact_set_fold="off",
+            qsa_private_delta_min_context=0,
+        )
+    )
+    assert plan["branch_mode"] == mode
+    assert plan["composition"] == {
+        "qsa_private_delta": "on",
+        "qsa_exact_set_fold": "off",
+        "qsa_private_delta_min_context": 0,
+    }
 
 
 def test_arm_order_counterbalances():
@@ -44,6 +72,7 @@ def test_arm_order_counterbalances():
         {"measured_cycles": 0},
         {"branches": 3},
         {"idle_seconds": -1},
+        {"branch_mode": "unknown"},
     ],
 )
 def test_invalid_plans_fail(updates):

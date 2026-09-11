@@ -34,6 +34,7 @@ DEFAULT_MODEL = (
     "Qwen3.8-Flash-Next-MLX-4bit-MTP"
 )
 ARMS = ("warm_live_tip", "idle_live_tip")
+BRANCH_MODES = ("physical", "segmented")
 
 
 def utc_now() -> str:
@@ -64,6 +65,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("this gate is qualified only for two branches")
     if args.reps < 1 or args.idle_seconds < 0 or args.cooldown_seconds < 0:
         raise ValueError("reps must be positive and waits cannot be negative")
+    branch_mode = getattr(args, "branch_mode", "physical")
+    if branch_mode not in BRANCH_MODES:
+        raise ValueError(f"branch-mode must be one of {BRANCH_MODES}")
     return {
         "schema": f"{SCHEMA}.plan",
         "created_at_utc": utc_now(),
@@ -74,6 +78,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "warmup_cycles": args.warmup_cycles,
         "measured_cycles": args.measured_cycles,
         "branches": args.branches,
+        "branch_mode": branch_mode,
         "repetitions": args.reps,
         "idle_seconds": args.idle_seconds,
         "cooldown_before_arm_seconds": args.cooldown_seconds,
@@ -92,6 +97,13 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "greedy sibling token traces match within every arm and complete "
             "warm/idle traces match by bracket slot"
         ),
+        "composition": {
+            "qsa_private_delta": getattr(args, "qsa_private_delta", "default"),
+            "qsa_exact_set_fold": getattr(args, "qsa_exact_set_fold", "default"),
+            "qsa_private_delta_min_context": getattr(
+                args, "qsa_private_delta_min_context", None
+            ),
+        },
     }
 
 
@@ -161,6 +173,15 @@ def _state_values(pair: Any) -> list[Any]:
     return values
 
 
+def _batch_state_values(batch: Any) -> list[Any]:
+    if hasattr(batch, "caches"):
+        return _state_values(batch.caches)
+    values = []
+    for pair in batch.row_caches:
+        values.extend(_state_values(pair))
+    return values
+
+
 def _array_leaves(value: Any) -> Iterable[Any]:
     if isinstance(value, (list, tuple)):
         for item in value:
@@ -205,12 +226,14 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     import mlx.core as mx
     from mlx_lm.hybrid_speculative import (
         attach_self_mtp_lanes,
+        attach_segmented_self_mtp_lanes,
         commit_batched_self_mtp,
         detach_self_mtp_lanes,
         prepare_self_mtp_lane,
         propose_batched_self_mtp,
     )
     from mlx_lm.sample_utils import LaneRNG
+    from mlx_lm.segmented_self_mtp import segmented_self_mtp_stats
 
     before = system_snapshot()
     if not _thermal_healthy(before):
@@ -245,6 +268,10 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         prefill_step_size=args.prefill_step_size,
         share_qsa_indices=args.share_qsa_indices,
     )
+    if args.branch_mode == "segmented":
+        detached.shared_qsa_prefix_id = hashlib.sha256(
+            f"live-tip:{args.context}:{args.seed}".encode()
+        ).hexdigest()
     batch = attach_self_mtp_lanes(model, None, [detached])
     mx.synchronize()
     prepared_ns = time.perf_counter_ns()
@@ -281,8 +308,15 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     sibling = copy.deepcopy(canonical)
     sibling.lane.uid = 1
     sibling.lane.rng = LaneRNG(args.seed + 1)
-    branch_batch = attach_self_mtp_lanes(model, None, [canonical, sibling])
-    mx.eval(_state_values(branch_batch.caches))
+    segmented_self_mtp_stats(reset=True)
+    segmented_before = segmented_self_mtp_stats(reset=False)
+    attach = (
+        attach_segmented_self_mtp_lanes
+        if args.branch_mode == "segmented"
+        else attach_self_mtp_lanes
+    )
+    branch_batch = attach(model, None, [canonical, sibling])
+    mx.eval(_batch_state_values(branch_batch))
     mx.synchronize()
     branch_ready_ns = time.perf_counter_ns()
 
@@ -297,7 +331,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         emitted_counts=emitted,
         terminal=[False, False],
     )
-    mx.eval(_state_values(branch_batch.caches))
+    mx.eval(_batch_state_values(branch_batch))
     mx.synchronize()
     first_commit_ns = time.perf_counter_ns()
 
@@ -326,6 +360,12 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     if branch_batch.lanes or len(final_rows) != 2:
         raise RuntimeError("failed to detach both branch rows")
     sibling_state = _same_detached_state(mx, final_rows[0], final_rows[1])
+    segmented_after = segmented_self_mtp_stats(reset=False)
+    segmented_delta = {
+        key: int(value) - int(segmented_before.get(key, 0))
+        for key, value in segmented_after.items()
+        if isinstance(value, int) and isinstance(segmented_before.get(key, 0), int)
+    }
 
     after = system_snapshot()
     swap_after = _swap_bytes(after)
@@ -341,6 +381,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
 
     result = {
         "arm": arm,
+        "branch_mode": args.branch_mode,
         "prepare_ms": (prepared_ns - prepared_started) / 1e6,
         "warmup_ms": (last_warm_ns - prepared_ns) / 1e6,
         "warmup_cycles": args.warmup_cycles,
@@ -364,6 +405,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "branch_tokens": branch_rows,
         "token_digest": _token_digest(branch_rows),
         "sibling_state": sibling_state,
+        "segmented_delta": segmented_delta,
         "memory": _mlx_memory(mx),
         "system_before": before,
         "system_after": after,
@@ -414,11 +456,28 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def apply_composition_environment(args: argparse.Namespace) -> None:
+    if args.qsa_private_delta != "default":
+        os.environ["MLX_LM_QSA_PRIVATE_DELTA"] = str(
+            args.qsa_private_delta == "on"
+        ).lower()
+    if args.qsa_exact_set_fold != "default":
+        os.environ["MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"] = str(
+            args.qsa_exact_set_fold == "on"
+        ).lower()
+    if args.qsa_private_delta_min_context is not None:
+        floor = str(args.qsa_private_delta_min_context)
+        os.environ["MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT_M1"] = floor
+        os.environ["MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT_MN"] = floor
+
+
 def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     import mlx.core as mx
     from mlx_lm.utils import load
 
     from qwen4_mtp_dynamic_join_gate import exact_prompt
+
+    apply_composition_environment(args)
 
     model, tokenizer = load(args.model)
     model.eval()
@@ -466,6 +525,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-cycles", type=int, default=8)
     parser.add_argument("--measured-cycles", type=int, default=8)
     parser.add_argument("--branches", type=int, default=2)
+    parser.add_argument("--branch-mode", choices=BRANCH_MODES, default="physical")
     parser.add_argument("--reps", type=int, default=2)
     parser.add_argument("--idle-seconds", type=float, default=60.0)
     parser.add_argument("--cooldown-seconds", type=float, default=30.0)
@@ -473,6 +533,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--minimum-system-free-percent", type=int, default=30)
     parser.add_argument("--maximum-swap-growth-mb", type=int, default=16)
+    parser.add_argument(
+        "--qsa-private-delta", choices=("default", "on", "off"), default="default"
+    )
+    parser.add_argument(
+        "--qsa-exact-set-fold", choices=("default", "on", "off"), default="default"
+    )
+    parser.add_argument("--qsa-private-delta-min-context", type=int)
     parser.add_argument(
         "--share-qsa-indices",
         action=argparse.BooleanOptionalAction,
