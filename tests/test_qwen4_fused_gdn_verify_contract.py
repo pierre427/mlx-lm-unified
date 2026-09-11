@@ -146,6 +146,13 @@ def test_verify_kernel_source_is_pinned_across_the_width_bound():
     )
 
 
+def test_catchup_source_removes_only_rollback_snapshot_stores():
+    assert "state_snapshots" not in qwen4_fused_gdn_verify._CATCHUP_SOURCE
+    assert "conv_snapshots" not in qwen4_fused_gdn_verify._CATCHUP_SOURCE
+    assert "if (t + 1u == (uint)S)" in qwen4_fused_gdn_verify._CATCHUP_SOURCE
+    assert "output[t * VD + hv * DV + d]" in qwen4_fused_gdn_verify._CATCHUP_SOURCE
+
+
 @pytest.mark.parametrize("steps", [2, 8, 9, 15, 16, 17])
 def test_wide_dispatch_shapes_scale_only_the_token_axis(steps):
     """Geometry is width independent; only the snapshot extents move."""
@@ -202,6 +209,15 @@ def test_single_token_batch_mask_ragged_and_plain_forwards_fall_back():
     assert admission(spans=[3]).accepted
     assert admission(spans=[3], mask=object()).accepted
     assert admission(speculating=False).reason == "not a speculative verify"
+    assert admission(speculating=False, catchup=True).accepted
+    assert admission(speculating=True, catchup=True).reason == (
+        "catch-up cache is speculating"
+    )
+    assert admission(speculating=False, catchup=True, mask=object()).reason == "masked catch-up"
+    assert admission(speculating=False, catchup=True, spans=[3]).accepted
+    assert admission(speculating=False, catchup=True, spans=[2]).reason == (
+        "padded rollback geometry"
+    )
     assert admission(training=True).reason == "training"
     assert admission(sharded=True).reason == "distributed sharding"
     assert "unsupported geometry" in admission(num_key_heads=24).reason
@@ -260,6 +276,45 @@ def test_kernel_dispatch_emits_restore_points_for_every_earlier_position():
     assert outputs[4].dtype == mx.bfloat16
 
 
+def test_catchup_dispatch_emits_only_output_and_final_cache_states():
+    calls = []
+
+    def fake_kernel(**kwargs):
+        calls.append(kwargs)
+        return [
+            FakeArray(shape, dtype)
+            for shape, dtype in zip(kwargs["output_shapes"], kwargs["output_dtypes"])
+        ]
+
+    values = production_values(steps=7)
+    with patch.object(
+        qwen4_fused_gdn_verify, "_catchup_kernel", return_value=fake_kernel
+    ):
+        outputs = qwen4_fused_gdn_verify.qwen4_fused_gdn_catchup(
+            values["qkv"],
+            values["z"],
+            values["b"],
+            values["a"],
+            values["conv_state"],
+            values["conv_weight"],
+            values["A_log"],
+            values["dt_bias"],
+            values["recurrent_state"],
+            values["norm_weight"],
+            1.0e-6,
+            threadgroup_y=16,
+        )
+    assert calls[0]["grid"] == (32, 16, 48)
+    assert calls[0]["threadgroup"] == (32, 16, 1)
+    assert ("S", 7) in calls[0]["template"]
+    assert [item.shape for item in outputs] == [
+        (1, 7, 6144),
+        (1, 3, 10240),
+        (1, 48, 128, 128),
+    ]
+    assert outputs[2].dtype == mx.float32
+
+
 def test_probe_ladder_caches_per_width():
     with (
         patch.dict(qwen4_fused_gdn_verify._PROBED_STEPS, {}, clear=True),
@@ -287,6 +342,33 @@ def test_probe_ladder_caches_per_width():
             qwen4_fused_gdn_verify.probe_qwen4_fused_gdn_verify(mx.bfloat16, 1) is None
         )
     assert [c.kwargs["threadgroup_y"] for c in execute.call_args_list] == [16, 8, 16]
+
+
+def test_catchup_probe_ladder_caches_per_width():
+    with (
+        patch.dict(qwen4_fused_gdn_verify._PROBED_CATCHUP_STEPS, {}, clear=True),
+        patch.object(
+            qwen4_fused_gdn_verify, "fused_gdn_runtime_supported", return_value=True
+        ),
+        patch.object(
+            qwen4_fused_gdn_verify, "probe_qwen4_fused_gdn_decode", return_value=16
+        ),
+        patch.object(
+            qwen4_fused_gdn_verify,
+            "qwen4_fused_gdn_catchup",
+            side_effect=[RuntimeError("threadgroup resources"), (object(),) * 3],
+        ) as execute,
+        patch.object(qwen4_fused_gdn_verify.mx, "eval"),
+    ):
+        assert (
+            qwen4_fused_gdn_verify.probe_qwen4_fused_gdn_catchup(mx.bfloat16, 7)
+            == 8
+        )
+        assert (
+            qwen4_fused_gdn_verify.probe_qwen4_fused_gdn_catchup(mx.bfloat16, 7)
+            == 8
+        )
+    assert [c.kwargs["threadgroup_y"] for c in execute.call_args_list] == [16, 8]
 
 
 def test_resident_verify_switch_is_independent_of_decode():
@@ -336,6 +418,94 @@ def test_decode_hook_routes_speculating_multi_token_forwards_to_verify():
         )
     verify.assert_not_called()
     assert layer.fused_gdn_decode_last_fallback == "speculative rollback"
+
+
+def test_decode_hook_routes_enabled_plain_multi_token_forward_to_catchup():
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    sentinel = object()
+    values = production_values(steps=7)
+    cache = FakeCache(
+        values["conv_state"], values["recurrent_state"], speculating=False
+    )
+    with (
+        qwen4_exp._gdn_catchup_scope(True),
+        patch.object(layer, "_try_fused_verify", return_value=sentinel) as fused,
+    ):
+        assert layer._try_fused_decode(*_hook_args(values), cache) is sentinel
+    assert fused.call_args.kwargs == {"catchup": True}
+
+
+def test_catchup_scope_resets_after_exception_and_speculation_wins():
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    values = production_values(steps=3)
+    plain = FakeCache(
+        values["conv_state"], values["recurrent_state"], speculating=False
+    )
+    speculating = FakeCache(
+        values["conv_state"], values["recurrent_state"], speculating=True
+    )
+    assert not qwen4_exp._FUSED_GDN_CATCHUP_SCOPE.get()
+    with pytest.raises(RuntimeError, match="reset me"):
+        with qwen4_exp._gdn_catchup_scope(True):
+            assert qwen4_exp._FUSED_GDN_CATCHUP_SCOPE.get()
+            raise RuntimeError("reset me")
+    assert not qwen4_exp._FUSED_GDN_CATCHUP_SCOPE.get()
+    with (
+        qwen4_exp._gdn_catchup_scope(True),
+        patch.object(layer, "_try_fused_verify", return_value=object()) as fused,
+    ):
+        layer._try_fused_decode(*_hook_args(values), speculating)
+    assert fused.call_args.kwargs == {"catchup": False}
+    with patch.object(layer, "_try_fused_verify") as fused:
+        layer._try_fused_decode(*_hook_args(values), plain)
+    fused.assert_not_called()
+
+
+def test_admitted_catchup_commits_without_a_rollback_record():
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    layer.out_proj = Identity()
+    values = production_values(steps=7)
+    cache = FakeCache(
+        values["conv_state"], values["recurrent_state"], speculating=False
+    )
+    fused_output = FakeArray((1, 7, 6144), mx.bfloat16)
+    next_conv, next_state = object(), object()
+    accepted = qwen4_fused_gdn.FusedGdnAdmission(True, "eligible")
+    with (
+        patch.object(qwen4_exp, "admit_qwen4_fused_gdn_verify", return_value=accepted),
+        patch.object(qwen4_exp, "fused_gdn_runtime_supported", return_value=True),
+        patch.object(qwen4_exp, "probe_qwen4_fused_gdn_catchup", return_value=8),
+        patch.object(
+            qwen4_exp,
+            "qwen4_fused_gdn_catchup",
+            return_value=(fused_output, next_conv, next_state),
+        ) as execute,
+    ):
+        result = layer._try_fused_verify(
+            *_hook_args(values), cache, catchup=True
+        )
+    assert result is fused_output
+    assert execute.call_count == 1
+    assert cache.records == []
+    assert cache.events == [("set", 0), ("set", 1), ("advance", 7)]
+    assert layer.fused_gdn_catchup_calls == 1
+    assert layer.fused_gdn_verify_calls == 0
+
+
+def test_catchup_refuses_a_cache_that_cannot_describe_rollback_geometry():
+    layer = qwen4_exp.GatedDeltaNet(tiny_args())
+    layer.eval()
+    values = production_values(steps=7)
+    cache = NoRollbackCache(
+        values["conv_state"], values["recurrent_state"], speculating=False
+    )
+    assert layer._try_fused_verify(*_hook_args(values), cache, catchup=True) is None
+    assert layer.fused_gdn_catchup_last_fallback == (
+        "cache lacks rollback geometry"
+    )
 
 
 def test_stock_mode_and_unfit_caches_do_not_probe_metal():

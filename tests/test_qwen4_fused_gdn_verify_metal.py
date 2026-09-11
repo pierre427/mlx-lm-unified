@@ -194,8 +194,79 @@ def _assert_verify_kernel_matches_stock(steps, threadgroup_y, blocks=6):
         mx.set_default_device(previous)
 
 
+def _assert_catchup_kernel_matches_stock(steps, threadgroup_y, blocks=6):
+    """Always commit each block and compare the three retained outputs."""
+
+    _require_metal()
+    previous = mx.default_device()
+    mx.set_default_device(mx.gpu)
+    dtype = mx.bfloat16
+    conv_weight, A_log, dt_bias, norm_weight = _random_layer_weights(dtype)
+    stock_conv = mx.zeros(
+        (1, fused_gdn.CONV_KERNEL - 1, fused_gdn.CONV_DIM), dtype=dtype
+    )
+    fused_conv = mx.array(stock_conv)
+    stock_state = mx.zeros(
+        (
+            1,
+            fused_gdn.NUM_VALUE_HEADS,
+            fused_gdn.VALUE_HEAD_DIM,
+            fused_gdn.KEY_HEAD_DIM,
+        ),
+        dtype=mx.float32,
+    )
+    fused_state = mx.array(stock_state)
+    try:
+        for block in range(blocks):
+            seed = 7000 * steps + 10 * block
+
+            def draw(shape, offset, seed=seed, scale=0.2):
+                return (
+                    mx.random.normal(shape, key=mx.random.key(seed + offset)) * scale
+                ).astype(dtype)
+
+            qkv = draw((1, steps, fused_gdn.CONV_DIM), 1)
+            z = draw((1, steps, fused_gdn.VALUE_DIM), 2)
+            b = draw((1, steps, fused_gdn.NUM_VALUE_HEADS), 3)
+            a = draw((1, steps, fused_gdn.NUM_VALUE_HEADS), 4)
+            stock = _stock_verify_block(
+                qkv,
+                z,
+                b,
+                a,
+                stock_conv,
+                conv_weight,
+                A_log,
+                dt_bias,
+                norm_weight,
+                stock_state,
+            )
+            fused = fused_verify.qwen4_fused_gdn_catchup(
+                qkv,
+                z,
+                b,
+                a,
+                fused_conv,
+                conv_weight,
+                A_log,
+                dt_bias,
+                fused_state,
+                norm_weight,
+                1.0e-6,
+                threadgroup_y=threadgroup_y,
+            )
+            mx.eval(*stock[:3], *fused)
+            assert mx.array_equal(stock[0], fused[0]).item(), ("output", block)
+            assert mx.array_equal(stock[1], fused[1]).item(), ("conv", block)
+            assert mx.array_equal(stock[2], fused[2]).item(), ("state", block)
+            stock_conv, stock_state = stock[1], stock[2]
+            fused_conv, fused_state = fused[1], fused[2]
+    finally:
+        mx.set_default_device(previous)
+
+
 @pytest.mark.parametrize(
-    "steps", [2, 3, 5, 8, 9, 16, fused_verify.MAX_VERIFY_WIDTH_PROVEN]
+    "steps", [2, 3, 5, 7, 8, 9, 16, fused_verify.MAX_VERIFY_WIDTH_PROVEN]
 )
 def test_real_metal_verify_matches_stock_for_every_supported_threadgroup(steps):
     supported = []
@@ -210,6 +281,22 @@ def test_real_metal_verify_matches_stock_for_every_supported_threadgroup(steps):
         else:
             supported.append(threadgroup_y)
     assert supported, "Metal rejected every fused GDN verify threadgroup candidate"
+
+
+@pytest.mark.parametrize("steps", range(2, fused_verify.MAX_VERIFY_STEPS + 1))
+def test_real_metal_catchup_matches_stock_at_every_admitted_width(steps):
+    supported = []
+    for threadgroup_y in fused_gdn._THREADGROUP_Y_CANDIDATES:
+        try:
+            _assert_catchup_kernel_matches_stock(steps, threadgroup_y)
+        except ValueError as exc:
+            if "threads per threadgroup" not in str(exc):
+                raise
+        except RuntimeError:
+            continue
+        else:
+            supported.append(threadgroup_y)
+    assert supported, "Metal rejected every fused GDN catch-up threadgroup candidate"
 
 
 def _production_layer():

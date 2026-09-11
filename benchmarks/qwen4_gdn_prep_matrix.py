@@ -60,6 +60,9 @@ from mlx_lm.segmented_self_mtp import (
 )
 from mlx_lm.utils import load
 from mlx_lm.models.qwen4_ple_nvme import has_file_backed_ple
+from mlx_lm.models import qwen4_exp as _qwen4_exp
+from mlx_lm.models.qwen4_exp import qwen4_fused_gdn_stats
+from mlx_lm.models.qwen4_fused_gdn_verify import MAX_VERIFY_STEPS
 from mlx_lm.models.qwen4_qsa_indexed_merge import fused_merge_status
 
 
@@ -101,7 +104,20 @@ VARIANTS = {
         "_qsa_fused_merge": False,
         "_qsa_fused_gate": True,
     },
+    "gdn_catchup": {
+        "fused_gdn_catchup": True,
+    },
 }
+
+
+def _expected_gdn_catchup_chunks(tail_tokens, step_size):
+    chunks = 0
+    remaining = int(tail_tokens)
+    while remaining > 1:
+        width = min(int(step_size), remaining - 1)
+        chunks += int(2 <= width <= MAX_VERIFY_STEPS)
+        remaining -= width
+    return chunks
 
 
 def _emit(event, **payload):
@@ -207,6 +223,7 @@ def _once(model, cached, tail, args, variant):
             "1" if fused_gate_override else "0"
         )
     fused_merge_status(reset=True)
+    qwen4_fused_gdn_stats(model, reset=True)
     fanout_before = gdn_prefix_fanout_stats()
     segmented_before = segmented_self_mtp_stats()
     round_levers_before = _round_levers.counters()
@@ -290,6 +307,13 @@ def _once(model, cached, tail, args, variant):
                 round_levers_before, _round_levers.counters()
             ),
             "qsa_fused_merge": fused_merge_status(),
+            "fused_gdn": qwen4_fused_gdn_stats(model),
+            "expected_gdn_catchup_calls": sum(
+                isinstance(module, _qwen4_exp.GatedDeltaNet)
+                for _, module in model.named_modules()
+            ) * _expected_gdn_catchup_chunks(
+                args.cached_tail_tokens, args.prefill_step_size
+            ),
             "expects_qsa_private_delta": (
                 variant in {"segmented", "segmented_exact_set"}
                 and args.prompt_tokens // 4 * 4
@@ -351,6 +375,7 @@ def _require_receipts(arm):
     wants_tail_ple = switches.get("prefetch_known_tail_ple", False)
     wants_fused_merge = switches.get("_qsa_fused_merge")
     wants_fused_gate = switches.get("_qsa_fused_gate")
+    wants_gdn_catchup = switches.get("fused_gdn_catchup")
     if bool(fanout["serving_engaged"]) != wants_fanout:
         raise AssertionError(f"{variant}: fan-out engagement receipt mismatch")
     if bool(fanout["hybrid_tip_fanout_batches"]) != wants_consume:
@@ -396,6 +421,13 @@ def _require_receipts(arm):
             )
             if receipt["gate_path"] != expected_path:
                 raise AssertionError(f"{variant}: output-gate path mismatch")
+    if wants_gdn_catchup is not None:
+        calls = int(arm["fused_gdn"]["catchup_calls"])
+        expected = int(arm["expected_gdn_catchup_calls"])
+        if calls != (expected if wants_gdn_catchup else 0):
+            raise AssertionError(f"{variant}: fused GDN catch-up receipt mismatch")
+        if arm["fused_gdn"]["catchup_fallbacks"]:
+            raise AssertionError(f"{variant}: fused GDN catch-up fell back")
 
 
 def _summarize(block, candidate, attempt, arms, baseline="ordinary"):
@@ -686,6 +718,15 @@ def main():
         parser.error("--reps must be positive")
     if args.baseline in args.candidates:
         parser.error("the baseline cannot also be a candidate")
+    if "gdn_catchup" in args.candidates and _qwen4_exp._SHAPE_STABLE_SHORT_FORWARD:
+        parser.error(
+            "gdn_catchup requires MLX_QWEN4_SHAPE_STABLE_SHORT_FORWARD=0"
+        )
+    if "gdn_catchup" in args.candidates and _qwen4_exp._FUSED_GDN_CATCHUP_DEFAULT:
+        parser.error(
+            "gdn_catchup requires MLX_QWEN4_FUSED_GDN_CATCHUP=0 so the control "
+            "arm remains stock"
+        )
     if not 1 <= args.minimum_system_free_percent <= 100:
         parser.error("--minimum-system-free-percent must be in 1..100")
     if args.maximum_swap_growth_mb < 0:

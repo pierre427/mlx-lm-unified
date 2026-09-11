@@ -31,6 +31,7 @@ import copy
 import math
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
@@ -1881,6 +1882,7 @@ def prepare_self_mtp_lane(
     share_qsa_indices: bool,
     record_prefix_fanout: bool = False,
     diagnostic_stages: Optional[Dict[str, float]] = None,
+    fused_gdn_catchup: bool = False,
 ) -> Tuple[DetachedSelfMTPLane, MTPToken]:
     """Prefill one canonical persistent self-MTP lane without attaching it."""
     if getattr(model, "mtp", None) is None:
@@ -1937,7 +1939,12 @@ def prepare_self_mtp_lane(
     with mx.stream(generation_stream):
         while y.size > 1:
             n = min(prefill_step_size, int(y.size) - 1)
-            _, h_chunk = _mtp_backbone(model, y[:n][None], target_cache)
+            scope = getattr(model, "gdn_catchup_scope", None)
+            context = (
+                scope(fused_gdn_catchup) if callable(scope) else nullcontext()
+            )
+            with context:
+                _, h_chunk = _mtp_backbone(model, y[:n][None], target_cache)
             if diagnostic_stages is not None:
                 mx.eval(h_chunk, [c.state for c in target_cache])
             finish_diagnostic_stage("target_catchup_ms")

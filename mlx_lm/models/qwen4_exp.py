@@ -11,6 +11,7 @@ import os
 import threading
 from collections import Counter
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -41,7 +42,9 @@ from .qwen4_fused_gdn import (
 )
 from .qwen4_fused_gdn_verify import (
     admit_qwen4_fused_gdn_verify,
+    probe_qwen4_fused_gdn_catchup,
     probe_qwen4_fused_gdn_verify,
+    qwen4_fused_gdn_catchup,
     qwen4_fused_gdn_verify,
 )
 from .qwen4_gdn_outproj import admit_qwen4_gdn_outproj
@@ -472,7 +475,20 @@ _FUSED_GDN_DECODE_MODES = ("stock", "fused", "fused_outproj")
 # Speculative-verify sibling of the single-token fused GDN kernel: default off,
 # selected independently of the decode mode.
 _FUSED_GDN_VERIFY = _env_flag("MLX_QWEN4_FUSED_GDN_VERIFY")
+_FUSED_GDN_CATCHUP_DEFAULT = _env_flag("MLX_QWEN4_FUSED_GDN_CATCHUP")
+_FUSED_GDN_CATCHUP_SCOPE = ContextVar(
+    "qwen4_fused_gdn_catchup_scope", default=False
+)
 _FUSED_GDN_VERIFY_MODES = ("stock", "fused")
+
+
+@contextmanager
+def _gdn_catchup_scope(enabled: bool):
+    token = _FUSED_GDN_CATCHUP_SCOPE.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _FUSED_GDN_CATCHUP_SCOPE.reset(token)
 # Distinct decline reasons a layer's durable verify histogram will key on
 # before folding the tail into ``other``; admission reasons embed widths and
 # shapes, so the bound is what keeps a long-lived server's counter finite.
@@ -1201,6 +1217,9 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         self.fused_gdn_verify_calls = 0
         self.fused_gdn_verify_fallbacks = 0
         self.fused_gdn_verify_last_fallback = None
+        self.fused_gdn_catchup_calls = 0
+        self.fused_gdn_catchup_fallbacks = 0
+        self.fused_gdn_catchup_last_fallback = None
         # Durable decline histogram: ``last_fallback`` is cleared by the next
         # admitted call, so it cannot receipt a run that declines then succeeds.
         # Set through ``object`` and mutated in place so this dict stays out of
@@ -1274,7 +1293,12 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         reasons[reason] = reasons.get(reason, 0) + 1
         return None
 
-    def _try_fused_verify(self, qkv, z, b, a, mask, cache):
+    def _fused_gdn_catchup_fallback(self, reason: str):
+        self.fused_gdn_catchup_fallbacks += 1
+        self.fused_gdn_catchup_last_fallback = reason
+        return None
+
+    def _try_fused_verify(self, qkv, z, b, a, mask, cache, *, catchup=False):
         """Fuse a B=1 speculative verify block and record its restore points.
 
         The stock path records a replay closure that recomputes the recurrence
@@ -1282,13 +1306,23 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
         kernel's own per-token snapshots instead, which are bit-identical to
         that replay and cost no recomputation.
         """
-        if self.fused_gdn_verify_mode == "stock":
+        fallback = (
+            self._fused_gdn_catchup_fallback
+            if catchup
+            else self._fused_gdn_verify_fallback
+        )
+        if not catchup and self.fused_gdn_verify_mode == "stock":
             return None
         if cache is None or cache[0] is None or cache[1] is None:
-            return self._fused_gdn_verify_fallback("uninitialized cache")
+            return fallback("uninitialized cache")
         describe = getattr(cache, "rollback_spans", None)
-        if describe is None or not callable(getattr(cache, "record_rollback", None)):
-            return self._fused_gdn_verify_fallback("cache lacks rollback records")
+        if catchup:
+            if not callable(describe):
+                return fallback("cache lacks rollback geometry")
+        elif not callable(describe) or not callable(
+            getattr(cache, "record_rollback", None)
+        ):
+            return fallback("cache lacks rollback records")
         steps = int(qkv.shape[1])
         # Host-side geometry of this forward; admission decides whether the
         # mask-free kernel is exact for it (a ragged engine stamps ``lengths``
@@ -1309,6 +1343,7 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             mask=mask,
             spans=spans,
             speculating=bool(getattr(cache, "speculating", False)),
+            catchup=bool(catchup),
             training=bool(self.training),
             sharded=self.sharding_group is not None,
             num_key_heads=self.num_k_heads,
@@ -1319,21 +1354,23 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
             gate_activation=self.norm.activation,
         )
         if not admission.accepted:
-            return self._fused_gdn_verify_fallback(admission.reason)
+            return fallback(admission.reason)
         if not fused_gdn_runtime_supported():
-            return self._fused_gdn_verify_fallback("Metal runtime unavailable")
+            return fallback("Metal runtime unavailable")
 
         try:
-            threadgroup_y = probe_qwen4_fused_gdn_verify(qkv.dtype, steps)
+            probe = (
+                probe_qwen4_fused_gdn_catchup
+                if catchup
+                else probe_qwen4_fused_gdn_verify
+            )
+            threadgroup_y = probe(qkv.dtype, steps)
             if threadgroup_y is None:
-                return self._fused_gdn_verify_fallback("Metal kernel probe declined")
-            (
-                out,
-                conv_state,
-                recurrent_state,
-                state_snapshots,
-                conv_snapshots,
-            ) = qwen4_fused_gdn_verify(
+                return fallback("Metal kernel probe declined")
+            kernel = (
+                qwen4_fused_gdn_catchup if catchup else qwen4_fused_gdn_verify
+            )
+            outputs = kernel(
                 qkv,
                 z,
                 b,
@@ -1347,35 +1384,49 @@ class GatedDeltaNet(Qwen35GatedDeltaNet):
                 self.norm.eps,
                 threadgroup_y=threadgroup_y,
             )
+            out, conv_state, recurrent_state = outputs[:3]
+            if not catchup:
+                state_snapshots, conv_snapshots = outputs[3:]
         except Exception as exc:  # noqa: BLE001 - optional fast path fails closed
-            return self._fused_gdn_verify_fallback(
+            return fallback(
                 f"Metal kernel dispatch failed: {type(exc).__name__}"
             )
 
         # Same record the stock path makes (Qwen4ArraysCache combines it with
         # the PLE half staged earlier in this forward), recorded BEFORE the
         # live slots change so a contract failure leaves the cache untouched.
-        def _rollback(m, conv=conv_snapshots, state=state_snapshots):
-            return [mx.contiguous(conv[:, m - 1]), state[:, m - 1]]
+        if not catchup:
+            def _rollback(m, conv=conv_snapshots, state=state_snapshots):
+                return [mx.contiguous(conv[:, m - 1]), state[:, m - 1]]
 
-        cache.record_rollback(steps, _rollback, [cache[0], cache[1]])
+            cache.record_rollback(steps, _rollback, [cache[0], cache[1]])
         cache[0] = conv_state
         cache[1] = recurrent_state
         cache.advance(steps)
-        self.fused_gdn_verify_calls += 1
-        self.fused_gdn_verify_last_fallback = None
+        if catchup:
+            self.fused_gdn_catchup_calls += 1
+            self.fused_gdn_catchup_last_fallback = None
+        else:
+            self.fused_gdn_verify_calls += 1
+            self.fused_gdn_verify_last_fallback = None
         return self.out_proj(out)
 
     def _try_fused_decode(self, qkv, z, b, a, mask, cache):
         # A speculative verify block (rollback recording, width above one) has
         # its own fused path and counters; single-token forwards, speculating
         # or not, keep the decode admission below.
-        if (
-            cache is not None
-            and getattr(cache, "speculating", False)
-            and qkv.shape[1] > 1
-        ):
-            return self._try_fused_verify(qkv, z, b, a, mask, cache)
+        if cache is not None and qkv.shape[1] > 1:
+            speculating = bool(getattr(cache, "speculating", False))
+            if speculating or _FUSED_GDN_CATCHUP_SCOPE.get():
+                return self._try_fused_verify(
+                    qkv,
+                    z,
+                    b,
+                    a,
+                    mask,
+                    cache,
+                    catchup=not speculating,
+                )
         if self.fused_gdn_decode_mode == "stock":
             return None
         if cache is None or cache[0] is None or cache[1] is None:
@@ -1742,6 +1793,9 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
         "verify_fallbacks": 0,
         "verify_last_fallbacks": {},
         "verify_fallback_reasons": {},
+        "catchup_calls": 0,
+        "catchup_fallbacks": 0,
+        "catchup_last_fallbacks": {},
     }
     for _, module in model.named_modules():
         if not isinstance(module, GatedDeltaNet):
@@ -1767,6 +1821,13 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
         durable = stats["verify_fallback_reasons"]
         for reason, count in module.fused_gdn_verify_fallback_reasons.items():
             durable[reason] = durable.get(reason, 0) + count
+        stats["catchup_calls"] += module.fused_gdn_catchup_calls
+        stats["catchup_fallbacks"] += module.fused_gdn_catchup_fallbacks
+        reason = module.fused_gdn_catchup_last_fallback
+        if reason is not None:
+            stats["catchup_last_fallbacks"][reason] = (
+                stats["catchup_last_fallbacks"].get(reason, 0) + 1
+            )
         if reset:
             module.fused_gdn_decode_calls = 0
             module.fused_gdn_outproj_calls = 0
@@ -1777,6 +1838,9 @@ def qwen4_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> dict[str,
             module.fused_gdn_verify_fallbacks = 0
             module.fused_gdn_verify_last_fallback = None
             module.fused_gdn_verify_fallback_reasons.clear()
+            module.fused_gdn_catchup_calls = 0
+            module.fused_gdn_catchup_fallbacks = 0
+            module.fused_gdn_catchup_last_fallback = None
     return stats
 
 
@@ -5954,6 +6018,13 @@ class Model(nn.Module):
     def mtp_backbone(self, inputs, cache=None):
         """Return LM-head and scheme-A HC hiddens from one trunk forward."""
         return self.language_model.model(inputs, cache, return_hyper=True)
+
+    @contextmanager
+    def gdn_catchup_scope(self, enabled=False):
+        """Limit fused GDN catch-up to the cached-tail target forward."""
+
+        with _gdn_catchup_scope(bool(enabled) or _FUSED_GDN_CATCHUP_DEFAULT):
+            yield
 
     def prefill_prefetch_hook(self):
         """Return a chunk prefetcher when any PLE table is NVMe-backed.

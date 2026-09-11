@@ -4242,6 +4242,7 @@ class BatchGenerator:
                 ),
                 share_qsa_indices=bool(config.get("share_qsa_indices", False)),
                 diagnostic_stages=config.get("_diagnostic_prepare_stages"),
+                fused_gdn_catchup=bool(config.get("fused_gdn_catchup", False)),
             )
             lane.lane.token_prefix = mx.array(history + prompt, dtype=mx.uint32)
             lane.lane.logits_processors = processors
@@ -5083,6 +5084,7 @@ class ParallelSampleGenerator:
                 share_qsa_indices=bool(config.get("share_qsa_indices", False)),
                 record_prefix_fanout=fanout_candidate,
                 diagnostic_stages=config.get("_diagnostic_prepare_stages"),
+                fused_gdn_catchup=bool(config.get("fused_gdn_catchup", False)),
             )
             canonical.lane.token_prefix = mx.array(
                 history + prompt_tail, dtype=mx.uint32

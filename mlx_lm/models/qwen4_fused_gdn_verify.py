@@ -105,6 +105,7 @@ def admit_qwen4_fused_gdn_verify(
     mask: Any,
     spans: Any,
     speculating: bool,
+    catchup: bool = False,
     training: bool,
     sharded: bool,
     num_key_heads: int,
@@ -119,16 +120,25 @@ def admit_qwen4_fused_gdn_verify(
         return FusedGdnAdmission(False, "training")
     if sharded:
         return FusedGdnAdmission(False, "distributed sharding")
-    if not speculating:
-        return FusedGdnAdmission(False, "not a speculative verify")
-    # One predicate for both kernels: the decode admission runs the same test
-    # at width one, because the ragged engine stamps ``lengths`` on a plain
-    # decode slab exactly as it does on a verify slab.
-    refusal = admit_rollback_span(
-        spans, mask, _slab_width(qkv), masked_reason="masked verify"
-    )
-    if refusal is not None:
-        return refusal
+    if catchup:
+        if speculating:
+            return FusedGdnAdmission(False, "catch-up cache is speculating")
+        refusal = admit_rollback_span(
+            spans, mask, _slab_width(qkv), masked_reason="masked catch-up"
+        )
+        if refusal is not None:
+            return refusal
+    else:
+        if not speculating:
+            return FusedGdnAdmission(False, "not a speculative verify")
+        # One predicate for both kernels: the decode admission runs the same
+        # test at width one, because the ragged engine stamps ``lengths`` on a
+        # plain decode slab exactly as it does on a verify slab.
+        refusal = admit_rollback_span(
+            spans, mask, _slab_width(qkv), masked_reason="masked verify"
+        )
+        if refusal is not None:
+            return refusal
     if gate_activation != "sigmoid":
         return FusedGdnAdmission(False, f"output gate {gate_activation!r}")
 
@@ -386,6 +396,51 @@ _SOURCE = r"""
 """
 
 
+def _derive_catchup_source() -> str:
+    """Remove rollback-only stores from the exact verify kernel body.
+
+    Catch-up always commits the full token block, so it needs the output and
+    the two final cache states but none of the per-token restore points.  Keep
+    this as a checked derivation of ``_SOURCE`` so the arithmetic and rounding
+    sequence cannot drift from the already-proven kernel accidentally.
+    """
+
+    source = _SOURCE
+    conv_snapshot_loop = r"""      for (uint p = 1; p <= SNAPS; ++p) {
+        for (uint tap = 0; tap < KEEP; ++tap) {
+          uint row = p + tap;
+          conv_snapshots[((size_t)(p - 1u) * KEEP + tap) * CD + c] =
+              row < KEEP ? conv_state[(size_t)row * CD + c]
+                         : qkv[(size_t)(row - KEEP) * CD + c];
+        }
+      }
+"""
+    state_destination = r"""    device float* state_dst =
+        t < SNAPS ? state_snapshots + ((size_t)t * HV + hv) * DV * DK : so;
+"""
+    state_store = r"""      for (int i = 0; i < NDK; ++i)
+        state_dst[(size_t)dv * DK + NDK * lane + i] = st[j][i];
+"""
+    final_state_store = r"""      if (t + 1u == (uint)S) {
+        for (int i = 0; i < NDK; ++i)
+          so[(size_t)dv * DK + NDK * lane + i] = st[j][i];
+      }
+"""
+    replacements = (
+        (conv_snapshot_loop, ""),
+        (state_destination, ""),
+        (state_store, final_state_store),
+    )
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise RuntimeError("fused GDN catch-up source derivation drifted")
+        source = source.replace(old, new, 1)
+    return source
+
+
+_CATCHUP_SOURCE = _derive_catchup_source()
+
+
 @lru_cache(maxsize=None)
 def _kernel():
     return mx.fast.metal_kernel(
@@ -412,6 +467,30 @@ def _kernel():
         ],
         header=_HEADER,
         source=_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
+@lru_cache(maxsize=None)
+def _catchup_kernel():
+    return mx.fast.metal_kernel(
+        name="qwen4_fused_gdn_catchup",
+        input_names=[
+            "qkv",
+            "z",
+            "b",
+            "a",
+            "conv_state",
+            "conv_weight",
+            "A_log",
+            "dt_bias",
+            "recurrent_state",
+            "norm_weight",
+            "norm_eps",
+        ],
+        output_names=["output", "conv_state_out", "recurrent_state_out"],
+        header=_HEADER,
+        source=_CATCHUP_SOURCE,
         ensure_row_contiguous=True,
     )
 
@@ -492,7 +571,73 @@ def qwen4_fused_gdn_verify(
     return tuple(outputs)
 
 
+def qwen4_fused_gdn_catchup(
+    qkv,
+    z,
+    b,
+    a,
+    conv_state,
+    conv_weight,
+    A_log,
+    dt_bias,
+    recurrent_state,
+    norm_weight,
+    norm_eps: float,
+    *,
+    threadgroup_y: int,
+):
+    """Build the no-rollback catch-up graph for an always-committed block."""
+
+    if threadgroup_y not in _THREADGROUP_Y_CANDIDATES:
+        raise ValueError(
+            f"unsupported threadgroup_y {threadgroup_y}; "
+            f"expected one of {_THREADGROUP_Y_CANDIDATES}"
+        )
+    steps = int(qkv.shape[1])
+    if not 2 <= steps <= MAX_VERIFY_WIDTH_PROVEN:
+        raise ValueError(
+            f"unsupported catch-up width {steps}; "
+            f"expected 2..{MAX_VERIFY_WIDTH_PROVEN}"
+        )
+    outputs = _catchup_kernel()(
+        inputs=[
+            qkv,
+            z,
+            b,
+            a,
+            conv_state,
+            conv_weight,
+            A_log,
+            dt_bias,
+            recurrent_state,
+            norm_weight,
+            float(norm_eps),
+        ],
+        template=[
+            ("T", qkv.dtype),
+            ("HK", NUM_KEY_HEADS),
+            ("HV", NUM_VALUE_HEADS),
+            ("DK", KEY_HEAD_DIM),
+            ("DV", VALUE_HEAD_DIM),
+            ("K", CONV_KERNEL),
+            ("S", steps),
+            ("TY", threadgroup_y),
+            ("RATIO", NUM_VALUE_HEADS // NUM_KEY_HEADS),
+        ],
+        grid=(32, threadgroup_y, NUM_VALUE_HEADS),
+        threadgroup=(32, threadgroup_y, 1),
+        output_shapes=[
+            (1, steps, VALUE_DIM),
+            (1, CONV_KERNEL - 1, CONV_DIM),
+            (1, NUM_VALUE_HEADS, VALUE_HEAD_DIM, KEY_HEAD_DIM),
+        ],
+        output_dtypes=[qkv.dtype, qkv.dtype, mx.float32],
+    )
+    return tuple(outputs)
+
+
 _PROBED_STEPS: dict[int, Optional[int]] = {}
+_PROBED_CATCHUP_STEPS: dict[int, Optional[int]] = {}
 _PROBE_LOCK = Lock()
 
 
@@ -569,10 +714,81 @@ def probe_qwen4_fused_gdn_verify(dtype, steps: int) -> Optional[int]:
         return result
 
 
+def probe_qwen4_fused_gdn_catchup(dtype, steps: int) -> Optional[int]:
+    """Compile-and-run the no-snapshot catch-up specialization once."""
+
+    steps = int(steps)
+    if steps in _PROBED_CATCHUP_STEPS:
+        return _PROBED_CATCHUP_STEPS[steps]
+    with _PROBE_LOCK:
+        if steps in _PROBED_CATCHUP_STEPS:
+            return _PROBED_CATCHUP_STEPS[steps]
+        if (
+            not 2 <= steps <= MAX_VERIFY_WIDTH_PROVEN
+            or not fused_gdn_runtime_supported()
+        ):
+            _PROBED_CATCHUP_STEPS[steps] = None
+            return None
+        start = probe_qwen4_fused_gdn_decode(dtype)
+        if start is None:
+            _PROBED_CATCHUP_STEPS[steps] = None
+            return None
+
+        qkv = mx.zeros((1, steps, CONV_DIM), dtype=dtype)
+        z = mx.zeros((1, steps, VALUE_DIM), dtype=dtype)
+        gates = mx.zeros((1, steps, NUM_VALUE_HEADS), dtype=dtype)
+        conv_state = mx.zeros((1, CONV_KERNEL - 1, CONV_DIM), dtype=dtype)
+        conv_weight = mx.zeros((CONV_DIM, CONV_KERNEL, 1), dtype=dtype)
+        recurrent_state = mx.zeros(
+            (1, NUM_VALUE_HEADS, VALUE_HEAD_DIM, KEY_HEAD_DIM), dtype=mx.float32
+        )
+        vector = mx.zeros((NUM_VALUE_HEADS,), dtype=dtype)
+        A_log = mx.zeros((NUM_VALUE_HEADS,), dtype=mx.float32)
+        norm_weight = mx.ones((VALUE_HEAD_DIM,), dtype=dtype)
+        result: Optional[int] = None
+        for threadgroup_y in [c for c in _THREADGROUP_Y_CANDIDATES if c <= start]:
+            try:
+                outputs = qwen4_fused_gdn_catchup(
+                    qkv,
+                    z,
+                    gates,
+                    gates,
+                    conv_state,
+                    conv_weight,
+                    A_log,
+                    vector,
+                    recurrent_state,
+                    norm_weight,
+                    1.0e-6,
+                    threadgroup_y=threadgroup_y,
+                )
+                mx.eval(*outputs)
+                result = threadgroup_y
+                break
+            except ValueError as exc:
+                if "threads per threadgroup" in str(exc):
+                    continue
+                logger.info("Qwen4 fused GDN catch-up probe failed: %s", exc)
+                break
+            except RuntimeError as exc:
+                logger.info(
+                    "Qwen4 fused GDN catch-up width %d unavailable at "
+                    "threadgroup_y=%d: %s",
+                    steps,
+                    threadgroup_y,
+                    exc,
+                )
+                continue
+        _PROBED_CATCHUP_STEPS[steps] = result
+        return result
+
+
 __all__ = [
     "MAX_VERIFY_STEPS",
     "MAX_VERIFY_WIDTH_PROVEN",
     "admit_qwen4_fused_gdn_verify",
+    "probe_qwen4_fused_gdn_catchup",
     "probe_qwen4_fused_gdn_verify",
+    "qwen4_fused_gdn_catchup",
     "qwen4_fused_gdn_verify",
 ]
