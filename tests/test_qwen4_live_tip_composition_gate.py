@@ -44,6 +44,7 @@ def test_profiles_are_mechanically_distinct():
     assert profile_settings("private_delta")["qsa_exact_set_fold"] == "off"
     assert profile_settings("exact_set")["qsa_exact_set_fold"] == "on"
     assert profile_settings("physical")["branch_mode"] == "physical"
+    assert profile_settings("segmented_then_physical")["promote_after_first"]
 
 
 @pytest.mark.parametrize(

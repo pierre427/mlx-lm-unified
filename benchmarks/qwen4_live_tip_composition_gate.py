@@ -38,7 +38,12 @@ except ModuleNotFoundError:  # Imported as benchmarks.* by the test suite.
 
 
 SCHEMA = "mlx-uag.qwen4-live-tip-composition-gate.v1"
-PROFILES = ("segmented", "private_delta", "exact_set")
+PROFILES = (
+    "segmented",
+    "segmented_then_physical",
+    "private_delta",
+    "exact_set",
+)
 
 
 def profile_settings(profile: str) -> dict[str, Any]:
@@ -48,6 +53,7 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_private_delta": "off",
             "qsa_exact_set_fold": "off",
             "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
         }
     if profile == "segmented":
         return {
@@ -55,6 +61,15 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_private_delta": "off",
             "qsa_exact_set_fold": "off",
             "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+        }
+    if profile == "segmented_then_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "off",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": True,
         }
     if profile == "private_delta":
         return {
@@ -62,6 +77,7 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_private_delta": "on",
             "qsa_exact_set_fold": "off",
             "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
         }
     if profile == "exact_set":
         return {
@@ -69,6 +85,7 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_private_delta": "on",
             "qsa_exact_set_fold": "on",
             "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
         }
     raise ValueError(f"unknown profile {profile!r}")
 

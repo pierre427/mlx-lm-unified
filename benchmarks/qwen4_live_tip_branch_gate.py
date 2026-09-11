@@ -103,6 +103,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "qsa_private_delta_min_context": getattr(
                 args, "qsa_private_delta_min_context", None
             ),
+            "promote_after_first": getattr(args, "promote_after_first", False),
         },
     }
 
@@ -345,6 +346,20 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     branch_rows = [
         [int(output.token) for output in outputs] for outputs in proposal.outputs
     ]
+    promotion_ms = 0.0
+    if getattr(args, "promote_after_first", False):
+        if args.branch_mode != "segmented":
+            raise ValueError("post-first promotion requires a segmented branch")
+        promotion_started = time.perf_counter_ns()
+        emptied, promoted_rows = detach_self_mtp_lanes(
+            model, branch_batch, [0, 1]
+        )
+        if emptied.lanes or len(promoted_rows) != 2:
+            raise RuntimeError("failed to detach rows for physical promotion")
+        branch_batch = attach_self_mtp_lanes(model, None, promoted_rows)
+        mx.eval(_batch_state_values(branch_batch))
+        mx.synchronize()
+        promotion_ms = (time.perf_counter_ns() - promotion_started) / 1e6
     followup_tokens = sum(emitted)
     followup_started = time.perf_counter_ns()
     for _ in range(args.measured_cycles - 1):
@@ -400,6 +415,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "branch_ready_ms": (branch_ready_ns - branch_started) / 1e6,
         "first_proposal_verify_ms": (first_output_ns - branch_ready_ns) / 1e6,
         "first_commit_ms": (first_commit_ns - first_output_ns) / 1e6,
+        "promotion_after_first_ms": promotion_ms,
         "branch_to_first_output_ms": (first_output_ns - branch_started) / 1e6,
         "branch_to_first_commit_ms": (first_commit_ns - branch_started) / 1e6,
         "live_tip_to_first_commit_ms": (first_commit_ns - last_warm_ns) / 1e6,
@@ -549,6 +565,7 @@ def parse_args() -> argparse.Namespace:
         "--qsa-exact-set-fold", choices=("default", "on", "off"), default="default"
     )
     parser.add_argument("--qsa-private-delta-min-context", type=int)
+    parser.add_argument("--promote-after-first", action="store_true")
     parser.add_argument(
         "--share-qsa-indices",
         action=argparse.BooleanOptionalAction,
