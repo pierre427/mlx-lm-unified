@@ -1,3 +1,4 @@
+from itertools import product
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -19,9 +20,18 @@ from mlx_lm.hybrid_speculative import (
 from mlx_lm.segmented_self_mtp import (
     SegmentedLaneTransaction,
     require_segmented_self_mtp_engagement,
+    require_true_batched_segmented_self_mtp_engagement,
     segmented_self_mtp_enabled,
     segmented_self_mtp_stats,
 )
+
+
+def _tree_arrays(value):
+    if isinstance(value, mx.array):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _tree_arrays(item)
 
 
 @pytest.fixture(autouse=True)
@@ -519,6 +529,7 @@ def test_commit_failure_clears_open_row_ownership_and_poisons():
 def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
     from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
 
+    segmented_self_mtp_stats(reset=True)
     model = _tiny_qwen4_model()
     detached = [
         _prepare_lane(model, 0, [1, 2, 3, 4]),
@@ -533,6 +544,23 @@ def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
     ]
     state = attach_segmented_self_mtp_lanes(model, None, detached)
     accepted = iter([0, 1])
+    mtp_calls = 0
+    target_calls = 0
+    original_mtp_step = model.mtp_step
+    original_mtp_backbone = model.mtp_backbone
+
+    def counted_mtp_step(*args, **kwargs):
+        nonlocal mtp_calls
+        mtp_calls += 1
+        return original_mtp_step(*args, **kwargs)
+
+    def counted_mtp_backbone(*args, **kwargs):
+        nonlocal target_calls
+        target_calls += 1
+        return original_mtp_backbone(*args, **kwargs)
+
+    model.mtp_step = counted_mtp_step
+    model.mtp_backbone = counted_mtp_backbone
 
     def force(logprobs, *_args, **_kwargs):
         count = next(accepted)
@@ -550,7 +578,27 @@ def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
         emitted_counts=[len(row) for row in proposal.outputs],
         terminal=[False, False],
     )
+    counters = segmented_self_mtp_stats()
+    require_true_batched_segmented_self_mtp_engagement(counters)
+    assert counters["batched_target_forwards"] == 1
+    assert counters["batched_draft_forwards"] == 2
+    assert target_calls == 1
+    assert mtp_calls == 2
+    assert counters["b1_target_forwards"] == 0
+    assert counters["physical_b2_formations"] == 0
+    assert counters["segmented_attention_calls"] > 0
+    assert counters["full_prefix_materializations"] == 0
+    assert counters["full_prefix_materialized_bytes"] == 0
+    assert counters["row_state_splits"] > 0
     assert [transaction.position for transaction in state.transactions] == [5, 7]
+    compute_caches = state._segmented_caches
+    assert compute_caches is not None
+    with pytest.raises(RuntimeError, match="forbids dense index-ledger"):
+        compute_caches.target[1].update_index_keys(mx.zeros((2, 1, 1)))
+    with pytest.raises(RuntimeError, match="forbids dense K/V"):
+        compute_caches.target[1].update_and_fetch(
+            mx.zeros((2, 1, 1, 1)), mx.zeros((2, 1, 1, 1))
+        )
     planes = {
         base.kind.value
         for base in state.transactions[0].lineage.current_view().bases
@@ -563,6 +611,7 @@ def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
         side_effect=force,
     ):
         proposal = propose_batched_self_mtp(model, state)
+    assert state._segmented_caches is compute_caches
     commit_batched_self_mtp(
         state,
         proposal,
@@ -573,6 +622,7 @@ def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
 
     state, lanes = detach_self_mtp_lanes(model, state, [0, 1])
     assert not state.lanes
+    assert state._segmented_caches is None
     for item in lanes:
         target_position = max(
             int(getattr(cache, "offset", 0)) for cache in item.caches.target
@@ -583,6 +633,110 @@ def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
         assert draft_position == target_position - 1
     state = attach_segmented_self_mtp_lanes(model, state, lanes)
     assert len(state.lanes) == 2
+    close_segmented_self_mtp_state(state)
+
+
+@pytest.mark.parametrize("accepts", list(product(range(3), repeat=2)))
+def test_true_batched_segmented_matches_serial_b1_oracle(monkeypatch, accepts):
+    from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
+
+    model = _tiny_qwen4_model()
+    prompts = ([1, 2, 3, 4], [5, 6, 7, 8, 9])
+
+    def run(true_batched):
+        monkeypatch.setenv(
+            "MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1" if true_batched else "0"
+        )
+        detached = [
+            _prepare_lane(model, uid, prompt)
+            for uid, prompt in enumerate(prompts)
+        ]
+        state = attach_segmented_self_mtp_lanes(model, None, detached)
+        accepted = iter(accepts)
+
+        def force(logprobs, *_args, **_kwargs):
+            count = next(accepted)
+            return count, int(mx.argmax(logprobs[count]).item())
+
+        with patch(
+            "mlx_lm.hybrid_speculative._batched_residual_verify",
+            side_effect=force,
+        ):
+            proposal = propose_batched_self_mtp(model, state)
+        commit_batched_self_mtp(
+            state,
+            proposal,
+            emitted_counts=[len(row) for row in proposal.outputs],
+            terminal=[False, False],
+        )
+        state, rows = detach_self_mtp_lanes(model, state, [0, 1])
+        return proposal, rows
+
+    serial, serial_rows = run(False)
+    segmented, segmented_rows = run(True)
+    assert segmented.lane_uids == serial.lane_uids
+    assert segmented.draft_depths == serial.draft_depths
+    assert segmented.accepted_lengths == serial.accepted_lengths
+    assert tuple(tuple(token.token for token in row) for row in segmented.outputs) == (
+        tuple(tuple(token.token for token in row) for row in serial.outputs)
+    )
+    for expected, actual in zip(serial_rows, segmented_rows):
+        assert actual.lane.cur == expected.lane.cur
+        assert actual.lane.pending_ts == expected.lane.pending_ts
+        assert mx.allclose(
+            actual.lane.seed_h,
+            expected.lane.seed_h,
+            rtol=1e-5,
+            atol=1e-6,
+        ).item()
+        assert mx.array_equal(actual.lane.rng.key, expected.lane.rng.key).item()
+        assert actual.lane.stats.draft_proposed == expected.lane.stats.draft_proposed
+        assert actual.lane.stats.draft_accepted == expected.lane.stats.draft_accepted
+        for expected_cache, actual_cache in zip(
+            expected.caches.target + expected.caches.draft,
+            actual.caches.target + actual.caches.draft,
+        ):
+            expected_arrays = list(_tree_arrays(expected_cache.state))
+            actual_arrays = list(_tree_arrays(actual_cache.state))
+            assert len(actual_arrays) == len(expected_arrays)
+            for expected_array, actual_array in zip(expected_arrays, actual_arrays):
+                if expected_array.dtype in (mx.uint32, mx.int32, mx.int64):
+                    assert mx.array_equal(actual_array, expected_array).item()
+                else:
+                    assert mx.allclose(
+                        actual_array, expected_array, rtol=1e-5, atol=1e-6
+                    ).item()
+
+
+def test_true_batched_segmented_shared_qsa_cycle_is_disarmed():
+    from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
+
+    model = _tiny_qwen4_model()
+    detached = [
+        _prepare_lane(
+            model,
+            uid,
+            prompt,
+            share_qsa_indices=True,
+        )
+        for uid, prompt in enumerate(([1, 2, 3, 4], [5, 6, 7, 8, 9]))
+    ]
+    state = attach_segmented_self_mtp_lanes(model, None, detached)
+    proposal = propose_batched_self_mtp(model, state)
+    assert state._batched_state is not None
+    qsa = state._batched_state.caches.draft[0]
+    assert qsa._mtp_share_topk is False
+    assert qsa._mtp_shared_topk is None
+    commit_batched_self_mtp(
+        state,
+        proposal,
+        emitted_counts=[len(row) for row in proposal.outputs],
+        terminal=[False, False],
+    )
+    for pair in state.row_caches:
+        for cache in pair.draft:
+            assert cache._mtp_share_topk is False
+            assert cache._mtp_shared_topk is None
     close_segmented_self_mtp_state(state)
 
     zero = _prepare_lane(model, 3, [11, 12, 13, 14])

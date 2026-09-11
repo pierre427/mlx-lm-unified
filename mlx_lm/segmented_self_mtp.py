@@ -38,6 +38,19 @@ _ZERO = {
     "physical_b2_formations": 0,
     "b1_target_forwards": 0,
     "b1_draft_forwards": 0,
+    "batched_target_forwards": 0,
+    "batched_draft_forwards": 0,
+    "true_batched_requests": 0,
+    "true_batched_engaged": 0,
+    "true_batched_declined": 0,
+    "layer_local_materializations": 0,
+    "recurrent_state_materializations": 0,
+    "recurrent_state_materialized_bytes": 0,
+    "row_state_splits": 0,
+    "segmented_attention_calls": 0,
+    "independent_lineages_consumed": 0,
+    "full_prefix_materializations": 0,
+    "full_prefix_materialized_bytes": 0,
     "transaction_branches": 0,
     "transaction_promotions": 0,
     "transaction_rejections": 0,
@@ -73,6 +86,23 @@ def segmented_self_mtp_timing_enabled() -> bool:
     }
 
 
+def true_batched_segmented_self_mtp_enabled(value: bool | None = None) -> bool:
+    """Use one batched forward over segmented rows.
+
+    The consumer defaults on *inside* the separately default-off segmented
+    experiment.  Setting this knob to zero retains the original serial B1
+    consumer as an exact control/fallback.
+    """
+    if value is not None:
+        return bool(value)
+    return os.environ.get("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def note_segmented_self_mtp(key: str, amount: int = 1) -> None:
     if key not in _STATS:
         raise KeyError(f"unknown segmented self-MTP counter: {key}")
@@ -87,6 +117,9 @@ def segmented_self_mtp_stats(*, reset: bool = False) -> dict[str, Any]:
             _STATS.clear()
             _STATS.update(_ZERO)
     result["environment_enabled"] = segmented_self_mtp_enabled()
+    result["true_batched_environment_enabled"] = (
+        true_batched_segmented_self_mtp_enabled()
+    )
     result["timing_enabled"] = segmented_self_mtp_timing_enabled()
     result["counter_scope"] = "segmented_mechanism_only"
     # These describe the added ledger/scheduler mechanism, not the model
@@ -103,8 +136,12 @@ def require_segmented_self_mtp_engagement(
     counters = segmented_self_mtp_stats() if counters is None else counters
     if int(counters.get("engaged", 0)) < 1:
         raise RuntimeError("segmented self-MTP arm never engaged")
-    if int(counters.get("b1_target_forwards", 0)) < 1:
-        raise RuntimeError("segmented self-MTP arm ran no B1 target forward")
+    if (
+        int(counters.get("b1_target_forwards", 0))
+        + int(counters.get("batched_target_forwards", 0))
+        < 1
+    ):
+        raise RuntimeError("segmented self-MTP arm ran no target forward")
     if int(counters.get("physical_b2_formations", 0)):
         raise RuntimeError("segmented self-MTP arm formed a physical B2 cache")
     if int(counters.get("transaction_branches", 0)) < 1:
@@ -115,6 +152,27 @@ def require_segmented_self_mtp_engagement(
         < 1
     ):
         raise RuntimeError("segmented self-MTP arm completed no transaction")
+
+
+def require_true_batched_segmented_self_mtp_engagement(
+    counters: dict[str, Any] | None = None,
+) -> None:
+    counters = segmented_self_mtp_stats() if counters is None else counters
+    require_segmented_self_mtp_engagement(counters)
+    if int(counters.get("true_batched_engaged", 0)) < 1:
+        raise RuntimeError("true batched segmented consumer never engaged")
+    if int(counters.get("batched_target_forwards", 0)) < 1:
+        raise RuntimeError("true batched segmented consumer ran no target batch")
+    if int(counters.get("b1_target_forwards", 0)):
+        raise RuntimeError("true batched segmented consumer fell back to serial B1")
+    if int(counters.get("segmented_attention_calls", 0)) < 1:
+        raise RuntimeError(
+            "true batched segmented consumer used no segmented attention"
+        )
+    if int(counters.get("full_prefix_materialized_bytes", 0)):
+        raise RuntimeError(
+            "true batched segmented consumer materialized full-prefix B2"
+        )
 
 
 @dataclass(frozen=True)
@@ -548,7 +606,9 @@ __all__ = [
     "SegmentedLaneTransaction",
     "note_segmented_self_mtp",
     "require_segmented_self_mtp_engagement",
+    "require_true_batched_segmented_self_mtp_engagement",
     "segmented_self_mtp_enabled",
     "segmented_self_mtp_stats",
     "segmented_self_mtp_timing_enabled",
+    "true_batched_segmented_self_mtp_enabled",
 ]

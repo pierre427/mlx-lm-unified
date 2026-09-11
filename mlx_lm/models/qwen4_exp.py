@@ -5253,11 +5253,43 @@ class Attention(nn.Module):
         object.__setattr__(self, "_qsa_fused_cache", (key, table))
         return table
 
-    def __call__(self, x: mx.array, mask: mx.array, cache: Optional[QSAKVCache]):
+    def _project_segmented_qsa(self, x: mx.array):
+        """Project a segmented batch once before its B1 attention reductions."""
+        if _QSA_FUSED_PROJ and not self.training:
+            table = self._fused_projection_table()
+            if table is not None:
+                width_q = self.num_heads * self.head_dim * 2
+                width_kv = self.num_kv_heads * self.head_dim
+                return mx.split(
+                    _table_matmul(table, x),
+                    [width_q, width_q + width_kv, width_q + 2 * width_kv],
+                    axis=-1,
+                )
+        return (
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x),
+            self.indexer.index_qk_proj(x),
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: mx.array,
+        cache: Optional[QSAKVCache],
+        *,
+        _projected=None,
+        _return_pre_o=False,
+    ):
+        segmented_consumer = getattr(cache, "segmented_attention", None)
+        if segmented_consumer is not None and _projected is None:
+            return segmented_consumer(self, x, mask)
         batch, length, _ = x.shape
         quantized_indexed = qsa_indexed_quantized_cache_config(cache)
-        fused_index_qk = None
-        if _QSA_FUSED_PROJ and not self.training:
+        qg = k_flat = v_flat = fused_index_qk = None
+        if _projected is not None:
+            qg, k_flat, v_flat, fused_index_qk = _projected
+        elif _QSA_FUSED_PROJ and not self.training:
             table = self._fused_projection_table()
             if table is not None:
                 width_q = self.num_heads * self.head_dim * 2
@@ -5375,7 +5407,7 @@ class Attention(nn.Module):
             if (use_nax or use_indexed or use_gather)
             else selection.dense_mask()
         )
-        if fused_index_qk is None:
+        if qg is None:
             qg = self.q_proj(x)
             k_flat = self.k_proj(x)
             v_flat = self.v_proj(x)
@@ -5475,6 +5507,8 @@ class Attention(nn.Module):
                 q, k, v, cache=cache, scale=self.scale, mask=sparse_mask
             )
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        if _return_pre_o:
+            return out, gate
         return self.o_proj(out * mx.sigmoid(gate))
 
 

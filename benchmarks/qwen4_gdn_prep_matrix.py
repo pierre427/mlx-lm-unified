@@ -52,6 +52,7 @@ from mlx_lm.generate import ParallelSampleGenerator, StopSequenceMatcher
 from mlx_lm.sample_utils import LaneRNG
 from mlx_lm.segmented_self_mtp import (
     require_segmented_self_mtp_engagement,
+    require_true_batched_segmented_self_mtp_engagement,
     segmented_self_mtp_stats,
 )
 from mlx_lm.utils import load
@@ -228,7 +229,7 @@ def _require_receipts(arm):
         raise AssertionError(f"{variant}: fan-out silently declined")
     segmented = arm["segmented_delta"]
     if wants_segmented:
-        require_segmented_self_mtp_engagement(segmented)
+        require_true_batched_segmented_self_mtp_engagement(segmented)
     elif segmented["requests"] or segmented["engaged"]:
         raise AssertionError(f"{variant}: segmented self-MTP unexpectedly engaged")
 

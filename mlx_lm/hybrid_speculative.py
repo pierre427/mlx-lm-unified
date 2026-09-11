@@ -365,8 +365,9 @@ class BatchedSelfMTPState:
 class SegmentedSelfMTPState:
     """Independent concrete B1 caches under one scheduler cohort.
 
-    Model calls remain B1 and no merged cache object exists. Each row carries
-    a generation-safe aligned-plane transaction used only at commit.
+    Persistent storage remains B1.  An optional transient batched compute view
+    streams the model once while each row carries a generation-safe aligned-
+    plane transaction used only at commit.
     """
 
     lanes: List[SelfMTPLane]
@@ -384,6 +385,12 @@ class SegmentedSelfMTPState:
     )
     _row_proposals: List["SelfMTPCycleResult"] = field(
         default_factory=list, repr=False, compare=False
+    )
+    _batched_state: Optional[BatchedSelfMTPState] = field(
+        default=None, repr=False, compare=False
+    )
+    _segmented_caches: Optional[SelfMTPCachePair] = field(
+        default=None, repr=False, compare=False
     )
     _transaction_branches: List[Any] = field(
         default_factory=list, repr=False, compare=False
@@ -2237,6 +2244,7 @@ def attach_segmented_self_mtp_lanes(
         note_segmented_self_mtp("requests")
         note_segmented_self_mtp("engaged")
     else:
+        batch._segmented_caches = None
         batch.lanes.extend(item.lane for item in joining)
         batch.row_caches.extend(item.caches for item in joining)
         batch.transactions.extend(transactions)
@@ -2273,6 +2281,8 @@ def close_segmented_self_mtp_state(batch: SegmentedSelfMTPState) -> None:
     batch.transactions.clear()
     batch._row_states.clear()
     batch._row_proposals.clear()
+    batch._batched_state = None
+    batch._segmented_caches = None
     batch._transaction_branches.clear()
     batch.proposal_open = False
     batch._open_proposal = None
@@ -2284,11 +2294,12 @@ def _propose_segmented_self_mtp(
     model: nn.Module,
     batch: SegmentedSelfMTPState,
 ) -> SelfMTPCycleResult:
-    """Reuse the exact cycle engine once per independent B1 cache row."""
+    """Run one batched cycle over B1 lineages, or the exact serial fallback."""
 
     from .segmented_self_mtp import (
         note_segmented_self_mtp,
         segmented_self_mtp_timing_enabled,
+        true_batched_segmented_self_mtp_enabled,
     )
 
     _require_healthy_self_mtp_batch(batch)
@@ -2313,10 +2324,61 @@ def _propose_segmented_self_mtp(
             batch.lanes, batch.row_caches, batch.transactions
         ):
             transaction.validate(pair, lane, transaction.position)
-            branch = transaction.fork(
-                f"mtp:{batch.membership_epoch}:{lane.uid}"
+            branches.append(
+                transaction.fork(f"mtp:{batch.membership_epoch}:{lane.uid}")
             )
-            branches.append(branch)
+
+        true_batched = true_batched_segmented_self_mtp_enabled()
+        if true_batched:
+            from .segmented_batch_cache import (
+                SegmentedBatchUnsupported,
+                build_segmented_batch_cache_pair,
+            )
+
+            note_segmented_self_mtp("true_batched_requests")
+            compute_caches = batch._segmented_caches
+            if compute_caches is None:
+                try:
+                    compute_caches = build_segmented_batch_cache_pair(
+                        batch.row_caches, note=note_segmented_self_mtp
+                    )
+                except SegmentedBatchUnsupported:
+                    note_segmented_self_mtp("true_batched_declined")
+            if compute_caches is not None:
+                batch._segmented_caches = compute_caches
+                batched_state = BatchedSelfMTPState(
+                    lanes=batch.lanes,
+                    caches=compute_caches,
+                    membership_epoch=batch.membership_epoch,
+                )
+                proposal = _propose_batched_self_mtp_impl(model, batched_state)
+                batch._batched_state = batched_state
+                batch._row_states = []
+                batch._row_proposals = []
+                batch._transaction_branches = branches
+                batch.proposal_open = True
+                batch._open_proposal = proposal
+                note_segmented_self_mtp("true_batched_engaged")
+                note_segmented_self_mtp("batched_target_forwards")
+                note_segmented_self_mtp(
+                    "batched_draft_forwards", max(proposal.draft_depths, default=0)
+                )
+                if timing:
+                    note_segmented_self_mtp(
+                        "proposal_ns", time.perf_counter_ns() - started_ns
+                    )
+                return proposal
+        else:
+            # The control knob may change between cycles in a long-lived
+            # process.  A serial B1 cycle mutates the rows behind a retained
+            # compute view, so discard that view before taking the fallback.
+            batch._segmented_caches = None
+
+        # Exact compatibility fallback for cache formats not covered by the
+        # first true-batched consumer.
+        for lane, pair, transaction in zip(
+            batch.lanes, batch.row_caches, batch.transactions
+        ):
             row_state = BatchedSelfMTPState(
                 lanes=[lane],
                 caches=pair,
@@ -2337,6 +2399,8 @@ def _propose_segmented_self_mtp(
                 pass
         batch.proposal_open = False
         batch._open_proposal = None
+        batch._batched_state = None
+        batch._segmented_caches = None
         _poison_self_mtp_batch(batch, f"segmented proposal failed: {error}")
         note_segmented_self_mtp("failures")
         raise
@@ -2358,6 +2422,7 @@ def _propose_segmented_self_mtp(
     )
     batch._row_states = row_states
     batch._row_proposals = row_proposals
+    batch._batched_state = None
     batch._transaction_branches = branches
     batch.proposal_open = True
     batch._open_proposal = aggregate
@@ -2780,7 +2845,11 @@ def _commit_segmented_self_mtp(
         raise RuntimeError("segmented MTP membership changed during a proposal")
     if proposal.lane_uids != tuple(lane.uid for lane in batch.lanes):
         raise RuntimeError("segmented MTP lane order changed during a proposal")
-    if not (
+    true_batched = batch._batched_state is not None
+    if true_batched:
+        if len(batch._transaction_branches) != len(batch.lanes):
+            raise RuntimeError("segmented transaction ownership is misaligned")
+    elif not (
         len(batch.lanes)
         == len(batch._row_states)
         == len(batch._row_proposals)
@@ -2793,30 +2862,54 @@ def _commit_segmented_self_mtp(
     timing = segmented_self_mtp_timing_enabled()
     started_ns = time.perf_counter_ns() if timing else 0
     try:
-        for row, (row_state, row_proposal, branch, transaction, pair) in enumerate(
-            zip(
+        if true_batched:
+            commit_batched_self_mtp(
+                batch._batched_state,
+                proposal,
+                emitted_counts=emitted_counts,
+                terminal=terminal,
+            )
+            rows = zip(
+                batch._transaction_branches,
+                batch.transactions,
+                batch.row_caches,
+            )
+        else:
+            rows = zip(
                 batch._row_states,
                 batch._row_proposals,
                 batch._transaction_branches,
                 batch.transactions,
                 batch.row_caches,
             )
-        ):
+        for row, values in enumerate(rows):
+            if true_batched:
+                branch, transaction, pair = values
+                row_lane = batch.lanes[row]
+                proposed = proposal.draft_depths[row]
+                accepted = proposal.accepted_lengths[row]
+            else:
+                row_state, row_proposal, branch, transaction, pair = values
+                count = int(emitted_counts[row])
+                is_terminal = bool(terminal[row])
+                commit_batched_self_mtp(
+                    row_state,
+                    row_proposal,
+                    emitted_counts=[count],
+                    terminal=[is_terminal],
+                )
+                row_lane = row_state.lanes[0]
+                proposed = row_proposal.draft_depths[0]
+                accepted = row_proposal.accepted_lengths[0]
             count = int(emitted_counts[row])
             is_terminal = bool(terminal[row])
-            commit_batched_self_mtp(
-                row_state,
-                row_proposal,
-                emitted_counts=[count],
-                terminal=[is_terminal],
-            )
             batch.transactions[row] = transaction.publish(
                 branch,
                 pair,
-                row_state.lanes[0],
+                row_lane,
                 count,
-                proposed=row_proposal.draft_depths[0],
-                accepted=row_proposal.accepted_lengths[0],
+                proposed=proposed,
+                accepted=accepted,
                 zero_rollback_attested=(count == 0 and is_terminal),
             )
     except BaseException as error:
@@ -2829,6 +2922,8 @@ def _commit_segmented_self_mtp(
         batch._open_proposal = None
         batch._row_states.clear()
         batch._row_proposals.clear()
+        batch._batched_state = None
+        batch._segmented_caches = None
         batch._transaction_branches.clear()
         _poison_self_mtp_batch(batch, f"segmented commit failed: {error}")
         note_segmented_self_mtp("failures")
@@ -2838,6 +2933,7 @@ def _commit_segmented_self_mtp(
     batch._open_proposal = None
     batch._row_states.clear()
     batch._row_proposals.clear()
+    batch._batched_state = None
     batch._transaction_branches.clear()
     note_segmented_self_mtp("committed_cycles")
     if timing:
@@ -2993,6 +3089,14 @@ def abort_batched_self_mtp(
             _poison_self_mtp_batch(row_state, "parent segmented proposal aborted")
         batch._row_states.clear()
         batch._row_proposals.clear()
+        if batch._batched_state is not None:
+            batch._batched_state.proposal_open = False
+            batch._batched_state._open_proposal = None
+            _poison_self_mtp_batch(
+                batch._batched_state, "parent segmented proposal aborted"
+            )
+        batch._batched_state = None
+        batch._segmented_caches = None
         batch._transaction_branches.clear()
     batch.proposal_open = False
     batch._open_proposal = None
@@ -3023,6 +3127,7 @@ def detach_self_mtp_lanes(
         return batch, []
 
     if isinstance(batch, SegmentedSelfMTPState):
+        batch._segmented_caches = None
         leaving = set(requested)
         keep = [index for index in range(len(batch.lanes)) if index not in leaving]
         detached = []
