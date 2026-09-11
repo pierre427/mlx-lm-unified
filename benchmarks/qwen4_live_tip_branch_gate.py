@@ -229,6 +229,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         attach_segmented_self_mtp_lanes,
         commit_batched_self_mtp,
         detach_self_mtp_lanes,
+        _self_mtp_group_offset,
         prepare_self_mtp_lane,
         propose_batched_self_mtp,
     )
@@ -286,6 +287,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
             commit_batched_self_mtp,
         )
         warmup_rows[0].extend(int(output.token) for output in proposal.outputs[0])
+    live_tip_position = _self_mtp_group_offset(batch.caches.target)
     mx.synchronize()
     last_warm_ns = time.perf_counter_ns()
 
@@ -295,6 +297,11 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     canonical = rows[0]
     mx.synchronize()
     detached_ns = time.perf_counter_ns()
+    if args.branch_mode == "segmented":
+        # Physical B1 detach deliberately drops any earlier cohort attestation.
+        # This gate creates the sibling from this exact canonical object, so it
+        # can safely attest the new initial cohort at the branch boundary.
+        canonical.shared_qsa_prefix_id = _token_digest(warmup_rows)
 
     idle_wait_ns = 0
     if arm == "idle_live_tip" and args.idle_seconds:
@@ -385,6 +392,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "prepare_ms": (prepared_ns - prepared_started) / 1e6,
         "warmup_ms": (last_warm_ns - prepared_ns) / 1e6,
         "warmup_cycles": args.warmup_cycles,
+        "live_tip_position": live_tip_position,
         "live_tip_detach_ms": (detached_ns - last_warm_ns) / 1e6,
         "warm_to_detach_gap_ms": (detached_ns - last_warm_ns) / 1e6,
         "idle_wait_ms": idle_wait_ns / 1e6,
@@ -406,6 +414,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "token_digest": _token_digest(branch_rows),
         "sibling_state": sibling_state,
         "segmented_delta": segmented_delta,
+        "segmented_receipt": segmented_after,
         "memory": _mlx_memory(mx),
         "system_before": before,
         "system_after": after,

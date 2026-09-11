@@ -20,7 +20,8 @@ def _args(**updates):
         "measured_cycles": 32,
         "reps": 1,
         "candidates": list(PROFILES),
-        "cooldown_seconds": 30.0,
+        "cooldown_seconds": 60.0,
+        "max_closing_drift": 0.05,
     }
     values.update(updates)
     return Namespace(**values)
@@ -52,6 +53,7 @@ def test_profiles_are_mechanically_distinct():
         {"candidates": ["bad"]},
         {"reps": 0},
         {"cooldown_seconds": -1},
+        {"max_closing_drift": 1.1},
     ],
 )
 def test_bad_plans_fail(updates):

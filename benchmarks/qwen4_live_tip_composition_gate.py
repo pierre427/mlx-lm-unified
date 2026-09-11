@@ -85,6 +85,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("reps must be positive")
     if args.cooldown_seconds < 0:
         raise ValueError("cooldown cannot be negative")
+    if not 0 <= args.max_closing_drift <= 1:
+        raise ValueError("max-closing-drift must be between zero and one")
     unknown = sorted(set(args.candidates).difference(PROFILES))
     if unknown:
         raise ValueError(f"unknown candidates: {unknown}")
@@ -98,6 +100,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "warmup_cycles": args.warmup_cycles,
         "measured_cycles": args.measured_cycles,
         "repetitions": args.reps,
+        "max_closing_drift": args.max_closing_drift,
         "candidates": list(args.candidates),
         "orders": {
             profile: [block_order(profile, rep) for rep in range(1, args.reps + 1)]
@@ -129,7 +132,17 @@ def _median(rows: list[dict[str, Any]], key: str) -> float:
 def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     by_candidate: dict[str, Any] = {}
     for candidate in sorted({block["candidate"] for block in blocks}):
-        chosen = [block for block in blocks if block["candidate"] == candidate]
+        all_blocks = [block for block in blocks if block["candidate"] == candidate]
+        chosen = [block for block in all_blocks if block["accepted"]]
+        if not chosen:
+            by_candidate[candidate] = {
+                "accepted_blocks": 0,
+                "discarded_blocks": len(all_blocks),
+                "discard_reasons": sorted(
+                    {reason for block in all_blocks for reason in block["discard_reasons"]}
+                ),
+            }
+            continue
         controls = [row for block in chosen for row in block["rows"] if row["profile"] == "physical"]
         trials = [row for block in chosen for row in block["rows"] if row["profile"] == candidate]
         control_first = _median(controls, "branch_to_first_commit_ms")
@@ -137,6 +150,8 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         control_tps = _median(controls, "aggregate_branch_decode_tps")
         trial_tps = _median(trials, "aggregate_branch_decode_tps")
         by_candidate[candidate] = {
+            "accepted_blocks": len(chosen),
+            "discarded_blocks": len(all_blocks) - len(chosen),
             "samples_per_arm": len(trials),
             "physical_branch_to_first_commit_ms": control_first,
             "candidate_branch_to_first_commit_ms": trial_first,
@@ -179,7 +194,23 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
             candidate_tokens = [row["branch_tokens"] for row in rows if row["profile"] == candidate]
             if any(tokens != control_tokens[0] for tokens in [*control_tokens[1:], *candidate_tokens]):
                 raise AssertionError(f"{candidate} token trace differs from physical control")
-            blocks.append({"candidate": candidate, "repetition": repetition, "rows": rows})
+            controls = [row for row in rows if row["profile"] == "physical"]
+            closing_drift = abs(
+                controls[-1]["aggregate_branch_decode_tps"]
+                - controls[0]["aggregate_branch_decode_tps"]
+            ) / controls[0]["aggregate_branch_decode_tps"]
+            discard_reasons = []
+            if closing_drift > args.max_closing_drift:
+                discard_reasons.append("closing_control_drift")
+            block = {
+                "candidate": candidate,
+                "repetition": repetition,
+                "accepted": not discard_reasons,
+                "closing_control_drift_fraction": closing_drift,
+                "discard_reasons": discard_reasons,
+                "rows": rows,
+            }
+            blocks.append(block)
 
     return {
         "metadata": plan,
@@ -201,7 +232,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branches", type=int, default=2)
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--candidates", nargs="+", choices=PROFILES, default=list(PROFILES))
-    parser.add_argument("--cooldown-seconds", type=float, default=30.0)
+    parser.add_argument("--cooldown-seconds", type=float, default=60.0)
+    parser.add_argument("--max-closing-drift", type=float, default=0.05)
     parser.add_argument("--idle-seconds", type=float, default=0.0)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=20260911)

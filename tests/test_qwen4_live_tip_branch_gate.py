@@ -7,6 +7,7 @@ from benchmarks.qwen4_live_tip_branch_gate import (
     BRANCH_MODES,
     arm_order,
     build_plan,
+    _token_digest,
 )
 
 
@@ -51,16 +52,21 @@ def test_plan_records_composition_mode(mode):
         )
     )
     assert plan["branch_mode"] == mode
-    assert plan["composition"] == {
+    expected = {
         "qsa_private_delta": "on",
         "qsa_exact_set_fold": "off",
         "qsa_private_delta_min_context": 0,
     }
+    assert {key: plan["composition"][key] for key in expected} == expected
 
 
 def test_arm_order_counterbalances():
     assert arm_order(1) == ["warm_live_tip", "idle_live_tip"]
     assert arm_order(2) == ["idle_live_tip", "warm_live_tip"]
+
+
+def test_prefix_attestation_digest_is_order_sensitive():
+    assert _token_digest([[1, 2], [3]]) != _token_digest([[2, 1], [3]])
 
 
 @pytest.mark.parametrize(
