@@ -160,6 +160,9 @@ def _once(model, cached, tail, args, variant):
         "gdn_prefix_fanout_consume": False,
         **config_switches,
     }
+    prepare_stages = {} if args.stage_timing else None
+    if prepare_stages is not None:
+        config["_diagnostic_prepare_stages"] = prepare_stages
     private_delta_override = switches.get("_qsa_private_delta")
     exact_set_override = switches.get("_qsa_exact_set_fold")
     old_private_delta = os.environ.get("MLX_LM_QSA_PRIVATE_DELTA")
@@ -221,6 +224,7 @@ def _once(model, cached, tail, args, variant):
         memory["after_prepare"] = _mlx_memory()
         if args.stage_timing:
             stages["generator_prepare_ms"] = (prepared_ns - stage_started) / 1e6
+            stages.update(prepare_stages)
         rows = [[], []]
         while len(parallel):
             for row, response in parallel.next():

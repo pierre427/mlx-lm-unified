@@ -1880,6 +1880,7 @@ def prepare_self_mtp_lane(
     prefill_step_size: int,
     share_qsa_indices: bool,
     record_prefix_fanout: bool = False,
+    diagnostic_stages: Optional[Dict[str, float]] = None,
 ) -> Tuple[DetachedSelfMTPLane, MTPToken]:
     """Prefill one canonical persistent self-MTP lane without attaching it."""
     if getattr(model, "mtp", None) is None:
@@ -1898,7 +1899,6 @@ def prepare_self_mtp_lane(
         raise TypeError("lane_rng must be a sample_utils.LaneRNG")
     if prompt.ndim != 1 or int(prompt.size) == 0:
         raise ValueError("prompt must be a non-empty rank-1 token array")
-
     transform = _make_sampling_transform(
         sampling_temp, sampling_top_p, sampling_top_k, sampling_min_p
     )
@@ -1916,6 +1916,21 @@ def prepare_self_mtp_lane(
         draft_cache, restored_seed_h = _restore_mtp_state(target_cache, mtp_state)
     _reject_unsupported_self_mtp_caches(draft_cache)
 
+    diagnostic_started_ns = time.perf_counter_ns()
+
+    def finish_diagnostic_stage(name: str) -> None:
+        nonlocal diagnostic_started_ns
+        if diagnostic_stages is None:
+            return
+        mx.synchronize(generation_stream)
+        now_ns = time.perf_counter_ns()
+        diagnostic_stages[name] = diagnostic_stages.get(name, 0.0) + (
+            now_ns - diagnostic_started_ns
+        ) / 1e6
+        diagnostic_started_ns = now_ns
+
+    finish_diagnostic_stage("cache_restore_setup_ms")
+
     processor_prompt = prompt.astype(mx.uint32)
     y = processor_prompt
     prev_h = restored_seed_h
@@ -1923,6 +1938,9 @@ def prepare_self_mtp_lane(
         while y.size > 1:
             n = min(prefill_step_size, int(y.size) - 1)
             _, h_chunk = _mtp_backbone(model, y[:n][None], target_cache)
+            if diagnostic_stages is not None:
+                mx.eval(h_chunk, [c.state for c in target_cache])
+            finish_diagnostic_stage("target_catchup_ms")
             if prev_h is None:
                 hs, ts = h_chunk[:, :-1], y[1:n][None]
             else:
@@ -1930,12 +1948,20 @@ def prepare_self_mtp_lane(
                 ts = y[:n][None]
             if ts.size > 0:
                 model.mtp_step(hs, ts, draft_cache)
+                if diagnostic_stages is not None:
+                    mx.eval([c.state for c in draft_cache])
+            finish_diagnostic_stage("mtp_teacher_force_ms")
             prev_h = h_chunk[:, -1:, :]
             mx.eval([c.state for c in target_cache], [c.state for c in draft_cache])
+            finish_diagnostic_stage("cache_eval_ms")
             y = y[n:]
             mx.clear_cache()
+            finish_diagnostic_stage("cache_clear_ms")
         if prev_h is not None:
             model.mtp_step(prev_h, y[None], draft_cache)
+            if diagnostic_stages is not None:
+                mx.eval([c.state for c in draft_cache])
+        finish_diagnostic_stage("final_mtp_boundary_ms")
         if record_prefix_fanout:
             _start_speculation_or_cleanup(
                 target_cache,
@@ -1944,6 +1970,9 @@ def prepare_self_mtp_lane(
             )
         try:
             logit_hidden, hidden = _mtp_backbone(model, y[None], target_cache)
+            if diagnostic_stages is not None:
+                mx.eval(logit_hidden, hidden, [c.state for c in target_cache])
+            finish_diagnostic_stage("final_target_m1_ms")
             seed_h = hidden[:, -1:, :]
             logits = model.logits(logit_hidden[:, -1:, :])[0, -1]
             logits = _apply_logits_processors(
@@ -1955,6 +1984,9 @@ def prepare_self_mtp_lane(
                 else _temperature_logprobs(logits, sampling_temp)
             )
             cur = _sample_from_logprobs(first_lp, sampling_temp, rng=lane_rng)
+            if diagnostic_stages is not None:
+                mx.eval(first_lp, cur)
+            finish_diagnostic_stage("lm_head_and_sample_ms")
         except BaseException:
             if record_prefix_fanout:
                 _stop_all_speculation(target_cache)
@@ -1986,6 +2018,7 @@ def prepare_self_mtp_lane(
     )
     _eval_self_mtp_lane_state(detached)
     _validate_detached_self_mtp(detached)
+    finish_diagnostic_stage("lane_finalize_ms")
     return detached, MTPToken(cur, first_lp, False)
 
 

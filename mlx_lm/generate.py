@@ -4241,6 +4241,7 @@ class BatchGenerator:
                     config.get("prefill_step_size", self.prefill_step_size)
                 ),
                 share_qsa_indices=bool(config.get("share_qsa_indices", False)),
+                diagnostic_stages=config.get("_diagnostic_prepare_stages"),
             )
             lane.lane.token_prefix = mx.array(history + prompt, dtype=mx.uint32)
             lane.lane.logits_processors = processors
@@ -5081,6 +5082,7 @@ class ParallelSampleGenerator:
                 prefill_step_size=prefill_step_size,
                 share_qsa_indices=bool(config.get("share_qsa_indices", False)),
                 record_prefix_fanout=fanout_candidate,
+                diagnostic_stages=config.get("_diagnostic_prepare_stages"),
             )
             canonical.lane.token_prefix = mx.array(
                 history + prompt_tail, dtype=mx.uint32
