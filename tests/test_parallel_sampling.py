@@ -23,6 +23,7 @@ import io
 import json
 import types
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -35,6 +36,11 @@ from mlx_lm.generate import (
     prefill_prompt_cache,
 )
 from mlx_lm.apc import APCLookup
+from mlx_lm.cache_capsule import (
+    CacheCapsuleGeneration,
+    CacheCapsulePool,
+    prepare_prompt_cache_capsules,
+)
 from mlx_lm.models.cache import KVCache
 from mlx_lm.sample_utils import LaneRNG, make_sampler
 from mlx_lm.server import (
@@ -151,6 +157,58 @@ class TestParallelSampleGenerator(unittest.TestCase):
         # the prompt: the prefix was paid once, before the replication.
         self.assertTrue(forwards)
         self.assertTrue(all(shape[0] == 3 and shape[1] == 1 for shape in forwards))
+
+    def test_prepared_apc_capsule_is_the_first_model_cache_consumer(self):
+        cache = KVCache()
+        prefix = mx.ones((1, 1, 3, 4), dtype=mx.bfloat16)
+        cache.update_and_fetch(prefix, prefix)
+        mx.eval(cache.state)
+        clock = CacheCapsuleGeneration()
+        pool = CacheCapsulePool(clock, enabled=True)
+        prepared = prepare_prompt_cache_capsules(
+            [cache],
+            target_batch=2,
+            generation=clock.current,
+            pool=pool,
+            backend="gpu",
+            source_prefix="parallel-test-apc",
+        )
+        seen = []
+
+        class PreparedCoinModel(CoinModel):
+            def __call__(self, inputs, cache=None):
+                seen.append(
+                    (
+                        tuple(inputs.shape),
+                        tuple(cache[0].keys.shape),
+                        tuple(cache[0].offset.tolist()),
+                    )
+                )
+                B, S = inputs.shape
+                kv = mx.ones((B, 1, S, self.dims), dtype=mx.bfloat16)
+                cache[0].update_and_fetch(kv, kv)
+                logits = mx.full((B, S, VOCAB), -1e9, dtype=mx.float32)
+                logits[:, :, COIN_TOKENS[0]] = 0.0
+                return logits
+
+        parallel = ParallelSampleGenerator(
+            PreparedCoinModel(),
+            [cache],
+            4,
+            2,
+            max_tokens=1,
+            stop_matchers=[StopSequenceMatcher()] * 2,
+            prepared_prompt_cache=prepared.prompt_cache,
+            prepared_prompt_cache_owner=prepared,
+        )
+        try:
+            rows = parallel.next()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(seen[0], ((2, 1), (2, 1, 256, 4), (3, 3)))
+        finally:
+            parallel.close()
+            pool.close()
+        self.assertTrue(all(r.owner.released for r in prepared.receipts))
 
     def test_samples_are_distinct_and_two_sided(self):
         sequences, _ = self._run(n=4, steps=32)
@@ -425,10 +483,13 @@ class _StubAPC(_StubPromptCache):
     def __init__(self, hit_tokens):
         super().__init__()
         self.hit_tokens = hit_tokens
+        self.capsule_generation = CacheCapsuleGeneration()
 
     def lookup(self, model_key, tokens):
         cache = [KVCache()]
         prefill_prompt_cache(CoinModel(), list(tokens[: self.hit_tokens]), cache)
+        cache[0].keys = cache[0].keys.astype(mx.bfloat16)
+        cache[0].values = cache[0].values.astype(mx.bfloat16)
         return APCLookup(
             cache=cache,
             remaining_tokens=list(tokens[self.hit_tokens :]),
@@ -436,6 +497,7 @@ class _StubAPC(_StubPromptCache):
             hit=True,
             hit_kind="prefix",
             miss_reason=None,
+            capsule_generation=self.capsule_generation.current,
         )
 
 
@@ -613,6 +675,26 @@ class TestServeParallelSamples(unittest.TestCase):
         _, items = self._serve(generator, self._args(n=2, max_tokens=2))
         responses = [i for i in items if not isinstance(i, tuple)]
         self.assertEqual(sorted({r.index for r in responses}), [0, 1])
+
+    def test_apc_hit_capsule_reaches_parallel_serving_consumer(self):
+        generator = self._generator()
+        apc = _StubAPC(hit_tokens=3)
+        generator.prompt_cache = apc
+        generator._cache_capsule_pool = CacheCapsulePool(
+            apc.capsule_generation, enabled=True
+        )
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "MLX_LM_CACHE_CAPSULE": "1",
+                "MLX_LM_CACHE_CAPSULE_BACKEND": "gpu",
+            },
+        ):
+            _, items = self._serve(generator, self._args(n=2, max_tokens=2))
+        responses = [i for i in items if not isinstance(i, tuple)]
+        self.assertEqual(sorted({r.index for r in responses}), [0, 1])
+        self.assertGreater(generator._cache_capsule_pool.counters["requests"], 0)
+        generator._cache_capsule_pool.close()
 
     def test_a_request_over_the_state_budget_is_refused(self):
         # The count cap is not a memory bound: n rows replicate the whole

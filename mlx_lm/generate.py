@@ -4875,6 +4875,8 @@ class ParallelSampleGenerator:
                 Mapping[int, Union[int, str]],
             ]
         ] = None,
+        prepared_prompt_cache: Optional[List[Any]] = None,
+        prepared_prompt_cache_owner: Any = None,
         kv_bits: Optional[int] = None,
         kv_group_size: int = 64,
     ):
@@ -4889,6 +4891,7 @@ class ParallelSampleGenerator:
             raise ValueError("each sample needs its own logits_processors list")
 
         self.n = n
+        self._prepared_prompt_cache_owner = prepared_prompt_cache_owner
         history = list(all_tokens or [])
         if self_mtp is None:
             self._generator = BatchGenerator(
@@ -4898,17 +4901,44 @@ class ParallelSampleGenerator:
                 prefill_step_size=prefill_step_size,
                 stream=stream,
             )
-            uids = self._generator.insert(
-                prompts=[[int(seed_token)] for _ in range(n)],
-                max_tokens=[max_tokens] * n,
-                # merge() reads these leaves and creates independent rows.
-                caches=[list(prompt_cache) for _ in range(n)],
-                all_tokens=[list(history) for _ in range(n)],
-                samplers=samplers,
-                logits_processors=logits_processors,
-                stop_matchers=stop_matchers,
-            )
+            if prepared_prompt_cache is None:
+                uids = self._generator.insert(
+                    prompts=[[int(seed_token)] for _ in range(n)],
+                    max_tokens=[max_tokens] * n,
+                    # merge() reads these leaves and creates independent rows.
+                    caches=[list(prompt_cache) for _ in range(n)],
+                    all_tokens=[list(history) for _ in range(n)],
+                    samplers=samplers,
+                    logits_processors=logits_processors,
+                    stop_matchers=stop_matchers,
+                )
+            else:
+                # The cache was materialized from the one shared APC/prefill
+                # result. Enter generation directly so BatchGenerator cannot
+                # merge the same B1 history a second time before the first
+                # authoritative model consumer.
+                uids = list(range(n))
+                matchers = stop_matchers or [StopSequenceMatcher()] * n
+                row_samplers = samplers or [None] * n
+                processors = logits_processors or [[] for _ in range(n)]
+                self._generator._generation_batch = GenerationBatch(
+                    model,
+                    uids,
+                    mx.array([int(seed_token)] * n, dtype=mx.uint32),
+                    prepared_prompt_cache,
+                    [list(history) for _ in range(n)],
+                    row_samplers,
+                    self._generator.sampler,
+                    processors,
+                    matchers,
+                    [max_tokens] * n,
+                )
+                self._generator._uid_count = n
         else:
+            if prepared_prompt_cache is not None:
+                raise ValueError(
+                    "prepared cache capsules are not yet a self-MTP cache ABI"
+                )
             # Route processor-bearing requests to plain BEFORE any self-MTP
             # validation can raise: this branch must fail closed, never crash.
             processors = logits_processors or [[] for _ in range(n)]
@@ -5172,6 +5202,14 @@ class ParallelSampleGenerator:
 
     def close(self):
         self._generator.close()
+        owner = self._prepared_prompt_cache_owner
+        if owner is not None:
+            self._prepared_prompt_cache_owner = None
+            mx.synchronize(self._generator.stream)
+            batch = getattr(self._generator, "_generation_batch", None)
+            if batch is not None:
+                batch.prompt_cache = []
+            owner.close(synchronize=False)
 
 
 @dataclass

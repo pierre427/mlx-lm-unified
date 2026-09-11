@@ -32,6 +32,7 @@ from .cache_planes import (
     PLEResidencyHints,
     PromptHostPlane,
 )
+from .cache_capsule import CacheCapsuleGeneration
 from .models.cache import (
     _copy_prompt_cache_for_restore,
     _mark_prompt_cache_restored,
@@ -89,6 +90,7 @@ class APCLookup:
     sidecar: Any = None
     prep_telemetry: Any = None
     prompt_host: Optional[PromptHostPlane] = None
+    capsule_generation: Optional[int] = None
 
 
 @dataclass
@@ -205,6 +207,13 @@ class AutomaticPrefixCache(LRUPromptCache):
         # the live cache could still serve, so it restarts at every clear.
         self._apc_lifetime = {key: 0 for key in self._STAT_KEYS}
         self._apc_clears = 0
+        self._capsule_generation = CacheCapsuleGeneration()
+
+    @property
+    def capsule_generation(self) -> CacheCapsuleGeneration:
+        """Generation authority for work captured at an APC lookup boundary."""
+
+        return self._capsule_generation
 
     @staticmethod
     def key(
@@ -288,6 +297,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                     False,
                     None,
                     "stale_cow_generation",
+                    capsule_generation=self._capsule_generation.current,
                 )
             self._apc_stats["lookups"] += 1
             self._apc_stats["hits"] += 1
@@ -321,6 +331,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                         "prompt_host",
                         None,
                     ),
+                    capsule_generation=self._capsule_generation.current,
                 )
         try:
             cache, remaining = super().fetch_nearest_cache(key, tokens)
@@ -370,6 +381,7 @@ class AutomaticPrefixCache(LRUPromptCache):
             prompt_host=getattr(
                 getattr(cache, "cow_metadata", None), "prompt_host", None
             ),
+            capsule_generation=self._capsule_generation.current,
         )
 
     def store(
@@ -447,6 +459,7 @@ class AutomaticPrefixCache(LRUPromptCache):
             cache_type=cache_type,
             sidecar=sidecar,
         )
+        self._capsule_generation.advance()
         if before or cow_source is not None:
             live_entries = list(_iter_trie_entries(self._trie))
             live = {id(entry) for entry in live_entries}
@@ -536,6 +549,8 @@ class AutomaticPrefixCache(LRUPromptCache):
             entry.sidecar = None
             entry.nbytes = 0
         entries.clear()
+        if report["entries"]:
+            self._capsule_generation.advance()
 
         for key in self._STAT_KEYS:
             self._apc_lifetime[key] += self._apc_stats[key]
@@ -572,6 +587,8 @@ class AutomaticPrefixCache(LRUPromptCache):
         before = {id(entry): entry for entry in _iter_trie_entries(self._trie)}
         super().trim_to(n_sequences=n_sequences, n_bytes=n_bytes)
         live = {id(entry) for entry in _iter_trie_entries(self._trie)}
+        if live != set(before):
+            self._capsule_generation.advance()
         for ident, entry in before.items():
             if ident not in live and isinstance(
                 entry.prompt_cache, COWFrozenPromptCache

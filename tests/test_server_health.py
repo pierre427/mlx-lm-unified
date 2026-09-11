@@ -64,6 +64,10 @@ class HealthServer:
         response = requests.get(f"http://localhost:{self.port}/health", timeout=10)
         return response.status_code, json.loads(response.text)
 
+    def get_json(self, path):
+        response = requests.get(f"http://localhost:{self.port}{path}", timeout=10)
+        return response.status_code, json.loads(response.text)
+
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -97,6 +101,17 @@ class TestHealthLiveness(unittest.TestCase):
         status, body = server.get_health()
         self.assertEqual(status, 200)
         self.assertEqual(body, {"status": "ok"})
+
+    def test_decode_lane_and_cache_capsule_status_routes_both_respond(self):
+        _generator, server = self.start()
+        status, body = server.get_json("/v1/status/decode-lanes")
+        self.assertEqual(status, 200)
+        self.assertIn("requests", body)
+
+        status, body = server.get_json("/v1/status/cache-capsules")
+        self.assertEqual(status, 200)
+        self.assertIn("enabled", body)
+        self.assertIn("requests", body)
 
     def test_dead_generation_thread_is_503(self):
         # Stop the thread, then clear the stop flag: an exit nobody asked

@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import numpy as np
@@ -16,8 +17,10 @@ from mlx_lm.cache_capsule import (
     KVCacheCapsulePayload,
     StaleCacheCapsule,
     build_kv_cache_capsule_cpu,
+    build_kv_cache_capsule_gpu,
     capture_kv_cache_plane,
     inspect_kv_cache_capsule,
+    prepare_prompt_cache_capsules,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
@@ -122,6 +125,140 @@ class TestCacheCapsule(unittest.TestCase):
             ).item()
         )
         self.assertEqual(product.payload.keys.dtype, mx.bfloat16)
+
+    def test_mixed_prompt_cache_reaches_real_attention_consumer(self):
+        class MergeOnly:
+            def merge(self, caches):
+                return ("ordinary", len(caches))
+
+        clock = CacheCapsuleGeneration()
+        source_cache = _cache(length=7)
+        with CacheCapsulePool(clock, enabled=True) as pool:
+            prepared = prepare_prompt_cache_capsules(
+                [source_cache, MergeOnly()],
+                target_batch=2,
+                generation=clock.current,
+                pool=pool,
+                backend="gpu",
+                source_prefix="test-apc-hit",
+            )
+            self.assertIsNotNone(prepared)
+            self.assertEqual(prepared.capsule_planes, 1)
+            self.assertEqual(prepared.ordinary_planes, 1)
+            restored = prepared.prompt_cache[0]
+            self.assertEqual(restored.keys.shape[0], 2)
+            self.assertEqual(prepared.prompt_cache[1], ("ordinary", 2))
+
+            query = mx.ones((2, 2, 1, 3), dtype=mx.bfloat16)
+            keys, values = restored.keys_and_values()
+            output = mx.fast.scaled_dot_product_attention(
+                query,
+                keys,
+                values,
+                scale=3 ** -0.5,
+            )
+            mx.eval(output)
+            self.assertEqual(output.shape, (2, 2, 1, 3))
+            self.assertTrue(mx.array_equal(output[0], output[1]).item())
+            prepared.close()
+            self.assertTrue(all(r.owner.released for r in prepared.receipts))
+
+    def test_no_eligible_plane_declines_without_replacing_incumbent_merge(self):
+        class MergeOnly:
+            def __init__(self):
+                self.calls = 0
+
+            def merge(self, caches):
+                self.calls += 1
+                return len(caches)
+
+        clock = CacheCapsuleGeneration()
+        plane = MergeOnly()
+        with CacheCapsulePool(clock, enabled=True) as pool:
+            self.assertIsNone(
+                prepare_prompt_cache_capsules(
+                    [plane],
+                    target_batch=2,
+                    generation=clock.current,
+                    pool=pool,
+                )
+            )
+        self.assertEqual(plane.calls, 0)
+
+    def test_restore_failure_releases_current_capsule_owner_and_lease(self):
+        class BackingOwner:
+            def __init__(self):
+                self.releases = 0
+
+            def release(self):
+                self.releases += 1
+
+        backing = BackingOwner()
+        clock = CacheCapsuleGeneration()
+
+        def build_with_backing(source):
+            product = build_kv_cache_capsule_gpu(source)
+            return CacheCapsuleProduct(product.payload, backing_owner=backing)
+
+        with (
+            CacheCapsulePool(clock, enabled=True) as pool,
+            mock.patch(
+                "mlx_lm.cache_capsule.build_kv_cache_capsule_gpu",
+                side_effect=build_with_backing,
+            ),
+            self.assertRaisesRegex(RuntimeError, "consumer sync failed"),
+        ):
+            prepare_prompt_cache_capsules(
+                [_cache()],
+                target_batch=2,
+                generation=clock.current,
+                pool=pool,
+                backend="gpu",
+                synchronize=lambda _payload: (_ for _ in ()).throw(
+                    RuntimeError("consumer sync failed")
+                ),
+            )
+        self.assertEqual(backing.releases, 1)
+
+    def test_close_releases_owner_even_when_stream_synchronize_raises(self):
+        class BackingOwner:
+            def __init__(self):
+                self.releases = 0
+
+            def release(self):
+                self.releases += 1
+
+        backing = BackingOwner()
+        clock = CacheCapsuleGeneration()
+
+        def build_with_backing(source):
+            product = build_kv_cache_capsule_gpu(source)
+            return CacheCapsuleProduct(product.payload, backing_owner=backing)
+
+        with (
+            CacheCapsulePool(clock, enabled=True) as pool,
+            mock.patch(
+                "mlx_lm.cache_capsule.build_kv_cache_capsule_gpu",
+                side_effect=build_with_backing,
+            ),
+        ):
+            prepared = prepare_prompt_cache_capsules(
+                [_cache()],
+                target_batch=2,
+                generation=clock.current,
+                pool=pool,
+                backend="gpu",
+            )
+            with (
+                mock.patch(
+                    "mlx_lm.cache_capsule.mx.synchronize",
+                    side_effect=RuntimeError("stream sync failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "stream sync failed"),
+            ):
+                prepared.close()
+        self.assertEqual(backing.releases, 1)
+        self.assertTrue(all(receipt.owner.released for receipt in prepared.receipts))
 
     def test_captured_source_isolated_from_later_live_cache_write(self):
         clock = CacheCapsuleGeneration()

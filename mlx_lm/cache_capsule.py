@@ -19,12 +19,12 @@ import hashlib
 import threading
 from concurrent.futures import Future, TimeoutError
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
 
-from .models.cache import KVCache
+from .models.cache import BatchKVCache, KVCache
 
 
 class CacheCapsuleError(RuntimeError):
@@ -119,6 +119,54 @@ class CacheCapsuleReceipt:
     fallback_reason: Optional[str]
 
 
+class PreparedPromptCacheCapsules:
+    """Own a mixed capsule/ordinary batched prompt cache until stream drain."""
+
+    def __init__(
+        self,
+        prompt_cache: List[Any],
+        receipts: Sequence[CacheCapsuleReceipt],
+        leases: Sequence["CacheCapsuleLease"],
+        *,
+        backend: str,
+        ordinary_planes: int,
+    ):
+        self.prompt_cache = prompt_cache
+        self.receipts = tuple(receipts)
+        self.leases = tuple(leases)
+        self.backend = str(backend)
+        self.ordinary_planes = int(ordinary_planes)
+        self._closed = False
+
+    @property
+    def capsule_planes(self) -> int:
+        return len(self.receipts)
+
+    def close(self, *, synchronize: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        sync_error = None
+        try:
+            if synchronize:
+                mx.synchronize()
+        except BaseException as error:
+            sync_error = error
+        finally:
+            for lease in reversed(self.leases):
+                lease.close()
+            for receipt in reversed(self.receipts):
+                receipt.owner.release()
+        if sync_error is not None:
+            raise sync_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
 class CacheCapsuleGeneration:
     """Small generation authority shared by APC invalidation and workers."""
 
@@ -166,6 +214,85 @@ def inspect_kv_cache_capsule(
         source_batch=1,
         target_batch=int(target_batch),
         dtype=str(cache.keys.dtype),
+    )
+
+
+def prepare_prompt_cache_capsules(
+    prompt_cache: Sequence[Any],
+    *,
+    target_batch: int,
+    generation: int,
+    pool: "CacheCapsulePool",
+    backend: str = "gpu",
+    fallback: Optional[str] = "gpu",
+    timeout_s: Optional[float] = None,
+    source_prefix: str = "apc",
+    synchronize: Optional[Callable[[KVCacheCapsulePayload], None]] = None,
+) -> Optional[PreparedPromptCacheCapsules]:
+    """Build the first mixed batched cache directly from an APC-restored cache.
+
+    Plain BF16/FP16 ``KVCache`` planes use the capsule ownership path. Every
+    other cache class retains its existing exact ``merge`` implementation.
+    Returning ``None`` means no plane was eligible and lets the caller use its
+    incumbent whole-cache merge without changing behavior.
+    """
+
+    if int(target_batch) < 2:
+        raise ValueError("cache-capsule batch must contain at least two rows")
+    if synchronize is None:
+        synchronize = lambda payload: mx.eval(payload.keys, payload.values)
+    capabilities = [
+        inspect_kv_cache_capsule(cache, target_batch) for cache in prompt_cache
+    ]
+    if not any(capability.supported for capability in capabilities):
+        return None
+    batched = []
+    receipts = []
+    leases = []
+    ordinary = 0
+    try:
+        for index, (cache, capability) in enumerate(
+            zip(prompt_cache, capabilities)
+        ):
+            if capability.supported:
+                source = capture_kv_cache_plane(
+                    cache,
+                    generation=int(generation),
+                    source_id=f"{source_prefix}:plane:{index}",
+                    target_batch=int(target_batch),
+                    verify_raw_bits=pool.verify_raw_bits,
+                )
+                receipt = pool.prepare(
+                    source,
+                    primary=str(backend),
+                    fallback=fallback,
+                    primary_timeout_s=timeout_s,
+                )
+                receipts.append(receipt)
+                lease = receipt.owner.lease()
+                leases.append(lease)
+                restored = lease.restore_batch_kv_cache(synchronize)
+                batched.append(restored)
+                continue
+            merge = getattr(cache, "merge", None)
+            if not callable(merge):
+                raise CacheCapsuleUnsupported(
+                    f"unsupported_nonmergeable_plane:{type(cache).__name__}"
+                )
+            batched.append(merge([cache] * int(target_batch)))
+            ordinary += 1
+    except BaseException:
+        for lease in reversed(leases):
+            lease.close()
+        for receipt in reversed(receipts):
+            receipt.owner.release()
+        raise
+    return PreparedPromptCacheCapsules(
+        batched,
+        receipts,
+        leases,
+        backend=str(backend),
+        ordinary_planes=ordinary,
     )
 
 
@@ -409,6 +536,22 @@ class CacheCapsuleLease:
             (payload.keys, payload.values),
             (str(payload.offset),),
         )
+
+    def restore_batch_kv_cache(
+        self,
+        synchronize: Callable[[KVCacheCapsulePayload], None],
+    ) -> BatchKVCache:
+        """Restore the capsule with the cache API required by batch serving."""
+
+        payload = self.payload_for_consumer(synchronize)
+        batch = int(payload.keys.shape[0])
+        cache = BatchKVCache([0] * batch)
+        cache.keys = payload.keys
+        cache.values = payload.values
+        cache.offset = mx.array([int(payload.offset)] * batch)
+        cache.left_padding = mx.zeros((batch,), dtype=mx.int32)
+        cache._idx = int(payload.offset)
+        return cache
 
     def close(self):
         close_owner = False
@@ -847,10 +990,12 @@ __all__ = [
     "CacheCapsuleUnsupported",
     "KVCacheCapsulePayload",
     "KVCachePlaneSource",
+    "PreparedPromptCacheCapsules",
     "StaleCacheCapsule",
     "build_kv_cache_capsule_cpu",
     "build_kv_cache_capsule_gpu",
     "cache_capsules_enabled",
     "capture_kv_cache_plane",
     "inspect_kv_cache_capsule",
+    "prepare_prompt_cache_capsules",
 ]

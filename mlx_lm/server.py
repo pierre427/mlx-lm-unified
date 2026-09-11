@@ -14,6 +14,8 @@ DECODE_LANE_LOG = _collections.deque(maxlen=64)
 # Completed continuous self-MTP requests, exposed read-only for operators.
 # A configured flag is not proof of engagement; these receipts are.
 SELF_MTP_RECEIPTS = _collections.deque(maxlen=64)
+# Reached-path cache-capsule receipts. Configuration alone is not engagement.
+CACHE_CAPSULE_LOG = _collections.deque(maxlen=64)
 from .megakernel_lane import megakernel_lane_enabled, _text_model as megakernel_text_model
 import math
 import os
@@ -52,6 +54,12 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .apc import AutomaticPrefixCache, MTPAPCSidecar, _walk_cache_entries
+from .cache_capsule import (
+    CacheCapsuleError,
+    CacheCapsulePool,
+    cache_capsules_enabled,
+    prepare_prompt_cache_capsules,
+)
 from .compiled_decode import (
     compiled_decode_context_policy,
     compiled_decode_enabled,
@@ -2207,6 +2215,12 @@ class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
+        capsule_generation = getattr(prompt_cache, "capsule_generation", None)
+        self._cache_capsule_pool = (
+            CacheCapsulePool(capsule_generation)
+            if capsule_generation is not None
+            else None
+        )
         self.requests = Queue()
         self._state_machine_cache = {}
         # The generation thread creates and evaluates this root before use.
@@ -2267,6 +2281,8 @@ class ResponseGenerator:
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
+        if self._cache_capsule_pool is not None:
+            self._cache_capsule_pool.close()
 
     def join(self):
         self._generation_thread.join()
@@ -3125,6 +3141,7 @@ class ResponseGenerator:
         """
         rqueue, request, args = request
         parallel = None
+        prepared_capsules = None
         try:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
@@ -3190,6 +3207,7 @@ class ResponseGenerator:
                 self.cli_args,
                 lookup_self_mtp,
             )
+            lookup = None
             if hasattr(self.prompt_cache, "lookup"):
                 lookup = self.prompt_cache.lookup(
                     prompt_cache_model_key, prompt
@@ -3344,6 +3362,82 @@ class ResponseGenerator:
                 )
                 progress(len(rest) - prefilled, len(rest))
 
+                if (
+                    cache_capsules_enabled()
+                    and lookup is not None
+                    and lookup.hit
+                    and lookup.capsule_generation is not None
+                    and self._cache_capsule_pool is not None
+                ):
+                    backend = os.environ.get(
+                        "MLX_LM_CACHE_CAPSULE_BACKEND", "gpu"
+                    ).strip().lower()
+                    fallback = os.environ.get(
+                        "MLX_LM_CACHE_CAPSULE_FALLBACK", "gpu"
+                    ).strip().lower()
+                    if fallback in {"", "none", "off"}:
+                        fallback = None
+                    timeout_value = os.environ.get(
+                        "MLX_LM_CACHE_CAPSULE_TIMEOUT_MS"
+                    )
+                    timeout_s = (
+                        None
+                        if timeout_value in (None, "")
+                        else max(float(timeout_value), 0.0) / 1000.0
+                    )
+                    try:
+                        prepared_capsules = prepare_prompt_cache_capsules(
+                            cache,
+                            target_batch=n,
+                            generation=lookup.capsule_generation,
+                            pool=self._cache_capsule_pool,
+                            backend=backend,
+                            fallback=fallback,
+                            timeout_s=timeout_s,
+                            source_prefix=(
+                                f"parallel:{ctx.prompt_cache_count}:n{n}"
+                            ),
+                            synchronize=lambda payload: (
+                                mx.eval(payload.keys, payload.values),
+                                mx.synchronize(generation_stream),
+                            ),
+                        )
+                    except (CacheCapsuleError, ValueError) as error:
+                        prepared_capsules = None
+                        CACHE_CAPSULE_LOG.append(
+                            {
+                                "engaged": False,
+                                "reason": f"{type(error).__name__}:{error}",
+                                "n": n,
+                                "cached_tokens": ctx.prompt_cache_count,
+                            }
+                        )
+                        logging.warning(
+                            "APC cache capsule declined; using ordinary "
+                            "batch merge: %s",
+                            error,
+                        )
+                    if prepared_capsules is not None:
+                        CACHE_CAPSULE_LOG.append(
+                            {
+                                "engaged": True,
+                                "backend": prepared_capsules.backend,
+                                "capsule_planes": prepared_capsules.capsule_planes,
+                                "ordinary_planes": prepared_capsules.ordinary_planes,
+                                "n": n,
+                                "cached_tokens": ctx.prompt_cache_count,
+                            }
+                        )
+                        logging.info(
+                            "APC cache capsule engaged: backend=%s planes=%d "
+                            "ordinary=%d n=%d cached=%d",
+                            prepared_capsules.backend,
+                            prepared_capsules.capsule_planes,
+                            prepared_capsules.ordinary_planes,
+                            n,
+                            ctx.prompt_cache_count,
+                        )
+
             rqueue.put(ctx)
             parallel_history = (
                 prompt[: ctx.prompt_cache_count]
@@ -3370,8 +3464,15 @@ class ResponseGenerator:
                 mtp_admission=(
                     parallel_admission if self_mtp is not None else None
                 ),
+                prepared_prompt_cache=(
+                    None
+                    if prepared_capsules is None
+                    else prepared_capsules.prompt_cache
+                ),
+                prepared_prompt_cache_owner=prepared_capsules,
                 **_batched_kv_quantization(self.cli_args, self_mtp),
             )
+            prepared_capsules = None
             logging.info(
                 "Parallel sampling: kind=%s n=%d prompt=%d cached=%d",
                 parallel_kind,
@@ -3440,6 +3541,8 @@ class ResponseGenerator:
         finally:
             if parallel is not None:
                 parallel.close()
+            elif prepared_capsules is not None:
+                prepared_capsules.close()
 
     def _serve_single(self, request, *, tokenized=None):
         rqueue, request, args = request
@@ -4849,6 +4952,19 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(payload).encode())
         elif self.path == "/v1/status/decode-lanes":
             payload = json.dumps({"requests": list(DECODE_LANE_LOG)}, default=str).encode()
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/v1/status/cache-capsules":
+            pool = getattr(self.response_generator, "_cache_capsule_pool", None)
+            payload = json.dumps(
+                {
+                    "enabled": cache_capsules_enabled(),
+                    "pool": None if pool is None else pool.counters,
+                    "requests": list(CACHE_CAPSULE_LOG),
+                },
+                default=str,
+            ).encode()
             self._set_completion_headers(200)
             self.end_headers()
             self.wfile.write(payload)

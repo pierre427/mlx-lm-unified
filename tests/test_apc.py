@@ -36,6 +36,20 @@ class TestAutomaticPrefixCache(unittest.TestCase):
         self.assertEqual(hit.hit_kind, "prefix")
         self.assertEqual(hit.cached_tokens, 3)
         self.assertEqual(hit.remaining_tokens, [4])
+        self.assertIsNotNone(hit.capsule_generation)
+
+    def test_capsule_generation_changes_when_apc_membership_changes(self):
+        apc = AutomaticPrefixCache()
+        key = APCKey("model")
+        apc.store(key, [1, 2], [_state(KVCache(), 2)])
+        first = apc.lookup(key, [1, 2, 3])
+
+        apc.store(key, [1, 2, 3], [_state(KVCache(), 3)])
+        second = apc.lookup(key, [1, 2, 3, 4])
+
+        self.assertGreater(second.capsule_generation, first.capsule_generation)
+        apc.clear(release_memory=False)
+        self.assertGreater(apc.capsule_generation.current, second.capsule_generation)
 
     def test_laguna_north_mixed_rotating_topology_hits_exact_prefix(self):
         apc = AutomaticPrefixCache()
