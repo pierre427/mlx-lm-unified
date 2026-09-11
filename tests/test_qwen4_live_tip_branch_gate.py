@@ -30,6 +30,7 @@ def _args(**updates):
         "promote_after_first": False,
         "async_promote_after_first": False,
         "async_qsa_promote_after_first": False,
+        "apc_mode": "none",
     }
     values.update(updates)
     return Namespace(**values)

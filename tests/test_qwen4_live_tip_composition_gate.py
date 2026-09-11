@@ -7,6 +7,7 @@ from benchmarks.qwen4_live_tip_composition_gate import (
     block_order,
     build_plan,
     profile_settings,
+    summarize,
     validate_mechanism_receipt,
 )
 
@@ -139,6 +140,44 @@ def test_live_tip_fanout_receipt_is_strict():
     row["fanout_delta"]["hybrid_tip_fanout_batches"] = 0
     with pytest.raises(RuntimeError, match="mechanism receipt mismatch"):
         validate_mechanism_receipt(row, "physical_live_tip_fanout")
+
+
+def test_apc_factorial_summary_keeps_identity_for_prequeued_metrics():
+    def row(profile, tps, first_ms, prequeued=None):
+        return {
+            "profile": profile,
+            "aggregate_branch_decode_tps": tps,
+            "branch_to_first_commit_ms": first_ms,
+            "branch_to_first_commit_if_prequeued_ms": prequeued,
+            "async_qsa_queue_ms": 2.0,
+            "async_wait_after_first_ms": 1.0,
+            "branch_tokens": [[1], [1]],
+            "sibling_state": {"equal": True},
+            "swap_growth_bytes": 0,
+        }
+
+    candidate = "segmented_async_qsa_physical"
+    result = summarize(
+        [
+            {
+                "apc_mode": "apcv2",
+                "candidate": candidate,
+                "accepted": True,
+                "discard_reasons": [],
+                "rows": [
+                    row("physical", 100.0, 10.0),
+                    row(candidate, 101.0, 9.0, 7.0),
+                    row(candidate, 101.0, 9.0, 7.0),
+                    row("physical", 100.0, 10.0),
+                ],
+            }
+        ]
+    )
+    identity = f"apcv2:{candidate}"
+    assert result[identity]["decode_tps_ratio"] == pytest.approx(1.01)
+    assert result[identity]["prequeued_first_commit_speedup"] == pytest.approx(
+        10.0 / 7.0
+    )
 
 
 @pytest.mark.parametrize(

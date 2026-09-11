@@ -203,6 +203,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "follow-up shape"
         ),
         "candidates": list(args.candidates),
+        "apc_modes": list(getattr(args, "apc_modes", ("none",))),
         "orders": {
             profile: [
                 block_order(profile, rep)
@@ -230,11 +231,14 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _configured_args(args: argparse.Namespace, profile: str) -> argparse.Namespace:
+def _configured_args(
+    args: argparse.Namespace, profile: str, apc_mode: str = "none"
+) -> argparse.Namespace:
     configured = copy.copy(args)
     for key, value in profile_settings(profile).items():
         setattr(configured, key, value)
     configured.idle_seconds = 0.0
+    configured.apc_mode = apc_mode
     return configured
 
 
@@ -357,11 +361,16 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
 
 def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
     by_candidate: dict[str, Any] = {}
-    for candidate in sorted({block["candidate"] for block in blocks}):
-        all_blocks = [block for block in blocks if block["candidate"] == candidate]
+    identities = sorted({(block["apc_mode"], block["candidate"]) for block in blocks})
+    for apc_mode, candidate in identities:
+        identity = f"{apc_mode}:{candidate}"
+        all_blocks = [
+            block for block in blocks
+            if block["candidate"] == candidate and block["apc_mode"] == apc_mode
+        ]
         chosen = [block for block in all_blocks if block["accepted"]]
         if not chosen:
-            by_candidate[candidate] = {
+            by_candidate[identity] = {
                 "accepted_blocks": 0,
                 "discarded_blocks": len(all_blocks),
                 "discard_reasons": sorted(
@@ -375,7 +384,7 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         trial_first = _median(trials, "branch_to_first_commit_ms")
         control_tps = _median(controls, "aggregate_branch_decode_tps")
         trial_tps = _median(trials, "aggregate_branch_decode_tps")
-        by_candidate[candidate] = {
+        by_candidate[identity] = {
             "accepted_blocks": len(chosen),
             "discarded_blocks": len(all_blocks) - len(chosen),
             "samples_per_arm": len(trials),
@@ -396,7 +405,7 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             prequeued = _median(
                 trials, "branch_to_first_commit_if_prequeued_ms"
             )
-            by_candidate[candidate].update(
+            by_candidate[identity].update(
                 candidate_prequeued_first_commit_ms=prequeued,
                 prequeued_first_commit_speedup=control_first / prequeued,
                 async_qsa_queue_ms=_median(trials, "async_qsa_queue_ms"),
@@ -447,50 +456,93 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
                 )
 
     blocks = []
-    for candidate in args.candidates:
-        first_repetition = getattr(args, "first_repetition", 1)
-        for repetition in range(first_repetition, first_repetition + args.reps):
-            rows = []
-            for slot, profile in enumerate(block_order(candidate, repetition)):
-                if args.cooldown_seconds:
-                    time.sleep(args.cooldown_seconds)
-                configured = _configured_args(args, profile)
-                apply_composition_environment(configured)
-                row = _run_arm(model, prompt, configured, "warm_live_tip")
-                row.update(profile=profile, candidate=candidate, repetition=repetition, slot=slot)
-                validate_mechanism_receipt(row, profile)
-                rows.append(row)
-                if args.out:
-                    atomic_write(args.out, {"metadata": plan, "status": "running", "prime_rows": prime_rows, "blocks": [*blocks, {"candidate": candidate, "repetition": repetition, "rows": rows}]})
-            control_tokens = [row["branch_tokens"] for row in rows if row["profile"] == "physical"]
-            candidate_tokens = [row["branch_tokens"] for row in rows if row["profile"] == candidate]
-            if any(tokens != control_tokens[0] for tokens in [*control_tokens[1:], *candidate_tokens]):
-                raise AssertionError(f"{candidate} token trace differs from physical control")
-            controls = [row for row in rows if row["profile"] == "physical"]
-            trials = [row for row in rows if row["profile"] == candidate]
-            closing_drift = abs(
-                controls[-1]["aggregate_branch_decode_tps"]
-                - controls[0]["aggregate_branch_decode_tps"]
-            ) / controls[0]["aggregate_branch_decode_tps"]
-            candidate_drift = abs(
-                trials[-1]["aggregate_branch_decode_tps"]
-                - trials[0]["aggregate_branch_decode_tps"]
-            ) / trials[0]["aggregate_branch_decode_tps"]
-            discard_reasons = []
-            if closing_drift > args.max_closing_drift:
-                discard_reasons.append("closing_control_drift")
-            if candidate_drift > args.max_closing_drift:
-                discard_reasons.append("candidate_drift")
-            block = {
-                "candidate": candidate,
-                "repetition": repetition,
-                "accepted": not discard_reasons,
-                "closing_control_drift_fraction": closing_drift,
-                "candidate_drift_fraction": candidate_drift,
-                "discard_reasons": discard_reasons,
-                "rows": rows,
-            }
-            blocks.append(block)
+    for apc_mode in getattr(args, "apc_modes", ("none",)):
+        for candidate in args.candidates:
+            first_repetition = getattr(args, "first_repetition", 1)
+            for repetition in range(first_repetition, first_repetition + args.reps):
+                rows = []
+                for slot, profile in enumerate(block_order(candidate, repetition)):
+                    if args.cooldown_seconds:
+                        time.sleep(args.cooldown_seconds)
+                    configured = _configured_args(args, profile, apc_mode)
+                    apply_composition_environment(configured)
+                    row = _run_arm(model, prompt, configured, "warm_live_tip")
+                    row.update(
+                        profile=profile,
+                        candidate=candidate,
+                        apc_mode=apc_mode,
+                        repetition=repetition,
+                        slot=slot,
+                    )
+                    if apc_mode != "none" and not (row.get("apc") or {}).get(
+                        "hit"
+                    ):
+                        raise RuntimeError(
+                            "factorial arm did not exercise a real APC hit"
+                        )
+                    validate_mechanism_receipt(row, profile)
+                    rows.append(row)
+                    if args.out:
+                        atomic_write(
+                            args.out,
+                            {
+                                "metadata": plan,
+                                "status": "running",
+                                "prime_rows": prime_rows,
+                                "blocks": [
+                                    *blocks,
+                                    {
+                                        "candidate": candidate,
+                                        "apc_mode": apc_mode,
+                                        "repetition": repetition,
+                                        "rows": rows,
+                                    },
+                                ],
+                            },
+                        )
+                control_tokens = [
+                    row["branch_tokens"]
+                    for row in rows
+                    if row["profile"] == "physical"
+                ]
+                candidate_tokens = [
+                    row["branch_tokens"]
+                    for row in rows
+                    if row["profile"] == candidate
+                ]
+                if any(
+                    tokens != control_tokens[0]
+                    for tokens in [*control_tokens[1:], *candidate_tokens]
+                ):
+                    raise AssertionError(
+                        f"{candidate} token trace differs from physical control"
+                    )
+                controls = [row for row in rows if row["profile"] == "physical"]
+                trials = [row for row in rows if row["profile"] == candidate]
+                closing_drift = abs(
+                    controls[-1]["aggregate_branch_decode_tps"]
+                    - controls[0]["aggregate_branch_decode_tps"]
+                ) / controls[0]["aggregate_branch_decode_tps"]
+                candidate_drift = abs(
+                    trials[-1]["aggregate_branch_decode_tps"]
+                    - trials[0]["aggregate_branch_decode_tps"]
+                ) / trials[0]["aggregate_branch_decode_tps"]
+                discard_reasons = []
+                if closing_drift > args.max_closing_drift:
+                    discard_reasons.append("closing_control_drift")
+                if candidate_drift > args.max_closing_drift:
+                    discard_reasons.append("candidate_drift")
+                block = {
+                    "candidate": candidate,
+                    "apc_mode": apc_mode,
+                    "repetition": repetition,
+                    "accepted": not discard_reasons,
+                    "closing_control_drift_fraction": closing_drift,
+                    "candidate_drift_fraction": candidate_drift,
+                    "discard_reasons": discard_reasons,
+                    "rows": rows,
+                }
+                blocks.append(block)
 
     return {
         "metadata": plan,
@@ -519,6 +571,12 @@ def parse_args() -> argparse.Namespace:
         help="first counterbalance index (use 2 for candidate/control/control/candidate)",
     )
     parser.add_argument("--candidates", nargs="+", choices=PROFILES, default=list(PROFILES))
+    parser.add_argument(
+        "--apc-modes",
+        nargs="+",
+        choices=("none", "legacy", "apcv2"),
+        default=["none"],
+    )
     parser.add_argument("--cooldown-seconds", type=float, default=60.0)
     parser.add_argument("--max-closing-drift", type=float, default=0.05)
     parser.add_argument(

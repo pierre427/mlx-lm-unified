@@ -212,6 +212,78 @@ class TestMTPGenerationBatch(unittest.TestCase):
         self.assertEqual(active.uids, [1, 2])
         self.assertEqual([lane.num_draft for lane in active.state.lanes], [1, 1])
 
+    def test_async_segmented_cohort_cancels_empties_and_reconstructs(self):
+        """A membership churn boundary must retire and re-arm async work."""
+
+        class Ticket:
+            def __init__(self):
+                self.stream = object()
+                self.cancel_count = 0
+
+            def cancel_and_drain(self):
+                self.cancel_count += 1
+
+        def shell(lanes, *, ticket=None, pending=True):
+            batch = MTPGenerationBatch.__new__(MTPGenerationBatch)
+            batch.model = object()
+            batch.state = _state([_Detached(lane) for lane in lanes])
+            batch.segmented_live_tip = True
+            batch.async_qsa_promotion = True
+            batch.stop_matchers = [StopSequenceMatcher() for _ in lanes]
+            batch._matcher_states = [matcher.make_state() for matcher in batch.stop_matchers]
+            batch._num_tokens = [0] * len(lanes)
+            batch._initial_outputs = [None] * len(lanes)
+            batch._paused = {}
+            batch._plain_ready = []
+            batch.mtp_admission = None
+            batch._async_qsa_ticket = ticket
+            batch._async_qsa_pending = pending
+            batch._async_qsa_receipt = None
+            batch._async_qsa_receipts_by_uid = {
+                lane.uid: {"queued": True} for lane in lanes
+            }
+            return batch
+
+        ticket = Ticket()
+        active = shell([_Lane(1), _Lane(2)], ticket=ticket)
+        joining = shell([_Lane(3)], pending=False)
+        armed = []
+
+        def attach(_model, state, packages):
+            state.lanes.extend(package.lane for package in packages)
+            state.membership_epoch += 1
+            return state
+
+        with (
+            patch(
+                "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+                side_effect=_detach,
+            ),
+            patch(
+                "mlx_lm.hybrid_speculative.attach_segmented_self_mtp_lanes",
+                side_effect=attach,
+            ),
+            patch("mlx_lm.generate._close_segmented_detached"),
+            patch.object(active, "_arm_async_qsa_promotion", side_effect=lambda: armed.append(True)),
+        ):
+            # Cancellation/exit of the whole cohort drains the queued device
+            # work before any cache row is released.
+            active.remove_uids([1, 2])
+            self.assertEqual(ticket.cancel_count, 1)
+            self.assertEqual(active.uids, [])
+            self.assertTrue(active.segmented_live_tip)
+            self.assertTrue(active._async_qsa_pending)
+            self.assertIsNone(active._async_qsa_ticket)
+            self.assertEqual(active._async_qsa_receipts_by_uid, {})
+
+            # A later join reconstructs the empty segmented cohort and queues
+            # one fresh async promotion against the new membership epoch.
+            active.extend(joining)
+
+        self.assertEqual(active.uids, [3])
+        self.assertEqual(joining.uids, [])
+        self.assertEqual(len(armed), 1)
+
     def test_parallel_logits_processors_fail_closed_to_plain(self):
         # lane_rng=None: the processor route must be decided BEFORE the
         # lane-RNG check, config validation, and RNG fork can raise.

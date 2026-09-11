@@ -391,6 +391,12 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         propose_batched_self_mtp,
     )
     from mlx_lm.sample_utils import LaneRNG
+    from mlx_lm.apc import (
+        APCKey,
+        AutomaticPrefixCache,
+        AutomaticPrefixCacheV2,
+        MTPAPCSidecar,
+    )
     from mlx_lm.gdn_prefix_fanout import (
         HybridCachePrefixFanout,
         gdn_prefix_fanout_stats,
@@ -415,6 +421,13 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         args.num_draft + 1
     )
     prepared_started = time.perf_counter_ns()
+    apc_mode = str(getattr(args, "apc_mode", "none"))
+    if apc_mode not in {"none", "legacy", "apcv2"}:
+        raise ValueError("apc-mode must be none, legacy, or apcv2")
+    os.environ["MLX_LM_MTP_BOUNDARY_COW"] = (
+        "1" if apc_mode == "apcv2" else "0"
+    )
+    prompt_boundary = {} if apc_mode != "none" else None
     detached, first = prepare_self_mtp_lane(
         prompt,
         model,
@@ -432,7 +445,80 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         logits_processors=[],
         prefill_step_size=args.prefill_step_size,
         share_qsa_indices=args.share_qsa_indices,
+        prompt_boundary_out=prompt_boundary,
     )
+    apc_receipt = None
+    apc = None
+    if apc_mode != "none":
+        if not prompt_boundary or not prompt_boundary.get("committed_only"):
+            raise RuntimeError("APC benchmark did not capture a committed boundary")
+        covered = int(prompt_boundary["covered_tokens"])
+        key = APCKey(
+            "qwen4-live-tip-factorial",
+            cache_layout_fingerprint=(
+                "qwen4-exp-layer-segments-v1" if apc_mode == "apcv2" else "legacy"
+            ),
+        )
+        apc = (
+            AutomaticPrefixCacheV2(
+                max_size=4, layout_name="qwen4-exp-layer-segments-v1"
+            )
+            if apc_mode == "apcv2"
+            else AutomaticPrefixCache(max_size=4, cow_branching=False)
+        )
+        sidecar = MTPAPCSidecar(
+            prompt_boundary["mtp_state"],
+            covered,
+            rng_key=prompt_boundary.get("rng_key"),
+            rng_draws=int(prompt_boundary.get("rng_draws", 0)),
+        )
+        apc.store(
+            key,
+            [int(token) for token in prompt[:covered].tolist()],
+            prompt_boundary["target_cache"],
+            sidecar=sidecar,
+        )
+        lookup = apc.lookup(key, [int(token) for token in prompt.tolist()])
+        if not lookup.hit or lookup.cached_tokens != covered or lookup.sidecar is None:
+            raise RuntimeError(
+                "APC factorial requires a real exact MTP sidecar hit: "
+                f"hit={lookup.hit} cached={lookup.cached_tokens} expected={covered}"
+            )
+        restored_rng = (
+            LaneRNG.from_key(lookup.sidecar.rng_key, lookup.sidecar.rng_draws)
+            if lookup.sidecar.rng_key is not None
+            else LaneRNG(args.seed)
+        )
+        detached = first = None
+        gc.collect()
+        detached, first = prepare_self_mtp_lane(
+            mx.array(lookup.remaining_tokens, dtype=mx.uint32),
+            model,
+            uid=0,
+            max_tokens=max_tokens,
+            prompt_cache=lookup.cache,
+            mtp_state=lookup.sidecar.state,
+            lane_rng=restored_rng,
+            num_draft=args.num_draft,
+            sampling_temp=0.0,
+            sampling_top_p=1.0,
+            sampling_top_k=0,
+            sampling_min_p=0.0,
+            accept_rule="residual",
+            logits_processors=[],
+            prefill_step_size=args.prefill_step_size,
+            share_qsa_indices=args.share_qsa_indices,
+        )
+        apc_receipt = {
+            "mode": apc_mode,
+            "hit": True,
+            "hit_kind": lookup.hit_kind,
+            "cached_tokens": int(lookup.cached_tokens),
+            "remaining_tokens": len(lookup.remaining_tokens),
+            "snapshot_mode": prompt_boundary["snapshot_mode"],
+            "lookup_segments": lookup.segment_manifest,
+            "stats": apc.apc_stats,
+        }
     if args.branch_mode == "segmented":
         detached.shared_qsa_prefix_id = hashlib.sha256(
             f"live-tip:{args.context}:{args.seed}".encode()
@@ -754,6 +840,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
 
     result = {
         "arm": arm,
+        "apc": apc_receipt,
         "branch_mode": args.branch_mode,
         "prepare_ms": (prepared_ns - prepared_started) / 1e6,
         "warmup_ms": (last_warm_ns - prepared_ns) / 1e6,
@@ -827,9 +914,24 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     batch = branch_batch = None
     rows = final_rows = None
     detached = canonical = sibling = None
+    # The APC lookup result owns the live COW branch.  Drop every request-side
+    # reference before clearing the resident source so the telemetry proves
+    # that both the branch pin and APC owner were released at the arm boundary.
+    lookup = sidecar = restored_rng = prompt_boundary = None
+    if apc is not None:
+        result["apc_clear"] = apc.clear(release_memory=False)
     gc.collect()
     mx.clear_cache()
     mx.synchronize()
+    if apc is not None:
+        result["apc_after_cleanup"] = apc.apc_stats
+        active_leases = int(
+            result["apc_after_cleanup"].get("cow", {}).get("active_leases", 0)
+        )
+        if active_leases:
+            raise RuntimeError(
+                f"APC arm leaked {active_leases} COW ownership lease(s)"
+            )
     result["memory_after_cleanup"] = _mlx_memory(mx)
     return result
 
