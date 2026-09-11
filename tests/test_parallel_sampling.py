@@ -49,6 +49,7 @@ from mlx_lm.server import (
     GenerationContext,
     RequestCompositionError,
     ResponseGenerator,
+    _cache_capsule_admissible,
     _parallel_sampling_route,
     _parallel_sampling_state_bytes,
 )
@@ -481,6 +482,14 @@ class TestParallelSamplingRoute(unittest.TestCase):
                 prompt_tokens=256,
                 cached_prompt_tokens=200,
                 mtp_state=("mtp-cache", "hidden"),
+            )
+
+    def test_cache_capsule_admission_excludes_self_mtp(self):
+        lookup = types.SimpleNamespace(hit=True, capsule_generation=7)
+        with mock.patch.dict("os.environ", {"MLX_LM_CACHE_CAPSULE": "1"}):
+            self.assertTrue(_cache_capsule_admissible(lookup, None, object()))
+            self.assertFalse(
+                _cache_capsule_admissible(lookup, {"num_draft": 1}, object())
             )
 
     def test_n_gt_1_never_joins_the_continuous_batch(self):

@@ -1800,6 +1800,19 @@ def _batched_kv_quantization(cli_args, self_mtp):
     }
 
 
+def _cache_capsule_admissible(lookup, self_mtp, pool) -> bool:
+    """Whether plain parallel serving may replace its first cache merge."""
+
+    return bool(
+        cache_capsules_enabled()
+        and lookup is not None
+        and lookup.hit
+        and lookup.capsule_generation is not None
+        and pool is not None
+        and self_mtp is None
+    )
+
+
 def _batched_prompt_cache_model_key(model_identity, cli_args, self_mtp):
     """Separate opted-in quantized APC entries from full-precision entries."""
     quantization = _batched_kv_quantization(cli_args, self_mtp)
@@ -3362,12 +3375,10 @@ class ResponseGenerator:
                 )
                 progress(len(rest) - prefilled, len(rest))
 
-                if (
-                    cache_capsules_enabled()
-                    and lookup is not None
-                    and lookup.hit
-                    and lookup.capsule_generation is not None
-                    and self._cache_capsule_pool is not None
+                if _cache_capsule_admissible(
+                    lookup,
+                    self_mtp,
+                    getattr(self, "_cache_capsule_pool", None),
                 ):
                     backend = os.environ.get(
                         "MLX_LM_CACHE_CAPSULE_BACKEND", "gpu"
