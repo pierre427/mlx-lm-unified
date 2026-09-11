@@ -1,0 +1,105 @@
+{
+  "exactness": {
+    "diagnostic": {
+      "gate_bit_exact": false,
+      "gate_max_abs": 0.0234375,
+      "hidden_bit_exact": false,
+      "hidden_max_abs": 0.03125,
+      "up_bit_exact": false,
+      "up_max_abs": 0.0174560546875
+    },
+    "max_abs": 0.00146484375,
+    "raw_bit_equal": false,
+    "stock_sha256_f32": "b99a99a169b04f5bbddeb98fb33be12983fadee4122596ccde625461d67b83d5",
+    "union_sha256_f32": "5ef851e1730e365b09eefd78e32290e24829b4eed30e4547e42ee4e8946e5503"
+  },
+  "geometry": {
+    "expert_hidden": 640,
+    "experts": 512,
+    "hidden": 2560,
+    "tokens": 7,
+    "top_k": 10,
+    "unique_experts": 49
+  },
+  "layer": 0,
+  "memory": {
+    "active_gb": 1.421196952,
+    "cache_gb": 0.94567262,
+    "peak_gb": 2.365802284
+  },
+  "model": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+  "passed": false,
+  "receipts": {
+    "counts": {
+      "admission_calls": 41,
+      "admitted": 41,
+      "component_calls": 41,
+      "disabled": 0,
+      "e1_dispatches": 41,
+      "e2_dispatches": 41,
+      "rejected": 0
+    },
+    "enabled": false
+  },
+  "runtime": {
+    "mlx_version": "0.32.2.dev20260911+a0d69e543",
+    "python": "/Users/pierrelamy/Library/Application Support/mlxuag-qwen38-flash-next/.venv-rapid/bin/python",
+    "python_version": "3.12.13"
+  },
+  "schema": "mlx-uag.qwen4-s7-expert-union-micro.v1",
+  "timing": {
+    "pattern": [
+      "stock",
+      "union",
+      "union",
+      "stock"
+    ],
+    "speedup": 0.24637569767473486,
+    "stock": {
+      "max_ms": 1.9124375,
+      "median_ms": 0.611448,
+      "min_ms": 0.5096665,
+      "samples_ms": [
+        1.408708,
+        0.7024375,
+        1.293125,
+        0.697375,
+        1.4024165,
+        0.7970835,
+        0.7086665,
+        1.9124375,
+        0.5248125,
+        0.5208125,
+        0.5208335,
+        0.5102915,
+        0.525521,
+        0.5196455,
+        0.5096665,
+        0.5240835
+      ]
+    },
+    "union": {
+      "max_ms": 3.4264795,
+      "median_ms": 2.48177075,
+      "min_ms": 1.924979,
+      "samples_ms": [
+        3.410875,
+        3.4264795,
+        3.41825,
+        3.1102085,
+        2.8958335,
+        2.7753125,
+        2.7929375,
+        2.5476875,
+        2.415854,
+        2.180979,
+        2.1856455,
+        2.2296875,
+        2.0867085,
+        2.074354,
+        2.005896,
+        1.924979
+      ]
+    }
+  }
+}

@@ -1,0 +1,324 @@
+{
+  "document_cycle_ms": {
+    "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-unified/mlx_lm/hybrid_speculative.py": [
+      44.717584,
+      38.484125,
+      38.815875,
+      38.584084,
+      38.23575,
+      38.691083,
+      38.411625,
+      38.700791,
+      38.806792,
+      37.925042,
+      38.35775,
+      37.98425,
+      38.5185,
+      37.907084,
+      37.98125,
+      37.998166
+    ],
+    "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-unified/mlx_lm/models/qwen4_exp.py": [
+      42.263125,
+      38.583834,
+      39.31675,
+      38.423958,
+      38.9925,
+      38.219542,
+      36.275584,
+      44.579834,
+      37.702458,
+      38.101958,
+      38.068208,
+      37.609,
+      37.680542,
+      37.184416,
+      38.296958,
+      39.049667
+    ],
+    "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-unified/results/qwen4-cache-segmentation-calibration-20260910.json": [
+      47.602417,
+      38.191542,
+      37.66875,
+      38.268125,
+      38.507292,
+      36.367,
+      38.626291,
+      38.729458,
+      38.48725,
+      37.295709,
+      39.102459,
+      38.061042,
+      38.482,
+      39.802541,
+      37.840542,
+      38.5135
+    ],
+    "/Users/pierrelamy/Desktop/mlx-uag/wiki/docs/research/ane-low-level-interface-survey-2026-09-06.md": [
+      40.563083,
+      38.774042,
+      37.872375,
+      38.81225,
+      37.747083,
+      37.196083,
+      37.143583,
+      37.291875,
+      41.408375,
+      38.574375,
+      39.102,
+      38.500041,
+      39.309125,
+      39.102875,
+      39.026083,
+      37.382875
+    ],
+    "/Users/pierrelamy/Desktop/mlx-uag/wiki/docs/research/qwen4-selfmtp-meta-analysis-2026-09-03.md": [
+      39.774375,
+      38.955458,
+      39.705583,
+      39.625792,
+      40.396041,
+      39.016584,
+      39.39325,
+      38.9595,
+      39.323,
+      39.937167,
+      39.41375,
+      38.896541,
+      38.826084,
+      38.697,
+      38.776541,
+      39.578042
+    ]
+  },
+  "environment": {
+    "MLX_ENABLE_TF32": "0",
+    "MLX_LM_COMPILED_DECODE": "0",
+    "MLX_LM_UBC_EVICT": "1",
+    "MLX_QWEN4_EAGER_DISPATCH": "1",
+    "MLX_QWEN4_FUSED_GDN_DECODE": "1",
+    "MLX_QWEN4_FUSED_GDN_VERIFY": "1",
+    "MLX_QWEN4_MEGAKERNEL": "0",
+    "MLX_QWEN4_PLE_NVME": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP/ple_rows.bin",
+    "MLX_QWEN4_PLE_NVME_LRU_MB": "2048",
+    "MLX_QWEN4_QSA_POOLED_KEY_CACHE": "1"
+  },
+  "geometry": {
+    "cycles_per_document": 16,
+    "expert_bytes": 2764800,
+    "layers": 48,
+    "prefix_tokens": 512,
+    "slab_tokens": 7
+  },
+  "memory": {
+    "mlx": {
+      "active_bytes": 72248908424,
+      "cache_bytes": 147464,
+      "peak_bytes": 74030755760
+    },
+    "swap_growth_bytes": 0,
+    "system_free_percent_after": 42,
+    "system_free_percent_before": 94
+  },
+  "metrics": {
+    "mean_lag1_jaccard": 0.3020121268870616,
+    "mean_route_union_cardinality": 40.06111111111111,
+    "predictors": {
+      "lag_union": {
+        "16": {
+          "mean_precision": 0.6026645171957674,
+          "mean_score_mass_recall": 0.4134331916852392,
+          "mean_set_recall": 0.25604934027615833,
+          "predicted_bytes": 95507251200,
+          "samples": 2160,
+          "useful_bytes": 57565900800,
+          "wasted_bytes": 37941350400
+        },
+        "24": {
+          "mean_precision": 0.5368791901014209,
+          "mean_score_mass_recall": 0.49002005506879054,
+          "mean_set_recall": 0.3369410510933947,
+          "predicted_bytes": 142226841600,
+          "samples": 2160,
+          "useful_bytes": 76338892800,
+          "wasted_bytes": 65887948800
+        },
+        "32": {
+          "mean_precision": 0.48945050849335164,
+          "mean_score_mass_recall": 0.5393170533998108,
+          "mean_set_recall": 0.39579432614465,
+          "predicted_bytes": 185537433600,
+          "samples": 2160,
+          "useful_bytes": 90312192000,
+          "wasted_bytes": 95225241600
+        },
+        "48": {
+          "mean_precision": 0.45863823877384013,
+          "mean_score_mass_recall": 0.5885275199963086,
+          "mean_set_recall": 0.45398924631743054,
+          "predicted_bytes": 234443980800,
+          "samples": 2160,
+          "useful_bytes": 104600678400,
+          "wasted_bytes": 129843302400
+        },
+        "64": {
+          "mean_precision": 0.45734380746322667,
+          "mean_score_mass_recall": 0.5916512331880625,
+          "mean_set_recall": 0.4580976291930245,
+          "predicted_bytes": 239130316800,
+          "samples": 2160,
+          "useful_bytes": 105759129600,
+          "wasted_bytes": 133371187200
+        },
+        "8": {
+          "mean_precision": 0.6970486111111112,
+          "mean_score_mass_recall": 0.2905238728939192,
+          "mean_set_recall": 0.1492403379095929,
+          "predicted_bytes": 47775744000,
+          "samples": 2160,
+          "useful_bytes": 33302016000,
+          "wasted_bytes": 14473728000
+        }
+      },
+      "static": {
+        "16": {
+          "mean_precision": 0.37410300925925927,
+          "mean_score_mass_recall": 0.2419157451014081,
+          "mean_set_recall": 0.15368252313730085,
+          "predicted_bytes": 95551488000,
+          "samples": 2160,
+          "useful_bytes": 35746099200,
+          "wasted_bytes": 59805388800
+        },
+        "24": {
+          "mean_precision": 0.33016975308641944,
+          "mean_score_mass_recall": 0.29511343806538737,
+          "mean_set_recall": 0.20225008508176992,
+          "predicted_bytes": 143327232000,
+          "samples": 2160,
+          "useful_bytes": 47322316800,
+          "wasted_bytes": 96004915200
+        },
+        "32": {
+          "mean_precision": 0.2982638888888889,
+          "mean_score_mass_recall": 0.3376151153185375,
+          "mean_set_recall": 0.24310874499971874,
+          "predicted_bytes": 191102976000,
+          "samples": 2160,
+          "useful_bytes": 56999116800,
+          "wasted_bytes": 134103859200
+        },
+        "48": {
+          "mean_precision": 0.25216049382716105,
+          "mean_score_mass_recall": 0.4043393856766672,
+          "mean_set_recall": 0.3068801691752616,
+          "predicted_bytes": 286654464000,
+          "samples": 2160,
+          "useful_bytes": 72282931200,
+          "wasted_bytes": 214371532800
+        },
+        "64": {
+          "mean_precision": 0.22509403935185185,
+          "mean_score_mass_recall": 0.46132537932387707,
+          "mean_set_recall": 0.36368085879354617,
+          "predicted_bytes": 382205952000,
+          "samples": 2160,
+          "useful_bytes": 86032281600,
+          "wasted_bytes": 296173670400
+        },
+        "8": {
+          "mean_precision": 0.4432291666666667,
+          "mean_score_mass_recall": 0.16906723903485651,
+          "mean_set_recall": 0.0917748172013533,
+          "predicted_bytes": 47775744000,
+          "samples": 2160,
+          "useful_bytes": 21175603200,
+          "wasted_bytes": 26600140800
+        }
+      },
+      "lag_top10": {
+        "16": {
+          "mean_precision": 0.670370370370371,
+          "mean_score_mass_recall": 0.3281296612962031,
+          "mean_set_recall": 0.17929528766268105,
+          "predicted_bytes": 59719680000,
+          "samples": 2160,
+          "useful_bytes": 40034304000,
+          "wasted_bytes": 19685376000
+        },
+        "24": {
+          "mean_precision": 0.670370370370371,
+          "mean_score_mass_recall": 0.3281296612962031,
+          "mean_set_recall": 0.17929528766268105,
+          "predicted_bytes": 59719680000,
+          "samples": 2160,
+          "useful_bytes": 40034304000,
+          "wasted_bytes": 19685376000
+        },
+        "32": {
+          "mean_precision": 0.670370370370371,
+          "mean_score_mass_recall": 0.3281296612962031,
+          "mean_set_recall": 0.17929528766268105,
+          "predicted_bytes": 59719680000,
+          "samples": 2160,
+          "useful_bytes": 40034304000,
+          "wasted_bytes": 19685376000
+        },
+        "48": {
+          "mean_precision": 0.670370370370371,
+          "mean_score_mass_recall": 0.3281296612962031,
+          "mean_set_recall": 0.17929528766268105,
+          "predicted_bytes": 59719680000,
+          "samples": 2160,
+          "useful_bytes": 40034304000,
+          "wasted_bytes": 19685376000
+        },
+        "64": {
+          "mean_precision": 0.670370370370371,
+          "mean_score_mass_recall": 0.3281296612962031,
+          "mean_set_recall": 0.17929528766268105,
+          "predicted_bytes": 59719680000,
+          "samples": 2160,
+          "useful_bytes": 40034304000,
+          "wasted_bytes": 19685376000
+        },
+        "8": {
+          "mean_precision": 0.6970486111111112,
+          "mean_score_mass_recall": 0.2905238728939192,
+          "mean_set_recall": 0.1492403379095929,
+          "predicted_bytes": 47775744000,
+          "samples": 2160,
+          "useful_bytes": 33302016000,
+          "wasted_bytes": 14473728000
+        }
+      }
+    }
+  },
+  "model": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+  "passed": true,
+  "scope": "route-predictor signal only; no prefetch wall-time claim",
+  "test_documents": [
+    {
+      "path": "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-unified/mlx_lm/models/qwen4_exp.py",
+      "token_count": 65704
+    },
+    {
+      "path": "/Users/pierrelamy/Desktop/mlx-uag/wiki/docs/research/ane-low-level-interface-survey-2026-09-06.md",
+      "token_count": 3173
+    },
+    {
+      "path": "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-unified/results/qwen4-cache-segmentation-calibration-20260910.json",
+      "token_count": 10205
+    }
+  ],
+  "train_documents": [
+    {
+      "path": "/Users/pierrelamy/Desktop/mlx-uag/mlx-lm-unified/mlx_lm/hybrid_speculative.py",
+      "token_count": 41530
+    },
+    {
+      "path": "/Users/pierrelamy/Desktop/mlx-uag/wiki/docs/research/qwen4-selfmtp-meta-analysis-2026-09-03.md",
+      "token_count": 4533
+    }
+  ]
+}
