@@ -639,6 +639,7 @@ class TestQSAIndexedReference(unittest.TestCase):
         self.assertIsNotNone(indexed._private_delta_partition_kernel())
         self.assertIsNotNone(indexed._quantized_partition_kernel())
         self.assertIsNotNone(indexed._combine_kernel())
+        self.assertIsNotNone(indexed._combine_kernel(True))
 
     def test_real_capture_fixture_has_production_two_pass_geometry(self):
         q, k, v, compact = _real_bf16_fixture()
@@ -1117,6 +1118,33 @@ class TestQSAIndexedReference(unittest.TestCase):
             "RuntimeError",
         )
 
+    def test_synchronous_dispatch_failure_preserves_requested_output_gate(self):
+        mx.random.seed(32)
+        compact = _compact(1, 3)
+        q, k, v = _arrays(1, 3)
+        gate = mx.random.normal((1, 3, 32))
+        gathered = _gather_qsa_attention(
+            q, k, v, compact, scale=8**-0.5, tile_rows=1
+        )
+        expected = qwen4_exp.mlx_apply_output_gate(gathered, gate)
+        with mock.patch.object(
+            qwen4_exp,
+            "qwen4_qsa_indexed_attention",
+            side_effect=RuntimeError("synthetic dispatch failure"),
+        ):
+            actual = qwen4_exp._indexed_qsa_attention_or_gather(
+                q,
+                k,
+                v,
+                compact,
+                scale=8**-0.5,
+                splits=4,
+                tile_rows=1,
+                output_gate=gate,
+            )
+        mx.eval(actual, expected)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
     def test_contract_value_error_does_not_fall_back(self):
         compact = _compact(1, 3)
         q, k, v = _arrays(1, 3)
@@ -1373,6 +1401,7 @@ class TestQSAIndexedReference(unittest.TestCase):
         compact = _compact(1, 3)
         q, k, v = _arrays(1, 3)
         sentinel = mx.zeros_like(q)
+        gate = mx.zeros((1, 3, 32))
         with (
             mock.patch.dict(
                 os.environ,
@@ -1400,9 +1429,11 @@ class TestQSAIndexedReference(unittest.TestCase):
                 layer_index=0,
                 call_counter=0,
                 gather_would_admit=True,
+                output_gate=gate,
             )
         self.assertIs(actual, sentinel)
         normal.assert_called_once()
+        self.assertIs(normal.call_args.kwargs["output_gate"], gate)
 
 
 _LEGACY_PASS1_PREAMBLE = """    const uint lane = thread_index_in_simdgroup;
@@ -1932,7 +1963,7 @@ class TestQSAIndexedServer(unittest.TestCase):
             self.assertTrue(body["enabled"])
             self.assertEqual(body["mode"], "on")
             self.assertEqual(body["mlx_version"], mx.__version__)
-            self.assertEqual(body["mlx_build_hash"], "334084ce9")
+            self.assertEqual(body["mlx_build_hash"], "a0d69e543")
             self.assertEqual(body["auto_min_context_m3"], 16_384)
             self.assertEqual(body["auto_min_context_m1"], 65_536)
             self.assertIn("query_width_counts", body)

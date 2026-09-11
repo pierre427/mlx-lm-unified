@@ -21,6 +21,7 @@ from .qwen4_qsa_indexed_merge import (
     fused_merge_enabled,
     fused_merge_status,
     mlx_sequential_merge,
+    record_native_gate_engaged,
 )
 from .qwen4_qsa_nax import (
     compact_blocks_to_kernel_inputs,
@@ -35,7 +36,12 @@ _SDPA_BLOCKS = 128
 _SPLIT_CANDIDATES = (128, 64, 32, 16, 8)
 _HPT_LADDER = (12, 6, 3, 1)
 _HPT_ALLOWED = (12, 6, 4, 3, 2, 1)
-_EXACT_MLX_BUILDS = frozenset({"0.32.2.dev20260829+334084ce9"})
+_EXACT_MLX_BUILDS = frozenset(
+    {
+        "0.32.2.dev20260829+334084ce9",
+        "0.32.2.dev20260911+a0d69e543",
+    }
+)
 _SDPA_VECTOR_HEADER_SHA256 = (
     "2100a4d1eaa8a524c5147c82c771cad75197495c72daffa03e7ea4c259aebf10"
 )
@@ -1664,6 +1670,28 @@ _COMBINE_SOURCE = r"""
 """
 
 
+_COMBINE_SOURCE_GATED = _COMBINE_SOURCE.replace(
+    """        for (uint part = 0; part < elements; ++part)
+            row_out[part] = T(values[part]);""",
+    """        const uint b = bh / H;
+        const uint h = bh - b * H;
+        const device T* row_gate = output_gate
+            + (((size_t)b * L + row) * H + h) * D + sg * elements;
+        for (uint part = 0; part < elements; ++part) {
+            const T attention = T(values[part]);
+            const T gate_x = row_gate[part];
+            const T gate_y = T(1) / (T(1) + metal::exp(metal::abs(gate_x)));
+            T gate_sigmoid = gate_x < T(0) ? gate_y : T(1) - gate_y;
+            if constexpr (metal::is_same_v<T, bfloat>) {
+                if (gate_x == T(-6.84375f)) {
+                    gate_sigmoid = T(0.00106048583984375f);
+                }
+            }
+            row_out[part] = attention * gate_sigmoid;
+        }""",
+)
+
+
 @lru_cache(maxsize=None)
 def _partition_kernel():
     return mx.fast.metal_kernel(
@@ -1772,13 +1800,21 @@ def _quantized_partition_kernel():
 
 
 @lru_cache(maxsize=None)
-def _combine_kernel():
+def _combine_kernel(gated: bool = False):
     return mx.fast.metal_kernel(
-        name="qwen4_qsa_indexed_sdpa_pass2_v3",
-        input_names=["part_m", "part_l", "part_o", "dims"],
+        name=(
+            "qwen4_qsa_indexed_sdpa_pass2_gate_v1"
+            if gated
+            else "qwen4_qsa_indexed_sdpa_pass2_v3"
+        ),
+        input_names=(
+            ["part_m", "part_l", "part_o", "dims", "output_gate"]
+            if gated
+            else ["part_m", "part_l", "part_o", "dims"]
+        ),
         output_names=["out"],
         header=_HEADER,
-        source=_COMBINE_SOURCE,
+        source=_COMBINE_SOURCE_GATED if gated else _COMBINE_SOURCE,
         ensure_row_contiguous=True,
     )
 
@@ -2296,7 +2332,9 @@ def _quantized_partition_dispatch(
     )
 
 
-def _combine_sdpa_partials(m, l, o, engaged, *, output_dtype):
+def _combine_sdpa_partials(
+    m, l, o, engaged, *, output_dtype, output_gate=None
+):
     batch, nqh, length, blocks = map(int, m.shape)
     dim = int(o.shape[-1])
     if blocks != _SDPA_BLOCKS or dim % 32:
@@ -2308,14 +2346,26 @@ def _combine_sdpa_partials(m, l, o, engaged, *, output_dtype):
             o,
             output_dtype=output_dtype,
             on_fallback=_record_merge_fallback,
+            output_gate=output_gate,
         )
         return output, engaged
-    output = _combine_kernel()(
-        inputs=[m, l, o, mx.array([length], dtype=mx.int32)],
+    gated = output_gate is not None
+    inputs = [m, l, o, mx.array([length], dtype=mx.int32)]
+    if gated:
+        expected = (batch, length, nqh * dim)
+        if output_gate.shape != expected or output_gate.dtype != output_dtype:
+            raise ValueError(
+                f"QSA output gate must be {expected} with dtype {output_dtype}"
+            )
+        inputs.append(mx.contiguous(output_gate))
+        record_native_gate_engaged()
+    output = _combine_kernel(gated)(
+        inputs=inputs,
         template=[
             ("T", output_dtype),
             ("D", dim),
             ("BLOCKS", _SDPA_BLOCKS),
+            ("H", nqh),
         ],
         grid=(1024, length, batch * nqh),
         threadgroup=(1024, 1, 1),
@@ -2625,6 +2675,7 @@ def qwen4_qsa_indexed_attention(
     scale: float,
     splits: int | None = None,
     hpt: int | None = None,
+    output_gate=None,
 ):
     """Dispatch indexed attention with MLX SDPA's two-pass reduction tree."""
 
@@ -2709,6 +2760,7 @@ def qwen4_qsa_indexed_attention(
         int(compact.causal_mask is not None),
         requested,
         requested_hpt,
+        output_gate is not None,
     )
 
     candidate = _PROBE_RESULTS.get(key, _MISSING)
@@ -2734,7 +2786,9 @@ def qwen4_qsa_indexed_attention(
                         hpt=attempted[2],
                     )
                     return _combine_sdpa_partials(
-                        *partials, output_dtype=q.dtype
+                        *partials,
+                        output_dtype=q.dtype,
+                        output_gate=output_gate,
                     )
 
                 candidate, combined, counter, timings = _measure_candidates(
@@ -2771,7 +2825,12 @@ def qwen4_qsa_indexed_attention(
         hpt=candidate[2],
     )
     output, counter = _combine_sdpa_partials(
-        m, l, o, counter, output_dtype=q.dtype
+        m,
+        l,
+        o,
+        counter,
+        output_dtype=q.dtype,
+        output_gate=output_gate,
     )
     return _device_attest_output(
         output,

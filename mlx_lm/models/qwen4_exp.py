@@ -65,6 +65,10 @@ from .qwen4_qsa_indexed import (
     qwen4_qsa_indexed_reference,
     record_qsa_indexed_receipt,
 )
+from .qwen4_qsa_indexed_merge import (
+    fused_gate_enabled,
+    mlx_apply_output_gate,
+)
 from .qwen4_qsa_stage1 import (
     qsa_stage1_kernel_cache_info,
     qsa_stage1_score_producer,
@@ -4464,6 +4468,7 @@ def _indexed_qsa_attention_or_gather(
     scale: float,
     splits: int | None,
     tile_rows: int,
+    output_gate=None,
 ):
     """Run indexed QSA or fall back with the same fetched cache tensors.
 
@@ -4476,7 +4481,13 @@ def _indexed_qsa_attention_or_gather(
     context = int(compact.physical_width)
     try:
         return qwen4_qsa_indexed_attention(
-            q, k, v, compact, scale=scale, splits=splits
+            q,
+            k,
+            v,
+            compact,
+            scale=scale,
+            splits=splits,
+            output_gate=output_gate,
         )
     except (QSAIndexedProbeDeclined, RuntimeError) as error:
         reason = (
@@ -4493,8 +4504,13 @@ def _indexed_qsa_attention_or_gather(
         splits=splits,
         exception_class=exception_class,
     )
-    return _gather_qsa_attention(
+    output = _gather_qsa_attention(
         q, k, v, compact, scale=scale, tile_rows=tile_rows
+    )
+    return (
+        mlx_apply_output_gate(output, output_gate)
+        if output_gate is not None
+        else output
     )
 
 
@@ -4764,9 +4780,10 @@ def _dispatch_qsa_indexed_with_optional_capture(
     layer_index: int,
     call_counter: int,
     gather_would_admit: bool,
+    output_gate=None,
 ):
     if os.environ.get("MLX_QWEN4_QSA_INDEXED_CAPTURE_DIR"):
-        return _capture_qsa_indexed_comparison(
+        output = _capture_qsa_indexed_comparison(
             q,
             k,
             v,
@@ -4778,6 +4795,11 @@ def _dispatch_qsa_indexed_with_optional_capture(
             call_counter=call_counter,
             gather_would_admit=gather_would_admit,
         )
+        return (
+            mlx_apply_output_gate(output, output_gate)
+            if output_gate is not None
+            else output
+        )
     return _indexed_qsa_attention_or_gather(
         q,
         k,
@@ -4786,6 +4808,7 @@ def _dispatch_qsa_indexed_with_optional_capture(
         scale=scale,
         splits=splits,
         tile_rows=tile_rows,
+        output_gate=output_gate,
     )
 
 
@@ -5462,6 +5485,11 @@ class Attention(nn.Module):
             ).astype(q.dtype)
         elif use_indexed:
             compact = selection.compact_blocks()
+            indexed_gate_applied = (
+                quantized_indexed is None
+                and not _return_pre_o
+                and fused_gate_enabled()
+            )
             cached_width = (
                 k[0].shape[2] if quantized_indexed is not None else k.shape[2]
             )
@@ -5506,6 +5534,7 @@ class Attention(nn.Module):
                         and length <= _QSA_GATHER_MAX_QUERY
                         and gather_context_ok
                     ),
+                    output_gate=gate if indexed_gate_applied else None,
                 )
         elif use_gather:
             if quantized_indexed is not None:
@@ -5536,6 +5565,8 @@ class Attention(nn.Module):
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         if _return_pre_o:
             return out, gate
+        if use_indexed and indexed_gate_applied:
+            return self.o_proj(out)
         return self.o_proj(out * mx.sigmoid(gate))
 
 

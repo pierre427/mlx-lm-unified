@@ -31,8 +31,21 @@ class TestQSAIndexedMerge(unittest.TestCase):
 
     def test_metal_source_constructs_as_a_kernel_object(self):
         self.assertIsNotNone(merge._fused_merge_kernel())
+        self.assertIsNotNone(merge._fused_merge_kernel(True))
         self.assertIn("metal::precise::exp", merge._SOURCE)
+        self.assertIn("output_gate[", merge._SOURCE_GATED)
+        self.assertIn("metal::exp(metal::abs(gate_x))", merge._SOURCE_GATED)
         self.assertEqual(merge._THREAD_CANDIDATES, (256, 128))
+
+    def test_output_gate_preserves_attention_layout(self):
+        out = mx.arange(2 * 3 * 2 * 4, dtype=mx.float32).reshape(2, 3, 2, 4)
+        gate = mx.linspace(-3, 3, 2 * 2 * 3 * 4).reshape(2, 2, 12)
+        expected = out.transpose(0, 2, 1, 3).reshape(2, 2, 12)
+        expected = expected * mx.sigmoid(gate)
+        expected = expected.reshape(2, 2, 3, 4).transpose(0, 2, 1, 3)
+        actual = merge.mlx_apply_output_gate(out, gate)
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
 
     def test_sequential_order_is_independent_of_split_grouping(self):
         m, l, o = self.partials()
@@ -76,7 +89,13 @@ class TestQSAIndexedMerge(unittest.TestCase):
         self.assertTrue(mx.array_equal(expected, actual).item())
         self.assertEqual(
             merge.fused_merge_status(),
-            {"engaged": False, "fallbacks": 0, "candidate": None},
+            {
+                "engaged": False,
+                "fallbacks": 0,
+                "candidate": None,
+                "gate_engaged": False,
+                "gate_path": None,
+            },
         )
 
         sentinel = mx.zeros((1, 1, 1, 256), dtype=mx.float32)
@@ -130,7 +149,13 @@ class TestQSAIndexedMerge(unittest.TestCase):
         self.assertEqual(status["counts"]["merge_fallback"], 1)
         self.assertEqual(
             status["fused_merge"],
-            {"engaged": False, "fallbacks": 1, "candidate": None},
+            {
+                "engaged": False,
+                "fallbacks": 1,
+                "candidate": None,
+                "gate_engaged": False,
+                "gate_path": None,
+            },
         )
 
 

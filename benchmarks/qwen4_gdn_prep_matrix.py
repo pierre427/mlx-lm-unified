@@ -60,6 +60,7 @@ from mlx_lm.segmented_self_mtp import (
 )
 from mlx_lm.utils import load
 from mlx_lm.models.qwen4_ple_nvme import has_file_backed_ple
+from mlx_lm.models.qwen4_qsa_indexed_merge import fused_merge_status
 
 
 VARIANTS = {
@@ -83,6 +84,22 @@ VARIANTS = {
     "segmented_serial_qsa": {
         "segment_aware_live_tip": True,
         "_qsa_private_delta": False,
+    },
+    "qsa_merge": {
+        "_qsa_fused_merge": True,
+        "_qsa_fused_gate": False,
+    },
+    "qsa_merge_gate": {
+        "_qsa_fused_merge": True,
+        "_qsa_fused_gate": True,
+    },
+    "qsa_native": {
+        "_qsa_fused_merge": False,
+        "_qsa_fused_gate": False,
+    },
+    "qsa_native_gate": {
+        "_qsa_fused_merge": False,
+        "_qsa_fused_gate": True,
     },
 }
 
@@ -165,10 +182,14 @@ def _once(model, cached, tail, args, variant):
         config["_diagnostic_prepare_stages"] = prepare_stages
     private_delta_override = switches.get("_qsa_private_delta")
     exact_set_override = switches.get("_qsa_exact_set_fold")
+    fused_merge_override = switches.get("_qsa_fused_merge")
+    fused_gate_override = switches.get("_qsa_fused_gate")
     old_private_delta = os.environ.get("MLX_LM_QSA_PRIVATE_DELTA")
     old_exact_set = os.environ.get(
         "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"
     )
+    old_fused_merge = os.environ.get("MLX_QWEN4_QSA_INDEXED_FUSED_MERGE")
+    old_fused_gate = os.environ.get("MLX_QWEN4_QSA_INDEXED_FUSED_GATE")
     if private_delta_override is not None:
         os.environ["MLX_LM_QSA_PRIVATE_DELTA"] = (
             "1" if private_delta_override else "0"
@@ -177,6 +198,15 @@ def _once(model, cached, tail, args, variant):
         os.environ["MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"] = (
             "1" if exact_set_override else "0"
         )
+    if fused_merge_override is not None:
+        os.environ["MLX_QWEN4_QSA_INDEXED_FUSED_MERGE"] = (
+            "1" if fused_merge_override else "0"
+        )
+    if fused_gate_override is not None:
+        os.environ["MLX_QWEN4_QSA_INDEXED_FUSED_GATE"] = (
+            "1" if fused_gate_override else "0"
+        )
+    fused_merge_status(reset=True)
     fanout_before = gdn_prefix_fanout_stats()
     segmented_before = segmented_self_mtp_stats()
     round_levers_before = _round_levers.counters()
@@ -259,6 +289,7 @@ def _once(model, cached, tail, args, variant):
             "round_levers_delta": _numeric_counter_delta(
                 round_levers_before, _round_levers.counters()
             ),
+            "qsa_fused_merge": fused_merge_status(),
             "expects_qsa_private_delta": (
                 variant in {"segmented", "segmented_exact_set"}
                 and args.prompt_tokens // 4 * 4
@@ -298,6 +329,16 @@ def _once(model, cached, tail, args, variant):
                 os.environ[
                     "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"
                 ] = old_exact_set
+        if fused_merge_override is not None:
+            if old_fused_merge is None:
+                os.environ.pop("MLX_QWEN4_QSA_INDEXED_FUSED_MERGE", None)
+            else:
+                os.environ["MLX_QWEN4_QSA_INDEXED_FUSED_MERGE"] = old_fused_merge
+        if fused_gate_override is not None:
+            if old_fused_gate is None:
+                os.environ.pop("MLX_QWEN4_QSA_INDEXED_FUSED_GATE", None)
+            else:
+                os.environ["MLX_QWEN4_QSA_INDEXED_FUSED_GATE"] = old_fused_gate
 
 
 def _require_receipts(arm):
@@ -308,6 +349,8 @@ def _require_receipts(arm):
     wants_consume = switches.get("gdn_prefix_fanout_consume", False)
     wants_segmented = switches.get("segment_aware_live_tip", False)
     wants_tail_ple = switches.get("prefetch_known_tail_ple", False)
+    wants_fused_merge = switches.get("_qsa_fused_merge")
+    wants_fused_gate = switches.get("_qsa_fused_gate")
     if bool(fanout["serving_engaged"]) != wants_fanout:
         raise AssertionError(f"{variant}: fan-out engagement receipt mismatch")
     if bool(fanout["hybrid_tip_fanout_batches"]) != wants_consume:
@@ -339,6 +382,20 @@ def _require_receipts(arm):
             raise AssertionError(f"{variant}: known-tail PLE prefetch failed")
     elif tail_ple["ple_tail_prefetch_requests"]:
         raise AssertionError(f"{variant}: known-tail PLE prefetch unexpectedly ran")
+    if wants_fused_merge is not None:
+        receipt = arm["qsa_fused_merge"]
+        if bool(receipt["engaged"]) != wants_fused_merge:
+            raise AssertionError(f"{variant}: fused-merge receipt mismatch")
+        if bool(receipt["gate_engaged"]) != wants_fused_gate:
+            raise AssertionError(f"{variant}: fused output-gate receipt mismatch")
+        if wants_fused_gate:
+            expected_path = (
+                "sequential_fused_merge"
+                if wants_fused_merge
+                else "native_sdpa_merge"
+            )
+            if receipt["gate_path"] != expected_path:
+                raise AssertionError(f"{variant}: output-gate path mismatch")
 
 
 def _summarize(block, candidate, attempt, arms, baseline="ordinary"):
@@ -582,7 +639,13 @@ def main():
     )
     parser.add_argument(
         "--baseline",
-        choices=("ordinary", "segmented", "segmented_serial_qsa"),
+        choices=(
+            "ordinary",
+            "segmented",
+            "segmented_serial_qsa",
+            "qsa_merge",
+            "qsa_native",
+        ),
         default="ordinary",
         help="Control arm used for each A/B/B/A candidate bracket.",
     )
