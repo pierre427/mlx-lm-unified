@@ -217,6 +217,56 @@ def test_prompt_lru_eviction_does_not_affect_another_entry():
     assert isinstance(adopted, CachePlaneLease)
     assert second.stats()["eligible"] is True
     adopted.close()
+    assert cache.stats() == {
+        "lookups": 1,
+        "hits": 1,
+        "misses": 0,
+        "stores": 2,
+        "replacements": 0,
+        "evictions": 1,
+        "invalidations": 1,
+        "bypasses": 0,
+        "entries": 1,
+        "max_entries": 1,
+        "bypass_reasons": {},
+    }
+
+
+def test_prompt_cache_miss_hit_and_explicit_invalidation_are_counted():
+    cache = PromptHostPlaneCache()
+    plane = _prompt()
+
+    miss = cache.lookup(plane.input_fingerprint, plane.fingerprint)
+    cache.store(plane)
+    hit = cache.lookup(plane.input_fingerprint, plane.fingerprint)
+    assert isinstance(miss, CachePlaneFallback)
+    assert isinstance(hit, CachePlaneLease)
+    assert cache.invalidate(plane.input_fingerprint, "template_changed") is True
+
+    # Invalidation removes future visibility while a current reader stays pinned.
+    assert hit.payload is plane
+    after_invalidation = cache.lookup(plane.input_fingerprint, plane.fingerprint)
+    assert isinstance(after_invalidation, CachePlaneFallback)
+    hit.close()
+
+    stats = cache.stats()
+    assert stats["lookups"] == 3
+    assert stats["hits"] == 1
+    assert stats["misses"] == 2
+    assert stats["stores"] == 1
+    assert stats["invalidations"] == 1
+    assert stats["entries"] == 0
+
+
+def test_prompt_cache_records_fail_open_bypass_reasons():
+    cache = PromptHostPlaneCache()
+    cache.record_bypass("disabled")
+    cache.record_bypass("disabled")
+    cache.record_bypass("uncacheable_input")
+
+    stats = cache.stats()
+    assert stats["bypasses"] == 3
+    assert stats["bypass_reasons"] == {"disabled": 2, "uncacheable_input": 1}
 
 
 def test_optional_hint_and_schedule_planes_are_metadata_only():

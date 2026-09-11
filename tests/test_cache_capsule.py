@@ -89,6 +89,70 @@ class _BrokenAdapter:
         return built
 
 
+class _CountingBacking:
+    def __init__(self):
+        self.releases = 0
+
+    def release(self):
+        self.releases += 1
+
+
+class _CompletedAdapter:
+    def __init__(self, product):
+        self.product = product
+        self.discard_calls = 0
+
+    def stage(self, source):
+        return self.product
+
+    def build(self, staged):
+        return staged
+
+    def adopt(self, built, source):
+        return built
+
+    def discard(self, value):
+        self.discard_calls += 1
+        value.backing_owner.release()
+
+
+class _StageLease:
+    def __init__(self):
+        self.releases = 0
+        self._lock = threading.Lock()
+
+    def release(self):
+        with self._lock:
+            self.releases += 1
+
+
+class _StageAbortAdapter:
+    def __init__(self, staged, *, clock=None, entered=None, resume=None):
+        self.staged = staged
+        self.clock = clock
+        self.entered = entered
+        self.resume = resume
+        self.abort_calls = 0
+        self.build_calls = 0
+
+    def stage(self, source):
+        if self.entered is not None:
+            self.entered.set()
+        if self.resume is not None:
+            self.resume.wait(timeout=2)
+        if self.clock is not None:
+            self.clock.advance()
+        return self.staged
+
+    def build(self, staged):
+        self.build_calls += 1
+        raise AssertionError("stale or closed staged work must not build")
+
+    def abort(self, staged, reason):
+        self.abort_calls += 1
+        staged.release()
+
+
 class TestCacheCapsule(unittest.TestCase):
     def test_capability_is_deliberately_plain_kv_only(self):
         self.assertTrue(inspect_kv_cache_capsule(_cache(), 2).supported)
@@ -518,6 +582,115 @@ class TestCacheCapsule(unittest.TestCase):
         while adapter.discard_calls == 0 and time.monotonic() < deadline:
             time.sleep(0.001)
         self.assertEqual(adapter.discard_calls, 1)
+
+    def test_completed_then_cancel_disposes_external_result_exactly_once(self):
+        clock = CacheCapsuleGeneration()
+        source = _source(clock)
+        backing = _CountingBacking()
+        adapter = _CompletedAdapter(_e5rt_product(source, backing))
+        pool = CacheCapsulePool(clock, e5rt_adapter=adapter, enabled=True)
+
+        ticket = pool.submit(source)
+        ticket.future.result(timeout=1)
+        deadline = time.monotonic() + 1
+        while pool._active_ticket is not None and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        self.assertTrue(ticket.cancel("completed_then_cancel"))
+        self.assertFalse(ticket.cancel("repeat_cancel"))
+        pool.close()
+        pool.close()
+        self.assertEqual(adapter.discard_calls, 1)
+        self.assertEqual(backing.releases, 1)
+
+    def test_completed_then_stale_await_disposes_external_result_exactly_once(self):
+        clock = CacheCapsuleGeneration()
+        source = _source(clock)
+        backing = _CountingBacking()
+        adapter = _CompletedAdapter(_e5rt_product(source, backing))
+        pool = CacheCapsulePool(clock, e5rt_adapter=adapter, enabled=True)
+
+        ticket = pool.submit(source)
+        ticket.future.result(timeout=1)
+        clock.advance()
+        with self.assertRaises(StaleCacheCapsule):
+            ticket.await_adopt(timeout_s=1, fallback=None)
+        pool.close()
+
+        self.assertEqual(adapter.discard_calls, 1)
+        self.assertEqual(backing.releases, 1)
+
+    def test_pool_close_reclaims_completed_unadopted_result_exactly_once(self):
+        clock = CacheCapsuleGeneration()
+        source = _source(clock)
+        backing = _CountingBacking()
+        adapter = _CompletedAdapter(_e5rt_product(source, backing))
+        pool = CacheCapsulePool(clock, e5rt_adapter=adapter, enabled=True)
+
+        ticket = pool.submit(source)
+        ticket.future.result(timeout=1)
+        deadline = time.monotonic() + 1
+        while pool._active_ticket is not None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertIsNone(pool._active_ticket)
+
+        pool.close()
+        pool.close()
+        self.assertEqual(adapter.discard_calls, 1)
+        self.assertEqual(backing.releases, 1)
+
+    def test_generation_change_after_stage_aborts_staged_owner_exactly_once(self):
+        clock = CacheCapsuleGeneration()
+        source = _source(clock)
+        staged = _StageLease()
+        adapter = _StageAbortAdapter(staged, clock=clock)
+        pool = CacheCapsulePool(clock, e5rt_adapter=adapter, enabled=True)
+
+        ticket = pool.submit(source)
+        with self.assertRaises(StaleCacheCapsule):
+            ticket.future.result(timeout=1)
+        pool.close()
+        deadline = time.monotonic() + 1
+        while staged.releases == 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+        self.assertEqual(adapter.build_calls, 0)
+        self.assertEqual(adapter.abort_calls, 1)
+        self.assertEqual(staged.releases, 1)
+
+    def test_pool_close_during_stage_aborts_returned_owner_exactly_once(self):
+        clock = CacheCapsuleGeneration()
+        staged = _StageLease()
+        entered = threading.Event()
+        resume = threading.Event()
+        adapter = _StageAbortAdapter(staged, entered=entered, resume=resume)
+        pool = CacheCapsulePool(clock, e5rt_adapter=adapter, enabled=True)
+        errors = []
+
+        def submit_from_creator_thread():
+            try:
+                pool.submit(_source(clock))
+            except BaseException as error:
+                errors.append(error)
+
+        submitter = threading.Thread(target=submit_from_creator_thread)
+        submitter.start()
+        self.assertTrue(entered.wait(timeout=1))
+        pool.close()
+        resume.set()
+        submitter.join(timeout=1)
+        self.assertFalse(submitter.is_alive())
+
+        deadline = time.monotonic() + 1
+        while staged.releases == 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        pool.close()
+
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "closed during stage")
+        self.assertEqual(adapter.build_calls, 0)
+        self.assertEqual(adapter.abort_calls, 1)
+        self.assertEqual(staged.releases, 1)
 
     def test_owner_release_is_deferred_until_lease_closes(self):
         clock = CacheCapsuleGeneration()

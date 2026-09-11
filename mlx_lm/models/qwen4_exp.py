@@ -4402,6 +4402,33 @@ def _gather_qsa_attention(
     return out.reshape(batch, length, heads, dim).transpose(0, 2, 1, 3)
 
 
+def qsa_dense_attention_from_selection(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    selection: QSASelection,
+    cache: QSAKVCache,
+    *,
+    scale: float,
+) -> mx.array:
+    """Consume an existing QSA selection/fetched cache without mutation.
+
+    This is the fail-closed continuation for a segmented private-delta kernel
+    that declines after the index ledger and K/V append. It reproduces the
+    stock dense-mask call from that point instead of re-entering ``Attention``
+    and appending the same token slab twice.
+    """
+
+    return scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        cache=cache,
+        scale=scale,
+        mask=selection.dense_mask(),
+    )
+
+
 def _gather_qsa_quantized_attention(
     q,
     q_keys,

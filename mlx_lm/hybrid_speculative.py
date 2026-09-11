@@ -346,6 +346,13 @@ class DetachedSelfMTPLane:
     segment_transaction: Optional[Any] = field(
         default=None, repr=False, compare=False
     )
+    # Host-derived identity of the immutable QSA prefix shared by an initial
+    # fan-out cohort.  It is deliberately cleared at a membership boundary:
+    # after rows have generated independently, equal cache offsets no longer
+    # prove equal cache contents.
+    shared_qsa_prefix_id: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass
@@ -374,6 +381,9 @@ class SegmentedSelfMTPState:
     row_caches: List[SelfMTPCachePair]
     transactions: List[Any]
     membership_epoch: int
+    shared_qsa_prefix_id: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
     proposal_open: bool = False
     poisoned: bool = False
     poison_reason: Optional[str] = None
@@ -2235,16 +2245,28 @@ def attach_segmented_self_mtp_lanes(
         raise
 
     if batch is None:
+        prefix_ids = [item.shared_qsa_prefix_id for item in joining]
+        shared_qsa_prefix_id = (
+            prefix_ids[0]
+            if prefix_ids
+            and prefix_ids[0] is not None
+            and all(value == prefix_ids[0] for value in prefix_ids[1:])
+            else None
+        )
         result = SegmentedSelfMTPState(
             lanes=[item.lane for item in joining],
             row_caches=[item.caches for item in joining],
             transactions=transactions,
             membership_epoch=1,
+            shared_qsa_prefix_id=shared_qsa_prefix_id,
         )
         note_segmented_self_mtp("requests")
         note_segmented_self_mtp("engaged")
     else:
         batch._segmented_caches = None
+        # Attestation is only valid for the initial cohort.  A later join may
+        # have the same host-visible length while carrying different K/V.
+        batch.shared_qsa_prefix_id = None
         batch.lanes.extend(item.lane for item in joining)
         batch.row_caches.extend(item.caches for item in joining)
         batch.transactions.extend(transactions)
@@ -2340,7 +2362,9 @@ def _propose_segmented_self_mtp(
             if compute_caches is None:
                 try:
                     compute_caches = build_segmented_batch_cache_pair(
-                        batch.row_caches, note=note_segmented_self_mtp
+                        batch.row_caches,
+                        note=note_segmented_self_mtp,
+                        shared_qsa_prefix=(batch.shared_qsa_prefix_id is not None),
                     )
                 except SegmentedBatchUnsupported:
                     note_segmented_self_mtp("true_batched_declined")
@@ -2376,6 +2400,10 @@ def _propose_segmented_self_mtp(
 
         # Exact compatibility fallback for cache formats not covered by the
         # first true-batched consumer.
+        # A serial cycle lets rows diverge behind equal host offsets, so the
+        # initial-cohort prefix proof cannot be reused if true batching is
+        # enabled again later.
+        batch.shared_qsa_prefix_id = None
         for lane, pair, transaction in zip(
             batch.lanes, batch.row_caches, batch.transactions
         ):
@@ -3128,6 +3156,9 @@ def detach_self_mtp_lanes(
 
     if isinstance(batch, SegmentedSelfMTPState):
         batch._segmented_caches = None
+        # Detach/rebuild is a membership boundary.  Preserve correctness by
+        # requiring a fresh host-side provenance proof before sharing again.
+        batch.shared_qsa_prefix_id = None
         leaving = set(requested)
         keep = [index for index in range(len(batch.lanes)) if index not in leaving]
         detached = []

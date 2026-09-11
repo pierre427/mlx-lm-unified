@@ -11,6 +11,7 @@ from mlx_lm.hybrid_speculative import (
     SelfMTPCachePair,
     SelfMTPCycleResult,
     SelfMTPLane,
+    abort_batched_self_mtp,
     attach_segmented_self_mtp_lanes,
     close_segmented_self_mtp_state,
     commit_batched_self_mtp,
@@ -162,6 +163,64 @@ def _detached(uid, position=6):
             draft=[_FakeMTPKVCache(position - 1)],
         ),
     )
+
+
+def test_shared_qsa_prefix_attestation_is_host_only_and_initial_cohort_scoped():
+    first = _detached(0, position=8)
+    second = _detached(1, position=8)
+    first.shared_qsa_prefix_id = "same-host-token-digest"
+    second.shared_qsa_prefix_id = "same-host-token-digest"
+
+    state = attach_segmented_self_mtp_lanes(_FakeModel(), None, [first, second])
+    assert state.shared_qsa_prefix_id == "same-host-token-digest"
+
+    state, detached = detach_self_mtp_lanes(_FakeModel(), state, [1])
+    assert state.shared_qsa_prefix_id is None
+    assert detached[0].shared_qsa_prefix_id is None
+    close_segmented_self_mtp_state(state)
+    detached[0].segment_transaction.close()
+
+
+def test_shared_qsa_prefix_attestation_rejects_mixed_host_identities():
+    first = _detached(0, position=8)
+    second = _detached(1, position=8)
+    first.shared_qsa_prefix_id = "prefix-a"
+    second.shared_qsa_prefix_id = "prefix-b"
+
+    state = attach_segmented_self_mtp_lanes(_FakeModel(), None, [first, second])
+    assert state.shared_qsa_prefix_id is None
+    close_segmented_self_mtp_state(state)
+
+
+def test_serial_cycle_permanently_invalidates_shared_qsa_prefix(monkeypatch):
+    first = _detached(0, position=8)
+    second = _detached(1, position=8)
+    first.shared_qsa_prefix_id = "same-host-token-digest"
+    second.shared_qsa_prefix_id = "same-host-token-digest"
+    state = attach_segmented_self_mtp_lanes(_FakeModel(), None, [first, second])
+    assert state.shared_qsa_prefix_id is not None
+
+    monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "0")
+    with patch(
+        "mlx_lm.hybrid_speculative._propose_batched_self_mtp_impl",
+        side_effect=lambda _model, row: _fake_row_proposal({row.lanes[0].uid: 0})(
+            _model, row
+        ),
+    ):
+        proposal = propose_batched_self_mtp(_FakeModel(), state)
+    assert state.shared_qsa_prefix_id is None
+    commit_batched_self_mtp(
+        state,
+        proposal,
+        emitted_counts=[1, 1],
+        terminal=[False, False],
+    )
+
+    monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1")
+    # Re-enabling batching must not recreate a shared-prefix proof from equal
+    # host offsets after the serial rows were allowed to diverge.
+    assert state.shared_qsa_prefix_id is None
+    close_segmented_self_mtp_state(state)
 
 
 def _fake_row_proposal(accepted_by_uid):
@@ -636,6 +695,252 @@ def test_tiny_qwen4_gdn_qsa_mtp_runs_real_independent_b1_cycle():
     close_segmented_self_mtp_state(state)
 
 
+def test_private_delta_late_decline_consumes_existing_selection_once(monkeypatch):
+    from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+    from mlx_lm.segmented_batch_cache import SegmentedBatchQSAKVCache
+    from mlx_lm.segmented_self_mtp import note_segmented_self_mtp
+
+    segmented_self_mtp_stats(reset=True)
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", "1")
+    model = _tiny_qwen4_model()
+    attention = model.language_model.model.layers[1].self_attn
+    prefix = mx.random.normal((1, 12, 32), key=mx.random.key(101))
+    prefix_mask = (
+        mx.arange(12)[:, None] >= mx.arange(12)[None, :]
+    )[None, None]
+    private_rows = []
+    for _ in range(2):
+        cache = QSAKVCache(attention.indexer.summary_identity)
+        output = attention(prefix, prefix_mask, cache)
+        mx.eval(output)
+        private_rows.append(cache)
+
+    serial_rows = []
+    for source in private_rows:
+        cache = QSAKVCache(attention.indexer.summary_identity)
+        cache.state = source.state
+        cache.meta_state = source.meta_state
+        serial_rows.append(cache)
+
+    counts = {"index": [0, 0], "kv": [0, 0]}
+    for row_index, cache in enumerate(private_rows):
+        original_index = cache.update_index_keys
+        original_kv = cache.update_and_fetch
+
+        def counted_index(keys, *, _index=row_index, _original=original_index):
+            counts["index"][_index] += 1
+            return _original(keys)
+
+        def counted_kv(keys, values, *, _index=row_index, _original=original_kv):
+            counts["kv"][_index] += 1
+            return _original(keys, values)
+
+        cache.update_index_keys = counted_index
+        cache.update_and_fetch = counted_kv
+
+    hidden = mx.random.normal((2, 3, 32), key=mx.random.key(102))
+    serial = SegmentedBatchQSAKVCache(serial_rows, shared_qsa_prefix=False)
+    serial.prepare(lengths=[3, 3], right_padding=[0, 0])
+    expected = serial.segmented_attention(attention, hidden, None)
+
+    private = SegmentedBatchQSAKVCache(
+        private_rows,
+        note=note_segmented_self_mtp,
+        shared_qsa_prefix=True,
+    )
+    private.prepare(lengths=[3, 3], right_padding=[0, 0])
+    with patch(
+        "mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_preflight",
+        return_value=(True, "engaged"),
+    ), patch(
+        "mlx_lm.segmented_batch_cache."
+        "qwen4_qsa_indexed_private_delta_exact_set_preflight",
+        return_value=(True, "engaged"),
+    ), patch(
+        "mlx_lm.segmented_batch_cache."
+        "qwen4_qsa_indexed_private_delta_exact_set_attention",
+        side_effect=RuntimeError("synthetic exact-set dispatch decline"),
+    ), patch(
+        "mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_attention",
+        side_effect=RuntimeError("synthetic dispatch decline"),
+    ):
+        actual = private.segmented_attention(attention, hidden, None)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
+    assert counts == {"index": [1, 1], "kv": [1, 1]}
+    assert [row.offset for row in private_rows] == [15, 15]
+    assert [row.offset for row in serial_rows] == [15, 15]
+    counters = segmented_self_mtp_stats()
+    assert counters["private_delta_requests"] == 1
+    assert counters["private_delta_declines"] == 1
+    assert counters["private_delta_attention_calls"] == 0
+    assert counters["private_delta_late_gather_fallbacks"] == 1
+    assert counters["exact_set_fold_requests"] == 1
+    assert counters["exact_set_fold_device_proofs"] == 1
+    assert counters["exact_set_fold_attention_calls"] == 0
+    assert counters["exact_set_fold_declines"] == 1
+    assert counters["exact_set_fold_private_fallbacks"] == 1
+    assert counters["exact_set_fold_decline_reasons"] == {
+        "dispatch_raised": 1
+    }
+
+
+def test_exact_set_preflight_decline_uses_proven_private_path(monkeypatch):
+    from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+    from mlx_lm.segmented_batch_cache import SegmentedBatchQSAKVCache
+    from mlx_lm.segmented_self_mtp import note_segmented_self_mtp
+
+    segmented_self_mtp_stats(reset=True)
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", "1")
+    model = _tiny_qwen4_model()
+    attention = model.language_model.model.layers[1].self_attn
+    prefix = mx.random.normal((1, 12, 32), key=mx.random.key(111))
+    prefix_mask = (
+        mx.arange(12)[:, None] >= mx.arange(12)[None, :]
+    )[None, None]
+    rows = []
+    for _ in range(2):
+        cache = QSAKVCache(attention.indexer.summary_identity)
+        mx.eval(attention(prefix, prefix_mask, cache))
+        rows.append(cache)
+    segmented = SegmentedBatchQSAKVCache(
+        rows,
+        note=note_segmented_self_mtp,
+        shared_qsa_prefix=True,
+    )
+    segmented.prepare(lengths=[3, 3], right_padding=[0, 0])
+    hidden = mx.random.normal((2, 3, 32), key=mx.random.key(112))
+    sentinel = mx.zeros_like(hidden)
+    with patch(
+        "mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_preflight",
+        return_value=(True, "engaged"),
+    ), patch(
+        "mlx_lm.segmented_batch_cache."
+        "qwen4_qsa_indexed_private_delta_exact_set_preflight",
+        return_value=(False, "synthetic_exact_preflight_decline"),
+    ), patch.object(
+        segmented,
+        "_private_delta_attention",
+        return_value=sentinel,
+    ) as consume:
+        actual = segmented.segmented_attention(attention, hidden, None)
+
+    assert actual is sentinel
+    consume.assert_called_once_with(attention, hidden, exact_set_fold=False)
+    counters = segmented_self_mtp_stats()
+    assert counters["exact_set_fold_requests"] == 1
+    assert counters["exact_set_fold_declines"] == 1
+    assert counters["exact_set_fold_preflight_declines"] == 1
+    assert counters["exact_set_fold_device_proofs"] == 0
+    assert counters["exact_set_fold_decline_reasons"] == {
+        "synthetic_exact_preflight_decline": 1
+    }
+
+
+def test_exact_set_success_records_engagement_and_updates_each_row_once(monkeypatch):
+    from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
+    from mlx_lm.models import qwen4_qsa_indexed as indexed
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+    from mlx_lm.segmented_batch_cache import SegmentedBatchQSAKVCache
+    from mlx_lm.segmented_self_mtp import note_segmented_self_mtp
+
+    segmented_self_mtp_stats(reset=True)
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", "1")
+    model = _tiny_qwen4_model()
+    attention = model.language_model.model.layers[1].self_attn
+    prefix = mx.random.normal((1, 12, 32), key=mx.random.key(121))
+    prefix_mask = (
+        mx.arange(12)[:, None] >= mx.arange(12)[None, :]
+    )[None, None]
+    rows = []
+    for _ in range(2):
+        cache = QSAKVCache(attention.indexer.summary_identity)
+        mx.eval(attention(prefix, prefix_mask, cache))
+        rows.append(cache)
+
+    updates = {"index": 0, "kv": 0}
+    for cache in rows:
+        original_index = cache.update_index_keys
+        original_kv = cache.update_and_fetch
+
+        def counted_index(keys, *, _original=original_index):
+            updates["index"] += 1
+            return _original(keys)
+
+        def counted_kv(keys, values, *, _original=original_kv):
+            updates["kv"] += 1
+            return _original(keys, values)
+
+        cache.update_index_keys = counted_index
+        cache.update_and_fetch = counted_kv
+
+    segmented = SegmentedBatchQSAKVCache(
+        rows,
+        note=note_segmented_self_mtp,
+        shared_qsa_prefix=True,
+    )
+    segmented.prepare(lengths=[3, 3], right_padding=[0, 0])
+    hidden = mx.random.normal((2, 3, 32), key=mx.random.key(122))
+
+    def exact_reference(
+        q,
+        base_k,
+        base_v,
+        delta_k,
+        delta_v,
+        _lengths,
+        compact,
+        *,
+        scale,
+    ):
+        return indexed.qwen4_qsa_indexed_private_delta_reference(
+            q,
+            base_k,
+            base_v,
+            delta_k,
+            delta_v,
+            compact,
+            scale=scale,
+            splits=8,
+        )
+
+    with patch(
+        "mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_preflight",
+        return_value=(True, "engaged"),
+    ), patch(
+        "mlx_lm.segmented_batch_cache."
+        "qwen4_qsa_indexed_private_delta_exact_set_preflight",
+        return_value=(True, "engaged"),
+    ), patch(
+        "mlx_lm.segmented_batch_cache."
+        "qwen4_qsa_indexed_private_delta_exact_set_attention",
+        side_effect=exact_reference,
+    ) as folded, patch(
+        "mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_attention"
+    ) as proven:
+        actual = segmented.segmented_attention(attention, hidden, None)
+    mx.eval(actual)
+
+    assert bool(mx.all(mx.isfinite(actual)).item())
+    assert updates == {"index": 2, "kv": 2}
+    assert folded.call_count == 1
+    proven.assert_not_called()
+    counters = segmented_self_mtp_stats()
+    assert counters["private_delta_requests"] == 1
+    assert counters["private_delta_attention_calls"] == 1
+    assert counters["exact_set_fold_requests"] == 1
+    assert counters["exact_set_fold_device_proofs"] == 1
+    assert counters["exact_set_fold_attention_calls"] == 1
+    assert counters["exact_set_fold_rows"] == 2
+    assert counters["exact_set_fold_declines"] == 0
+
+
 @pytest.mark.parametrize("accepts", list(product(range(3), repeat=2)))
 def test_true_batched_segmented_matches_serial_b1_oracle(monkeypatch, accepts):
     from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
@@ -706,6 +1011,344 @@ def test_true_batched_segmented_matches_serial_b1_oracle(monkeypatch, accepts):
                     assert mx.allclose(
                         actual_array, expected_array, rtol=1e-5, atol=1e-6
                     ).item()
+
+
+def _qsa_prefix_snapshot(rows):
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+
+    snapshots = {}
+    for row, item in enumerate(rows):
+        for group_name, caches in (
+            ("target", item.caches.target),
+            ("draft", item.caches.draft),
+        ):
+            for layer, cache in enumerate(caches):
+                if not isinstance(cache, QSAKVCache):
+                    continue
+                width = int(cache.offset)
+                values = {
+                    "keys": None if cache.keys is None else mx.array(cache.keys[..., :width, :]),
+                    "values": (
+                        None
+                        if cache.values is None
+                        else mx.array(cache.values[..., :width, :])
+                    ),
+                    "index_keys": (
+                        None
+                        if cache.index_keys is None
+                        else mx.array(cache.index_keys[:, :width])
+                    ),
+                }
+                mx.eval(*(value for value in values.values() if value is not None))
+                snapshots[(row, group_name, layer)] = (width, values)
+    return snapshots
+
+
+def _assert_qsa_prefix_unchanged(snapshots, rows):
+    from test_verify_state_oracle import _array_atom
+
+    for (row, group_name, layer), (width, values) in snapshots.items():
+        cache = getattr(rows[row].caches, group_name)[layer]
+        assert int(cache.offset) >= width
+        current = {
+            "keys": None if cache.keys is None else cache.keys[..., :width, :],
+            "values": None if cache.values is None else cache.values[..., :width, :],
+            "index_keys": (
+                None if cache.index_keys is None else cache.index_keys[:, :width]
+            ),
+        }
+        for name, expected in values.items():
+            actual = current[name]
+            assert (actual is None) == (expected is None)
+            if expected is not None:
+                assert _array_atom(actual) == _array_atom(expected), (
+                    row,
+                    group_name,
+                    layer,
+                    name,
+                )
+
+
+def _instrument_qsa_updates(rows):
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+
+    counts = {
+        "target_index": 0,
+        "target_kv": 0,
+        "draft_index": 0,
+        "draft_kv": 0,
+    }
+    for item in rows:
+        for group_name, caches in (
+            ("target", item.caches.target),
+            ("draft", item.caches.draft),
+        ):
+            for cache in caches:
+                if not isinstance(cache, QSAKVCache):
+                    continue
+                original_index = cache.update_index_keys
+                original_kv = cache.update_and_fetch
+
+                def counted_index(
+                    keys, *, _group=group_name, _original=original_index
+                ):
+                    counts[f"{_group}_index"] += 1
+                    return _original(keys)
+
+                def counted_kv(
+                    keys, values, *, _group=group_name, _original=original_kv
+                ):
+                    counts[f"{_group}_kv"] += 1
+                    return _original(keys, values)
+
+                cache.update_index_keys = counted_index
+                cache.update_and_fetch = counted_kv
+    return counts
+
+
+def _assert_detached_rows_oracle(expected_rows, actual_rows):
+    from test_verify_state_oracle import (
+        _array_atom,
+        capture_cache_list,
+    )
+
+    assert len(actual_rows) == len(expected_rows)
+    for expected, actual in zip(expected_rows, actual_rows):
+        for name in ("uid", "cur", "ntoks", "pending_ts"):
+            assert getattr(actual.lane, name) == getattr(expected.lane, name)
+        for name in ("seed_h", "pending_hs", "token_prefix"):
+            expected_value = getattr(expected.lane, name)
+            actual_value = getattr(actual.lane, name)
+            assert (actual_value is None) == (expected_value is None)
+            if expected_value is not None:
+                assert mx.allclose(
+                    actual_value, expected_value, rtol=1e-5, atol=1e-6
+                ).item()
+        assert _array_atom(actual.lane.rng.key) == _array_atom(expected.lane.rng.key)
+        assert vars(actual.lane.stats) == vars(expected.lane.stats)
+
+        for group_name in ("target", "draft"):
+            expected_caches = getattr(expected.caches, group_name)
+            actual_caches = getattr(actual.caches, group_name)
+            expected_capture = capture_cache_list(expected_caches, group_name)
+            actual_capture = capture_cache_list(actual_caches, group_name)
+            assert set(actual_capture) == set(expected_capture)
+            for path, expected_atom in expected_capture.items():
+                actual_atom = actual_capture[path]
+                assert actual_atom.kind == expected_atom.kind, path
+                assert actual_atom.dtype == expected_atom.dtype, path
+                assert actual_atom.shape == expected_atom.shape, path
+                if not (
+                    expected_atom.kind == "array"
+                    and "float" in expected_atom.dtype
+                ):
+                    assert actual_atom == expected_atom, path
+
+            for expected_cache, actual_cache in zip(
+                expected_caches, actual_caches
+            ):
+                expected_arrays = list(_tree_arrays(expected_cache.state))
+                actual_arrays = list(_tree_arrays(actual_cache.state))
+                assert len(actual_arrays) == len(expected_arrays)
+                for expected_array, actual_array in zip(
+                    expected_arrays, actual_arrays
+                ):
+                    if "float" in str(expected_array.dtype):
+                        assert mx.allclose(
+                            actual_array,
+                            expected_array,
+                            rtol=1e-5,
+                            atol=1e-6,
+                        ).item()
+                    else:
+                        assert _array_atom(actual_array) == _array_atom(
+                            expected_array
+                        )
+
+
+def test_private_qsa_repeated_cycles_have_bounded_state_oracle(monkeypatch):
+    from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
+
+    model = _tiny_qwen4_model()
+    prompts = ([1, 2, 3, 4], [1, 2, 3, 4])
+    accept_cycles = ((0, 0), (1, 1), (2, 2), (1, 2), (2, 0))
+
+    def run(private_delta):
+        monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1")
+        monkeypatch.setenv(
+            "MLX_LM_QSA_PRIVATE_DELTA", "1" if private_delta else "0"
+        )
+        monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+        rows = [
+            _prepare_lane(model, uid, prompt)
+            for uid, prompt in enumerate(prompts)
+        ]
+        for item in rows:
+            item.lane.max_tokens = 64
+            item.lane.sampling_temp = 0.0
+            item.shared_qsa_prefix_id = "identical-four-token-prefix"
+        base = _qsa_prefix_snapshot(rows)
+        counts = _instrument_qsa_updates(rows) if private_delta else None
+        state = attach_segmented_self_mtp_lanes(model, None, rows)
+        private_calls = 0
+        outputs = []
+
+        def decline_private(*_args, **_kwargs):
+            nonlocal private_calls
+            private_calls += 1
+            assert counts["target_index"] == 2 * private_calls
+            assert counts["target_kv"] == 2 * private_calls
+            raise RuntimeError("synthetic exact private-delta dispatch decline")
+
+        private_patches = (
+            patch(
+                "mlx_lm.segmented_batch_cache."
+                "qwen4_qsa_indexed_private_delta_preflight",
+                return_value=(True, "engaged"),
+            ),
+            patch(
+                "mlx_lm.segmented_batch_cache."
+                "qwen4_qsa_indexed_private_delta_attention",
+                side_effect=decline_private,
+            ),
+        )
+        with private_patches[0], private_patches[1]:
+            for cycle, accepts in enumerate(accept_cycles):
+                if cycle == 3:
+                    state, detached = detach_self_mtp_lanes(model, state, [0, 1])
+                    assert state.shared_qsa_prefix_id is None
+                    state = attach_segmented_self_mtp_lanes(model, state, detached)
+                    monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "0")
+                elif cycle == 4:
+                    monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1")
+                    calls_before_reenable = private_calls
+
+                accepted = iter(accepts)
+
+                def force(logprobs, *_args, **_kwargs):
+                    count = next(accepted)
+                    return count, int(mx.argmax(logprobs[count]).item())
+
+                with patch(
+                    "mlx_lm.hybrid_speculative._batched_residual_verify",
+                    side_effect=force,
+                ):
+                    proposal = propose_batched_self_mtp(model, state)
+                outputs.append(
+                    tuple(tuple(token.token for token in row) for row in proposal.outputs)
+                )
+                commit_batched_self_mtp(
+                    state,
+                    proposal,
+                    emitted_counts=[len(row) for row in proposal.outputs],
+                    terminal=[False, False],
+                )
+
+                if cycle == 4:
+                    assert private_calls == calls_before_reenable
+
+        state, rows = detach_self_mtp_lanes(model, state, [0, 1])
+        _assert_qsa_prefix_unchanged(base, rows)
+        close_segmented_self_mtp_state(state)
+        return outputs, rows, counts, private_calls
+
+    expected_outputs, expected_rows, _, _ = run(False)
+    actual_outputs, actual_rows, counts, private_calls = run(True)
+    assert actual_outputs == expected_outputs
+    assert private_calls > 0
+    assert counts["target_index"] == counts["target_kv"]
+    assert counts["draft_index"] == counts["draft_kv"]
+    _assert_detached_rows_oracle(expected_rows, actual_rows)
+
+    # Equal prompt prefixes stay bit-identical, while the private suffixes
+    # diverge after the two RNG streams produce different live tokens.
+    from test_verify_state_oracle import _array_atom
+
+    for group_name in ("target", "draft"):
+        left = next(
+            cache
+            for cache in getattr(actual_rows[0].caches, group_name)
+            if hasattr(cache, "index_keys")
+        )
+        right = next(
+            cache
+            for cache in getattr(actual_rows[1].caches, group_name)
+            if hasattr(cache, "index_keys")
+        )
+        base_width = 4 if group_name == "target" else 3
+        assert _array_atom(left.keys[..., :base_width, :]) == _array_atom(
+            right.keys[..., :base_width, :]
+        )
+        assert _array_atom(left.keys[..., base_width:, :]) != _array_atom(
+            right.keys[..., base_width:, :]
+        )
+
+
+def test_private_qsa_abort_preserves_base_and_fails_closed(monkeypatch):
+    from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
+
+    monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+    model = _tiny_qwen4_model()
+    rows = [
+        _prepare_lane(model, uid, [1, 2, 3, 4])
+        for uid in range(2)
+    ]
+    for item in rows:
+        item.shared_qsa_prefix_id = "abort-base"
+    base = _qsa_prefix_snapshot(rows)
+    counts = _instrument_qsa_updates(rows)
+    state = attach_segmented_self_mtp_lanes(model, None, rows)
+    private_calls = 0
+
+    def decline_private(*_args, **_kwargs):
+        nonlocal private_calls
+        private_calls += 1
+        assert counts["target_index"] == 2 * private_calls
+        assert counts["target_kv"] == 2 * private_calls
+        raise RuntimeError("synthetic exact private-delta dispatch decline")
+
+    accepted = iter((0, 2))
+
+    def force(logprobs, *_args, **_kwargs):
+        count = next(accepted)
+        return count, int(mx.argmax(logprobs[count]).item())
+
+    with (
+        patch(
+            "mlx_lm.segmented_batch_cache."
+            "qwen4_qsa_indexed_private_delta_preflight",
+            return_value=(True, "engaged"),
+        ),
+        patch(
+            "mlx_lm.segmented_batch_cache."
+            "qwen4_qsa_indexed_private_delta_attention",
+            side_effect=decline_private,
+        ),
+        patch(
+            "mlx_lm.hybrid_speculative._batched_residual_verify",
+            side_effect=force,
+        ),
+    ):
+        proposal = propose_batched_self_mtp(model, state)
+
+    _assert_qsa_prefix_unchanged(base, rows)
+    assert counts["target_index"] == counts["target_kv"] == 2 * private_calls
+    assert counts["draft_index"] == counts["draft_kv"]
+    abort_batched_self_mtp(state, proposal, cause=RuntimeError("client gone"))
+    assert state.poisoned is True
+    assert "client gone" in state.poison_reason
+    assert state.proposal_open is False
+    assert state._open_proposal is None
+    assert state._batched_state is None
+    assert state._segmented_caches is None
+    assert state._transaction_branches == []
+    with pytest.raises(RuntimeError, match="poisoned"):
+        propose_batched_self_mtp(model, state)
+    with pytest.raises(RuntimeError, match="poisoned"):
+        detach_self_mtp_lanes(model, state, [0])
+    close_segmented_self_mtp_state(state)
 
 
 def test_true_batched_segmented_shared_qsa_cycle_is_disarmed():

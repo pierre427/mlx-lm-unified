@@ -90,7 +90,11 @@ class PromptCacheKeyProvenance:
 
 @dataclass(frozen=True)
 class PromptHostPlane:
-    """Canonical rendering/tokenization result, safe across device fallbacks."""
+    """Canonical rendering/tokenization result, safe across device fallbacks.
+
+    ``rendered_prompt`` can be empty when a fused chat-template call returns
+    tokens without exposing its intermediate text.
+    """
 
     input_fingerprint: str
     rendered_prompt: str
@@ -102,10 +106,13 @@ class PromptHostPlane:
     chat_template_identity: str
     chat_template_version: str
     cache_key_provenance: PromptCacheKeyProvenance
+    initial_state: str = "normal"
 
     def __post_init__(self) -> None:
         if not self.input_fingerprint:
             raise ValueError("prompt input fingerprint is required")
+        if not isinstance(self.initial_state, str) or not self.initial_state:
+            raise ValueError("prompt initial state must be a non-empty string")
         if not self.tokenizer_identity or not self.chat_template_identity:
             raise ValueError("tokenizer and chat-template identities are required")
         if len(self.token_offsets) not in (0, len(self.token_ids)):
@@ -343,6 +350,17 @@ class PromptHostPlaneCache:
         self.max_entries = int(max_entries)
         self._entries: OrderedDict[str, CachePlaneOwner] = OrderedDict()
         self._lock = threading.RLock()
+        self._counters = {
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "stores": 0,
+            "replacements": 0,
+            "evictions": 0,
+            "invalidations": 0,
+            "bypasses": 0,
+        }
+        self._bypass_reasons: dict[str, int] = {}
 
     def store(self, plane: PromptHostPlane) -> CachePlaneOwner:
         owner = CachePlaneOwner(
@@ -351,28 +369,83 @@ class PromptHostPlaneCache:
             fingerprint=plane.fingerprint,
         )
         with self._lock:
+            self._counters["stores"] += 1
             previous = self._entries.pop(plane.input_fingerprint, None)
             if previous is not None:
                 previous.invalidate("replaced")
+                self._counters["replacements"] += 1
+                self._counters["invalidations"] += 1
             self._entries[plane.input_fingerprint] = owner
             while len(self._entries) > self.max_entries:
                 _, evicted = self._entries.popitem(last=False)
                 evicted.invalidate("lru_evicted")
+                self._counters["evictions"] += 1
+                self._counters["invalidations"] += 1
         return owner
 
     def lookup(
         self, input_fingerprint: str, expected: CachePlaneFingerprint
     ) -> CachePlaneLease | CachePlaneFallback:
         with self._lock:
+            self._counters["lookups"] += 1
             owner = self._entries.get(input_fingerprint)
             if owner is None:
+                self._counters["misses"] += 1
                 return CachePlaneFallback(
                     CachePlaneKind.PROMPT_HOST,
                     "input_miss",
                     "render_and_tokenize",
                 )
             self._entries.move_to_end(input_fingerprint)
-        return owner.try_adopt(expected)
+            adopted = owner.try_adopt(expected)
+            counter = "hits" if isinstance(adopted, CachePlaneLease) else "misses"
+            self._counters[counter] += 1
+            return adopted
+
+    def invalidate(self, input_fingerprint: str, reason: str) -> bool:
+        """Remove one entry and invalidate any outstanding lease safely."""
+        if not reason:
+            raise ValueError("prompt host cache invalidation needs a reason")
+        with self._lock:
+            owner = self._entries.pop(input_fingerprint, None)
+            if owner is None:
+                return False
+            owner.invalidate(reason)
+            self._counters["invalidations"] += 1
+            return True
+
+    def clear(self, reason: str) -> int:
+        """Invalidate every entry and return the number removed."""
+        if not reason:
+            raise ValueError("prompt host cache invalidation needs a reason")
+        with self._lock:
+            owners = tuple(self._entries.values())
+            self._entries.clear()
+            for owner in owners:
+                owner.invalidate(reason)
+            self._counters["invalidations"] += len(owners)
+            return len(owners)
+
+    def record_bypass(self, reason: str) -> None:
+        """Record why a request did not attempt host-plane reuse."""
+        if not reason:
+            raise ValueError("prompt host cache bypass needs a reason")
+        with self._lock:
+            self._counters["bypasses"] += 1
+            self._bypass_reasons[reason] = self._bypass_reasons.get(reason, 0) + 1
+
+    def stats(self) -> dict[str, Any]:
+        """Return cache-wide reachability counters without timing or device sync."""
+        with self._lock:
+            result = dict(self._counters)
+            result.update(
+                {
+                    "entries": len(self._entries),
+                    "max_entries": self.max_entries,
+                    "bypass_reasons": dict(self._bypass_reasons),
+                }
+            )
+            return result
 
 
 __all__ = [

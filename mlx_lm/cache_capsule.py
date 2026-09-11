@@ -602,6 +602,7 @@ class CacheCapsuleTicket:
         self._state = "pending"
         self._receipt = None
         self._built_disposed = False
+        self._stage_aborted = False
 
     def await_adopt(self, *, timeout_s=None, fallback="gpu"):
         return self._pool._await_ticket(self, timeout_s, fallback)
@@ -611,15 +612,47 @@ class CacheCapsuleTicket:
             if self._state != "pending":
                 return False
             self._state = "cancelled"
-        cancel = getattr(self._pool.e5rt_adapter, "cancel", None)
-        if callable(cancel):
-            threading.Thread(
-                target=cancel,
-                args=(self.staged, reason),
-                name="cache-capsule-cancel",
-                daemon=True,
-            ).start()
 
+        # A Future's callback may already have observed the old pending state
+        # before this transition.  In that completed-then-cancel race there is
+        # no later callback to reclaim the external result, so cancellation
+        # must also attempt the idempotent disposal itself.
+        completed = self.future.done()
+        if completed:
+            self._dispose_if_completed()
+        if (
+            not completed
+            or self.future.cancelled()
+            or self.future.exception() is not None
+        ):
+            self._abort_stage(reason)
+
+        self._pool._ticket_terminal(self)
+
+        return True
+
+    def _dispose_if_completed(self):
+        if (
+            not self.future.done()
+            or self.future.cancelled()
+            or self.future.exception() is not None
+            or not self._claim_built_disposal()
+        ):
+            return False
+        self._pool._discard_e5rt(self.future.result())
+        return True
+
+    def _abort_stage(self, reason):
+        with self._lock:
+            if self._stage_aborted:
+                return False
+            self._stage_aborted = True
+        threading.Thread(
+            target=self._pool._abort_e5rt_stage,
+            args=(self.staged, reason),
+            name="cache-capsule-stage-abort",
+            daemon=True,
+        ).start()
         return True
 
     def _claim_built_disposal(self):
@@ -650,6 +683,7 @@ class CacheCapsuleTicket:
         with self._lock:
             self._receipt = receipt
             self._state = state
+        self._pool._ticket_terminal(self)
 
 
 class CacheCapsulePool:
@@ -690,6 +724,10 @@ class CacheCapsulePool:
         self._counter_lock = threading.Lock()
         self._ticket_lock = threading.Lock()
         self._active_ticket = None
+        # Completed products remain owned by their tickets until adopted or
+        # cancelled.  Track them separately from the physical worker slot so a
+        # later pool close can still reclaim a result whose callback has run.
+        self._tickets = set()
         self._closed = False
 
     @property
@@ -723,6 +761,15 @@ class CacheCapsulePool:
         self._check_generation(source)
         return self.e5rt_adapter.build(staged)
 
+    def _abort_e5rt_stage(self, staged, reason):
+        """Relinquish an adapter's staged slot without assuming build ran."""
+
+        abort = getattr(self.e5rt_adapter, "abort", None)
+        if not callable(abort):
+            abort = getattr(self.e5rt_adapter, "cancel", None)
+        if callable(abort):
+            abort(staged, reason)
+
     def submit(self, source: KVCachePlaneSource) -> CacheCapsuleTicket:
         """Stage and submit e5rt work, returning before it completes."""
 
@@ -755,28 +802,23 @@ class CacheCapsulePool:
             if self._closed:
                 if self._active_ticket is self._STAGING:
                     self._active_ticket = None
-                cancel = getattr(self.e5rt_adapter, "cancel", None)
-                if callable(cancel):
-                    threading.Thread(
-                        target=cancel,
-                        args=(staged, "pool_closed_during_stage"),
-                        daemon=True,
-                    ).start()
+                threading.Thread(
+                    target=self._abort_e5rt_stage,
+                    args=(staged, "pool_closed_during_stage"),
+                    name="cache-capsule-stage-abort",
+                    daemon=True,
+                ).start()
                 raise CacheCapsuleError("cache capsule pool closed during stage")
             future = Future()
             ticket = CacheCapsuleTicket(self, source, staged, future)
             self._active_ticket = ticket
+            self._tickets.add(ticket)
 
         def physical_done(completed):
             with ticket._lock:
                 cancelled = ticket._state in ("cancelled", "fallback")
-            if (
-                cancelled
-                and not completed.cancelled()
-                and completed.exception() is None
-                and ticket._claim_built_disposal()
-            ):
-                self._discard_e5rt(completed.result())
+            if cancelled:
+                ticket._dispose_if_completed()
             self._ticket_done(ticket)
 
         future.add_done_callback(physical_done)
@@ -785,6 +827,8 @@ class CacheCapsulePool:
             try:
                 future.set_result(self._build_e5rt(source, staged))
             except BaseException as error:
+                if isinstance(error, StaleCacheCapsule):
+                    ticket._abort_stage("stale_before_build")
                 future.set_exception(error)
 
         threading.Thread(
@@ -797,6 +841,10 @@ class CacheCapsulePool:
         with self._ticket_lock:
             if self._active_ticket is ticket:
                 self._active_ticket = None
+
+    def _ticket_terminal(self, ticket):
+        with self._ticket_lock:
+            self._tickets.discard(ticket)
 
     def _await_ticket(self, ticket, timeout_s, fallback):
         if threading.get_ident() != ticket.source.creator_thread:
@@ -974,8 +1022,8 @@ class CacheCapsulePool:
     def close(self):
         with self._ticket_lock:
             self._closed = True
-            ticket = self._active_ticket
-        if isinstance(ticket, CacheCapsuleTicket):
+            tickets = tuple(self._tickets)
+        for ticket in tickets:
             ticket.cancel("pool_close")
 
     def __enter__(self):

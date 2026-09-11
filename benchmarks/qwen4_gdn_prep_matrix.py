@@ -51,6 +51,8 @@ from mlx_lm.gdn_prefix_fanout import gdn_prefix_fanout_stats
 from mlx_lm.generate import ParallelSampleGenerator, StopSequenceMatcher
 from mlx_lm.sample_utils import LaneRNG
 from mlx_lm.segmented_self_mtp import (
+    require_qsa_exact_set_fold_engagement,
+    require_qsa_private_delta_engagement,
     require_segmented_self_mtp_engagement,
     require_true_batched_segmented_self_mtp_engagement,
     segmented_self_mtp_stats,
@@ -66,7 +68,20 @@ VARIANTS = {
         "gdn_prefix_fanout": True,
         "gdn_prefix_fanout_consume": True,
     },
-    "segmented": {"segment_aware_live_tip": True},
+    "segmented": {
+        "segment_aware_live_tip": True,
+        "_qsa_private_delta": True,
+        "_qsa_exact_set_fold": False,
+    },
+    "segmented_exact_set": {
+        "segment_aware_live_tip": True,
+        "_qsa_private_delta": True,
+        "_qsa_exact_set_fold": True,
+    },
+    "segmented_serial_qsa": {
+        "segment_aware_live_tip": True,
+        "_qsa_private_delta": False,
+    },
 }
 
 
@@ -85,8 +100,13 @@ def _mlx_memory():
 def _numeric_counter_delta(before, after):
     """Return mechanism counters without the descriptive receipt metadata."""
 
+    gauges = {
+        "private_delta_base_tokens_last",
+        "private_delta_base_tokens_min",
+        "private_delta_base_tokens_max",
+    }
     return {
-        key: int(value - before.get(key, 0))
+        key: int(value if key in gauges else value - before.get(key, 0))
         for key, value in after.items()
         if type(value) is int
     }
@@ -107,8 +127,26 @@ def _system_free_percent():
     return int(match.group(1)) if completed.returncode == 0 and match else None
 
 
+def _swap_used_bytes():
+    completed = subprocess.run(
+        ("/usr/sbin/sysctl", "-n", "vm.swapusage"),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    match = re.search(r"used\s*=\s*([0-9.]+)([KMG])", completed.stdout)
+    if completed.returncode != 0 or match is None:
+        return None
+    scale = {"K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2)]
+    return int(float(match.group(1)) * scale)
+
+
 def _once(model, cached, tail, args, variant):
     switches = VARIANTS[variant]
+    config_switches = {
+        key: value for key, value in switches.items() if not key.startswith("_")
+    }
     config = {
         "num_draft": args.num_draft,
         "persistent": True,
@@ -118,8 +156,22 @@ def _once(model, cached, tail, args, variant):
         "accept_rule": "residual",
         "gdn_prefix_fanout": False,
         "gdn_prefix_fanout_consume": False,
-        **switches,
+        **config_switches,
     }
+    private_delta_override = switches.get("_qsa_private_delta")
+    exact_set_override = switches.get("_qsa_exact_set_fold")
+    old_private_delta = os.environ.get("MLX_LM_QSA_PRIVATE_DELTA")
+    old_exact_set = os.environ.get(
+        "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"
+    )
+    if private_delta_override is not None:
+        os.environ["MLX_LM_QSA_PRIVATE_DELTA"] = (
+            "1" if private_delta_override else "0"
+        )
+    if exact_set_override is not None:
+        os.environ["MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"] = (
+            "1" if exact_set_override else "0"
+        )
     fanout_before = gdn_prefix_fanout_stats()
     segmented_before = segmented_self_mtp_stats()
     started = time.perf_counter_ns()
@@ -197,6 +249,20 @@ def _once(model, cached, tail, args, variant):
             "segmented_delta": _numeric_counter_delta(
                 segmented_before, segmented_self_mtp_stats()
             ),
+            "expects_qsa_private_delta": (
+                variant in {"segmented", "segmented_exact_set"}
+                and args.prompt_tokens // 4 * 4
+                >= int(
+                    os.environ.get(
+                        "MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "65536"
+                    )
+                )
+                and os.environ.get("MLX_LM_QSA_PRIVATE_DELTA", "1").lower()
+                in {"1", "true", "yes", "on"}
+            ),
+            "expects_qsa_exact_set_fold": (
+                variant == "segmented_exact_set"
+            ),
             "mlx_memory": memory,
         }
         return result
@@ -208,6 +274,20 @@ def _once(model, cached, tail, args, variant):
         mx.clear_cache()
         mx.synchronize()
         memory["after_cleanup"] = _mlx_memory()
+        if private_delta_override is not None:
+            if old_private_delta is None:
+                os.environ.pop("MLX_LM_QSA_PRIVATE_DELTA", None)
+            else:
+                os.environ["MLX_LM_QSA_PRIVATE_DELTA"] = old_private_delta
+        if exact_set_override is not None:
+            if old_exact_set is None:
+                os.environ.pop(
+                    "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", None
+                )
+            else:
+                os.environ[
+                    "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"
+                ] = old_exact_set
 
 
 def _require_receipts(arm):
@@ -230,12 +310,16 @@ def _require_receipts(arm):
     segmented = arm["segmented_delta"]
     if wants_segmented:
         require_true_batched_segmented_self_mtp_engagement(segmented)
+        if arm["expects_qsa_private_delta"]:
+            require_qsa_private_delta_engagement(segmented)
+        if arm["expects_qsa_exact_set_fold"]:
+            require_qsa_exact_set_fold_engagement(segmented)
     elif segmented["requests"] or segmented["engaged"]:
         raise AssertionError(f"{variant}: segmented self-MTP unexpectedly engaged")
 
 
-def _summarize(block, candidate, attempt, arms):
-    baselines = tuple(arm for arm in arms if arm["variant"] == "ordinary")
+def _summarize(block, candidate, attempt, arms, baseline="ordinary"):
+    baselines = tuple(arm for arm in arms if arm["variant"] == baseline)
     candidates = tuple(arm for arm in arms if arm["variant"] == candidate)
     if len(baselines) != 2 or len(candidates) != 2:
         raise AssertionError("a comparison bracket must contain two arms each")
@@ -255,6 +339,7 @@ def _summarize(block, candidate, attempt, arms):
         min(baselines[0]["total_ms"], baselines[1]["total_ms"]), 1e-9
     )
     return {
+        "baseline": baseline,
         "candidate": candidate,
         "block": block,
         "attempt": attempt,
@@ -291,12 +376,13 @@ def _candidate_gate(model, cached, tail, args, candidate):
             arms = []
             reasons = []
             order = (
-                (candidate, "ordinary", "ordinary", candidate)
+                (candidate, args.baseline, args.baseline, candidate)
                 if args.candidate_first
-                else ("ordinary", candidate, candidate, "ordinary")
+                else (args.baseline, candidate, candidate, args.baseline)
             )
             for slot, variant in enumerate(order):
                 system_free = _system_free_percent()
+                swap_before = _swap_used_bytes()
                 _emit(
                     "qwen4_gdn_prep_memory_gate",
                     candidate=candidate,
@@ -306,9 +392,11 @@ def _candidate_gate(model, cached, tail, args, candidate):
                     variant=variant,
                     system_free_percent=system_free,
                     minimum_system_free_percent=args.minimum_system_free_percent,
+                    swap_used_bytes=swap_before,
+                    maximum_swap_growth_bytes=args.maximum_swap_growth_mb * 1024**2,
                     mlx_memory=_mlx_memory(),
                 )
-                if system_free is None:
+                if system_free is None or swap_before is None:
                     reasons.append("system_memory_unverified")
                     break
                 if system_free < args.minimum_system_free_percent:
@@ -352,8 +440,12 @@ def _candidate_gate(model, cached, tail, args, candidate):
                     reasons.append("thermal_warning_after_arm")
                     break
                 system_free = _system_free_percent()
-                if system_free is None:
+                swap_after = _swap_used_bytes()
+                if system_free is None or swap_after is None:
                     reasons.append("system_memory_unverified_after_arm")
+                    break
+                if swap_after - swap_before > args.maximum_swap_growth_mb * 1024**2:
+                    reasons.append("swap_growth_after_arm")
                     break
                 if system_free < args.minimum_system_free_percent:
                     reasons.append("system_memory_pressure_after_arm")
@@ -366,7 +458,9 @@ def _candidate_gate(model, cached, tail, args, candidate):
                 ]
                 if mismatched_slots:
                     reasons.append("greedy_token_trace_mismatch")
-                row = _summarize(block, candidate, attempt, arms)
+                row = _summarize(
+                    block, candidate, attempt, arms, baseline=args.baseline
+                )
                 row["mismatched_token_slots"] = mismatched_slots
                 if row["closing_baseline_drift_fraction"] > args.max_bracket_drift:
                     reasons.append("closing_baseline_drift")
@@ -444,6 +538,12 @@ def main():
         help="Fail the arm before swap/reclamation pressure contaminates timing.",
     )
     parser.add_argument(
+        "--maximum-swap-growth-mb",
+        type=int,
+        default=16,
+        help="Reject an arm if swap use grows by more than this many MiB.",
+    )
+    parser.add_argument(
         "--allow-resident-ple",
         action="store_true",
         help=(
@@ -455,7 +555,13 @@ def main():
         "--candidates",
         nargs="+",
         choices=tuple(name for name in VARIANTS if name != "ordinary"),
-        default=tuple(name for name in VARIANTS if name != "ordinary"),
+        default=("immutable", "consume", "segmented"),
+    )
+    parser.add_argument(
+        "--baseline",
+        choices=("ordinary", "segmented", "segmented_serial_qsa"),
+        default="ordinary",
+        help="Control arm used for each A/B/B/A candidate bracket.",
     )
     parser.add_argument("--minimum-cooldown-seconds", type=float, default=60.0)
     parser.add_argument("--thermal-poll-seconds", type=float, default=5.0)
@@ -492,8 +598,12 @@ def main():
         parser.error("the cached tail must be positive and shorter than the prompt")
     if args.reps < 1:
         parser.error("--reps must be positive")
+    if args.baseline in args.candidates:
+        parser.error("the baseline cannot also be a candidate")
     if not 1 <= args.minimum_system_free_percent <= 100:
         parser.error("--minimum-system-free-percent must be in 1..100")
+    if args.maximum_swap_growth_mb < 0:
+        parser.error("--maximum-swap-growth-mb must be non-negative")
 
     ple_sidecar = os.environ.get("MLX_QWEN4_PLE_NVME")
     if not args.allow_resident_ple:
@@ -546,6 +656,7 @@ def main():
             "num_draft": args.num_draft,
             "max_tokens": args.max_tokens,
         },
+        "baseline": args.baseline,
         "thermal_controls": {
             "command": list(PMSET_THERM_COMMAND),
             "minimum_cooldown_seconds": args.minimum_cooldown_seconds,
@@ -554,6 +665,11 @@ def main():
             "stable_snapshots_required": args.thermal_stable_snapshots,
             "max_bracket_drift": args.max_bracket_drift,
             "max_block_retries": args.max_block_retries,
+        },
+        "memory_controls": {
+            "minimum_system_free_percent": args.minimum_system_free_percent,
+            "maximum_swap_growth_mb": args.maximum_swap_growth_mb,
+            "swap_growth_is_measured_per_arm": True,
         },
         "environment": {
             key: value

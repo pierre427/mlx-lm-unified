@@ -536,6 +536,18 @@ class TestSoftReloadReport(unittest.TestCase):
         self.assertEqual(report["prompt_cache"]["entries_dropped"], 1)
         self.assertEqual(len(cache), 0)
 
+    def test_reload_invalidates_prompt_host_entries_too(self):
+        gen = make_generator()
+        reasons = []
+        gen._prompt_host_cache = types.SimpleNamespace(
+            clear=lambda reason: reasons.append(reason) or 2
+        )
+
+        report = gen.soft_reload({"self_mtp_num_draft": 2})
+
+        self.assertEqual(reasons, ["soft_reload"])
+        self.assertEqual(report["prompt_cache"]["host_entries_dropped"], 2)
+
 
 class StubHandler:
     """APIHandler wired to byte buffers, with the status code captured."""

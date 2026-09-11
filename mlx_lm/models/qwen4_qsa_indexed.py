@@ -43,10 +43,10 @@ _QUANTIZED_BITS = frozenset({4, 8})
 _QUANTIZED_GROUP_SIZES = frozenset({32, 64, 128})
 
 
-def _env_flag(name: str) -> bool:
+def _env_flag(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
-        return False
+        return bool(default)
     value = raw.strip().lower()
     if value in {"1", "true", "on", "yes"}:
         return True
@@ -60,6 +60,11 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return value
+
+
+_PRIVATE_DELTA_MAX_QUERY = _env_int(
+    "MLX_LM_QSA_PRIVATE_DELTA_MAX_QUERY", 9, minimum=1
+)
 
 
 def _env_mode(name: str) -> bool | None:
@@ -262,6 +267,145 @@ def indexed_kernel_available() -> bool:
         and mx.metal.is_available()
         and mx.default_device() == mx.gpu
     )
+
+
+def qwen4_qsa_private_delta_min_context(length: int) -> int:
+    """Return the runtime threshold for a source-phased query width.
+
+    The legacy single threshold remains an explicit qualification override.
+    Without it, M=1 is effectively disabled and speculative slabs require
+    64K. The previous 16K/64K defaults were invalidated by the accepted
+    256-token full-model brackets; the legacy override remains available for
+    explicit qualification runs.
+    """
+
+    legacy = os.environ.get("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT")
+    if legacy is not None:
+        return max(0, int(legacy))
+    name = (
+        "MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT_M1"
+        if int(length) == 1
+        else "MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT_MN"
+    )
+    default = 2**31 - 1 if int(length) == 1 else 65536
+    return max(0, int(os.environ.get(name, str(default))))
+
+
+def qwen4_qsa_indexed_private_delta_preflight(
+    *,
+    length: int,
+    base_tokens: int,
+    head_dim: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    selected_blocks: int,
+    training: bool = False,
+) -> tuple[bool, str]:
+    """Side-effect-free admission before any QSA ledger or KV mutation."""
+
+    length = int(length)
+    base_tokens = int(base_tokens)
+    head_dim = int(head_dim)
+    nqh = int(num_query_heads)
+    nkh = int(num_kv_heads)
+    block_size = int(block_size)
+    selected_blocks = int(selected_blocks)
+    if training:
+        return False, "training"
+    if length < 1 or length > _PRIVATE_DELTA_MAX_QUERY:
+        return False, "width_out_of_range"
+    if base_tokens <= 0 or base_tokens % _BLOCK_SIZE:
+        return False, "unaligned_base"
+    if block_size != _BLOCK_SIZE:
+        return False, "unsupported_block_size"
+    if head_dim != 256:
+        return False, "unsupported_head_dim"
+    if nkh < 1 or nqh % nkh or nqh // nkh != 12:
+        return False, "unsupported_gqa"
+    # Compaction reserves the selected block slab plus at most one incomplete
+    # tail block.  Its shape is static from the indexer budget, so this check
+    # does not need to read a device count after the index ledger is appended.
+    token_width = (selected_blocks + 1) * block_size
+    if token_width <= 1024 or token_width > 8192:
+        return False, "unsupported_two_pass_geometry"
+    mlx_version = str(getattr(mx, "__version__", "unknown"))
+    allow_unverified = (
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX") == "1"
+    )
+    if mlx_version not in _EXACT_MLX_BUILDS and not allow_unverified:
+        return False, "mlx_build_unverified"
+    header_verified, _, header_reason = _sdpa_header_state()
+    if not header_verified and not allow_unverified:
+        return False, str(header_reason)
+    if not indexed_kernel_available():
+        return False, "kernel_unavailable"
+    return True, "engaged"
+
+
+def qwen4_qsa_indexed_private_delta_exact_set_preflight(
+    *,
+    batch: int,
+    length: int,
+    base_tokens: int,
+    head_dim: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    selected_blocks: int,
+    training: bool = False,
+) -> tuple[bool, str]:
+    """Admit the experimental two-row shared-base fold.
+
+    Exact-set identity is proved later by device array operations and consumed
+    by the Metal kernel without a host readback.  This host preflight only
+    admits the fixed B2 geometry in which that proof is meaningful.
+    """
+
+    if not _env_flag(
+        "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", default=True
+    ):
+        return False, "exact_set_fold_disabled"
+    if int(batch) != 2:
+        return False, "exact_set_fold_requires_b2"
+    return qwen4_qsa_indexed_private_delta_preflight(
+        length=length,
+        base_tokens=base_tokens,
+        head_dim=head_dim,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        selected_blocks=selected_blocks,
+        training=training,
+    )
+
+
+def qwen4_qsa_indexed_private_delta_exact_set_proof(
+    compact, *, base_tokens: int
+):
+    """Return a device-resident per-query proof of equal ordered base sets.
+
+    There is intentionally no ``mx.eval`` or ``.item()`` here. The predicate
+    becomes another dependency of the folded Metal dispatch. Delta/tail block
+    ids may differ; only selected ids below the immutable-base boundary are
+    part of the proof.
+    """
+
+    if int(compact.block_ids.shape[0]) != 2:
+        raise ValueError("exact-set proof requires a B2 compact selection")
+    if int(base_tokens) <= 0 or int(base_tokens) % int(compact.block_size):
+        raise ValueError("exact-set proof base must be positive and aligned")
+    ids, counts, _n_sel, u_width, _q_pos, _left_pad, _total = (
+        compact_blocks_to_kernel_inputs(compact)
+    )
+    base_block = int(base_tokens) // int(compact.block_size)
+    slots = mx.arange(u_width, dtype=mx.uint32)[None, :]
+    valid = (slots < counts[..., None]) & (ids < base_block)
+    same_valid = mx.all(valid[0] == valid[1], axis=-1)
+    same_ids = mx.all(
+        ~(valid[0] | valid[1]) | (ids[0] == ids[1]), axis=-1
+    )
+    return mx.contiguous(same_valid & same_ids)
 
 
 def _selection_topk_width(selection) -> int:
@@ -1097,6 +1241,267 @@ _PRIVATE_DELTA_SOURCE = r"""
 """
 
 
+_PRIVATE_DELTA_EXACT_SET_SOURCE = r"""
+    // Experimental B2 exact-set fold. One threadgroup owns both batch rows
+    // for one query position, KV head, split and head slice. When the ordered
+    // base-page ids match, each lane loads its K/V element once and updates
+    // two independent online-softmax accumulators. Row-local Q, masks,
+    // positions and private suffixes remain independent.
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint unit = threadgroup_position_in_grid.z;
+    const uint slices = GQA / HPT;
+    const uint hslice = unit % slices;
+    const uint rest = unit / slices;
+    const uint head = hslice * HPT + simdgroup_index_in_threadgroup;
+    const uint split = rest % S;
+    const uint hkv = rest / S;
+
+    const int L = dims[0];
+    const int TOT = dims[1];
+    const int U = dims[2];
+    const int BASE = dims[3];
+    const uint split_base = BLOCKS / S;
+    const uint remainder = BLOCKS % S;
+    const uint block_begin =
+        split * split_base + metal::min(split, remainder);
+    const uint block_count = split_base + (split < remainder ? 1u : 0u);
+    const uint token_width = uint(U) * BS;
+    const uint qh = hkv * GQA + head;
+    const uint elements = D / 32;
+    const size_t base_k_head = (size_t)hkv * base_k_strides[1];
+    const size_t base_v_head = (size_t)hkv * base_v_strides[1];
+    const bool fold_query = exact_set[row];
+
+    float q_values[2][D / 32];
+    for (uint b = 0; b < 2; ++b) {
+        for (uint part = 0; part < elements; ++part) {
+            const uint d = lane * elements + part;
+            const size_t q_index =
+                (size_t)b * q_strides[0] +
+                (size_t)qh * q_strides[1] +
+                (size_t)row * q_strides[2] +
+                (size_t)d * q_strides[3];
+            q_values[b][part] = float(scale[0]) * float(q[q_index]);
+        }
+    }
+
+    const uint count[2] = {counts[row], counts[L + row]};
+    const uint base_slots[2] = {
+        base_counts[row], base_counts[L + row]
+    };
+    const uint selected[2] = {n_sel[row], n_sel[L + row]};
+    const int qp[2] = {qpos[row], qpos[L + row]};
+    const int complete[2] = {
+        ((qp[0] + 1) / BS) * BS,
+        ((qp[1] + 1) / BS) * BS
+    };
+    const int delta_length[2] = {
+        int(delta_lengths[0]), int(delta_lengths[1])
+    };
+    const uint max_base_slots = metal::max(base_slots[0], base_slots[1]);
+    const uint base_token_stop =
+        metal::min(max_base_slots * BS, token_width);
+
+    for (uint local_block = 0; local_block < block_count; ++local_block) {
+        const uint block_idx = block_begin + local_block;
+        float out_values[2][D / 32] = {{0}};
+        float maximum[2] = {
+            -3.402823466e+38F, -3.402823466e+38F
+        };
+        float sum[2] = {0.0f, 0.0f};
+
+        for (uint token = block_idx; token < base_token_stop;
+             token += BLOCKS) {
+            const uint slot = token / BS;
+            const uint tail = token % BS;
+            int logical[2] = {0, 0};
+            bool live[2] = {false, false};
+            for (uint b = 0; b < 2; ++b) {
+                live[b] = slot < count[b] && slot < base_slots[b];
+                if (live[b]) {
+                    const uint slot_base = (b * L + row) * uint(U);
+                    const int block = int(ids[slot_base + slot]);
+                    logical[b] = block * BS + int(tail);
+                    live[b] = logical[b] >= 0 && logical[b] < BASE;
+                    live[b] = live[b] && logical[b] <= qp[b];
+                    live[b] = live[b]
+                        && (slot < selected[b] || logical[b] >= complete[b]);
+                    if (HAS_MASK && live[b]) {
+                        const uint mask_batch = mask_shape[0] == 1 ? 0 : b;
+                        const size_t mask_index =
+                            (size_t)mask_batch * mask_strides[0] +
+                            (size_t)row * mask_strides[2] +
+                            (size_t)logical[b] * mask_strides[3];
+                        live[b] = mask[mask_index];
+                    }
+                }
+            }
+            if (!live[0] && !live[1]) continue;
+
+            if (fold_query && logical[0] == logical[1]) {
+                float score[2] = {0.0f, 0.0f};
+                for (uint part = 0; part < elements; ++part) {
+                    const uint d = lane * elements + part;
+                    const size_t k_index =
+                        base_k_head +
+                        (size_t)logical[0] * base_k_strides[2] +
+                        (size_t)d * base_k_strides[3];
+                    const float key_value = float(base_k[k_index]);
+                    if (live[0]) score[0] += q_values[0][part] * key_value;
+                    if (live[1]) score[1] += q_values[1][part] * key_value;
+                }
+                if (live[0]) score[0] = simd_sum(score[0]);
+                if (live[1]) score[1] = simd_sum(score[1]);
+                float factor[2] = {0.0f, 0.0f};
+                float probability[2] = {0.0f, 0.0f};
+                for (uint b = 0; b < 2; ++b) {
+                    if (!live[b]) continue;
+                    const float new_max = metal::max(maximum[b], score[b]);
+                    factor[b] = fast::exp(maximum[b] - new_max);
+                    probability[b] = fast::exp(score[b] - new_max);
+                    maximum[b] = new_max;
+                    sum[b] = sum[b] * factor[b] + probability[b];
+                }
+                for (uint part = 0; part < elements; ++part) {
+                    const uint d = lane * elements + part;
+                    const size_t v_index =
+                        base_v_head +
+                        (size_t)logical[0] * base_v_strides[2] +
+                        (size_t)d * base_v_strides[3];
+                    const float value = float(base_v[v_index]);
+                    for (uint b = 0; b < 2; ++b) {
+                        if (live[b]) {
+                            out_values[b][part] =
+                                out_values[b][part] * factor[b]
+                                + probability[b] * value;
+                        }
+                    }
+                }
+            } else {
+                // A stale structural proof cannot corrupt the result: fall
+                // back to two row-local base reads for this token.
+                for (uint b = 0; b < 2; ++b) {
+                    if (!live[b]) continue;
+                    float score = 0.0f;
+                    for (uint part = 0; part < elements; ++part) {
+                        const uint d = lane * elements + part;
+                        const size_t k_index =
+                            base_k_head +
+                            (size_t)logical[b] * base_k_strides[2] +
+                            (size_t)d * base_k_strides[3];
+                        score += q_values[b][part] * float(base_k[k_index]);
+                    }
+                    score = simd_sum(score);
+                    const float new_max = metal::max(maximum[b], score);
+                    const float factor = fast::exp(maximum[b] - new_max);
+                    const float probability = fast::exp(score - new_max);
+                    maximum[b] = new_max;
+                    sum[b] = sum[b] * factor + probability;
+                    for (uint part = 0; part < elements; ++part) {
+                        const uint d = lane * elements + part;
+                        const size_t v_index =
+                            base_v_head +
+                            (size_t)logical[b] * base_v_strides[2] +
+                            (size_t)d * base_v_strides[3];
+                        out_values[b][part] = out_values[b][part] * factor
+                            + probability * float(base_v[v_index]);
+                    }
+                }
+            }
+        }
+
+        // Private suffixes remain row-local. Their token order and online
+        // softmax update order match the proven source-phased kernel exactly.
+        for (uint b = 0; b < 2; ++b) {
+            const uint slot_base = (b * L + row) * uint(U);
+            const size_t delta_k_head =
+                (size_t)b * delta_k_strides[0] +
+                (size_t)hkv * delta_k_strides[1];
+            const size_t delta_v_head =
+                (size_t)b * delta_v_strides[0] +
+                (size_t)hkv * delta_v_strides[1];
+            uint delta_begin = block_idx;
+            const uint row_base_stop =
+                metal::min(base_slots[b] * BS, token_width);
+            if (delta_begin < row_base_stop) {
+                delta_begin +=
+                    ((row_base_stop - delta_begin + BLOCKS - 1) / BLOCKS)
+                    * BLOCKS;
+            }
+            for (uint token = delta_begin; token < token_width;
+                 token += BLOCKS) {
+                const uint slot = token / BS;
+                const uint tail = token % BS;
+                int logical = 0;
+                int position = 0;
+                bool live = slot < count[b];
+                if (live) {
+                    const int block = int(ids[slot_base + slot]);
+                    logical = block * BS + int(tail);
+                    position = logical - BASE;
+                    live = logical >= BASE && logical < TOT;
+                    live = live && logical <= qp[b];
+                    live = live && position >= 0;
+                    live = live && position < delta_length[b];
+                    live = live
+                        && (slot < selected[b] || logical >= complete[b]);
+                    if (HAS_MASK && live) {
+                        const uint mask_batch = mask_shape[0] == 1 ? 0 : b;
+                        const size_t mask_index =
+                            (size_t)mask_batch * mask_strides[0] +
+                            (size_t)row * mask_strides[2] +
+                            (size_t)logical * mask_strides[3];
+                        live = mask[mask_index];
+                    }
+                }
+                if (!live) continue;
+
+                float score = 0.0f;
+                for (uint part = 0; part < elements; ++part) {
+                    const uint d = lane * elements + part;
+                    const size_t k_index =
+                        delta_k_head +
+                        (size_t)position * delta_k_strides[2] +
+                        (size_t)d * delta_k_strides[3];
+                    score += q_values[b][part] * float(delta_k[k_index]);
+                }
+                score = simd_sum(score);
+                const float new_max = metal::max(maximum[b], score);
+                const float factor = fast::exp(maximum[b] - new_max);
+                const float probability = fast::exp(score - new_max);
+                maximum[b] = new_max;
+                sum[b] = sum[b] * factor + probability;
+                for (uint part = 0; part < elements; ++part) {
+                    const uint d = lane * elements + part;
+                    const size_t v_index =
+                        delta_v_head +
+                        (size_t)position * delta_v_strides[2] +
+                        (size_t)d * delta_v_strides[3];
+                    out_values[b][part] = out_values[b][part] * factor
+                        + probability * float(delta_v[v_index]);
+                }
+            }
+        }
+
+        for (uint b = 0; b < 2; ++b) {
+            const size_t state =
+                ((size_t)(b * NQH + qh) * L + row) * BLOCKS + block_idx;
+            if (lane == 0) {
+                part_m[state] = maximum[b];
+                part_l[state] = sum[b];
+            }
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                part_o[state * D + d] = T(out_values[b][part]);
+            }
+        }
+    }
+    if (unit == 0 && row == 0 && head == 0 && lane == 0)
+        engaged[0] = 1;
+"""
+
+
 _QUANTIZED_SOURCE = r"""
     // Keep the bf16 SDPA order while dequantizing only selected K/V values.
     const uint lane = thread_index_in_simdgroup;
@@ -1311,6 +1716,34 @@ def _private_delta_partition_kernel():
 
 
 @lru_cache(maxsize=None)
+def _private_delta_exact_set_partition_kernel():
+    return mx.fast.metal_kernel(
+        name="qwen4_qsa_indexed_private_delta_exact_set_pass1_v1",
+        input_names=[
+            "q",
+            "base_k",
+            "base_v",
+            "delta_k",
+            "delta_v",
+            "delta_lengths",
+            "base_counts",
+            "exact_set",
+            "ids",
+            "counts",
+            "n_sel",
+            "qpos",
+            "mask",
+            "scale",
+            "dims",
+        ],
+        output_names=["part_m", "part_l", "part_o", "engaged"],
+        header=_HEADER,
+        source=_PRIVATE_DELTA_EXACT_SET_SOURCE,
+        ensure_row_contiguous=False,
+    )
+
+
+@lru_cache(maxsize=None)
 def _quantized_partition_kernel():
     return mx.fast.metal_kernel(
         name="qwen4_qsa_indexed_quantized_sdpa_pass1_v2",
@@ -1362,7 +1795,70 @@ _PROBE_LOCK = threading.Lock()
 _PROBE_RESULTS = {}
 _PROBE_TIMINGS = {}
 _QUANTIZED_PROBE_RESULTS = {}
+_PRIVATE_DELTA_PROBE_RESULTS = {}
+_PRIVATE_DELTA_EXACT_SET_PROBE_RESULTS = {}
 _MISSING = object()
+_TOPOLOGY_CAPTURE_LOCK = threading.Lock()
+_TOPOLOGY_CAPTURE_COUNT = 0
+_TOPOLOGY_CAPTURE_DIR = os.environ.get("MLX_QWEN4_QSA_TOPOLOGY_CAPTURE_DIR")
+_TOPOLOGY_CAPTURE_LIMIT = (
+    _env_int("MLX_QWEN4_QSA_TOPOLOGY_CAPTURE_COUNT", 12, minimum=1)
+    if _TOPOLOGY_CAPTURE_DIR
+    else 0
+)
+
+
+def _capture_private_delta_topology_diagnostic(
+    compact,
+    *,
+    q,
+    base_tokens: int,
+    delta_width: int,
+    delta_lengths,
+    requested_splits: int | None,
+    requested_hpt: int | None,
+):
+    """Host one compact selection only when the diagnostic env is set."""
+
+    if not _TOPOLOGY_CAPTURE_DIR:
+        return None
+    global _TOPOLOGY_CAPTURE_COUNT
+    with _TOPOLOGY_CAPTURE_LOCK:
+        if _TOPOLOGY_CAPTURE_COUNT >= _TOPOLOGY_CAPTURE_LIMIT:
+            return None
+        capture_index = _TOPOLOGY_CAPTURE_COUNT
+        _TOPOLOGY_CAPTURE_COUNT += 1
+
+    # This synchronization is diagnostic-only. The production path never
+    # reads selected block IDs or counts back to the host.
+    mx.eval(compact.block_ids, compact.block_counts, delta_lengths)
+    from ..qsa_topology_receipt import write_qsa_topology_diagnostic
+
+    filename = (
+        f"qsa-topology-p{os.getpid()}-{time.time_ns()}-"
+        f"{capture_index:04d}.json"
+    )
+    return write_qsa_topology_diagnostic(
+        Path(_TOPOLOGY_CAPTURE_DIR).expanduser() / filename,
+        compact,
+        base_tokens=int(base_tokens),
+        metadata={
+            "capture_index": capture_index,
+            "q_shape": list(map(int, q.shape)),
+            "q_dtype": str(q.dtype),
+            "base_tokens": int(base_tokens),
+            "delta_width": int(delta_width),
+            "delta_lengths": np.asarray(delta_lengths)
+            .astype(np.int64)
+            .tolist(),
+            "physical_width": int(compact.physical_width),
+            "selected_block_capacity": int(compact.block_ids.shape[-1]),
+            "block_size": int(compact.block_size),
+            "causal_mask_present": compact.causal_mask is not None,
+            "requested_splits": requested_splits,
+            "requested_hpt": requested_hpt,
+        },
+    )
 
 
 def _candidate_ladder(splits: int | None, gqa: int, hpt: int | None = None):
@@ -1604,6 +2100,110 @@ def _private_delta_partition_dispatch(
     )
 
 
+def _private_delta_exact_set_partition_dispatch(
+    q,
+    base_k,
+    base_v,
+    delta_k,
+    delta_v,
+    delta_lengths,
+    compact,
+    *,
+    scale: float,
+    threads: int,
+    splits: int,
+    hpt: int,
+):
+    batch, nqh, length, dim = map(int, q.shape)
+    if batch != 2:
+        raise ValueError("exact-set folded private-delta QSA requires B=2")
+    nkh = int(base_k.shape[1])
+    gqa = nqh // nkh
+    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
+        compact_blocks_to_kernel_inputs(compact)
+    )
+    if compact.left_padding is not None:
+        raise ValueError("exact-set folded QSA requires an unpadded base")
+    base_block = int(base_k.shape[2]) // int(compact.block_size)
+    slots = mx.arange(u_width, dtype=mx.uint32)[None, None]
+    base_counts = mx.sum(
+        (slots < counts[..., None]) & (ids < base_block), axis=-1
+    ).astype(mx.uint32)
+    exact_set = qwen4_qsa_indexed_private_delta_exact_set_proof(
+        compact, base_tokens=int(base_k.shape[2])
+    )
+    if int(hpt) < 1 or gqa % int(hpt):
+        raise ValueError("indexed QSA heads per threadgroup must divide GQA")
+    required_threads = int(hpt) * 32
+    if threads != required_threads:
+        raise ValueError("indexed QSA pass 1 requires one SIMD group per head")
+    head_slices = gqa // int(hpt)
+    if compact.causal_mask is None:
+        mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
+        has_mask = False
+    else:
+        mask = compact.causal_mask
+        if (
+            mask.ndim != 4
+            or int(mask.shape[1]) != 1
+            or int(mask.shape[2]) != length
+            or int(mask.shape[3]) != total
+            or mask.dtype != mx.bool_
+        ):
+            raise ValueError(
+                "exact-set folded QSA mask must be [B|1,1,L,T] bool"
+            )
+        if int(mask.shape[0]) not in (1, batch):
+            raise ValueError("exact-set folded QSA mask batch must be 1 or B")
+        if int(mask.shape[0]) == 1:
+            mask = mx.broadcast_to(mask, (batch, 1, length, total))
+        has_mask = True
+    return _private_delta_exact_set_partition_kernel()(
+        inputs=[
+            q,
+            base_k,
+            base_v,
+            delta_k,
+            delta_v,
+            mx.contiguous(delta_lengths.astype(mx.uint32)),
+            mx.contiguous(base_counts),
+            exact_set,
+            mx.contiguous(ids.astype(mx.uint32)),
+            mx.contiguous(counts.astype(mx.uint32)),
+            mx.contiguous(n_sel.astype(mx.uint32)),
+            mx.contiguous(q_pos.astype(mx.int32)),
+            mask,
+            mx.array([scale], dtype=mx.float32),
+            mx.array(
+                [length, total, u_width, int(base_k.shape[2])],
+                dtype=mx.int32,
+            ),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("D", dim),
+            ("NQH", nqh),
+            ("NKVH", nkh),
+            ("GQA", gqa),
+            ("BS", int(compact.block_size)),
+            ("S", int(splits)),
+            ("HPT", int(hpt)),
+            ("BLOCKS", _SDPA_BLOCKS),
+            ("HAS_MASK", int(has_mask)),
+        ],
+        # B2 is folded into each threadgroup instead of the grid.
+        grid=(threads, length, nkh * splits * head_slices),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS, dim),
+            (1,),
+        ],
+        output_dtypes=[mx.float32, mx.float32, q.dtype, mx.uint32],
+    )
+
+
 def _quantized_partition_dispatch(
     q,
     q_keys,
@@ -1749,24 +2349,6 @@ def qwen4_qsa_indexed_private_delta_attention(
 ):
     """Read one shared QSA prefix plus private suffixes in source phases."""
 
-    mlx_version = str(getattr(mx, "__version__", "unknown"))
-    allow_unverified = (
-        os.environ.get("MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX") == "1"
-    )
-    if mlx_version not in _EXACT_MLX_BUILDS and not allow_unverified:
-        raise QSAIndexedProbeDeclined(
-            f"indexed QSA exactness is unproven on mlx {mlx_version}",
-            reason="mlx_build_unverified",
-        )
-    header_verified, _, header_reason = _sdpa_header_state()
-    if not header_verified and not allow_unverified:
-        raise QSAIndexedProbeDeclined(
-            "indexed QSA exactness clones the installed sdpa_vector.h "
-            f"({header_reason})",
-            reason=header_reason,
-        )
-    if not indexed_kernel_available():
-        raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
     arrays = (q, base_k, base_v, delta_k, delta_v)
     if any(value.ndim != 4 for value in arrays):
         raise ValueError("private-delta QSA requires rank-4 q/base/delta tensors")
@@ -1794,19 +2376,90 @@ def qwen4_qsa_indexed_private_delta_attention(
     if int(compact.block_size) != _BLOCK_SIZE:
         raise ValueError("private-delta QSA requires block size 4")
     nkh = int(base_k.shape[1])
-    if nkh < 1 or nqh % nkh or nqh // nkh != 12:
-        raise QSAIndexedProbeDeclined("private-delta QSA requires GQA=12")
+    preflight_ok, preflight_reason = qwen4_qsa_indexed_private_delta_preflight(
+        length=length,
+        base_tokens=base_tokens,
+        head_dim=dim,
+        num_query_heads=nqh,
+        num_kv_heads=nkh,
+        block_size=int(compact.block_size),
+        selected_blocks=int(compact.block_ids.shape[-1]),
+    )
+    if not preflight_ok:
+        raise QSAIndexedProbeDeclined(
+            f"private-delta QSA preflight declined: {preflight_reason}",
+            reason=preflight_reason,
+        )
     _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
     token_width = u_width * _BLOCK_SIZE
     if token_width <= 1024 or token_width > 8192:
         raise QSAIndexedProbeDeclined(
             "private-delta QSA requires the MLX two-pass SDPA geometry"
         )
-    split_count = indexed_splits_for(u_width) if splits is None else int(splits)
-    if split_count not in _SPLIT_CANDIDATES:
+    requested = None if splits is None else int(splits)
+    if requested is not None and requested not in _SPLIT_CANDIDATES:
         allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
         raise ValueError(f"indexed QSA splits must be one of {allowed}")
-    heads_per_group = indexed_hpt_for(12) if hpt is None else validate_hpt(hpt, 12)
+    requested_hpt = None if hpt is None else validate_hpt(hpt, 12)
+    if _TOPOLOGY_CAPTURE_DIR:
+        _capture_private_delta_topology_diagnostic(
+            compact,
+            q=q,
+            base_tokens=base_tokens,
+            delta_width=delta_width,
+            delta_lengths=delta_lengths,
+            requested_splits=requested,
+            requested_hpt=requested_hpt,
+        )
+    key = (
+        str(q.dtype),
+        batch,
+        nqh,
+        nkh,
+        length,
+        dim,
+        u_width,
+        compact.causal_mask is not None,
+        requested,
+        requested_hpt,
+    )
+    with _PROBE_LOCK:
+        candidate = _PRIVATE_DELTA_PROBE_RESULTS.get(key, _MISSING)
+        if candidate is False:
+            raise QSAIndexedProbeDeclined(
+                "private-delta indexed QSA candidate ladder was declined"
+            )
+        if candidate is _MISSING:
+            def dispatch(attempted):
+                partials = _private_delta_partition_dispatch(
+                    q,
+                    base_k,
+                    base_v,
+                    delta_k,
+                    delta_v,
+                    delta_lengths,
+                    compact,
+                    scale=scale,
+                    threads=attempted[0],
+                    splits=attempted[1],
+                    hpt=attempted[2],
+                )
+                return _combine_sdpa_partials(
+                    *partials, output_dtype=q.dtype
+                )
+
+            candidate, output, counter, timings = _measure_candidates(
+                _candidate_ladder(requested, 12, requested_hpt), dispatch
+            )
+            if candidate is None:
+                _PRIVATE_DELTA_PROBE_RESULTS[key] = False
+                raise QSAIndexedProbeDeclined(
+                    "private-delta indexed QSA candidate ladder was declined"
+                )
+            _PRIVATE_DELTA_PROBE_RESULTS[key] = candidate
+            _PROBE_TIMINGS[("private_delta",) + key] = timings
+            return mx.depends(output, counter)
+
     partials = _private_delta_partition_dispatch(
         q,
         base_k,
@@ -1816,13 +2469,150 @@ def qwen4_qsa_indexed_private_delta_attention(
         delta_lengths,
         compact,
         scale=scale,
-        threads=heads_per_group * 32,
-        splits=split_count,
-        hpt=heads_per_group,
+        threads=candidate[0],
+        splits=candidate[1],
+        hpt=candidate[2],
     )
-    output, counter = _combine_sdpa_partials(
-        *partials, output_dtype=q.dtype
+    output, counter = _combine_sdpa_partials(*partials, output_dtype=q.dtype)
+    return mx.depends(output, counter)
+
+
+def qwen4_qsa_indexed_private_delta_exact_set_attention(
+    q,
+    base_k,
+    base_v,
+    delta_k,
+    delta_v,
+    delta_lengths,
+    compact,
+    *,
+    scale: float,
+    splits: int | None = None,
+    hpt: int | None = None,
+):
+    """Experimental B2 fold for equal ordered selected-base-page sets.
+
+    This is deliberately separate from the proven private-delta entry point.
+    It is the default B2 consumer only after the private-delta lane itself has
+    been admitted. A device-resident exact-set proof gates each query, and the
+    row-local path preserves exactness wherever that proof is false.
+    """
+
+    arrays = (q, base_k, base_v, delta_k, delta_v)
+    if any(value.ndim != 4 for value in arrays):
+        raise ValueError("exact-set folded QSA requires rank-4 tensors")
+    if base_k.shape != base_v.shape or delta_k.shape != delta_v.shape:
+        raise ValueError("exact-set folded QSA K/V geometries must match")
+    if int(base_k.shape[0]) != 1:
+        raise ValueError("exact-set folded QSA base must have one row")
+    batch, nqh, length, dim = map(int, q.shape)
+    if int(delta_k.shape[0]) != batch:
+        raise ValueError("exact-set folded QSA needs one suffix per row")
+    if int(compact.block_ids.shape[0]) != batch:
+        raise ValueError("exact-set folded QSA compact batch differs")
+    if base_k.shape[1] != delta_k.shape[1] or base_k.shape[3] != delta_k.shape[3]:
+        raise ValueError("exact-set folded QSA base and suffix layouts differ")
+    if dim != int(base_k.shape[3]) or dim != 256:
+        raise QSAIndexedProbeDeclined(
+            "exact-set folded QSA exact mode requires D=256"
+        )
+    if any(value.dtype != q.dtype for value in arrays[1:]):
+        raise ValueError("exact-set folded QSA requires one unquantized dtype")
+    if delta_lengths.ndim != 1 or int(delta_lengths.shape[0]) != batch:
+        raise ValueError("exact-set folded QSA lengths must have shape [B]")
+    base_tokens = int(base_k.shape[2])
+    delta_width = int(delta_k.shape[2])
+    if base_tokens % _BLOCK_SIZE:
+        raise ValueError("exact-set folded QSA base must align to four tokens")
+    if base_tokens + delta_width != int(compact.physical_width):
+        raise ValueError("exact-set folded QSA storage differs from logical width")
+    nkh = int(base_k.shape[1])
+    preflight_ok, preflight_reason = (
+        qwen4_qsa_indexed_private_delta_exact_set_preflight(
+            batch=batch,
+            length=length,
+            base_tokens=base_tokens,
+            head_dim=dim,
+            num_query_heads=nqh,
+            num_kv_heads=nkh,
+            block_size=int(compact.block_size),
+            selected_blocks=int(compact.block_ids.shape[-1]),
+        )
     )
+    if not preflight_ok:
+        raise QSAIndexedProbeDeclined(
+            f"exact-set folded QSA preflight declined: {preflight_reason}",
+            reason=preflight_reason,
+        )
+    _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+    requested = None if splits is None else int(splits)
+    if requested is not None and requested not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    requested_hpt = None if hpt is None else validate_hpt(hpt, 12)
+    key = (
+        str(q.dtype),
+        batch,
+        nqh,
+        nkh,
+        length,
+        dim,
+        u_width,
+        compact.causal_mask is not None,
+        requested,
+        requested_hpt,
+    )
+    with _PROBE_LOCK:
+        candidate = _PRIVATE_DELTA_EXACT_SET_PROBE_RESULTS.get(key, _MISSING)
+        if candidate is False:
+            raise QSAIndexedProbeDeclined(
+                "exact-set folded QSA candidate ladder was declined"
+            )
+        if candidate is _MISSING:
+            def dispatch(attempted):
+                partials = _private_delta_exact_set_partition_dispatch(
+                    q,
+                    base_k,
+                    base_v,
+                    delta_k,
+                    delta_v,
+                    delta_lengths,
+                    compact,
+                    scale=scale,
+                    threads=attempted[0],
+                    splits=attempted[1],
+                    hpt=attempted[2],
+                )
+                return _combine_sdpa_partials(
+                    *partials, output_dtype=q.dtype
+                )
+
+            candidate, output, counter, timings = _measure_candidates(
+                _candidate_ladder(requested, 12, requested_hpt), dispatch
+            )
+            if candidate is None:
+                _PRIVATE_DELTA_EXACT_SET_PROBE_RESULTS[key] = False
+                raise QSAIndexedProbeDeclined(
+                    "exact-set folded QSA candidate ladder was declined"
+                )
+            _PRIVATE_DELTA_EXACT_SET_PROBE_RESULTS[key] = candidate
+            _PROBE_TIMINGS[("private_delta_exact_set",) + key] = timings
+            return mx.depends(output, counter)
+
+    partials = _private_delta_exact_set_partition_dispatch(
+        q,
+        base_k,
+        base_v,
+        delta_k,
+        delta_v,
+        delta_lengths,
+        compact,
+        scale=scale,
+        threads=candidate[0],
+        splits=candidate[1],
+        hpt=candidate[2],
+    )
+    output, counter = _combine_sdpa_partials(*partials, output_dtype=q.dtype)
     return mx.depends(output, counter)
 
 
@@ -2224,7 +3014,12 @@ __all__ = [
     "qsa_indexed_enabled",
     "qsa_indexed_quantized_cache_config",
     "qwen4_qsa_indexed_attention",
+    "qwen4_qsa_indexed_private_delta_exact_set_attention",
+    "qwen4_qsa_indexed_private_delta_exact_set_preflight",
+    "qwen4_qsa_indexed_private_delta_exact_set_proof",
     "qwen4_qsa_indexed_private_delta_attention",
+    "qwen4_qsa_indexed_private_delta_preflight",
+    "qwen4_qsa_private_delta_min_context",
     "qwen4_qsa_indexed_private_delta_reference",
     "qwen4_qsa_indexed_quantized_attention",
     "qwen4_qsa_indexed_quantized_reference",

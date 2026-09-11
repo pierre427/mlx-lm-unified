@@ -48,6 +48,24 @@ _ZERO = {
     "recurrent_state_materialized_bytes": 0,
     "row_state_splits": 0,
     "segmented_attention_calls": 0,
+    "private_delta_requests": 0,
+    "private_delta_declines": 0,
+    "private_delta_preflight_declines": 0,
+    "private_delta_late_gather_fallbacks": 0,
+    "private_delta_attention_calls": 0,
+    "private_delta_rows": 0,
+    "private_delta_base_tokens_cumulative": 0,
+    "private_delta_base_tokens_last": 0,
+    "private_delta_base_tokens_min": 0,
+    "private_delta_base_tokens_max": 0,
+    "private_delta_duplicate_base_storage_bytes_not_formed_cumulative": 0,
+    "exact_set_fold_requests": 0,
+    "exact_set_fold_declines": 0,
+    "exact_set_fold_preflight_declines": 0,
+    "exact_set_fold_private_fallbacks": 0,
+    "exact_set_fold_attention_calls": 0,
+    "exact_set_fold_rows": 0,
+    "exact_set_fold_device_proofs": 0,
     "independent_lineages_consumed": 0,
     "full_prefix_materializations": 0,
     "full_prefix_materialized_bytes": 0,
@@ -62,8 +80,15 @@ _ZERO = {
     "proposal_ns": 0,
     "commit_ns": 0,
 }
+for _width in range(1, 10):
+    for _event in ("requests", "engaged", "declined"):
+        _ZERO[f"private_delta_width_{_width}_{_event}"] = 0
+for _event in ("requests", "engaged", "declined"):
+    _ZERO[f"private_delta_width_other_{_event}"] = 0
 _STATS = dict(_ZERO)
 _STATS_LOCK = threading.Lock()
+_PRIVATE_DELTA_DECLINE_REASONS: dict[str, int] = {}
+_EXACT_SET_FOLD_DECLINE_REASONS: dict[str, int] = {}
 
 
 def segmented_self_mtp_enabled(value: bool | None = None) -> bool:
@@ -103,6 +128,32 @@ def true_batched_segmented_self_mtp_enabled(value: bool | None = None) -> bool:
     }
 
 
+def qsa_private_delta_enabled(value: bool | None = None) -> bool:
+    """Use the source-phased QSA consumer inside segmented self-MTP.
+
+    This defaults on only inside the separately default-off segmented lane.
+    The zero setting retains the serial per-row QSA reduction as its exact
+    control without changing persistent cache ownership.
+    """
+
+    if value is not None:
+        return bool(value)
+    return os.environ.get("MLX_LM_QSA_PRIVATE_DELTA", "1").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def qsa_private_delta_exact_set_fold_enabled() -> bool:
+    """Return whether admitted private-delta B2 uses the exact-set fold."""
+
+    return os.environ.get(
+        "MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", "1"
+    ).lower() in {"1", "true", "yes", "on"}
+
+
 def note_segmented_self_mtp(key: str, amount: int = 1) -> None:
     if key not in _STATS:
         raise KeyError(f"unknown segmented self-MTP counter: {key}")
@@ -110,15 +161,107 @@ def note_segmented_self_mtp(key: str, amount: int = 1) -> None:
         _STATS[key] += int(amount)
 
 
+def note_qsa_private_delta_event(
+    event: str,
+    *,
+    width: int,
+    base_tokens: int = 0,
+    rows: int = 0,
+    duplicate_base_storage_bytes_not_formed: int = 0,
+    reason: str | None = None,
+) -> None:
+    """Record one source-phased admission outcome with unambiguous units."""
+
+    if event not in {"request", "engaged", "declined"}:
+        raise ValueError(f"unknown private-delta event {event!r}")
+    width_key = str(int(width)) if 1 <= int(width) <= 9 else "other"
+    with _STATS_LOCK:
+        _STATS[
+            f"private_delta_width_{width_key}_{event if event != 'request' else 'requests'}"
+        ] += 1
+        if event == "request":
+            _STATS["private_delta_requests"] += 1
+            return
+        if event == "declined":
+            _STATS["private_delta_declines"] += 1
+            key = str(reason or "unspecified")
+            _PRIVATE_DELTA_DECLINE_REASONS[key] = (
+                _PRIVATE_DELTA_DECLINE_REASONS.get(key, 0) + 1
+            )
+            return
+        _STATS["private_delta_attention_calls"] += 1
+        _STATS["private_delta_rows"] += int(rows)
+        base_tokens = int(base_tokens)
+        _STATS["private_delta_base_tokens_cumulative"] += base_tokens
+        _STATS["private_delta_base_tokens_last"] = base_tokens
+        if not _STATS["private_delta_base_tokens_min"]:
+            _STATS["private_delta_base_tokens_min"] = base_tokens
+        else:
+            _STATS["private_delta_base_tokens_min"] = min(
+                _STATS["private_delta_base_tokens_min"], base_tokens
+            )
+        _STATS["private_delta_base_tokens_max"] = max(
+            _STATS["private_delta_base_tokens_max"], base_tokens
+        )
+        _STATS[
+            "private_delta_duplicate_base_storage_bytes_not_formed_cumulative"
+        ] += int(duplicate_base_storage_bytes_not_formed)
+
+
+def note_qsa_exact_set_fold_event(
+    event: str, *, rows: int = 0, reason: str | None = None
+) -> None:
+    """Record host-visible exact-set admission without reading its predicate."""
+
+    if event not in {
+        "request",
+        "proof",
+        "engaged",
+        "declined",
+        "private_fallback",
+    }:
+        raise ValueError(f"unknown exact-set fold event {event!r}")
+    with _STATS_LOCK:
+        if event == "request":
+            _STATS["exact_set_fold_requests"] += 1
+        elif event == "proof":
+            _STATS["exact_set_fold_device_proofs"] += 1
+        elif event == "engaged":
+            _STATS["exact_set_fold_attention_calls"] += 1
+            _STATS["exact_set_fold_rows"] += int(rows)
+        else:
+            _STATS["exact_set_fold_declines"] += 1
+            if event == "private_fallback":
+                _STATS["exact_set_fold_private_fallbacks"] += 1
+            else:
+                _STATS["exact_set_fold_preflight_declines"] += 1
+            key = str(reason or "unspecified")
+            _EXACT_SET_FOLD_DECLINE_REASONS[key] = (
+                _EXACT_SET_FOLD_DECLINE_REASONS.get(key, 0) + 1
+            )
+
+
 def segmented_self_mtp_stats(*, reset: bool = False) -> dict[str, Any]:
     with _STATS_LOCK:
         result = dict(_STATS)
+        result["private_delta_decline_reasons"] = dict(
+            _PRIVATE_DELTA_DECLINE_REASONS
+        )
+        result["exact_set_fold_decline_reasons"] = dict(
+            _EXACT_SET_FOLD_DECLINE_REASONS
+        )
         if reset:
             _STATS.clear()
             _STATS.update(_ZERO)
+            _PRIVATE_DELTA_DECLINE_REASONS.clear()
+            _EXACT_SET_FOLD_DECLINE_REASONS.clear()
     result["environment_enabled"] = segmented_self_mtp_enabled()
     result["true_batched_environment_enabled"] = (
         true_batched_segmented_self_mtp_enabled()
+    )
+    result["qsa_private_delta_environment_enabled"] = qsa_private_delta_enabled()
+    result["qsa_exact_set_fold_environment_enabled"] = (
+        qsa_private_delta_exact_set_fold_enabled()
     )
     result["timing_enabled"] = segmented_self_mtp_timing_enabled()
     result["counter_scope"] = "segmented_mechanism_only"
@@ -172,6 +315,52 @@ def require_true_batched_segmented_self_mtp_engagement(
     if int(counters.get("full_prefix_materialized_bytes", 0)):
         raise RuntimeError(
             "true batched segmented consumer materialized full-prefix B2"
+        )
+
+
+def require_qsa_private_delta_engagement(
+    counters: dict[str, Any] | None = None,
+) -> None:
+    counters = segmented_self_mtp_stats() if counters is None else counters
+    require_true_batched_segmented_self_mtp_engagement(counters)
+    if int(counters.get("private_delta_attention_calls", 0)) < 1:
+        raise RuntimeError("source-phased QSA private-delta consumer never engaged")
+    if int(counters.get("private_delta_rows", 0)) < 2:
+        raise RuntimeError("QSA private-delta consumer saw no batched row cohort")
+    requests = int(counters.get("private_delta_requests", 0))
+    engaged = int(counters.get("private_delta_attention_calls", 0))
+    declined = int(counters.get("private_delta_declines", 0))
+    if requests != engaged + declined:
+        raise RuntimeError(
+            "QSA private-delta request accounting is incomplete: "
+            f"{requests} requests != {engaged} engaged + {declined} declined"
+        )
+    if declined:
+        raise RuntimeError(
+            f"QSA private-delta qualification saw {declined} declined calls"
+        )
+
+
+def require_qsa_exact_set_fold_engagement(
+    counters: dict[str, Any] | None = None,
+) -> None:
+    counters = segmented_self_mtp_stats() if counters is None else counters
+    require_qsa_private_delta_engagement(counters)
+    if int(counters.get("exact_set_fold_attention_calls", 0)) < 1:
+        raise RuntimeError("QSA exact-set folded consumer never engaged")
+    if int(counters.get("exact_set_fold_rows", 0)) < 2:
+        raise RuntimeError("QSA exact-set folded consumer saw no B2 cohort")
+    requests = int(counters.get("exact_set_fold_requests", 0))
+    engaged = int(counters.get("exact_set_fold_attention_calls", 0))
+    declined = int(counters.get("exact_set_fold_declines", 0))
+    if requests != engaged + declined:
+        raise RuntimeError(
+            "QSA exact-set fold accounting is incomplete: "
+            f"{requests} requests != {engaged} engaged + {declined} declined"
+        )
+    if declined:
+        raise RuntimeError(
+            f"QSA exact-set fold qualification saw {declined} declined calls"
         )
 
 
@@ -605,6 +794,12 @@ class SegmentedLaneTransaction:
 __all__ = [
     "SegmentedLaneTransaction",
     "note_segmented_self_mtp",
+    "qsa_private_delta_enabled",
+    "qsa_private_delta_exact_set_fold_enabled",
+    "note_qsa_private_delta_event",
+    "note_qsa_exact_set_fold_event",
+    "require_qsa_private_delta_engagement",
+    "require_qsa_exact_set_fold_engagement",
     "require_segmented_self_mtp_engagement",
     "require_true_batched_segmented_self_mtp_engagement",
     "segmented_self_mtp_enabled",

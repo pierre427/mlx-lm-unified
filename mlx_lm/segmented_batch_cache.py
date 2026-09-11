@@ -16,7 +16,21 @@ from typing import Any, Sequence
 import mlx.core as mx
 
 from .models.cache import ArraysCache, KVCache
-from .models.qwen4_exp import BatchQSAKVCache, QSAKVCache, Qwen4ArraysCache
+from .models.qwen4_exp import (
+    BatchQSAKVCache,
+    QSACompactBlocks,
+    QSAKVCache,
+    Qwen4ArraysCache,
+    qsa_dense_attention_from_selection,
+)
+from .models.qwen4_qsa_indexed import (
+    QSAIndexedProbeDeclined,
+    qwen4_qsa_indexed_private_delta_attention,
+    qwen4_qsa_indexed_private_delta_exact_set_attention,
+    qwen4_qsa_indexed_private_delta_exact_set_preflight,
+    qwen4_qsa_indexed_private_delta_preflight,
+    qwen4_qsa_private_delta_min_context,
+)
 
 
 class SegmentedBatchUnsupported(TypeError):
@@ -53,7 +67,13 @@ def _slice_row_tree(values, row: int):
 class SegmentedBatchQSAKVCache(BatchQSAKVCache):
     """QSA batch ABI backed by independent, unquantized B1 QSA caches."""
 
-    def __init__(self, rows: Sequence[QSAKVCache], note=None):
+    def __init__(
+        self,
+        rows: Sequence[QSAKVCache],
+        note=None,
+        *,
+        shared_qsa_prefix=False,
+    ):
         if not rows or not all(type(row) is QSAKVCache for row in rows):
             names = ", ".join(type(row).__name__ for row in rows)
             raise SegmentedBatchUnsupported(
@@ -62,6 +82,15 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             )
         self.rows = list(rows)
         self._note = note
+        offsets = [_host_offset(row) for row in rows]
+        aligned = min(offsets, default=0) // 4 * 4
+        self._private_delta_base_tokens = (
+            aligned
+            if shared_qsa_prefix
+            and aligned > 0
+            and len(set(offsets)) == 1
+            else None
+        )
         self._step_lengths = None
         self._right_padding = None
         self._mtp_share_topk = False
@@ -135,7 +164,69 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         """
         if self._step_lengths is None:
             raise RuntimeError("segmented attention outside prepare/finalize")
-        width = int(hidden.shape[1])
+        from .segmented_self_mtp import qsa_private_delta_enabled
+
+        length = int(hidden.shape[1])
+        private_candidate = (
+            qsa_private_delta_enabled()
+            and self._private_delta_base_tokens is not None
+            and len(set(self._step_lengths)) == 1
+            and self._step_lengths[0] > 0
+        )
+        if private_candidate:
+            from .segmented_self_mtp import (
+                note_qsa_exact_set_fold_event,
+                note_qsa_private_delta_event,
+                qsa_private_delta_exact_set_fold_enabled,
+            )
+
+            note_qsa_private_delta_event("request", width=length)
+            if (
+                int(self._private_delta_base_tokens)
+                < qwen4_qsa_private_delta_min_context(length)
+            ):
+                admitted, reason = False, "context_out_of_range"
+            else:
+                admitted, reason = qwen4_qsa_indexed_private_delta_preflight(
+                    length=length,
+                    base_tokens=int(self._private_delta_base_tokens),
+                    head_dim=int(attention.head_dim),
+                    num_query_heads=int(attention.num_heads),
+                    num_kv_heads=int(attention.num_kv_heads),
+                    block_size=int(attention.indexer.compress_ratio),
+                    selected_blocks=int(attention.indexer.block_topk),
+                    training=bool(attention.training),
+                )
+            if admitted:
+                exact_set_fold = qsa_private_delta_exact_set_fold_enabled()
+                if exact_set_fold:
+                    note_qsa_exact_set_fold_event("request")
+                    exact_admitted, exact_reason = (
+                        qwen4_qsa_indexed_private_delta_exact_set_preflight(
+                            batch=len(self.rows),
+                            length=length,
+                            base_tokens=int(self._private_delta_base_tokens),
+                            head_dim=int(attention.head_dim),
+                            num_query_heads=int(attention.num_heads),
+                            num_kv_heads=int(attention.num_kv_heads),
+                            block_size=int(attention.indexer.compress_ratio),
+                            selected_blocks=int(attention.indexer.block_topk),
+                            training=bool(attention.training),
+                        )
+                    )
+                    if not exact_admitted:
+                        note_qsa_exact_set_fold_event(
+                            "declined", reason=exact_reason
+                        )
+                        exact_set_fold = False
+                return self._private_delta_attention(
+                    attention, hidden, exact_set_fold=exact_set_fold
+                )
+            note_qsa_private_delta_event(
+                "declined", width=length, reason=reason
+            )
+            self._bump("private_delta_preflight_declines")
+        width = length
         projected = attention._project_segmented_qsa(hidden)
         outputs = []
         gates = []
@@ -168,6 +259,247 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         self._refresh_geometry()
         output = mx.concatenate(outputs, axis=0)
         gate = mx.concatenate(gates, axis=0)
+        return attention.o_proj(output * mx.sigmoid(gate))
+
+    def _private_delta_attention(
+        self, attention, hidden: mx.array, *, exact_set_fold: bool = False
+    ):
+        """Consume one attested common prefix plus request-private suffixes."""
+
+        batch, length, _ = hidden.shape
+        base_tokens = int(self._private_delta_base_tokens)
+        if length != int(self._step_lengths[0]):
+            raise RuntimeError("private-delta QSA requires an unpadded query slab")
+        projected = attention._project_segmented_qsa(hidden)
+        qg, k_flat, v_flat, projected_qk = projected
+        row_compacts = []
+        row_selections = []
+        offsets = []
+        for index, row in enumerate(self.rows):
+            offset = _host_offset(row)
+            if offset < base_tokens:
+                raise RuntimeError("QSA private delta trimmed through its base")
+            offsets.append(offset)
+            row_mask = row.make_mask(length, return_array=True, window_size=None)
+            if row_mask is not None and row_mask.ndim == 2:
+                row_mask = row_mask[None, None]
+            selection = attention.indexer(
+                hidden[index : index + 1],
+                row_mask,
+                row,
+                projected_qk=projected_qk[index : index + 1],
+            )
+            compact = selection.compact_blocks()
+            if selection.kind != "explicit" or compact is None:
+                raise RuntimeError(
+                    "QSA private delta requires an explicit compact selection"
+                )
+            if compact.left_padding is not None:
+                raise RuntimeError("QSA private delta rows must be unpadded")
+            row_compacts.append(compact)
+            row_selections.append(selection)
+
+        q, gate = mx.split(
+            qg.reshape(batch, length, attention.num_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(batch, length, -1)
+        k = k_flat.reshape(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        )
+        v = v_flat.reshape(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        )
+        # Preserve the stock B1 normalization/RoPE dispatch shape exactly.
+        # A batched vector-offset RoPE is mathematically equivalent but can
+        # choose a different primitive reduction and move low bits; the
+        # source-phased kernel is lossless only if its inputs are stock-exact.
+        q_rows = []
+        k_rows = []
+        for index, offset in enumerate(offsets):
+            row_q = attention.q_norm(q[index : index + 1]).transpose(0, 2, 1, 3)
+            row_k = attention.k_norm(k[index : index + 1]).transpose(0, 2, 1, 3)
+            q_rows.append(attention.rope(row_q, offset=offset))
+            k_rows.append(attention.rope(row_k, offset=offset))
+        q = mx.concatenate(q_rows, axis=0)
+        k = mx.concatenate(k_rows, axis=0)
+        v = v.transpose(0, 2, 1, 3)
+
+        row_keys = []
+        row_values = []
+        delta_lengths = []
+        for index, row in enumerate(self.rows):
+            keys, values = row.update_and_fetch(
+                k[index : index + 1], v[index : index + 1]
+            )
+            delta_length = int(keys.shape[2]) - base_tokens
+            if delta_length < 0:
+                raise RuntimeError("QSA private delta has a negative suffix")
+            row_keys.append(keys)
+            row_values.append(values)
+            delta_lengths.append(delta_length)
+        delta_width = max(delta_lengths)
+
+        def suffix_batch(values):
+            pieces = []
+            for value, delta_length in zip(values, delta_lengths):
+                suffix = value[:, :, base_tokens : base_tokens + delta_length]
+                pieces.append(
+                    _pad_sequence(
+                        suffix, 0, delta_width - delta_length, axis=2
+                    )
+                )
+            return mx.concatenate(pieces, axis=0)
+
+        base_k = row_keys[0][:, :, :base_tokens]
+        base_v = row_values[0][:, :, :base_tokens]
+        delta_k = suffix_batch(row_keys)
+        delta_v = suffix_batch(row_values)
+        total = base_tokens + delta_width
+
+        masks = [compact.causal_mask for compact in row_compacts]
+        if all(mask is None for mask in masks):
+            causal_mask = None
+        elif any(mask is None for mask in masks):
+            raise RuntimeError("QSA private delta rows disagree on mask mode")
+        else:
+            causal_mask = mx.concatenate(
+                [
+                    _pad_sequence(
+                        mask,
+                        0,
+                        total - int(mask.shape[-1]),
+                        axis=mask.ndim - 1,
+                    )
+                    for mask in masks
+                ],
+                axis=0,
+            )
+        compact = QSACompactBlocks(
+            block_ids=mx.concatenate(
+                [item.block_ids for item in row_compacts], axis=0
+            ),
+            block_counts=mx.concatenate(
+                [item.block_counts for item in row_compacts], axis=0
+            ),
+            tail_start=mx.concatenate(
+                [item.tail_start for item in row_compacts], axis=0
+            ),
+            tail_stop=mx.concatenate(
+                [item.tail_stop for item in row_compacts], axis=0
+            ),
+            left_padding=None,
+            block_size=row_compacts[0].block_size,
+            physical_width=total,
+            causal_mask=causal_mask,
+        )
+        exact_set_engaged = False
+        try:
+            if exact_set_fold:
+                try:
+                    from .segmented_self_mtp import (
+                        note_qsa_exact_set_fold_event,
+                    )
+
+                    note_qsa_exact_set_fold_event("proof")
+                    output = (
+                        qwen4_qsa_indexed_private_delta_exact_set_attention(
+                            q,
+                            base_k,
+                            base_v,
+                            delta_k,
+                            delta_v,
+                            mx.array(delta_lengths, dtype=mx.uint32),
+                            compact,
+                            scale=attention.scale,
+                        )
+                    )
+                except (QSAIndexedProbeDeclined, RuntimeError) as error:
+                    from .segmented_self_mtp import (
+                        note_qsa_exact_set_fold_event,
+                    )
+
+                    note_qsa_exact_set_fold_event(
+                        "private_fallback",
+                        reason=(
+                            error.reason
+                            if isinstance(error, QSAIndexedProbeDeclined)
+                            else "dispatch_raised"
+                        ),
+                    )
+                    output = qwen4_qsa_indexed_private_delta_attention(
+                        q,
+                        base_k,
+                        base_v,
+                        delta_k,
+                        delta_v,
+                        mx.array(delta_lengths, dtype=mx.uint32),
+                        compact,
+                        scale=attention.scale,
+                    )
+                else:
+                    exact_set_engaged = True
+            else:
+                output = qwen4_qsa_indexed_private_delta_attention(
+                    q,
+                    base_k,
+                    base_v,
+                    delta_k,
+                    delta_v,
+                    mx.array(delta_lengths, dtype=mx.uint32),
+                    compact,
+                    scale=attention.scale,
+                )
+        except (QSAIndexedProbeDeclined, RuntimeError) as error:
+            # The index ledger and K/V cache were already appended.  Consume
+            # those exact selections and fetched row tensors once; never
+            # re-enter Attention, which would append them a second time.
+            output = mx.concatenate(
+                [
+                    qsa_dense_attention_from_selection(
+                        q[index : index + 1],
+                        row_keys[index],
+                        row_values[index],
+                        row_selections[index],
+                        self.rows[index],
+                        scale=attention.scale,
+                    )
+                    for index in range(batch)
+                ],
+                axis=0,
+            )
+            from .segmented_self_mtp import note_qsa_private_delta_event
+
+            note_qsa_private_delta_event(
+                "declined",
+                width=length,
+                reason=(
+                    error.reason
+                    if isinstance(error, QSAIndexedProbeDeclined)
+                    else "dispatch_raised"
+                ),
+            )
+            self._bump("private_delta_late_gather_fallbacks")
+        else:
+            from .segmented_self_mtp import (
+                note_qsa_exact_set_fold_event,
+                note_qsa_private_delta_event,
+            )
+
+            note_qsa_private_delta_event(
+                "engaged",
+                width=length,
+                base_tokens=base_tokens,
+                rows=len(self.rows),
+                duplicate_base_storage_bytes_not_formed=(
+                    (len(self.rows) - 1) * int(base_k.nbytes + base_v.nbytes)
+                ),
+            )
+            if exact_set_engaged:
+                note_qsa_exact_set_fold_event("engaged", rows=len(self.rows))
+        self._bump("segmented_attention_calls")
+        self._bump("independent_lineages_consumed", len(self.rows))
+        self._refresh_geometry()
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return attention.o_proj(output * mx.sigmoid(gate))
 
     def update_index_keys(self, keys: mx.array):
@@ -418,7 +750,9 @@ class SegmentedBatchArraysCache(Qwen4ArraysCache):
         )
 
 
-def build_segmented_batch_cache_group(groups, *, note=None):
+def build_segmented_batch_cache_group(
+    groups, *, note=None, shared_qsa_prefix=False
+):
     """Transpose B1 cache groups into per-layer batched compute adapters."""
 
     groups = [list(group) for group in groups]
@@ -433,7 +767,13 @@ def build_segmented_batch_cache_group(groups, *, note=None):
         if isinstance(first, ArraysCache):
             result.append(SegmentedBatchArraysCache(layer_rows, note=note))
         elif isinstance(first, QSAKVCache):
-            result.append(SegmentedBatchQSAKVCache(layer_rows, note=note))
+            result.append(
+                SegmentedBatchQSAKVCache(
+                    layer_rows,
+                    note=note,
+                    shared_qsa_prefix=shared_qsa_prefix,
+                )
+            )
         elif isinstance(first, KVCache):
             raise SegmentedBatchUnsupported(
                 "plain KV segmented batching is not needed by Qwen4 and is not "
@@ -446,15 +786,21 @@ def build_segmented_batch_cache_group(groups, *, note=None):
     return result
 
 
-def build_segmented_batch_cache_pair(row_pairs, *, note=None):
+def build_segmented_batch_cache_pair(
+    row_pairs, *, note=None, shared_qsa_prefix=False
+):
     from .hybrid_speculative import SelfMTPCachePair
 
     return SelfMTPCachePair(
         target=build_segmented_batch_cache_group(
-            [pair.target for pair in row_pairs], note=note
+            [pair.target for pair in row_pairs],
+            note=note,
+            shared_qsa_prefix=shared_qsa_prefix,
         ),
         draft=build_segmented_batch_cache_group(
-            [pair.draft for pair in row_pairs], note=note
+            [pair.draft for pair in row_pairs],
+            note=note,
+            shared_qsa_prefix=shared_qsa_prefix,
         ),
     )
 

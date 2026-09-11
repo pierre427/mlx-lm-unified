@@ -178,6 +178,95 @@ def _private_delta_m3_fixture():
     )
 
 
+def _private_delta_randomized_fixture(length: int):
+    """Two row-specific selections, causal masks and unequal suffixes."""
+
+    batch, nqh, nkh, dim = 2, 12, 1, 256
+    base_tokens = 1028
+    delta_width = int(length) + 2
+    delta_lengths = np.array([delta_width, delta_width - 2], dtype=np.uint32)
+    key = mx.random.key(9000 + int(length))
+    q = mx.random.normal((batch, nqh, length, dim), key=key).astype(mx.bfloat16)
+    base_k = mx.random.normal(
+        (1, nkh, base_tokens, dim), key=mx.random.key(9100 + int(length))
+    ).astype(mx.bfloat16)
+    base_v = mx.random.normal(
+        (1, nkh, base_tokens, dim), key=mx.random.key(9200 + int(length))
+    ).astype(mx.bfloat16)
+    delta_k = mx.random.normal(
+        (batch, nkh, delta_width, dim), key=mx.random.key(9300 + int(length))
+    ).astype(mx.bfloat16)
+    delta_v = mx.random.normal(
+        (batch, nkh, delta_width, dim), key=mx.random.key(9400 + int(length))
+    ).astype(mx.bfloat16)
+    total = base_tokens + delta_width
+    selected_width = base_tokens // 4
+    ids = np.zeros((batch, length, selected_width), dtype=np.uint32)
+    counts = np.zeros((batch, length), dtype=np.int32)
+    tail_stop = np.zeros((batch, length), dtype=np.int32)
+    causal = np.zeros((batch, 1, length, total), dtype=np.bool_)
+    base_pages = list(range(selected_width))
+    for row in range(batch):
+        prior = int(delta_lengths[row]) - length
+        for query in range(length):
+            qpos = base_tokens + prior + query
+            tail_stop[row, query] = qpos + 1
+            # Omit a different old base page on every row/query.  The fixed
+            # compact width remains production's two-pass boundary while the
+            # count and ordered set are genuinely row-specific.
+            omitted = 1 + (row * length + query) % (selected_width - 1)
+            selected = [page for page in base_pages if page != omitted]
+            ids[row, query, : len(selected)] = selected
+            counts[row, query] = len(selected)
+            causal[row, 0, query, : qpos + 1] = True
+    compact = QSACompactBlocks(
+        block_ids=mx.array(ids),
+        block_counts=mx.array(counts),
+        tail_start=mx.array(tail_stop // 4 * 4),
+        tail_stop=mx.array(tail_stop),
+        left_padding=None,
+        block_size=4,
+        physical_width=total,
+        causal_mask=mx.array(causal),
+    )
+    return (
+        q,
+        base_k,
+        base_v,
+        delta_k,
+        delta_v,
+        mx.array(delta_lengths),
+        compact,
+    )
+
+
+def _private_delta_exact_set_fixture(length: int):
+    """B2 fixture with shared base-page sets and row-private suffix state."""
+
+    q, base_k, base_v, delta_k, delta_v, lengths, compact = (
+        _private_delta_randomized_fixture(length)
+    )
+    shared_ids = mx.concatenate(
+        [compact.block_ids[:1], compact.block_ids[:1]], axis=0
+    )
+    shared_counts = mx.concatenate(
+        [compact.block_counts[:1], compact.block_counts[:1]], axis=0
+    )
+    return (
+        q,
+        base_k,
+        base_v,
+        delta_k,
+        delta_v,
+        lengths,
+        replace(
+            compact,
+            block_ids=shared_ids,
+            block_counts=shared_counts,
+        ),
+    )
+
+
 class TestQSAIndexedReference(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -612,6 +701,109 @@ class TestQSAIndexedReference(unittest.TestCase):
         mx.eval(actual, expected)
         self.assertTrue(mx.array_equal(actual, expected).item())
 
+    def test_private_delta_preflight_is_width_bounded_and_side_effect_free(self):
+        with mock.patch.object(indexed, "indexed_kernel_available", return_value=True), mock.patch.object(
+            indexed, "_sdpa_header_state", return_value=(True, "digest", None)
+        ), mock.patch.object(indexed.mx, "__version__", next(iter(indexed._EXACT_MLX_BUILDS))):
+            for width in range(1, 10):
+                admitted, reason = indexed.qwen4_qsa_indexed_private_delta_preflight(
+                    length=width,
+                    base_tokens=16384,
+                    head_dim=256,
+                    num_query_heads=12,
+                    num_kv_heads=1,
+                    block_size=4,
+                    selected_blocks=512,
+                )
+                self.assertTrue(admitted, (width, reason))
+            admitted, reason = indexed.qwen4_qsa_indexed_private_delta_preflight(
+                length=10,
+                base_tokens=16384,
+                head_dim=256,
+                num_query_heads=12,
+                num_kv_heads=1,
+                block_size=4,
+                selected_blocks=512,
+            )
+            self.assertFalse(admitted)
+            self.assertEqual(reason, "width_out_of_range")
+
+    def test_private_delta_width_specific_context_thresholds(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", None)
+            self.assertEqual(
+                indexed.qwen4_qsa_private_delta_min_context(1), 2**31 - 1
+            )
+            self.assertEqual(indexed.qwen4_qsa_private_delta_min_context(2), 65536)
+            os.environ["MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT"] = "12000"
+            self.assertEqual(indexed.qwen4_qsa_private_delta_min_context(1), 12000)
+            self.assertEqual(indexed.qwen4_qsa_private_delta_min_context(9), 12000)
+
+    def test_private_delta_exact_set_preflight_is_default_on_and_b2_gated(self):
+        arguments = {
+            "batch": 2,
+            "length": 3,
+            "base_tokens": 16384,
+            "head_dim": 256,
+            "num_query_heads": 12,
+            "num_kv_heads": 1,
+            "block_size": 4,
+            "selected_blocks": 512,
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD": "0"},
+            clear=False,
+        ):
+            admitted, reason = (
+                indexed.qwen4_qsa_indexed_private_delta_exact_set_preflight(
+                    **arguments
+                )
+            )
+            self.assertFalse(admitted)
+            self.assertEqual(reason, "exact_set_fold_disabled")
+
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+            indexed, "indexed_kernel_available", return_value=True
+        ), mock.patch.object(
+            indexed, "_sdpa_header_state", return_value=(True, "digest", None)
+        ), mock.patch.object(
+            indexed.mx,
+            "__version__",
+            next(iter(indexed._EXACT_MLX_BUILDS)),
+        ):
+            os.environ.pop("MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD", None)
+            admitted, reason = (
+                indexed.qwen4_qsa_indexed_private_delta_exact_set_preflight(
+                    **arguments
+                )
+            )
+            self.assertTrue(admitted, reason)
+            admitted, reason = (
+                indexed.qwen4_qsa_indexed_private_delta_exact_set_preflight(
+                    **{**arguments, "batch": 3}
+                )
+            )
+            self.assertFalse(admitted)
+            self.assertEqual(reason, "exact_set_fold_requires_b2")
+
+    def test_private_delta_exact_set_proof_is_per_query_and_device_resident(self):
+        *_arrays, compact = _private_delta_exact_set_fixture(3)
+        proof = indexed.qwen4_qsa_indexed_private_delta_exact_set_proof(
+            compact, base_tokens=1028
+        )
+        self.assertEqual(proof.shape, (3,))
+        self.assertEqual(proof.dtype, mx.bool_)
+        mx.eval(proof)
+        self.assertEqual(np.asarray(proof).tolist(), [True, True, True])
+
+        *_arrays, compact = _private_delta_randomized_fixture(3)
+        proof = indexed.qwen4_qsa_indexed_private_delta_exact_set_proof(
+            compact, base_tokens=1028
+        )
+        mx.eval(proof)
+        self.assertEqual(np.asarray(proof).tolist(), [False, False, False])
+
     @unittest.skipUnless(
         os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
         "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
@@ -652,6 +844,167 @@ class TestQSAIndexedReference(unittest.TestCase):
                 splits=128,
                 hpt=12,
             )
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(actual, expected).item())
+        finally:
+            mx.set_default_device(device)
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
+    )
+    def test_private_delta_m1_to_m9_randomized_is_bit_exact_on_metal(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            for width in range(1, 10):
+                q, base_k, base_v, delta_k, delta_v, lengths, compact = (
+                    _private_delta_randomized_fixture(width)
+                )
+                physical_k = mx.concatenate(
+                    [mx.broadcast_to(base_k, (2, *base_k.shape[1:])), delta_k],
+                    axis=2,
+                )
+                physical_v = mx.concatenate(
+                    [mx.broadcast_to(base_v, (2, *base_v.shape[1:])), delta_v],
+                    axis=2,
+                )
+                expected = indexed.qwen4_qsa_indexed_attention(
+                    q,
+                    physical_k,
+                    physical_v,
+                    compact,
+                    scale=256**-0.5,
+                    splits=128,
+                    hpt=12,
+                )
+                actual = indexed.qwen4_qsa_indexed_private_delta_attention(
+                    q,
+                    base_k,
+                    base_v,
+                    delta_k,
+                    delta_v,
+                    lengths,
+                    compact,
+                    scale=256**-0.5,
+                    splits=128,
+                    hpt=12,
+                )
+                mx.eval(expected, actual)
+                self.assertTrue(
+                    mx.array_equal(actual, expected).item(), f"M={width}"
+                )
+        finally:
+            mx.set_default_device(device)
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for Metal exactness",
+    )
+    def test_private_delta_exact_set_fold_m1_to_m4_is_bit_exact_on_metal(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            with mock.patch.dict(
+                os.environ,
+                {"MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD": "1"},
+                clear=False,
+            ):
+                for width in range(1, 5):
+                    q, base_k, base_v, delta_k, delta_v, lengths, compact = (
+                        _private_delta_exact_set_fixture(width)
+                    )
+                    physical_k = mx.concatenate(
+                        [
+                            mx.broadcast_to(base_k, (2, *base_k.shape[1:])),
+                            delta_k,
+                        ],
+                        axis=2,
+                    )
+                    physical_v = mx.concatenate(
+                        [
+                            mx.broadcast_to(base_v, (2, *base_v.shape[1:])),
+                            delta_v,
+                        ],
+                        axis=2,
+                    )
+                    expected = indexed.qwen4_qsa_indexed_attention(
+                        q,
+                        physical_k,
+                        physical_v,
+                        compact,
+                        scale=256**-0.5,
+                        splits=128,
+                        hpt=12,
+                    )
+                    actual = (
+                        indexed.qwen4_qsa_indexed_private_delta_exact_set_attention(
+                            q,
+                            base_k,
+                            base_v,
+                            delta_k,
+                            delta_v,
+                            lengths,
+                            compact,
+                            scale=256**-0.5,
+                            splits=128,
+                            hpt=12,
+                        )
+                    )
+                    mx.eval(expected, actual)
+                    self.assertTrue(
+                        mx.array_equal(actual, expected).item(), f"M={width}"
+                    )
+        finally:
+            mx.set_default_device(device)
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for Metal exactness",
+    )
+    def test_private_delta_exact_set_fold_stale_proof_is_bit_exact_on_metal(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            q, base_k, base_v, delta_k, delta_v, lengths, compact = (
+                _private_delta_randomized_fixture(3)
+            )
+            physical_k = mx.concatenate(
+                [mx.broadcast_to(base_k, (2, *base_k.shape[1:])), delta_k],
+                axis=2,
+            )
+            physical_v = mx.concatenate(
+                [mx.broadcast_to(base_v, (2, *base_v.shape[1:])), delta_v],
+                axis=2,
+            )
+            expected = indexed.qwen4_qsa_indexed_attention(
+                q,
+                physical_k,
+                physical_v,
+                compact,
+                scale=256**-0.5,
+                splits=128,
+                hpt=12,
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD": "1"},
+                clear=False,
+            ):
+                actual = (
+                    indexed.qwen4_qsa_indexed_private_delta_exact_set_attention(
+                        q,
+                        base_k,
+                        base_v,
+                        delta_k,
+                        delta_v,
+                        lengths,
+                        compact,
+                        scale=256**-0.5,
+                        splits=128,
+                        hpt=12,
+                    )
+                )
             mx.eval(expected, actual)
             self.assertTrue(mx.array_equal(actual, expected).item())
         finally:

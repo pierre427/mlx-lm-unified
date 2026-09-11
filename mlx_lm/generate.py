@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -5051,6 +5052,13 @@ class ParallelSampleGenerator:
             canonical.lane.token_prefix = mx.array(
                 history + prompt_tail, dtype=mx.uint32
             )
+            if segmented_requested:
+                prefix_bytes = np.asarray(
+                    history + prompt_tail, dtype="<u4"
+                ).tobytes()
+                canonical.shared_qsa_prefix_id = hashlib.sha256(
+                    prefix_bytes
+                ).hexdigest()
             prepared_caches = None
             if fanout_candidate:
                 owner = None

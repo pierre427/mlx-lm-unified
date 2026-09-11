@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import hashlib
 import hmac
 import importlib
 import json
@@ -59,6 +60,15 @@ from .cache_capsule import (
     CacheCapsulePool,
     cache_capsules_enabled,
     prepare_prompt_cache_capsules,
+)
+from .cache_planes import (
+    CachePlaneFingerprint,
+    CachePlaneKind,
+    CachePlaneLease,
+    PromptCacheKeyProvenance,
+    PromptHostPlane,
+    PromptHostPlaneCache,
+    PromptPrefixSpan,
 )
 from .compiled_decode import (
     compiled_decode_context_policy,
@@ -2236,6 +2246,12 @@ class ResponseGenerator:
         )
         self.requests = Queue()
         self._state_machine_cache = {}
+        self._prompt_host_cache = PromptHostPlaneCache(
+            int(getattr(model_provider.cli_args, "prompt_host_cache_size", 64))
+        )
+        self._prompt_host_tokenizer = None
+        self._prompt_host_template = None
+        self._prompt_host_tokenizer_epoch = 0
         # The generation thread creates and evaluates this root before use.
         self._lane_rng_root = None
         _cli = self.model_provider.cli_args
@@ -2396,7 +2412,219 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
+    @staticmethod
+    def _prompt_initial_state(tokenizer, prompt):
+        initial_state = "normal"
+        if tokenizer.has_thinking:
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
+        return initial_state
+
+    def _prompt_host_metadata(self, tokenizer, request, args):
+        """Build an exact, process-local identity for one tokenization call."""
+        if self._prompt_host_tokenizer is not tokenizer:
+            if self._prompt_host_tokenizer is not None:
+                self._prompt_host_cache.clear("tokenizer_changed")
+            self._prompt_host_tokenizer = tokenizer
+            self._prompt_host_template = None
+            self._prompt_host_tokenizer_epoch += 1
+
+        base_tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
+        tokenizer_class = (
+            f"{type(base_tokenizer).__module__}.{type(base_tokenizer).__qualname__}"
+        )
+        init_kwargs = getattr(base_tokenizer, "init_kwargs", {}) or {}
+        revision = str(init_kwargs.get("_commit_hash", "") or "")
+        try:
+            vocab_size = len(tokenizer)
+        except TypeError:
+            vocab_size = getattr(tokenizer, "vocab_size", "")
+        tokenizer_version = (
+            f"epoch={self._prompt_host_tokenizer_epoch};"
+            f"revision={revision};vocab={vocab_size}"
+        )
+
+        custom_template = getattr(tokenizer, "_chat_template", None)
+        template = (
+            custom_template
+            if custom_template is not None
+            else getattr(tokenizer, "chat_template", None)
+        )
+        if callable(template):
+            if (
+                self._prompt_host_template is not None
+                and self._prompt_host_template is not template
+            ):
+                self._prompt_host_cache.clear("chat_template_changed")
+            self._prompt_host_template = template
+            template = (
+                f"{getattr(template, '__module__', '')}."
+                f"{getattr(template, '__qualname__', type(template).__qualname__)}:"
+                f"{id(template)}"
+            )
+        template_digest = hashlib.sha256(str(template or "none").encode()).hexdigest()
+
+        model_key = tuple(
+            "" if value is None else str(value)
+            for value in (self.model_provider.model_key or ())
+        )
+        semantic_input = {
+            "schema": 1,
+            "request_type": request.request_type,
+            "tokenizer_epoch": self._prompt_host_tokenizer_epoch,
+            "tokenizer_class": tokenizer_class,
+            "tokenizer_version": tokenizer_version,
+            "template_digest": template_digest,
+            "model_key": model_key,
+        }
+        if request.request_type == "chat":
+            chat_template_args = dict(
+                getattr(self.model_provider.cli_args, "chat_template_args", {}) or {}
+            )
+            if getattr(args, "chat_template_kwargs", None):
+                chat_template_args.update(args.chat_template_kwargs)
+            semantic_input.update(
+                {
+                    "messages": request.messages,
+                    "tools": request.tools,
+                    "role_mapping": request.role_mapping,
+                    "chat_template_args": chat_template_args,
+                    "add_generation_prompt": True,
+                    "has_chat_template": bool(tokenizer.has_chat_template),
+                    "has_thinking": bool(tokenizer.has_thinking),
+                }
+            )
+        else:
+            semantic_input["prompt"] = request.prompt
+
+        encoded = json.dumps(
+            semantic_input,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            # Chat templates are executable user inputs: some iterate message,
+            # tool-schema, role-mapping, or custom-argument mappings in their
+            # insertion order.  Sorting nested mappings would make requests
+            # with observably different template output share one cache key.
+            sort_keys=False,
+        ).encode()
+        input_fingerprint = hashlib.sha256(encoded).hexdigest()
+        provenance = PromptCacheKeyProvenance(
+            model=model_key[0] if model_key else "",
+            revision=revision,
+            adapter=model_key[1] if len(model_key) > 1 else "",
+            semantic_fingerprint=input_fingerprint,
+        )
+        return {
+            "input_fingerprint": input_fingerprint,
+            "tokenizer_identity": tokenizer_class,
+            "tokenizer_version": tokenizer_version,
+            "chat_template_identity": template_digest,
+            "chat_template_version": "server-v1",
+            "cache_key_provenance": provenance,
+        }
+
+    @staticmethod
+    def _prompt_host_fingerprint(metadata):
+        provenance = metadata["cache_key_provenance"]
+        return CachePlaneFingerprint.from_fields(
+            CachePlaneKind.PROMPT_HOST,
+            input=metadata["input_fingerprint"],
+            tokenizer=metadata["tokenizer_identity"],
+            tokenizer_version=metadata["tokenizer_version"],
+            chat_template=metadata["chat_template_identity"],
+            chat_template_version=metadata["chat_template_version"],
+            model=provenance.model,
+            revision=provenance.revision,
+            adapter=provenance.adapter,
+            semantic=provenance.semantic_fingerprint,
+        )
+
     def _tokenize(self, tokenizer, request, args):
+        """Reuse an exact host prompt plane when the opt-in serving gate is on."""
+        if request.request_type == "chat" and tokenizer.has_chat_template:
+            process_message_content(request.messages)
+            if request.tools and not tokenizer.has_tool_calling:
+                logging.warning(
+                    "Received tools but model does not support tool calling. "
+                    "If you think this is an error, file an issue here: "
+                    "https://github.com/ml-explore/mlx-lm/issues"
+                )
+
+        prompt_host_cache = getattr(self, "_prompt_host_cache", None)
+        if not getattr(self.model_provider.cli_args, "prompt_host_cache", False):
+            if prompt_host_cache is not None:
+                prompt_host_cache.record_bypass("disabled")
+            return self._tokenize_uncached(tokenizer, request, args)
+        if prompt_host_cache is None:
+            # ResponseGenerator normally creates this owner in __init__.  A
+            # few embedders construct a minimal generator around the uncached
+            # tokenizer path; preserve that supported path instead of making
+            # an opt-in cache an unconditional attribute dependency.
+            return self._tokenize_uncached(tokenizer, request, args)
+
+        try:
+            metadata = self._prompt_host_metadata(tokenizer, request, args)
+        except (TypeError, ValueError, OverflowError):
+            prompt_host_cache.record_bypass("uncacheable_input")
+            return self._tokenize_uncached(tokenizer, request, args)
+
+        adopted = prompt_host_cache.lookup(
+            metadata["input_fingerprint"], self._prompt_host_fingerprint(metadata)
+        )
+        if isinstance(adopted, CachePlaneLease):
+            try:
+                plane = adopted.payload
+                prompt = list(plane.token_ids)
+                segments = [
+                    prompt[span.token_start : span.token_stop]
+                    for span in plane.prefix_spans
+                ]
+                segment_types = [span.name for span in plane.prefix_spans]
+                return (
+                    prompt,
+                    segments,
+                    segment_types,
+                    plane.initial_state,
+                )
+            finally:
+                adopted.close()
+
+        result = self._tokenize_uncached(tokenizer, request, args)
+        prompt, segments, segment_types, initial_state = result
+        offset = 0
+        spans = []
+        for name, segment in zip(segment_types, segments):
+            stop = offset + len(segment)
+            spans.append(PromptPrefixSpan(name, offset, stop))
+            offset = stop
+        rendered_prompt = (
+            request.prompt
+            if request.request_type == "text"
+            else (
+                convert_chat(request.messages, request.role_mapping)
+                if not tokenizer.has_chat_template
+                else ""
+            )
+        )
+        try:
+            prompt_host_cache.store(
+                PromptHostPlane(
+                    rendered_prompt=rendered_prompt,
+                    token_ids=tuple(int(token) for token in prompt),
+                    prefix_spans=tuple(spans),
+                    token_offsets=(),
+                    initial_state=initial_state,
+                    **metadata,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            prompt_host_cache.record_bypass("uncacheable_result")
+        return result
+
+    def _tokenize_uncached(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
 
         Returns a tuple
@@ -2416,14 +2644,6 @@ class ResponseGenerator:
             role_mapping = request.role_mapping
 
             if tokenizer.has_chat_template:
-                process_message_content(messages)
-                if tools and not tokenizer.has_tool_calling:
-                    logging.warning(
-                        "Received tools but model does not support tool calling. "
-                        "If you think this is an error, file an issue here: "
-                        "https://github.com/ml-explore/mlx-lm/issues"
-                    )
-
                 chat_template_args = self.model_provider.cli_args.chat_template_args
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
@@ -2449,12 +2669,7 @@ class ResponseGenerator:
         # for segments for better cache management.
 
         # Choose the initial state among only reasoning or normal
-        initial_state = "normal"
-        if tokenizer.has_thinking:
-            think_start = tokenizer.rfind_think_start(prompt)
-            think_end = tokenizer.rfind_think_end(prompt)
-            if think_start > think_end:
-                initial_state = "reasoning"
+        initial_state = self._prompt_initial_state(tokenizer, prompt)
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
@@ -4041,6 +4256,12 @@ class ResponseGenerator:
                     )
                 changes = apply_soft_reload(self.cli_args, plan)
                 cache_report = self.clear_prompt_cache()
+                prompt_host_cache = getattr(self, "_prompt_host_cache", None)
+                host_entries_dropped = (
+                    prompt_host_cache.clear("soft_reload")
+                    if prompt_host_cache is not None
+                    else 0
+                )
             finally:
                 with self._admission:
                     self._paused = False
@@ -4061,6 +4282,7 @@ class ResponseGenerator:
                 "entries_dropped": cache_report["entries"],
                 "sidecars_dropped": cache_report["sidecars"],
                 "bytes_freed": cache_report["bytes"],
+                "host_entries_dropped": host_entries_dropped,
             },
             "drain": {
                 "inflight_at_start": inflight_at_start,
@@ -4988,6 +5210,15 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             self.end_headers()
             self.wfile.write(payload)
+        elif self.path == "/v1/status/prompt-host-cache":
+            cli = self.response_generator.cli_args
+            payload = {
+                "configured": bool(getattr(cli, "prompt_host_cache", False)),
+                "stats": self.response_generator._prompt_host_cache.stats(),
+            }
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
         elif self.path == "/v1/status/self-mtp":
             cli = self.response_generator.cli_args
             receipts = list(SELF_MTP_RECEIPTS)
@@ -5668,6 +5899,22 @@ def setup_arg_parser():
         help="Maximum number of distinct KV caches to hold in the prompt cache",
     )
     parser.add_argument(
+        "--prompt-host-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse exact request rendering and tokenization results in a "
+            "process-local host cache. Default: off because custom/remote "
+            "tokenizers are not guaranteed to be pure."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-host-cache-size",
+        type=int,
+        default=64,
+        help="Maximum host render/tokenization entries to retain (default: 64).",
+    )
+    parser.add_argument(
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
@@ -5760,6 +6007,8 @@ def main():
     ):
         if getattr(args, name, None) is not None and getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
+    if args.prompt_host_cache_size < 1:
+        parser.error("--prompt-host-cache-size must be >= 1")
     if args.self_mtp_window_size and not args.self_mtp_persistent:
         parser.error("--self-mtp-window-size requires --self-mtp-persistent")
     try:

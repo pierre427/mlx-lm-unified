@@ -8,6 +8,8 @@ The benchmark keeps the 16K production geometry and interleaves four arms:
 * ``serial_b1``: two independent B1 indexed-QSA dispatches;
 * ``private_delta``: one B2 dispatch whose single accumulator traverses a
   straight-line B1-base phase followed by a straight-line private-suffix phase.
+* ``exact_set_fold``: one B2 dispatch that loads each equal selected base row
+  once while maintaining two row-private accumulators and suffix traversals.
 
 All arms use the same compact block selection, split count, and merge path.
 The receipt includes raw samples, allocation deltas, exactness, immutable-base
@@ -19,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -33,6 +36,7 @@ from mlx_lm.models.qwen4_exp import QSACompactBlocks
 from mlx_lm.models.qwen4_qsa_indexed import (
     qwen4_qsa_indexed_attention,
     qwen4_qsa_indexed_private_delta_attention,
+    qwen4_qsa_indexed_private_delta_exact_set_attention,
 )
 
 
@@ -268,11 +272,26 @@ def _run_width(args, query: int) -> dict:
             hpt=args.hpt,
         )
 
+    def exact_set_fold():
+        return qwen4_qsa_indexed_private_delta_exact_set_attention(
+            q,
+            base_k,
+            base_v,
+            delta_k,
+            delta_v,
+            lengths,
+            compact,
+            scale=args.head_dim**-0.5,
+            splits=args.splits,
+            hpt=args.hpt,
+        )
+
     arms = {
         "physical_prebuilt": physical_prebuilt,
         "physical_build": physical_build,
         "serial_b1": serial_b1,
         "private_delta": private_delta,
+        "exact_set_fold": exact_set_fold,
     }
     for _ in range(args.warmup):
         for fn in arms.values():
@@ -303,6 +322,7 @@ def _run_width(args, query: int) -> dict:
     return {
         "query_width": query,
         "private_delta_layout": "source_homogeneous_single_accumulator",
+        "exact_set_fold_layout": "b2_shared_base_dual_accumulator",
         "geometry": {
             "batch": batch,
             "query_heads": args.query_heads,
@@ -335,6 +355,18 @@ def _run_width(args, query: int) -> dict:
             summaries["serial_b1"]["median_ms"]
             / summaries["private_delta"]["median_ms"]
         ),
+        "exact_set_fold_over_private_delta_speedup": (
+            summaries["private_delta"]["median_ms"]
+            / summaries["exact_set_fold"]["median_ms"]
+        ),
+        "exact_set_fold_over_physical_prebuilt_speedup": (
+            summaries["physical_prebuilt"]["median_ms"]
+            / summaries["exact_set_fold"]["median_ms"]
+        ),
+        "exact_set_fold_over_serial_b1_speedup": (
+            summaries["serial_b1"]["median_ms"]
+            / summaries["exact_set_fold"]["median_ms"]
+        ),
     }
 
 
@@ -355,10 +387,14 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
+    # Pin the measured arm explicitly even though admitted B2 private-delta
+    # runtime traffic now selects this exact fold by default.
+    os.environ["MLX_LM_QSA_PRIVATE_DELTA_EXACT_SET_FOLD"] = "1"
+
     if args.base % 4:
         raise ValueError("base must end on a four-token block")
-    if args.batch < 2:
-        raise ValueError("batch must be at least two")
+    if args.batch != 2:
+        raise ValueError("exact-set folded gate requires batch exactly two")
     if args.delta < 4:
         raise ValueError("delta must be at least four for the ragged B2 gate")
     before = _host_snapshot()
