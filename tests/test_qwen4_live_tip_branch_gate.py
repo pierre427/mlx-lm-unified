@@ -28,6 +28,8 @@ def _args(**updates):
         "qsa_exact_set_fold": "default",
         "qsa_private_delta_min_context": None,
         "promote_after_first": False,
+        "async_promote_after_first": False,
+        "async_qsa_promote_after_first": False,
     }
     values.update(updates)
     return Namespace(**values)
@@ -58,6 +60,8 @@ def test_plan_records_composition_mode(mode):
         "qsa_exact_set_fold": "off",
         "qsa_private_delta_min_context": 0,
         "promote_after_first": False,
+        "async_promote_after_first": False,
+        "async_qsa_promote_after_first": False,
     }
     assert {key: plan["composition"][key] for key in expected} == expected
 

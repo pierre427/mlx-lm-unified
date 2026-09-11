@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import asdict
 import gc
 import hashlib
 import json
@@ -22,6 +23,7 @@ import os
 import re
 import statistics
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +36,7 @@ DEFAULT_MODEL = (
     "Qwen3.8-Flash-Next-MLX-4bit-MTP"
 )
 ARMS = ("warm_live_tip", "idle_live_tip")
-BRANCH_MODES = ("physical", "segmented")
+BRANCH_MODES = ("physical", "physical_fanout", "segmented")
 
 
 def utc_now() -> str:
@@ -104,6 +106,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 args, "qsa_private_delta_min_context", None
             ),
             "promote_after_first": getattr(args, "promote_after_first", False),
+            "async_promote_after_first": getattr(
+                args, "async_promote_after_first", False
+            ),
+            "async_qsa_promote_after_first": getattr(
+                args, "async_qsa_promote_after_first", False
+            ),
         },
     }
 
@@ -162,6 +170,102 @@ def _mlx_memory(mx: Any) -> dict[str, int]:
         "cache_bytes": int(mx.get_cache_memory()),
         "peak_bytes": int(mx.get_peak_memory()),
     }
+
+
+def _cache_geometry(batch: Any) -> dict[str, Any]:
+    """Host-only structural fingerprint of the steady physical cache."""
+
+    def shape(value):
+        return None if value is None else list(value.shape)
+
+    result = {}
+    for name, caches in (
+        ("target", batch.caches.target),
+        ("draft", batch.caches.draft),
+    ):
+        layers = []
+        for cache in caches:
+            layers.append(
+                {
+                    "type": type(cache).__name__,
+                    "nbytes": int(cache.nbytes),
+                    "idx": getattr(cache, "_idx", None),
+                    "offset_shape": shape(getattr(cache, "offset", None)),
+                    "left_padding_shape": shape(
+                        getattr(cache, "left_padding", None)
+                    ),
+                    "keys_shape": shape(getattr(cache, "keys", None)),
+                    "values_shape": shape(getattr(cache, "values", None)),
+                    "index_keys_shape": shape(
+                        getattr(cache, "index_keys", None)
+                    ),
+                    "pooled_keys_shape": shape(
+                        getattr(cache, "_qsa_pooled_keys", None)
+                    ),
+                    "pooled_ratio": getattr(cache, "_qsa_pooled_ratio", None),
+                    "summary_identity": getattr(
+                        cache, "_qsa_summary_identity", None
+                    ),
+                    "right_padding_shape": shape(
+                        getattr(cache, "_right_padding", None)
+                    ),
+                    "mtp_share_topk": bool(
+                        getattr(cache, "_mtp_share_topk", False)
+                    ),
+                    "shared_topk_shape": shape(
+                        getattr(cache, "_mtp_shared_topk", None)
+                    ),
+                    "state_shapes": [
+                        shape(value)
+                        for value in getattr(cache, "cache", ())
+                    ],
+                    "checkpoint_lanes": len(
+                        getattr(cache, "_checkpoints", ())
+                    ),
+                    "rollback_records": len(
+                        getattr(cache, "_rollbacks", ())
+                    ),
+                    "rollback_window": getattr(
+                        cache, "_rollback_window", None
+                    ),
+                    "rollback_invalid_reason": getattr(
+                        cache, "_rollback_invalid_reason", None
+                    ),
+                    "speculating": bool(
+                        getattr(cache, "speculating", False)
+                    ),
+                }
+            )
+        result[name] = layers
+    return result
+
+
+def _ple_stats(model: Any) -> dict[str, float | int]:
+    """Aggregate host-only counters from all file-backed PLE tables."""
+
+    totals = {
+        "lookups": 0,
+        "rows": 0,
+        "unique_rows": 0,
+        "bytes_read": 0,
+        "elapsed_seconds": 0.0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "cache_evictions": 0,
+    }
+    layers = list(getattr(model, "layers", ()))
+    layers.extend(getattr(getattr(model, "mtp", None), "layers", ()))
+    for layer in layers:
+        ple = getattr(layer, "ple", None)
+        embedding = getattr(
+            getattr(ple, "ple_embedding", None), "ngram_embedding", None
+        )
+        stats = getattr(embedding, "stats", None)
+        if stats is None:
+            continue
+        for key in totals:
+            totals[key] += getattr(stats, key)
+    return totals
 
 
 def _token_digest(rows: list[list[int]]) -> str:
@@ -223,9 +327,61 @@ def _advance_cycle(mx: Any, model: Any, batch: Any, propose: Any, commit: Any):
     return proposal, emitted
 
 
+def _run_physical_first_cycle(
+    mx: Any,
+    model: Any,
+    rows: list[Any],
+    stream: Any,
+    attach: Any,
+    propose: Any,
+    commit: Any,
+    result: dict[str, Any],
+) -> None:
+    """Build and advance an independent physical B2 on one unsafe stream."""
+
+    started = time.perf_counter_ns()
+    try:
+        with mx.stream(stream):
+            batch = attach(model, None, rows)
+            mx.eval(_batch_state_values(batch))
+            ready = time.perf_counter_ns()
+            proposal = propose(model, batch)
+            mx.eval(
+                [output.logprobs for outputs in proposal.outputs for output in outputs]
+            )
+            emitted = [len(outputs) for outputs in proposal.outputs]
+            commit(
+                batch,
+                proposal,
+                emitted_counts=emitted,
+                terminal=[False] * len(emitted),
+            )
+            mx.eval(_batch_state_values(batch))
+            mx.synchronize(stream)
+        finished = time.perf_counter_ns()
+        result.update(
+            batch=batch,
+            emitted=emitted,
+            logprobs=[
+                output.logprobs for outputs in proposal.outputs for output in outputs
+            ],
+            tokens=[
+                [int(output.token) for output in outputs]
+                for outputs in proposal.outputs
+            ],
+            ready_ms=(ready - started) / 1e6,
+            total_ms=(finished - started) / 1e6,
+        )
+    except BaseException as error:
+        result["error"] = error
+
+
 def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dict[str, Any]:
     import mlx.core as mx
     from mlx_lm.hybrid_speculative import (
+        DetachedSelfMTPLane,
+        SelfMTPCachePair,
+        attach_prebatched_self_mtp_lanes,
         attach_self_mtp_lanes,
         attach_segmented_self_mtp_lanes,
         commit_batched_self_mtp,
@@ -235,7 +391,14 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         propose_batched_self_mtp,
     )
     from mlx_lm.sample_utils import LaneRNG
-    from mlx_lm.segmented_self_mtp import segmented_self_mtp_stats
+    from mlx_lm.gdn_prefix_fanout import (
+        HybridCachePrefixFanout,
+        gdn_prefix_fanout_stats,
+    )
+    from mlx_lm.segmented_self_mtp import (
+        note_segmented_self_mtp,
+        segmented_self_mtp_stats,
+    )
 
     before = system_snapshot()
     if not _thermal_healthy(before):
@@ -292,6 +455,20 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     mx.synchronize()
     last_warm_ns = time.perf_counter_ns()
 
+    fanout_before = gdn_prefix_fanout_stats()
+    fanout_owner = None
+    fanout_capture_ms = 0.0
+    if args.branch_mode == "physical_fanout":
+        capture_started = time.perf_counter_ns()
+        fanout_owner = HybridCachePrefixFanout.from_prompt_cache(
+            batch.caches.target,
+            enabled=True,
+            strict=True,
+        )
+        fanout_capture_ms = (time.perf_counter_ns() - capture_started) / 1e6
+        if fanout_owner is None:
+            raise RuntimeError("live-tip fanout refused the Qwen4 hybrid cache")
+
     batch, rows = detach_self_mtp_lanes(model, batch, [0])
     if batch.lanes or len(rows) != 1:
         raise RuntimeError("failed to detach the single live lane")
@@ -313,17 +490,108 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     # This is the branch boundary. The live-tip-to-commit metric also includes
     # the required detach/canonicalization immediately before this point.
     branch_started = time.perf_counter_ns()
-    sibling = copy.deepcopy(canonical)
+    ple_before = _ple_stats(model)
+    sibling = (
+        DetachedSelfMTPLane(
+            lane=copy.deepcopy(canonical.lane),
+            caches=canonical.caches,
+        )
+        if args.branch_mode == "physical_fanout"
+        else copy.deepcopy(canonical)
+    )
     sibling.lane.uid = 1
     sibling.lane.rng = LaneRNG(args.seed + 1)
+    async_promote = bool(getattr(args, "async_promote_after_first", False))
+    async_qsa_promote = bool(
+        getattr(args, "async_qsa_promote_after_first", False)
+    )
+    if async_promote and async_qsa_promote:
+        raise ValueError("select only one asynchronous promotion strategy")
+    if async_promote and args.branch_mode != "segmented":
+        raise ValueError("asynchronous promotion requires a segmented branch")
+    if async_qsa_promote and args.branch_mode != "segmented":
+        raise ValueError("asynchronous QSA promotion requires a segmented branch")
+    async_result: dict[str, Any] = {}
+    async_thread = None
+    async_started_ns = None
+    if async_promote:
+        # The physical contender owns independent lane/cache objects.  It
+        # executes the same authoritative first cycle on a separate Metal
+        # stream while the segmented lane supplies the first visible result.
+        # We promote only after proving the first-cycle token traces identical.
+        async_rows = copy.deepcopy([canonical, sibling])
+        async_stream = mx.new_thread_unsafe_stream(mx.gpu)
+        async_started_ns = time.perf_counter_ns()
+        async_thread = threading.Thread(
+            target=_run_physical_first_cycle,
+            args=(
+                mx,
+                model,
+                async_rows,
+                async_stream,
+                attach_self_mtp_lanes,
+                propose_batched_self_mtp,
+                commit_batched_self_mtp,
+                async_result,
+            ),
+            name="live-tip-physical-race",
+        )
+        async_thread.start()
     segmented_self_mtp_stats(reset=True)
     segmented_before = segmented_self_mtp_stats(reset=False)
-    attach = (
-        attach_segmented_self_mtp_lanes
-        if args.branch_mode == "segmented"
-        else attach_self_mtp_lanes
-    )
-    branch_batch = attach(model, None, [canonical, sibling])
+    if args.branch_mode == "physical_fanout":
+        try:
+            lease = fanout_owner.fork_live_tip()
+            target_batch = lease.take_batch()
+            draft_batch = [
+                type(cache).merge([cache, cache])
+                for cache in canonical.caches.draft
+            ]
+            mx.eval(
+                [cache.state for cache in target_batch],
+                [cache.state for cache in draft_batch],
+            )
+            prepared_caches = SelfMTPCachePair(
+                target=target_batch,
+                draft=draft_batch,
+            )
+        finally:
+            fanout_owner.close()
+        branch_batch = attach_prebatched_self_mtp_lanes(
+            model,
+            [canonical, sibling],
+            prepared_caches,
+        )
+    else:
+        attach = (
+            attach_segmented_self_mtp_lanes
+            if args.branch_mode == "segmented"
+            else attach_self_mtp_lanes
+        )
+        branch_batch = attach(model, None, [canonical, sibling])
+    async_qsa_ticket = None
+    async_qsa_queue_ms = 0.0
+    async_cache_receipt = None
+    if async_qsa_promote:
+        from mlx_lm.segmented_physical_promotion import (
+            begin_segmented_physical_promotion,
+        )
+
+        async_started_ns = time.perf_counter_ns()
+        async_qsa_ticket = begin_segmented_physical_promotion(
+            branch_batch,
+            reserve_tail=args.num_draft + 1,
+            stream=mx.new_stream(mx.gpu),
+            note=note_segmented_self_mtp,
+        )
+        async_qsa_queue_ms = (time.perf_counter_ns() - async_started_ns) / 1e6
+    # attach() consumes these detached owners.  Retaining the local wrappers
+    # through all follow-up cycles pins the original B1 arrays beside the B2
+    # cache and does not model serving, where the preparation list goes out of
+    # scope as soon as admission publishes the batch.  It particularly biases
+    # segmented promotion because its first cycle has just replaced recurrent
+    # row state before the physical B2 takes ownership.
+    rows = canonical = sibling = None
     mx.eval(_batch_state_values(branch_batch))
     mx.synchronize()
     branch_ready_ns = time.perf_counter_ns()
@@ -347,7 +615,72 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         [int(output.token) for output in outputs] for outputs in proposal.outputs
     ]
     promotion_ms = 0.0
-    if getattr(args, "promote_after_first", False):
+    async_physical_ready_ms = 0.0
+    async_physical_total_ms = 0.0
+    async_wait_after_first_ms = 0.0
+    async_first_logprobs_exact = False
+    if async_qsa_promote:
+        promotion_started = time.perf_counter_ns()
+        branch_batch, receipt = async_qsa_ticket.finish()
+        async_wait_after_first_ms = (
+            time.perf_counter_ns() - promotion_started
+        ) / 1e6
+        promotion_ms = async_wait_after_first_ms
+        async_physical_ready_ms = async_qsa_queue_ms
+        async_physical_total_ms = (
+            time.perf_counter_ns() - async_started_ns
+        ) / 1e6
+        async_cache_receipt = asdict(receipt)
+        # The ticket owns the retired segmented view (and therefore its B1
+        # row tensors). Production clears the scheduler ticket before the next
+        # decode call; retaining this local through the follow-up loop pins the
+        # very cache allocation we are trying to measure away.
+        async_qsa_ticket = None
+    elif async_promote:
+        promotion_started = time.perf_counter_ns()
+        emptied, segmented_rows = detach_self_mtp_lanes(
+            model, branch_batch, [0, 1]
+        )
+        if emptied.lanes or len(segmented_rows) != 2:
+            raise RuntimeError("failed to detach rows from asynchronous promotion")
+        async_thread.join()
+        if "error" in async_result:
+            raise RuntimeError("asynchronous physical contender failed") from async_result[
+                "error"
+            ]
+        if async_result["tokens"] != branch_rows:
+            raise AssertionError(
+                "asynchronous physical contender differs from segmented first cycle"
+            )
+        visible_logprobs = [
+            output.logprobs for outputs in proposal.outputs for output in outputs
+        ]
+        if len(visible_logprobs) != len(async_result["logprobs"]):
+            raise AssertionError("asynchronous first-cycle logprob count differs")
+        logprob_tests = [
+            mx.array_equal(left, right)
+            for left, right in zip(visible_logprobs, async_result["logprobs"])
+        ]
+        mx.eval(logprob_tests)
+        async_first_logprobs_exact = all(bool(test.item()) for test in logprob_tests)
+        if not async_first_logprobs_exact:
+            raise AssertionError(
+                "asynchronous physical contender logprobs differ from visible lane"
+            )
+        branch_batch = async_result["batch"]
+        async_physical_ready_ms = float(async_result["ready_ms"])
+        async_physical_total_ms = float(async_result["total_ms"])
+        async_wait_after_first_ms = (
+            time.perf_counter_ns() - promotion_started
+        ) / 1e6
+        promotion_ms = async_wait_after_first_ms
+        for row in segmented_rows:
+            transaction = getattr(row, "segment_transaction", None)
+            if transaction is not None:
+                transaction.close()
+                row.segment_transaction = None
+        segmented_rows = None
+    elif getattr(args, "promote_after_first", False):
         if args.branch_mode != "segmented":
             raise ValueError("post-first promotion requires a segmented branch")
         promotion_started = time.perf_counter_ns()
@@ -360,9 +693,13 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         mx.eval(_batch_state_values(branch_batch))
         mx.synchronize()
         promotion_ms = (time.perf_counter_ns() - promotion_started) / 1e6
+        promoted_rows = None
+    steady_cache_geometry = _cache_geometry(branch_batch)
     followup_tokens = sum(emitted)
+    followup_cycle_ms = []
     followup_started = time.perf_counter_ns()
     for _ in range(args.measured_cycles - 1):
+        cycle_started = time.perf_counter_ns()
         next_proposal, next_emitted = _advance_cycle(
             mx,
             model,
@@ -373,8 +710,16 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         for row, outputs in zip(branch_rows, next_proposal.outputs):
             row.extend(int(output.token) for output in outputs)
         followup_tokens += sum(next_emitted)
+        followup_cycle_ms.append(
+            (time.perf_counter_ns() - cycle_started) / 1e6
+        )
     mx.synchronize()
     followup_finished = time.perf_counter_ns()
+    ple_after = _ple_stats(model)
+    ple_delta = {
+        key: ple_after[key] - ple_before[key]
+        for key in ple_before
+    }
 
     branch_batch, final_rows = detach_self_mtp_lanes(
         model, branch_batch, [0, 1]
@@ -387,6 +732,12 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         key: int(value) - int(segmented_before.get(key, 0))
         for key, value in segmented_after.items()
         if isinstance(value, int) and isinstance(segmented_before.get(key, 0), int)
+    }
+    fanout_after = gdn_prefix_fanout_stats()
+    fanout_delta = {
+        key: int(value) - int(fanout_before.get(key, 0))
+        for key, value in fanout_after.items()
+        if isinstance(value, int) and isinstance(fanout_before.get(key, 0), int)
     }
 
     after = system_snapshot()
@@ -412,14 +763,49 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "warm_to_detach_gap_ms": (detached_ns - last_warm_ns) / 1e6,
         "idle_wait_ms": idle_wait_ns / 1e6,
         "detach_to_branch_gap_ms": (branch_started - detached_ns) / 1e6,
-        "branch_ready_ms": (branch_ready_ns - branch_started) / 1e6,
+        "branch_ready_ms": (
+            (branch_ready_ns - branch_started) / 1e6 + fanout_capture_ms
+        ),
+        "fanout_capture_ms": fanout_capture_ms,
         "first_proposal_verify_ms": (first_output_ns - branch_ready_ns) / 1e6,
         "first_commit_ms": (first_commit_ns - first_output_ns) / 1e6,
         "promotion_after_first_ms": promotion_ms,
-        "branch_to_first_output_ms": (first_output_ns - branch_started) / 1e6,
-        "branch_to_first_commit_ms": (first_commit_ns - branch_started) / 1e6,
+        "async_physical_ready_ms": async_physical_ready_ms,
+        "async_physical_total_ms": async_physical_total_ms,
+        "async_wait_after_first_ms": async_wait_after_first_ms,
+        "async_qsa_queue_ms": async_qsa_queue_ms,
+        "async_cache_receipt": async_cache_receipt,
+        "steady_cache_geometry": steady_cache_geometry,
+        "ple_delta": ple_delta,
+        "branch_to_first_commit_if_prequeued_ms": (
+            (first_commit_ns - branch_started) / 1e6 - async_qsa_queue_ms
+            if async_qsa_promote
+            else None
+        ),
+        "async_first_logprobs_exact": async_first_logprobs_exact,
+        "async_strategy": (
+            "qsa_base_only_plus_suffix_patch"
+            if async_qsa_promote
+            else (
+                "independent_physical_first_cycle_race"
+                if async_promote
+                else None
+            )
+        ),
+        "async_physical_started_before_branch_ready_ms": (
+            (branch_ready_ns - async_started_ns) / 1e6
+            if async_started_ns is not None
+            else 0.0
+        ),
+        "branch_to_first_output_ms": (
+            (first_output_ns - branch_started) / 1e6 + fanout_capture_ms
+        ),
+        "branch_to_first_commit_ms": (
+            (first_commit_ns - branch_started) / 1e6 + fanout_capture_ms
+        ),
         "live_tip_to_first_commit_ms": (first_commit_ns - last_warm_ns) / 1e6,
         "followup_ms": (followup_finished - followup_started) / 1e6,
+        "followup_cycle_ms": followup_cycle_ms,
         "measured_cycles": args.measured_cycles,
         "emitted_tokens": followup_tokens,
         "aggregate_branch_decode_tps": followup_tokens
@@ -430,6 +816,7 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "token_digest": _token_digest(branch_rows),
         "sibling_state": sibling_state,
         "segmented_delta": segmented_delta,
+        "fanout_delta": fanout_delta,
         "segmented_receipt": segmented_after,
         "memory": _mlx_memory(mx),
         "system_before": before,
@@ -566,6 +953,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--qsa-private-delta-min-context", type=int)
     parser.add_argument("--promote-after-first", action="store_true")
+    parser.add_argument("--async-promote-after-first", action="store_true")
+    parser.add_argument("--async-qsa-promote-after-first", action="store_true")
     parser.add_argument(
         "--share-qsa-indices",
         action=argparse.BooleanOptionalAction,

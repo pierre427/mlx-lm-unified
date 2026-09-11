@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import sys
 import time
 from collections import deque
@@ -3137,6 +3138,20 @@ def _segment_aware_live_tip_enabled(config: Optional[Mapping[str, Any]]) -> bool
     return segmented_self_mtp_enabled(explicit)
 
 
+def _segmented_async_qsa_promotion_enabled(
+    config: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return the default-off first-cycle segmented-to-physical policy."""
+
+    if config is None or not _segment_aware_live_tip_enabled(config):
+        return False
+    if "segment_aware_async_qsa_promotion" in config:
+        return bool(config["segment_aware_async_qsa_promotion"])
+    return os.environ.get(
+        "MLX_LM_SEGMENTED_ASYNC_QSA_PROMOTION", "0"
+    ).lower() in {"1", "true", "yes", "on"}
+
+
 def _prefetch_known_mtp_tail(model, history, prompt, config) -> int:
     """Asynchronously stage file-backed PLE rows for a known MTP tail.
 
@@ -3204,6 +3219,8 @@ class MTPGenerationBatch:
         *,
         prepared_caches: Optional[Any] = None,
         segmented_live_tip: bool = False,
+        async_qsa_promotion: bool = False,
+        arm_async_qsa_promotion: bool = True,
         mtp_admission: Optional[
             Callable[
                 [Sequence[Tuple[int, int, int, bool, float]]],
@@ -3227,6 +3244,10 @@ class MTPGenerationBatch:
 
         self.model = model
         self.segmented_live_tip = bool(segmented_live_tip)
+        # This is a cohort policy, not the current cache representation.  A
+        # successfully promoted batch is physical but must still compose with
+        # later physical joins created under the same configured policy.
+        self.async_qsa_promotion = bool(async_qsa_promotion)
         if self.segmented_live_tip and prepared_caches is not None:
             raise ValueError("segmented B1 state cannot accept a physical B2 cache")
         if self.segmented_live_tip:
@@ -3254,6 +3275,72 @@ class MTPGenerationBatch:
         self._paused: Dict[int, _PausedMTPGenerationLane] = {}
         self._plain_ready: List[_PausedMTPGenerationLane] = []
         self.mtp_admission = mtp_admission
+        self._async_qsa_ticket = None
+        self._async_qsa_receipt = None
+        self._async_qsa_receipts_by_uid = {}
+        self._async_qsa_pending = (
+            self.async_qsa_promotion and self.segmented_live_tip
+        )
+        if arm_async_qsa_promotion:
+            self._arm_async_qsa_promotion()
+
+    def _arm_async_qsa_promotion(self) -> None:
+        """Queue immutable QSA-base formation once, before the first cycle."""
+
+        if (
+            not self._async_qsa_pending
+            or self._async_qsa_ticket is not None
+            or not self.segmented_live_tip
+            or not self.state.lanes
+        ):
+            return
+        from .segmented_physical_promotion import (
+            SegmentedPhysicalPromotionDeclined,
+            begin_segmented_physical_promotion,
+        )
+        from .segmented_self_mtp import note_segmented_self_mtp
+
+        note_segmented_self_mtp("async_qsa_promotion_requests")
+        reserve_tail = max(int(lane.num_draft) + 1 for lane in self.state.lanes)
+        try:
+            self._async_qsa_ticket = begin_segmented_physical_promotion(
+                self.state,
+                reserve_tail=reserve_tail,
+                stream=mx.new_stream(mx.gpu),
+                note=note_segmented_self_mtp,
+            )
+        except SegmentedPhysicalPromotionDeclined as error:
+            self._async_qsa_pending = False
+            note_segmented_self_mtp("async_qsa_promotion_declined")
+            logging.warning("Async QSA promotion declined at queue: %s", error)
+        except Exception as error:
+            self._async_qsa_pending = False
+            note_segmented_self_mtp("async_qsa_promotion_failures")
+            logging.warning("Async QSA promotion failed at queue: %s", error)
+        else:
+            note_segmented_self_mtp("async_qsa_promotion_queued")
+
+    def _decline_async_qsa_promotion(self, reason: str) -> None:
+        if self._async_qsa_ticket is None and not self._async_qsa_pending:
+            return
+        from .segmented_self_mtp import note_segmented_self_mtp
+
+        ticket = self._async_qsa_ticket
+        if ticket is not None:
+            try:
+                drain = getattr(ticket, "cancel_and_drain", None)
+                if callable(drain):
+                    drain()
+            except BaseException as error:
+                note_segmented_self_mtp("async_qsa_promotion_failures")
+                logging.warning("Async QSA promotion drain failed: %s", error)
+            else:
+                if getattr(ticket, "stream", None) is not None:
+                    note_segmented_self_mtp("device_synchronizations")
+        self._async_qsa_ticket = None
+        self._async_qsa_pending = False
+        note_segmented_self_mtp("async_qsa_promotion_declined")
+        logging.info("Async QSA promotion retained segmented state: %s", reason)
 
     def __len__(self):
         return len(self.state.lanes)
@@ -3290,6 +3377,18 @@ class MTPGenerationBatch:
             for paused in self._paused.values()
             for cache in paused.detached.caches.target + paused.detached.caches.draft
         )
+        if self.segmented_live_tip:
+            view = getattr(self.state, "_segmented_caches", None)
+            if view is not None:
+                # Segmented QSA adapters report zero; recurrent adapters own
+                # real joined B2 arrays in addition to the persistent B1 rows.
+                total += sum(
+                    cache.nbytes for cache in view.target + view.draft
+                )
+        if self._async_qsa_ticket is not None:
+            # Count the complete lazy physical candidate immediately so
+            # admission sees the peak B1+B2 overlap, not only resident pages.
+            total += int(self._async_qsa_ticket.reserved_bytes)
         return total
 
     @property
@@ -3309,13 +3408,23 @@ class MTPGenerationBatch:
 
     def mtp_cycle_state(self):
         if self.segmented_live_tip:
+            overlap = 0
+            view = getattr(self.state, "_segmented_caches", None)
+            if view is not None:
+                overlap += sum(
+                    cache.nbytes for cache in view.target + view.draft
+                )
+            if self._async_qsa_ticket is not None:
+                overlap += int(self._async_qsa_ticket.reserved_bytes)
+            overlap_per_lane = overlap / max(len(self.state.lanes), 1)
             rows = [
                 (
                     lane.uid,
                     len(self._prefix_tokens(lane)) + 1,
                     lane.num_draft,
                     True,
-                    sum(cache.nbytes for cache in pair.target + pair.draft)
+                    (sum(cache.nbytes for cache in pair.target + pair.draft)
+                    + overlap_per_lane)
                     / float(1 << 30),
                 )
                 for lane, pair in zip(self.state.lanes, self.state.row_caches)
@@ -3389,6 +3498,8 @@ class MTPGenerationBatch:
         indices = sorted(set(int(i) for i in indices))
         if not indices:
             return []
+        if self._async_qsa_ticket is not None:
+            self._decline_async_qsa_promotion("membership changed before first cycle")
         old_matchers = self.stop_matchers
         old_states = self._matcher_states
         old_counts = self._num_tokens
@@ -3438,6 +3549,7 @@ class MTPGenerationBatch:
         self._matcher_states.extend(package.matcher_state for package in packages)
         self._num_tokens.extend(package.num_tokens for package in packages)
         self._initial_outputs.extend(package.initial_output for package in packages)
+        self._arm_async_qsa_promotion()
 
     def _apply_admission(self):
         if self.mtp_admission is None:
@@ -3467,10 +3579,38 @@ class MTPGenerationBatch:
 
     def take_plain_fallbacks(self):
         ready, self._plain_ready = self._plain_ready, []
+        self._normalize_empty_segmented_admission()
         return ready
+
+    def _normalize_empty_segmented_admission(self):
+        """Restore configured segmented admission at an ownership-free seam."""
+
+        if (
+            not self.async_qsa_promotion
+            or self.state.lanes
+            or self._paused
+            or self._plain_ready
+        ):
+            return
+        from .hybrid_speculative import SegmentedSelfMTPState
+
+        epoch = int(getattr(self.state, "membership_epoch", 0))
+        self.state = SegmentedSelfMTPState([], [], [], epoch)
+        self.segmented_live_tip = True
+        self._async_qsa_pending = True
+        self._async_qsa_receipt = None
+        self._async_qsa_receipts_by_uid.clear()
 
     def close(self):
         first_error = None
+        if self._async_qsa_ticket is not None:
+            self._decline_async_qsa_promotion("batch closed before promotion")
+        else:
+            # An ownership-free batch is normalized back to segmented
+            # admission so a later join can arm promotion.  Closing that idle
+            # shell is not a declined promotion attempt and must not inflate
+            # the production counter.
+            self._async_qsa_pending = False
         if self.segmented_live_tip:
             from .hybrid_speculative import close_segmented_self_mtp_state
 
@@ -3494,6 +3634,8 @@ class MTPGenerationBatch:
             raise TypeError("MTPGenerationBatch can extend only another MTP batch")
         if self.segmented_live_tip != batch.segmented_live_tip:
             raise ValueError("cannot mix segmented and physical self-MTP batches")
+        if self.async_qsa_promotion != batch.async_qsa_promotion:
+            raise ValueError("cannot mix async-promotion and control self-MTP batches")
         packages = batch._detach_packages(range(len(batch)))
         packages.extend(batch._paused.values())
         batch._paused.clear()
@@ -3522,8 +3664,12 @@ class MTPGenerationBatch:
     def filter(self, keep: List[int]):
         keep = sorted(set(keep))
         drop = [i for i in range(len(self)) if i not in set(keep)]
+        dropped_uids = [self.uids[i] for i in drop]
         for package in self._detach_packages(drop):
             _close_segmented_detached(package.detached, release_cache=True)
+        for uid in dropped_uids:
+            self._async_qsa_receipts_by_uid.pop(uid, None)
+        self._normalize_empty_segmented_admission()
 
     def extract_uid(self, uid: int):
         if uid in self.uids:
@@ -3544,6 +3690,9 @@ class MTPGenerationBatch:
             package = self._paused.pop(uid, None)
             if package is not None:
                 _close_segmented_detached(package.detached, release_cache=True)
+        for uid in requested:
+            self._async_qsa_receipts_by_uid.pop(uid, None)
+        self._normalize_empty_segmented_admission()
 
     @staticmethod
     def _finish_reason(
@@ -3587,8 +3736,12 @@ class MTPGenerationBatch:
                 "accept_rule": str(lane.accept_rule),
                 "sampling_temperature": float(lane.sampling_temp),
                 "stats": stats,
+                "async_qsa_promotion": self._async_qsa_receipts_by_uid.pop(
+                    lane.uid, None
+                ),
             }
             _close_segmented_detached(package.detached, release_cache=False)
+        self._normalize_empty_segmented_admission()
 
     def _emit_initial(self):
         responses = []
@@ -3679,6 +3832,50 @@ class MTPGenerationBatch:
                 emitted_counts=emitted_counts,
                 terminal=terminal,
             )
+            ticket = self._async_qsa_ticket
+            if ticket is not None:
+                if any(terminal):
+                    self._decline_async_qsa_promotion(
+                        "a lane terminated in the first segmented cycle"
+                    )
+                else:
+                    from dataclasses import asdict
+
+                    from .segmented_physical_promotion import (
+                        SegmentedPhysicalPromotionDeclined,
+                    )
+                    from .segmented_self_mtp import note_segmented_self_mtp
+
+                    try:
+                        self.state, receipt = ticket.finish()
+                    except SegmentedPhysicalPromotionDeclined as error:
+                        self._decline_async_qsa_promotion(str(error))
+                    except BaseException:
+                        note_segmented_self_mtp("async_qsa_promotion_failures")
+                        raise
+                    else:
+                        self._async_qsa_ticket = None
+                        self._async_qsa_pending = False
+                        self.segmented_live_tip = False
+                        self._async_qsa_receipt = asdict(receipt)
+                        self._async_qsa_receipts_by_uid.update(
+                            (lane.uid, dict(self._async_qsa_receipt))
+                            for lane in self.state.lanes
+                        )
+                        note_segmented_self_mtp("async_qsa_promotion_engaged")
+                        note_segmented_self_mtp(
+                            "async_qsa_promotion_reserved_bytes",
+                            receipt.reserved_bytes,
+                        )
+                        note_segmented_self_mtp(
+                            "async_qsa_promotion_patched_bytes",
+                            receipt.patched_bytes,
+                        )
+                        note_segmented_self_mtp(
+                            "async_qsa_promotion_wait_ns", receipt.stream_wait_ns
+                        )
+                        if getattr(ticket, "stream", None) is not None:
+                            note_segmented_self_mtp("device_synchronizations")
         except BaseException as error:
             if self.state.proposal_open:
                 abort_batched_self_mtp(self.state, proposal, cause=error)
@@ -3695,6 +3892,7 @@ class MTPGenerationBatch:
         *,
         mtp_admission=None,
         segmented_live_tip: bool = False,
+        async_qsa_promotion: bool = False,
     ):
         return cls(
             model,
@@ -3703,6 +3901,7 @@ class MTPGenerationBatch:
             [],
             mtp_admission=mtp_admission,
             segmented_live_tip=segmented_live_tip,
+            async_qsa_promotion=async_qsa_promotion,
         )
 
 
@@ -3888,6 +4087,9 @@ class BatchGenerator:
                 self.model,
                 mtp_admission=self.mtp_admission,
                 segmented_live_tip=_segment_aware_live_tip_enabled(self.self_mtp),
+                async_qsa_promotion=_segmented_async_qsa_promotion_enabled(
+                    self.self_mtp
+                ),
             )
         self._plain_fallback_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
@@ -4251,6 +4453,11 @@ class BatchGenerator:
             stop_matchers.append(matcher)
             total = len(history) + len(prompt)
             progress.append(PromptProcessingBatch.Response(uid, (total, total), True, True))
+        configured_segmented = _segment_aware_live_tip_enabled(self.self_mtp)
+        existing_rows = bool(self._generation_batch.mtp_cycle_state())
+        segmented_join = configured_segmented and (
+            not existing_rows or self._generation_batch.segmented_live_tip
+        )
         return (
             MTPGenerationBatch(
                 self.model,
@@ -4258,7 +4465,11 @@ class BatchGenerator:
                 initial,
                 stop_matchers,
                 mtp_admission=self.mtp_admission,
-                segmented_live_tip=_segment_aware_live_tip_enabled(self.self_mtp),
+                segmented_live_tip=segmented_join,
+                async_qsa_promotion=(
+                    _segmented_async_qsa_promotion_enabled(self.self_mtp)
+                ),
+                arm_async_qsa_promotion=False,
             ),
             progress,
         )
@@ -5190,6 +5401,9 @@ class ParallelSampleGenerator:
                     prepared_caches=prepared_caches,
                     mtp_admission=mtp_admission,
                     segmented_live_tip=segmented_requested,
+                    async_qsa_promotion=_segmented_async_qsa_promotion_enabled(
+                        config
+                    ),
                 )
                 if prepared_caches is not None:
                     _note_serving_event("engaged")

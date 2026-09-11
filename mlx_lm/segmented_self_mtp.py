@@ -77,6 +77,15 @@ _ZERO = {
     "accepted_zero": 0,
     "accepted_partial": 0,
     "accepted_all": 0,
+    "async_qsa_promotion_requests": 0,
+    "async_qsa_promotion_queued": 0,
+    "async_qsa_promotion_engaged": 0,
+    "async_qsa_promotion_declined": 0,
+    "async_qsa_promotion_failures": 0,
+    "async_qsa_promotion_reserved_bytes": 0,
+    "async_qsa_promotion_patched_bytes": 0,
+    "async_qsa_promotion_wait_ns": 0,
+    "device_synchronizations": 0,
     "proposal_ns": 0,
     "commit_ns": 0,
 }
@@ -263,13 +272,15 @@ def segmented_self_mtp_stats(*, reset: bool = False) -> dict[str, Any]:
     result["qsa_exact_set_fold_environment_enabled"] = (
         qsa_private_delta_exact_set_fold_enabled()
     )
+    result["async_qsa_promotion_environment_enabled"] = os.environ.get(
+        "MLX_LM_SEGMENTED_ASYNC_QSA_PROMOTION", "0"
+    ).lower() in {"1", "true", "yes", "on"}
     result["timing_enabled"] = segmented_self_mtp_timing_enabled()
     result["counter_scope"] = "segmented_mechanism_only"
     # These describe the added ledger/scheduler mechanism, not the model
     # forward it invokes. The underlying exact verifier may synchronize for
     # sampling or acceptance just as the legacy path does.
     result["array_readbacks"] = 0
-    result["device_synchronizations"] = 0
     return result
 
 

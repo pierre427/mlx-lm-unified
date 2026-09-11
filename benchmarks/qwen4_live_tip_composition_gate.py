@@ -39,8 +39,15 @@ except ModuleNotFoundError:  # Imported as benchmarks.* by the test suite.
 
 SCHEMA = "mlx-uag.qwen4-live-tip-composition-gate.v1"
 PROFILES = (
+    "physical_live_tip_fanout",
     "segmented",
     "segmented_then_physical",
+    "private_then_physical",
+    "exact_then_physical",
+    "segmented_async_qsa_physical",
+    "private_async_qsa_physical",
+    "exact_async_qsa_physical",
+    "segmented_race_physical",
     "private_delta",
     "exact_set",
 )
@@ -50,6 +57,14 @@ def profile_settings(profile: str) -> dict[str, Any]:
     if profile == "physical":
         return {
             "branch_mode": "physical",
+            "qsa_private_delta": "off",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+        }
+    if profile == "physical_live_tip_fanout":
+        return {
+            "branch_mode": "physical_fanout",
             "qsa_private_delta": "off",
             "qsa_exact_set_fold": "off",
             "qsa_private_delta_min_context": 0,
@@ -70,6 +85,65 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_exact_set_fold": "off",
             "qsa_private_delta_min_context": 0,
             "promote_after_first": True,
+            "async_promote_after_first": False,
+        }
+    if profile == "segmented_race_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "off",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+            "async_promote_after_first": True,
+            "async_qsa_promote_after_first": False,
+        }
+    if profile == "segmented_async_qsa_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "off",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+            "async_promote_after_first": False,
+            "async_qsa_promote_after_first": True,
+        }
+    if profile == "private_async_qsa_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "on",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+            "async_promote_after_first": False,
+            "async_qsa_promote_after_first": True,
+        }
+    if profile == "exact_async_qsa_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "on",
+            "qsa_exact_set_fold": "on",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+            "async_promote_after_first": False,
+            "async_qsa_promote_after_first": True,
+        }
+    if profile == "private_then_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "on",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": True,
+            "async_promote_after_first": False,
+        }
+    if profile == "exact_then_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "on",
+            "qsa_exact_set_fold": "on",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": True,
+            "async_promote_after_first": False,
         }
     if profile == "private_delta":
         return {
@@ -78,6 +152,7 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_exact_set_fold": "off",
             "qsa_private_delta_min_context": 0,
             "promote_after_first": False,
+            "async_promote_after_first": False,
         }
     if profile == "exact_set":
         return {
@@ -86,6 +161,7 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "qsa_exact_set_fold": "on",
             "qsa_private_delta_min_context": 0,
             "promote_after_first": False,
+            "async_promote_after_first": False,
         }
     raise ValueError(f"unknown profile {profile!r}")
 
@@ -100,6 +176,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("at least one candidate is required")
     if args.reps < 1:
         raise ValueError("reps must be positive")
+    if getattr(args, "first_repetition", 1) < 1:
+        raise ValueError("first-repetition must be positive")
     if args.cooldown_seconds < 0:
         raise ValueError("cooldown cannot be negative")
     if not 0 <= args.max_closing_drift <= 1:
@@ -118,9 +196,21 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "measured_cycles": args.measured_cycles,
         "repetitions": args.reps,
         "max_closing_drift": args.max_closing_drift,
+        "prime_candidates": bool(args.prime_candidates),
+        "prime_contract": (
+            "physical, every candidate, then physical stabilization; two "
+            "cycles so first-cycle promotion also primes the physical "
+            "follow-up shape"
+        ),
         "candidates": list(args.candidates),
         "orders": {
-            profile: [block_order(profile, rep) for rep in range(1, args.reps + 1)]
+            profile: [
+                block_order(profile, rep)
+                for rep in range(
+                    getattr(args, "first_repetition", 1),
+                    getattr(args, "first_repetition", 1) + args.reps,
+                )
+            ]
             for profile in args.candidates
         },
         "timing_boundary": (
@@ -131,6 +221,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "profiles": {
             name: profile_settings(name) for name in ("physical", *args.candidates)
         },
+        "asynchronous_scope": (
+            "segmented_race_physical races an independently owned complete "
+            "physical first cycle; segmented_async_qsa_physical instead "
+            "queues only immutable QSA-base formation on a second Metal "
+            "stream and patches the accepted suffix after the visible commit"
+        ),
     }
 
 
@@ -144,6 +240,119 @@ def _configured_args(args: argparse.Namespace, profile: str) -> argparse.Namespa
 
 def _median(rows: list[dict[str, Any]], key: str) -> float:
     return statistics.median(float(row[key]) for row in rows)
+
+
+def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
+    """Refuse a candidate arm whose requested cache consumer did not run."""
+
+    if profile == "physical":
+        return
+    if profile == "physical_live_tip_fanout":
+        receipt = row.get("fanout_delta") or {}
+        expected = {
+            "hybrid_tip_fanout_batches": 1,
+            "hybrid_tip_fanout_rows": 2,
+            "declined_disabled": 0,
+            "declined_unsupported_cache": 0,
+        }
+        mismatches = {
+            key: {"expected": value, "actual": int(receipt.get(key, 0))}
+            for key, value in expected.items()
+            if int(receipt.get(key, 0)) != value
+        }
+        row["mechanism_receipt"] = {
+            "validated": not mismatches,
+            "expected_cycles": int(row["measured_cycles"]),
+            "mismatches": mismatches,
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"{profile} mechanism receipt mismatch: {mismatches}"
+            )
+        return
+    receipt = row["segmented_delta"]
+    first_only = profile in {
+        "segmented_then_physical",
+        "private_then_physical",
+        "exact_then_physical",
+        "segmented_async_qsa_physical",
+        "private_async_qsa_physical",
+        "exact_async_qsa_physical",
+        "segmented_race_physical",
+    }
+    cycles = 1 if first_only else int(row["measured_cycles"])
+    expected = {
+        "engaged": 1,
+        "true_batched_engaged": cycles,
+        "batched_target_forwards": cycles,
+        "batched_draft_forwards": 2 * cycles,
+        "b1_target_forwards": 0,
+        "committed_cycles": cycles,
+        "transaction_branches": 2 * cycles,
+        "transaction_promotions": 2 * cycles,
+        "transaction_canonicalizations": (
+            0 if profile in {
+                "segmented_async_qsa_physical",
+                "private_async_qsa_physical",
+                "exact_async_qsa_physical",
+            } else 2
+        ),
+        "segmented_attention_calls": 14 * cycles,
+        "full_prefix_materialized_bytes": 0,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": int(receipt.get(key, 0))}
+        for key, value in expected.items()
+        if int(receipt.get(key, 0)) != value
+    }
+    private = profile in {
+        "private_delta",
+        "exact_set",
+        "private_then_physical",
+        "exact_then_physical",
+        "private_async_qsa_physical",
+        "exact_async_qsa_physical",
+    }
+    if private:
+        private_expected = {
+            "private_delta_attention_calls": 14 * cycles,
+            "private_delta_rows": 28 * cycles,
+            "private_delta_declines": 0,
+        }
+        mismatches.update(
+            {
+                key: {"expected": value, "actual": int(receipt.get(key, 0))}
+                for key, value in private_expected.items()
+                if int(receipt.get(key, 0)) != value
+            }
+        )
+    exact = profile in {
+        "exact_set",
+        "exact_then_physical",
+        "exact_async_qsa_physical",
+    }
+    if exact:
+        exact_expected = {
+            "exact_set_fold_attention_calls": 14 * cycles,
+            "exact_set_fold_rows": 28 * cycles,
+            "exact_set_fold_device_proofs": 14 * cycles,
+            "exact_set_fold_declines": 0,
+            "exact_set_fold_private_fallbacks": 0,
+        }
+        mismatches.update(
+            {
+                key: {"expected": value, "actual": int(receipt.get(key, 0))}
+                for key, value in exact_expected.items()
+                if int(receipt.get(key, 0)) != value
+            }
+        )
+    row["mechanism_receipt"] = {
+        "validated": not mismatches,
+        "expected_cycles": cycles,
+        "mismatches": mismatches,
+    }
+    if mismatches:
+        raise RuntimeError(f"{profile} mechanism receipt mismatch: {mismatches}")
 
 
 def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -180,6 +389,21 @@ def summarize(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             "all_sibling_states_exact": all(row["sibling_state"]["equal"] for row in trials),
             "swap_growth_bytes": sum(max(0, int(row["swap_growth_bytes"])) for row in trials),
         }
+        if all(
+            row.get("branch_to_first_commit_if_prequeued_ms") is not None
+            for row in trials
+        ):
+            prequeued = _median(
+                trials, "branch_to_first_commit_if_prequeued_ms"
+            )
+            by_candidate[candidate].update(
+                candidate_prequeued_first_commit_ms=prequeued,
+                prequeued_first_commit_speedup=control_first / prequeued,
+                async_qsa_queue_ms=_median(trials, "async_qsa_queue_ms"),
+                async_wait_after_first_ms=_median(
+                    trials, "async_wait_after_first_ms"
+                ),
+            )
     return by_candidate
 
 
@@ -193,9 +417,39 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     prompt = mx.array(exact_prompt(tokenizer, args.context, "live-tip-compose"), mx.uint32)
     mx.eval(prompt)
 
+    prime_rows = []
+    if args.prime_candidates:
+        # Prime both the B2 control and every candidate. Two measured cycles
+        # are required: first-cycle promotion profiles switch representation
+        # after cycle one, so cycle two is the first physical follow-up shape.
+        prime_profiles = (
+            "physical",
+            *tuple(dict.fromkeys(args.candidates)),
+            "physical",
+        )
+        for profile in prime_profiles:
+            configured = _configured_args(args, profile)
+            configured.measured_cycles = 2
+            apply_composition_environment(configured)
+            row = _run_arm(model, prompt, configured, "warm_live_tip")
+            row.update(profile=profile, phase="profile_prime")
+            validate_mechanism_receipt(row, profile)
+            prime_rows.append(row)
+            if args.out:
+                atomic_write(
+                    args.out,
+                    {
+                        "metadata": plan,
+                        "status": "priming",
+                        "prime_rows": prime_rows,
+                        "blocks": [],
+                    },
+                )
+
     blocks = []
     for candidate in args.candidates:
-        for repetition in range(1, args.reps + 1):
+        first_repetition = getattr(args, "first_repetition", 1)
+        for repetition in range(first_repetition, first_repetition + args.reps):
             rows = []
             for slot, profile in enumerate(block_order(candidate, repetition)):
                 if args.cooldown_seconds:
@@ -204,26 +458,35 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
                 apply_composition_environment(configured)
                 row = _run_arm(model, prompt, configured, "warm_live_tip")
                 row.update(profile=profile, candidate=candidate, repetition=repetition, slot=slot)
+                validate_mechanism_receipt(row, profile)
                 rows.append(row)
                 if args.out:
-                    atomic_write(args.out, {"metadata": plan, "status": "running", "blocks": [*blocks, {"candidate": candidate, "repetition": repetition, "rows": rows}]})
+                    atomic_write(args.out, {"metadata": plan, "status": "running", "prime_rows": prime_rows, "blocks": [*blocks, {"candidate": candidate, "repetition": repetition, "rows": rows}]})
             control_tokens = [row["branch_tokens"] for row in rows if row["profile"] == "physical"]
             candidate_tokens = [row["branch_tokens"] for row in rows if row["profile"] == candidate]
             if any(tokens != control_tokens[0] for tokens in [*control_tokens[1:], *candidate_tokens]):
                 raise AssertionError(f"{candidate} token trace differs from physical control")
             controls = [row for row in rows if row["profile"] == "physical"]
+            trials = [row for row in rows if row["profile"] == candidate]
             closing_drift = abs(
                 controls[-1]["aggregate_branch_decode_tps"]
                 - controls[0]["aggregate_branch_decode_tps"]
             ) / controls[0]["aggregate_branch_decode_tps"]
+            candidate_drift = abs(
+                trials[-1]["aggregate_branch_decode_tps"]
+                - trials[0]["aggregate_branch_decode_tps"]
+            ) / trials[0]["aggregate_branch_decode_tps"]
             discard_reasons = []
             if closing_drift > args.max_closing_drift:
                 discard_reasons.append("closing_control_drift")
+            if candidate_drift > args.max_closing_drift:
+                discard_reasons.append("candidate_drift")
             block = {
                 "candidate": candidate,
                 "repetition": repetition,
                 "accepted": not discard_reasons,
                 "closing_control_drift_fraction": closing_drift,
+                "candidate_drift_fraction": candidate_drift,
                 "discard_reasons": discard_reasons,
                 "rows": rows,
             }
@@ -232,6 +495,7 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     return {
         "metadata": plan,
         "status": "complete",
+        "prime_rows": prime_rows,
         "summary": summarize(blocks),
         "blocks": blocks,
         "system_after": system_snapshot(),
@@ -248,9 +512,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measured-cycles", type=int, default=32)
     parser.add_argument("--branches", type=int, default=2)
     parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument(
+        "--first-repetition",
+        type=int,
+        default=1,
+        help="first counterbalance index (use 2 for candidate/control/control/candidate)",
+    )
     parser.add_argument("--candidates", nargs="+", choices=PROFILES, default=list(PROFILES))
     parser.add_argument("--cooldown-seconds", type=float, default=60.0)
     parser.add_argument("--max-closing-drift", type=float, default=0.05)
+    parser.add_argument(
+        "--prime-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="execute untimed two-cycle physical and candidate arms before brackets",
+    )
     parser.add_argument("--idle-seconds", type=float, default=0.0)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=20260911)

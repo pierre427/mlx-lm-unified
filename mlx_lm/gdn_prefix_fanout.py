@@ -513,13 +513,28 @@ class HybridCachePrefixFanout:
 
         batched = []
         for index, source in enumerate(self._source):
-            merge = getattr(type(source), "merge", None)
+            merge_source = source
+            # A genuine warmed scheduler tip is commonly represented as a
+            # one-row BatchKV/BatchQSA cache. Their merge implementations take
+            # standalone rows (scalar offsets), so unwrap that non-recurrent
+            # shell before forming the two-row descendant. ArraysCache stays
+            # attached to its exported rollback handle and merges directly.
+            source_offset = getattr(source, "offset", None)
+            if (
+                index not in self._recurrent
+                and isinstance(source_offset, mx.array)
+                and source_offset.ndim == 1
+                and source_offset.size == 1
+                and callable(getattr(source, "extract", None))
+            ):
+                merge_source = source.extract(0)
+            merge = getattr(type(merge_source), "merge", None)
             if not callable(merge):
                 _STATS["declined_unsupported_cache"] += 1
                 raise TypeError(
-                    f"cache entry {index} ({type(source).__name__}) cannot merge"
+                    f"cache entry {index} ({type(merge_source).__name__}) cannot merge"
                 )
-            batched.append(merge([source, source]))
+            batched.append(merge([merge_source, merge_source]))
         arrays = [array for cache in batched for array in _tree_arrays(cache.state)]
         if arrays:
             mx.eval(*arrays)

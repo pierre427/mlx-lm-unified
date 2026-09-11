@@ -2588,14 +2588,27 @@ class ArraysCache(_BaseCache):
         if self.batch_size != 1:
             raise ValueError("an exact shared-prefix boundary needs one cache row")
         record = self._rollbacks[-1]
+        boundary_tokens = record.num_tokens
         if record.depths is not None:
-            raise ValueError("a ragged rollback record is not one shared prefix")
+            if (
+                len(record.depths) != 1
+                or record.depths[0] <= 0
+                or record.depths[0] > record.num_tokens
+            ):
+                raise ValueError(
+                    "a ragged rollback record is not one shared prefix: "
+                    f"forward={record.num_tokens}, depths={record.depths}"
+                )
+            # A one-row padded verify is not ragged: its sole depth is the
+            # exact valid suffix, and the live state already excludes the
+            # trailing filler positions. Export only that replayable span.
+            boundary_tokens = record.depths[0]
         if len(record.snapshot) != len(self.cache):
             raise RuntimeError("rollback record does not cover the full cache")
         return ExactRollbackBoundary(
             type(self),
             len(self.cache),
-            record.num_tokens,
+            boundary_tokens,
             record.fn,
             list(record.snapshot),
             list(self.cache),

@@ -614,6 +614,14 @@ class SegmentedBatchArraysCache(Qwen4ArraysCache):
         self._note = note
         self.speculating = True
         self._refresh_state()
+        # Preserve the same per-lane recurrent checkpoints as the ordinary
+        # physical ArraysCache.merge path.  The promotion helper unwraps this
+        # retained B2 view after the first cycle; without the checkpoint
+        # ledger, a later APC reuse loses otherwise valid recurrent anchors.
+        self._checkpoints = [
+            list(row._checkpoints[0]) if len(row._checkpoints) == 1 else []
+            for row in self.rows
+        ]
 
     def _bump(self, key, amount=1):
         if self._note is not None:
@@ -762,7 +770,7 @@ def build_segmented_batch_cache_group(
     if len(widths) != 1:
         raise SegmentedBatchUnsupported("segmented cache groups have different layers")
     result = []
-    for layer_rows in zip(*groups):
+    for layer_index, layer_rows in enumerate(zip(*groups)):
         first = layer_rows[0]
         if isinstance(first, ArraysCache):
             result.append(SegmentedBatchArraysCache(layer_rows, note=note))
@@ -777,7 +785,8 @@ def build_segmented_batch_cache_group(
         elif isinstance(first, KVCache):
             raise SegmentedBatchUnsupported(
                 "plain KV segmented batching is not needed by Qwen4 and is not "
-                "yet qualified"
+                f"yet qualified (layer={layer_index}, "
+                f"type={type(first).__module__}.{type(first).__name__})"
             )
         else:
             raise SegmentedBatchUnsupported(

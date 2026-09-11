@@ -23,6 +23,7 @@ from mlx_lm.server import (
     _make_self_mtp_admission_callback,
     _parallel_sampling_route,
     _parallel_prompt_cache_key,
+    _parallel_mtp_completion_cache,
     _parallel_self_mtp_required_gib,
     ResponseGenerator,
 )
@@ -548,6 +549,56 @@ class TestParallelAPCLifecycle(unittest.TestCase):
             max((getattr(c, "offset", 0) for c in lookup.cache), default=0),
             lookup.cached_tokens,
         )
+
+    def test_completed_row_retains_exact_continuation_after_source_is_consumed(self):
+        prompt = [1, 2, 3, 4, 5, 6]
+        self_mtp = {
+            "persistent": True,
+            "num_draft": 2,
+            "sampling_temp": 0.0,
+            "accept_rule": "residual",
+        }
+        source = make_prompt_cache(self.model)
+        parallel = ParallelSampleGenerator(
+            self.model,
+            source,
+            prompt[-1],
+            2,
+            max_tokens=4,
+            all_tokens=[],
+            prefill_step_size=4,
+            self_mtp=self_mtp,
+            mtp_state=None,
+            lane_rng=LaneRNG(7),
+            mtp_prompt=prompt,
+        )
+        completed = None
+        try:
+            while len(parallel) > 0:
+                for _, response in parallel.next():
+                    if response.finish_reason is not None and completed is None:
+                        completed = response
+        finally:
+            parallel.close()
+
+        self.assertIsNotNone(completed)
+        recovered = _parallel_mtp_completion_cache(prompt, completed)
+        self.assertIsNotNone(recovered)
+        key, cache, sidecar = recovered
+        self.assertEqual(key, completed.all_tokens)
+        self.assertEqual(sidecar.covered_tokens, len(key))
+        self.assertIs(sidecar.state, completed.mtp_state)
+        self.assertEqual(
+            max((getattr(c, "offset", 0) for c in cache), default=0),
+            len(key),
+        )
+        apc = AutomaticPrefixCache()
+        apc.insert_cache("model", key, cache, sidecar=sidecar)
+        lookup = apc.lookup("model", key + [7, 8])
+        self.assertEqual(lookup.cached_tokens, len(key))
+        self.assertEqual(lookup.remaining_tokens, [7, 8])
+        self.assertIsNotNone(lookup.sidecar)
+        self.assertEqual(lookup.sidecar.covered_tokens, len(key))
 
 
 if __name__ == "__main__":

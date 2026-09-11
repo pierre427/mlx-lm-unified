@@ -272,6 +272,28 @@ def test_serving_knob_honors_env_and_explicit_override(monkeypatch):
     assert _segment_aware_live_tip_enabled({"segment_aware_live_tip": False}) is False
 
 
+def test_async_qsa_promotion_is_nested_and_default_off(monkeypatch):
+    from mlx_lm.generate import _segmented_async_qsa_promotion_enabled
+
+    monkeypatch.delenv("MLX_LM_SEGMENTED_ASYNC_QSA_PROMOTION", raising=False)
+    assert not _segmented_async_qsa_promotion_enabled(
+        {"segment_aware_live_tip": True}
+    )
+    monkeypatch.setenv("MLX_LM_SEGMENTED_ASYNC_QSA_PROMOTION", "1")
+    assert _segmented_async_qsa_promotion_enabled(
+        {"segment_aware_live_tip": True}
+    )
+    assert not _segmented_async_qsa_promotion_enabled(
+        {"segment_aware_live_tip": False}
+    )
+    assert not _segmented_async_qsa_promotion_enabled(
+        {
+            "segment_aware_live_tip": True,
+            "segment_aware_async_qsa_promotion": False,
+        }
+    )
+
+
 def test_independent_b1_cycle_engages_without_physical_b2_and_promotes():
     segmented_self_mtp_stats(reset=True)
     detached = [_detached(0), _detached(1)]
@@ -360,7 +382,7 @@ def test_gate_refuses_silent_fallback_or_nonengagement():
 
 
 def test_generation_batch_seam_keeps_two_concrete_b1_rows():
-    from mlx_lm.generate import MTPGenerationBatch
+    from mlx_lm.generate import MTPGenerationBatch, StopSequenceMatcher
 
     detached = [_detached(0), _detached(1)]
     with patch(
@@ -371,13 +393,126 @@ def test_generation_batch_seam_keeps_two_concrete_b1_rows():
             object(),
             detached,
             [None, None],
-            [_FakeMatcher(), _FakeMatcher()],
+            [StopSequenceMatcher(), StopSequenceMatcher()],
             segmented_live_tip=True,
         )
     assert batch.state.row_caches == [item.caches for item in detached]
     assert not hasattr(batch.state, "caches")
     assert batch.cache_nbytes == 256
     batch.close()
+
+
+def test_generation_batch_promotes_after_one_uniform_segmented_cycle():
+    from types import SimpleNamespace
+
+    from mlx_lm.generate import MTPGenerationBatch, StopSequenceMatcher
+    from mlx_lm.segmented_physical_promotion import (
+        SegmentedPhysicalPromotionReceipt,
+    )
+
+    segmented_self_mtp_stats(reset=True)
+    holder = {}
+
+    class Ticket:
+        def finish(self):
+            state = holder["state"]
+            assert not state.proposal_open
+            physical = SimpleNamespace(
+                lanes=list(state.lanes),
+                caches=SimpleNamespace(target=[], draft=[]),
+                proposal_open=False,
+            )
+            return physical, SegmentedPhysicalPromotionReceipt(
+                queued_ns=10,
+                finish_ns=20,
+                stream_wait_ns=5,
+                reserved_bytes=30,
+                patched_bytes=40,
+                recurrent_arrays_reused=4,
+                cleanup_error_count=0,
+                rows=2,
+                layers=2,
+                advance=1,
+            )
+
+    def begin(state, **_kwargs):
+        holder["state"] = state
+        return Ticket()
+
+    detached = [_detached(0), _detached(1)]
+    with patch(
+        "mlx_lm.segmented_physical_promotion.begin_segmented_physical_promotion",
+        side_effect=begin,
+    ):
+        batch = MTPGenerationBatch(
+            object(),
+            detached,
+            [None, None],
+            [StopSequenceMatcher(), StopSequenceMatcher()],
+            segmented_live_tip=True,
+            async_qsa_promotion=True,
+        )
+
+    with patch(
+        "mlx_lm.hybrid_speculative._propose_batched_self_mtp_impl",
+        side_effect=_fake_row_proposal({0: 1, 1: 1}),
+    ):
+        responses = batch.next()
+
+    assert len(responses) == 4
+    assert batch.segmented_live_tip is False
+    assert batch._async_qsa_receipt["advance"] == 1
+    counters = segmented_self_mtp_stats()
+    assert counters["async_qsa_promotion_requests"] == 1
+    assert counters["async_qsa_promotion_queued"] == 1
+    assert counters["async_qsa_promotion_engaged"] == 1
+    assert counters["async_qsa_promotion_reserved_bytes"] == 30
+    assert counters["async_qsa_promotion_patched_bytes"] == 40
+    assert counters["async_qsa_promotion_wait_ns"] == 5
+    assert batch._async_qsa_receipts_by_uid[0]["advance"] == 1
+    assert batch._async_qsa_receipts_by_uid[1]["advance"] == 1
+
+
+def test_empty_physical_batch_preserves_policy_and_resets_segmented_admission():
+    from mlx_lm.generate import MTPGenerationBatch
+
+    batch = MTPGenerationBatch.empty(
+        object(), segmented_live_tip=False, async_qsa_promotion=True
+    )
+    assert batch.async_qsa_promotion is True
+    assert batch._async_qsa_pending is False
+
+    batch._normalize_empty_segmented_admission()
+
+    assert batch.segmented_live_tip is True
+    assert batch._async_qsa_pending is True
+
+
+def test_async_candidate_and_joined_recurrent_state_count_toward_peak_memory():
+    from types import SimpleNamespace
+
+    from mlx_lm.generate import MTPGenerationBatch, StopSequenceMatcher
+
+    batch = MTPGenerationBatch(
+        object(),
+        [_detached(0), _detached(1)],
+        [None, None],
+        [StopSequenceMatcher(), StopSequenceMatcher()],
+        segmented_live_tip=True,
+    )
+    baseline = batch.cache_nbytes
+    batch.state._segmented_caches = SimpleNamespace(
+        target=[SimpleNamespace(nbytes=70)],
+        draft=[SimpleNamespace(nbytes=30)],
+    )
+    batch._async_qsa_ticket = SimpleNamespace(reserved_bytes=200)
+
+    assert batch.cache_nbytes == baseline + 300
+    rows = batch.mtp_cycle_state()
+    assert len(rows) == 2
+    expected_gib = (baseline / 2 + 150) / float(1 << 30)
+    assert rows[0][4] == pytest.approx(expected_gib)
+    assert rows[1][4] == pytest.approx(expected_gib)
 
 
 def test_discarded_generation_row_releases_transaction_and_cache_owner():
@@ -1169,6 +1304,11 @@ def _assert_detached_rows_oracle(expected_rows, actual_rows):
 def test_private_qsa_repeated_cycles_have_bounded_state_oracle(monkeypatch):
     from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
 
+    # The oracle asserts that two deterministic lane trajectories actually
+    # diverge after their shared prefix.  Pin the randomly initialized tiny
+    # model so suite order cannot occasionally produce a degenerate model
+    # whose greedy suffixes remain identical.
+    mx.random.seed(0)
     model = _tiny_qwen4_model()
     prompts = ([1, 2, 3, 4], [1, 2, 3, 4])
     accept_cycles = ((0, 0), (1, 1), (2, 2), (1, 2), (2, 0))

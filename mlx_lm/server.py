@@ -1967,6 +1967,46 @@ def _parallel_prompt_cache_key(prompt, prompt_cache, self_mtp):
     return list(prompt[:covered])
 
 
+def _parallel_mtp_completion_cache(prompt, response):
+    """Return one completed sample's exact APC key/cache pair.
+
+    Cache-only promotion consumes the segmented B1 source, so it cannot be
+    retained under the old shared-prompt key.  Each completed lane already
+    owns an independent exact cache, though.  Storing every returned choice
+    under its own full token path is unbiased: a later request can reuse only
+    the choice whose tokens it actually contains.
+    """
+
+    cache = getattr(response, "prompt_cache", None)
+    tokens = getattr(response, "all_tokens", None)
+    if cache is None or tokens is None:
+        return None
+    tokens = [int(token) for token in tokens]
+    prompt = [int(token) for token in prompt]
+    if len(tokens) < len(prompt) or tokens[: len(prompt)] != prompt:
+        return None
+    _, covered = _cache_state_bytes(cache)
+    if covered != len(tokens):
+        return None
+    mtp_state = getattr(response, "mtp_state", None)
+    if mtp_state is None:
+        return None
+    carried_rng = getattr(response, "lane_rng", None)
+    rng_key = getattr(carried_rng, "key", carried_rng)
+    rng_draws = int(
+        getattr(response, "rng_draws", getattr(carried_rng, "draws", 0)) or 0
+    )
+    if rng_key is not None:
+        mx.eval(rng_key)
+    sidecar = MTPAPCSidecar(
+        mtp_state,
+        len(tokens),
+        rng_key=rng_key,
+        rng_draws=rng_draws,
+    )
+    return tokens, cache, sidecar
+
+
 def _state_budget_bytes(cli_args):
     """The ceiling an ``n>1`` request must project under, or ``None``.
 
@@ -3370,6 +3410,7 @@ class ResponseGenerator:
         rqueue, request, args = request
         parallel = None
         prepared_capsules = None
+        completed_mtp_responses = []
         try:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
@@ -3407,6 +3448,7 @@ class ResponseGenerator:
                 initial_state=initial_state,
                 prompt=prompt,
             )
+            context_published = False
 
             if args.seed is not None:
                 mx.random.seed(args.seed)
@@ -3571,6 +3613,10 @@ class ResponseGenerator:
                 self._check_parallel_sampling_state_budget(
                     cache, n, len(prompt), args.max_tokens
                 )
+                # Refusal above must remain an HTTP error, but every progress
+                # tuple below must follow the accepted GenerationContext.
+                rqueue.put(ctx)
+                context_published = True
                 prefilled = min(len(body), head_size)
 
                 def progress(processed, total):
@@ -3673,7 +3719,8 @@ class ResponseGenerator:
                             ctx.prompt_cache_count,
                         )
 
-            rqueue.put(ctx)
+            if not context_published:
+                rqueue.put(ctx)
             parallel_history = (
                 prompt[: ctx.prompt_cache_count]
                 if self_mtp is not None
@@ -3731,6 +3778,14 @@ class ResponseGenerator:
                     time.sleep(BATCH_IDLE_BACKOFF_SECONDS)
                     continue
                 for index, r in step_responses:
+                    if (
+                        self_mtp is not None
+                        and r.finish_reason is not None
+                    ):
+                        # Retain each detached row long enough to store its
+                        # exact returned continuation if segmented promotion
+                        # consumed the original B1 source cache.
+                        completed_mtp_responses.append(r)
                     detokenizer = detokenizers[index]
                     if r.finish_reason == "stop":
                         # Don't decode the final stop token.
@@ -3764,11 +3819,39 @@ class ResponseGenerator:
             # retained cache, so the stored span and its key always agree
             # (self-MTP retains the fully prefilled prompt; plain retains
             # exactly prompt[:-1]).
-            self.prompt_cache.insert_cache(
-                prompt_cache_model_key,
-                _parallel_prompt_cache_key(prompt, cache, self_mtp),
-                cache,
-            )
+            retained_cache = cache
+            try:
+                retained_key = _parallel_prompt_cache_key(
+                    prompt, retained_cache, self_mtp
+                )
+            except RuntimeError:
+                completions = [
+                    item
+                    for response in completed_mtp_responses
+                    if (
+                        item := _parallel_mtp_completion_cache(prompt, response)
+                    )
+                    is not None
+                ]
+                retained_key = None
+                for completion_key, completion_cache, completion_sidecar in completions:
+                    self.prompt_cache.insert_cache(
+                        prompt_cache_model_key,
+                        completion_key,
+                        completion_cache,
+                        sidecar=completion_sidecar,
+                    )
+                if not completions:
+                    logging.warning(
+                        "Parallel self-MTP completed, but no exact completion "
+                        "cache row remained for APC retention"
+                    )
+            if retained_key is not None:
+                self.prompt_cache.insert_cache(
+                    prompt_cache_model_key,
+                    retained_key,
+                    retained_cache,
+                )
 
             rqueue.put(None)
         except Exception as e:
@@ -5220,6 +5303,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode())
         elif self.path == "/v1/status/self-mtp":
+            from mlx_lm.segmented_self_mtp import segmented_self_mtp_stats
+
             cli = self.response_generator.cli_args
             receipts = list(SELF_MTP_RECEIPTS)
             payload = {
@@ -5250,6 +5335,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
                 "receipts": receipts,
                 "engaged_requests": len(receipts),
+                "segmented": segmented_self_mtp_stats(),
             }
             encoded = json.dumps(payload, default=str).encode()
             self._set_completion_headers(200)

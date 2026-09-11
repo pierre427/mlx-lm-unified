@@ -404,6 +404,20 @@ class TestGDNPrefixFanout(unittest.TestCase):
         _assert_state_equal(self, zero.cache, self.parent_before)
         _assert_state_equal(self, full.cache, self.source.cache)
 
+    def test_single_row_trailing_padding_exports_only_valid_depth(self):
+        record = self.source._rollbacks[-1]
+        valid = WINDOW - 1
+        self.source.cache = list(record.fn(valid))
+        self.source._rollbacks[-1] = record.with_depths([valid])
+        mx.eval(*(value for value in self.source.cache if value is not None))
+
+        boundary = self.source.latest_exact_rollback_boundary()
+        self.assertEqual(boundary.num_tokens, valid)
+        full = boundary.materialize(valid)
+        _assert_state_equal(self, full.cache, self.source.cache)
+        with self.assertRaises(ValueError):
+            boundary.materialize(WINDOW)
+
     def test_descendants_accept_zero_partial_all_and_match_solo(self):
         cases = ((0, 0), (1, 2), (WINDOW, WINDOW))
         owner = self._owner()

@@ -3044,6 +3044,11 @@ def _qsa_join_ledger_width(index_keys, cursor: int, who: str) -> int:
 def _qsa_merge_summaries(caches, logical_lengths):
     """Pooled rows for a join, and the identity that describes them.
 
+    The in-memory pooled-key cache and its durable APC identity are separate
+    levers.  Runtime-only joins may return ``(pooled, None)``: the blocks are
+    exact and reusable in this process even though no persistence provenance
+    is being claimed.
+
     Coverage and provenance are two quantities, not one.  A join that can
     carry no pooled BLOCK still knows exactly who produced the rows it
     joined, and that is the zero-coverage state the rest of this file keeps
@@ -3052,16 +3057,22 @@ def _qsa_merge_summaries(caches, logical_lengths):
     None)`` is reserved for a real provenance loss -- the joined rows
     disagree about who made them, or none of them ever had an identity.
     """
-    if not _QSA_APC_SUMMARIES or not caches:
+    # Runtime pooled-key reuse is independently useful even when durable APC
+    # summary persistence is disabled.  In-memory joins and segmented-to-
+    # physical promotion must carry those exact per-row pooled blocks or the
+    # new batch re-pools the entire long raw-key ledger on its next decode.
+    if not (_QSA_POOLED_KEY_CACHE or _QSA_APC_SUMMARIES) or not caches:
         return None, None
-    identity = getattr(caches[0], "_qsa_summary_identity", None)
-    if identity is None:
-        return None, None
-    for cache in caches[1:]:
-        if not _qsa_summary_identity_matches(
-            getattr(cache, "_qsa_summary_identity", None), identity
-        ):
+    identity = None
+    if _QSA_APC_SUMMARIES:
+        identity = getattr(caches[0], "_qsa_summary_identity", None)
+        if identity is None:
             return None, None
+        for cache in caches[1:]:
+            if not _qsa_summary_identity_matches(
+                getattr(cache, "_qsa_summary_identity", None), identity
+            ):
+                return None, None
     zero = _qsa_summary_with_coverage(identity, 0)
     ratio = getattr(caches[0], "_qsa_pooled_ratio", None)
     if not ratio:
@@ -3513,7 +3524,7 @@ class BatchQSAKVCache(BatchKVCache):
             batch.index_keys = mx.concatenate(rows)
         if pooled is not None:
             batch._qsa_pooled_keys = pooled
-            batch._qsa_pooled_ratio = identity["compress_ratio"]
+            batch._qsa_pooled_ratio = int(caches[0]._qsa_pooled_ratio)
             batch._qsa_summary_identity = identity
         return batch
 
@@ -4075,7 +4086,7 @@ class BatchQSAQuantizedKVCache(BatchQSAKVCache):
             batch._qsa_summary_identity = identity
         if pooled is not None:
             batch._qsa_pooled_keys = pooled
-            batch._qsa_pooled_ratio = identity["compress_ratio"]
+            batch._qsa_pooled_ratio = int(caches[0]._qsa_pooled_ratio)
         return batch
 
     def to_quantized(
