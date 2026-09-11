@@ -135,6 +135,49 @@ def _real_bf16_m3_fixture():
     return arrays["q"], arrays["k"], arrays["v"], compact
 
 
+def _private_delta_m3_fixture():
+    q, k, v, compact = _real_bf16_m3_fixture()
+    base_tokens = 1028
+    q = mx.concatenate([q, q], axis=0)
+    delta_k = mx.concatenate(
+        [k[:, :, base_tokens:], k[:, :, base_tokens:] + 0.25], axis=0
+    ).astype(k.dtype)
+    delta_v = mx.concatenate(
+        [v[:, :, base_tokens:], v[:, :, base_tokens:] - 0.25], axis=0
+    ).astype(v.dtype)
+    block_ids = mx.concatenate([compact.block_ids, compact.block_ids], axis=0)
+    block_counts = mx.concatenate(
+        [compact.block_counts, compact.block_counts], axis=0
+    )
+    tail_stop = mx.concatenate(
+        [compact.tail_stop, mx.array([[1029, 1030, 1030]])], axis=0
+    )
+    tail_start = tail_stop // 4 * 4
+    q_pos = tail_stop - 1
+    causal = (
+        mx.arange(1031, dtype=mx.int32)[None, None, :] <= q_pos[..., None]
+    )[:, None]
+    compact = QSACompactBlocks(
+        block_ids=block_ids,
+        block_counts=block_counts,
+        tail_start=tail_start,
+        tail_stop=tail_stop,
+        left_padding=None,
+        block_size=4,
+        physical_width=1031,
+        causal_mask=causal,
+    )
+    return (
+        q,
+        k[:, :, :base_tokens],
+        v[:, :, :base_tokens],
+        delta_k,
+        delta_v,
+        mx.array([3, 2], dtype=mx.uint32),
+        compact,
+    )
+
+
 class TestQSAIndexedReference(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -217,10 +260,17 @@ class TestQSAIndexedReference(unittest.TestCase):
 
     def test_bf16_kernel_sources_are_pinned(self):
         pass_one = hashlib.sha256(indexed._SOURCE.encode()).hexdigest()
+        private_delta = hashlib.sha256(
+            indexed._PRIVATE_DELTA_SOURCE.encode()
+        ).hexdigest()
         pass_two = hashlib.sha256(indexed._COMBINE_SOURCE.encode()).hexdigest()
         self.assertEqual(
             pass_one,
             "f5980991e8d5fb819a6f73bfb97c3444914cd236006911dee93577fe9eb262bf",
+        )
+        self.assertEqual(
+            private_delta,
+            "b0d3bcd76deb2bbbe7fe216806d46d0c800b215f18b16acb804a775ee1b46bdb",
         )
         self.assertEqual(
             pass_two,
@@ -497,6 +547,7 @@ class TestQSAIndexedReference(unittest.TestCase):
 
     def test_metal_kernel_object_construction_does_not_dispatch(self):
         self.assertIsNotNone(indexed._partition_kernel())
+        self.assertIsNotNone(indexed._private_delta_partition_kernel())
         self.assertIsNotNone(indexed._quantized_partition_kernel())
         self.assertIsNotNone(indexed._combine_kernel())
 
@@ -534,6 +585,77 @@ class TestQSAIndexedReference(unittest.TestCase):
             rtol=0.0,
             atol=1.0 / 128.0,
         )
+
+    def test_private_delta_materialized_oracle_matches_physical_b2(self):
+        q, base_k, base_v, delta_k, delta_v, _lengths, compact = (
+            _private_delta_m3_fixture()
+        )
+        actual = indexed.qwen4_qsa_indexed_private_delta_reference(
+            q,
+            base_k,
+            base_v,
+            delta_k,
+            delta_v,
+            compact,
+            scale=256**-0.5,
+            splits=8,
+        )
+        physical_k = mx.concatenate(
+            [mx.broadcast_to(base_k, (2, *base_k.shape[1:])), delta_k], axis=2
+        )
+        physical_v = mx.concatenate(
+            [mx.broadcast_to(base_v, (2, *base_v.shape[1:])), delta_v], axis=2
+        )
+        expected = indexed.qwen4_qsa_indexed_reference(
+            q, physical_k, physical_v, compact, scale=256**-0.5, splits=8
+        )
+        mx.eval(actual, expected)
+        self.assertTrue(mx.array_equal(actual, expected).item())
+
+    @unittest.skipUnless(
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_TEST_METAL") == "1",
+        "set MLX_QWEN4_QSA_INDEXED_TEST_METAL=1 for the real Metal fixture",
+    )
+    def test_private_delta_kernel_is_bit_exact_against_physical_b2(self):
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.gpu)
+            q, base_k, base_v, delta_k, delta_v, lengths, compact = (
+                _private_delta_m3_fixture()
+            )
+            physical_k = mx.concatenate(
+                [mx.broadcast_to(base_k, (2, *base_k.shape[1:])), delta_k],
+                axis=2,
+            )
+            physical_v = mx.concatenate(
+                [mx.broadcast_to(base_v, (2, *base_v.shape[1:])), delta_v],
+                axis=2,
+            )
+            expected = indexed.qwen4_qsa_indexed_attention(
+                q,
+                physical_k,
+                physical_v,
+                compact,
+                scale=256**-0.5,
+                splits=128,
+                hpt=12,
+            )
+            actual = indexed.qwen4_qsa_indexed_private_delta_attention(
+                q,
+                base_k,
+                base_v,
+                delta_k,
+                delta_v,
+                lengths,
+                compact,
+                scale=256**-0.5,
+                splits=128,
+                hpt=12,
+            )
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(actual, expected).item())
+        finally:
+            mx.set_default_device(device)
 
     def test_reviewed_sdpa_header_hash_matches_installed_mlx(self):
         header = (

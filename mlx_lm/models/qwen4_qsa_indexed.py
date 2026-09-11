@@ -720,6 +720,33 @@ def qwen4_qsa_indexed_reference(
     return _combine_reference_sdpa_partials(m, l, o, output_dtype=q.dtype)
 
 
+def qwen4_qsa_indexed_private_delta_reference(
+    q,
+    base_k,
+    base_v,
+    delta_k,
+    delta_v,
+    compact,
+    *,
+    scale: float,
+    splits: int,
+):
+    """Materialized oracle for the shared-base/private-delta kernel."""
+
+    batch = int(q.shape[0])
+    keys = mx.concatenate(
+        [mx.broadcast_to(base_k, (batch, *base_k.shape[1:])), delta_k],
+        axis=2,
+    )
+    values = mx.concatenate(
+        [mx.broadcast_to(base_v, (batch, *base_v.shape[1:])), delta_v],
+        axis=2,
+    )
+    return qwen4_qsa_indexed_reference(
+        q, keys, values, compact, scale=scale, splits=splits
+    )
+
+
 def dequantize_qsa_quantized_kv(
     q_keys,
     q_values,
@@ -869,6 +896,187 @@ _SOURCE = r"""
                         v[v_head + (size_t)physical * v_strides[2] +
                           (size_t)d * v_strides[3]]
                     );
+            }
+        }
+
+        const size_t state = (
+            ((size_t)(b * NQH + qh) * L + row) * BLOCKS + block_idx
+        );
+        if (lane == 0) {
+            part_m[state] = maximum;
+            part_l[state] = sum;
+        }
+        for (uint part = 0; part < elements; ++part) {
+            const uint d = lane * elements + part;
+            part_o[state * D + d] = T(out_values[part]);
+        }
+    }
+    if (unit == 0 && row == 0 && head == 0 && lane == 0)
+        engaged[0] = 1;
+"""
+
+
+_PRIVATE_DELTA_SOURCE = r"""
+    // The logical cache is [one immutable B1 base, one private suffix per
+    // row]. Keep the shipped indexed split-K traversal and reduction order;
+    // sorted ids let one accumulator traverse a straight-line base loop and
+    // then a straight-line delta loop without a source branch in either dot.
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint unit = threadgroup_position_in_grid.z;
+    const uint slices = GQA / HPT;
+    const uint hslice = unit % slices;
+    const uint rest = unit / slices;
+    const uint head = hslice * HPT + simdgroup_index_in_threadgroup;
+    const uint split = rest % S;
+    const uint bkv = rest / S;
+    const uint b = bkv / NKVH;
+    const uint hkv = bkv % NKVH;
+
+    const int L = dims[0];
+    const int TOT = dims[1];
+    const int U = dims[2];
+    const int BASE = dims[3];
+    const uint count = counts[b * L + row];
+    const uint base_slots = base_counts[b * L + row];
+    const uint selected = n_sel[b * L + row];
+    const int qp = qpos[b * L + row];
+    const int complete = ((qp + 1) / BS) * BS;
+    const int delta_length = int(delta_lengths[b]);
+    const uint base = BLOCKS / S;
+    const uint remainder = BLOCKS % S;
+    const uint block_begin = split * base + metal::min(split, remainder);
+    const uint block_count = base + (split < remainder ? 1u : 0u);
+    const uint token_width = uint(U) * BS;
+    const uint qh = hkv * GQA + head;
+    const uint elements = D / 32;
+
+    float q_values[D / 32];
+    for (uint part = 0; part < elements; ++part) {
+        const uint d = lane * elements + part;
+        const size_t q_index =
+            (size_t)b * q_strides[0] +
+            (size_t)qh * q_strides[1] +
+            (size_t)row * q_strides[2] +
+            (size_t)d * q_strides[3];
+        q_values[part] = float(scale[0]) * float(q[q_index]);
+    }
+
+    const uint slot_base = (b * L + row) * uint(U);
+    const size_t base_k_head = (size_t)hkv * base_k_strides[1];
+    const size_t base_v_head = (size_t)hkv * base_v_strides[1];
+    const size_t delta_k_head =
+        (size_t)b * delta_k_strides[0] +
+        (size_t)hkv * delta_k_strides[1];
+    const size_t delta_v_head =
+        (size_t)b * delta_v_strides[0] +
+        (size_t)hkv * delta_v_strides[1];
+    for (uint local_block = 0; local_block < block_count; ++local_block) {
+        const uint block_idx = block_begin + local_block;
+        const uint base_token_stop = metal::min(base_slots * BS, token_width);
+        float out_values[D / 32] = {0};
+        float maximum = -3.402823466e+38F;
+        float sum = 0.0f;
+
+        // Compact block ids are sorted, so every immutable-base slot precedes
+        // every private-delta slot. Keep the original token order but make
+        // each source loop straight-line: no K/V pointer choice in the dot.
+        for (uint token = block_idx; token < base_token_stop; token += BLOCKS) {
+            const uint slot = token / BS;
+            const uint tail = token % BS;
+            int logical = 0;
+            bool live = slot < count;
+            if (live) {
+                const int block = int(ids[slot_base + slot]);
+                logical = block * BS + int(tail);
+                live = logical >= 0 && logical < BASE && logical <= qp;
+                live = live && (slot < selected || logical >= complete);
+                if (HAS_MASK && live) {
+                    const uint mask_batch = mask_shape[0] == 1 ? 0 : b;
+                    const size_t mask_index =
+                        (size_t)mask_batch * mask_strides[0] +
+                        (size_t)row * mask_strides[2] +
+                        (size_t)logical * mask_strides[3];
+                    live = mask[mask_index];
+                }
+            }
+            if (!live) continue;
+
+            float score = 0.0f;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                const size_t k_index =
+                    base_k_head + (size_t)logical * base_k_strides[2]
+                    + (size_t)d * base_k_strides[3];
+                score += q_values[part] * float(base_k[k_index]);
+            }
+            score = simd_sum(score);
+            const float new_max = metal::max(maximum, score);
+            const float factor = fast::exp(maximum - new_max);
+            const float probability = fast::exp(score - new_max);
+            maximum = new_max;
+            sum = sum * factor + probability;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                const size_t v_index =
+                    base_v_head + (size_t)logical * base_v_strides[2]
+                    + (size_t)d * base_v_strides[3];
+                out_values[part] = out_values[part] * factor
+                    + probability * float(base_v[v_index]);
+            }
+        }
+
+        uint delta_begin = block_idx;
+        if (delta_begin < base_token_stop) {
+            delta_begin +=
+                ((base_token_stop - delta_begin + BLOCKS - 1) / BLOCKS)
+                * BLOCKS;
+        }
+        for (uint token = delta_begin; token < token_width; token += BLOCKS) {
+            const uint slot = token / BS;
+            const uint tail = token % BS;
+            int logical = 0;
+            int position = 0;
+            bool live = slot < count;
+            if (live) {
+                const int block = int(ids[slot_base + slot]);
+                logical = block * BS + int(tail);
+                position = logical - BASE;
+                live = logical >= BASE && logical < TOT && logical <= qp;
+                live = live && position >= 0 && position < delta_length;
+                live = live && (slot < selected || logical >= complete);
+                if (HAS_MASK && live) {
+                    const uint mask_batch = mask_shape[0] == 1 ? 0 : b;
+                    const size_t mask_index =
+                        (size_t)mask_batch * mask_strides[0] +
+                        (size_t)row * mask_strides[2] +
+                        (size_t)logical * mask_strides[3];
+                    live = mask[mask_index];
+                }
+            }
+            if (!live) continue;
+
+            float score = 0.0f;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                const size_t k_index =
+                    delta_k_head + (size_t)position * delta_k_strides[2]
+                    + (size_t)d * delta_k_strides[3];
+                score += q_values[part] * float(delta_k[k_index]);
+            }
+            score = simd_sum(score);
+            const float new_max = metal::max(maximum, score);
+            const float factor = fast::exp(maximum - new_max);
+            const float probability = fast::exp(score - new_max);
+            maximum = new_max;
+            sum = sum * factor + probability;
+            for (uint part = 0; part < elements; ++part) {
+                const uint d = lane * elements + part;
+                const size_t v_index =
+                    delta_v_head + (size_t)position * delta_v_strides[2]
+                    + (size_t)d * delta_v_strides[3];
+                out_values[part] = out_values[part] * factor
+                    + probability * float(delta_v[v_index]);
             }
         }
 
@@ -1076,6 +1284,33 @@ def _partition_kernel():
 
 
 @lru_cache(maxsize=None)
+def _private_delta_partition_kernel():
+    return mx.fast.metal_kernel(
+        name="qwen4_qsa_indexed_private_delta_pass1_v2",
+        input_names=[
+            "q",
+            "base_k",
+            "base_v",
+            "delta_k",
+            "delta_v",
+            "delta_lengths",
+            "base_counts",
+            "ids",
+            "counts",
+            "n_sel",
+            "qpos",
+            "mask",
+            "scale",
+            "dims",
+        ],
+        output_names=["part_m", "part_l", "part_o", "engaged"],
+        header=_HEADER,
+        source=_PRIVATE_DELTA_SOURCE,
+        ensure_row_contiguous=False,
+    )
+
+
+@lru_cache(maxsize=None)
 def _quantized_partition_kernel():
     return mx.fast.metal_kernel(
         name="qwen4_qsa_indexed_quantized_sdpa_pass1_v2",
@@ -1272,6 +1507,103 @@ def _partition_dispatch(
     )
 
 
+def _private_delta_partition_dispatch(
+    q,
+    base_k,
+    base_v,
+    delta_k,
+    delta_v,
+    delta_lengths,
+    compact,
+    *,
+    scale: float,
+    threads: int,
+    splits: int,
+    hpt: int,
+):
+    batch, nqh, length, dim = map(int, q.shape)
+    nkh = int(base_k.shape[1])
+    gqa = nqh // nkh
+    ids, counts, n_sel, u_width, q_pos, left_pad, total = (
+        compact_blocks_to_kernel_inputs(compact)
+    )
+    if compact.left_padding is not None:
+        raise ValueError("private-delta QSA requires an unpadded shared base")
+    base_block = int(base_k.shape[2]) // int(compact.block_size)
+    slots = mx.arange(u_width, dtype=mx.uint32)[None, None]
+    base_counts = mx.sum(
+        (slots < counts[..., None]) & (ids < base_block), axis=-1
+    ).astype(mx.uint32)
+    if int(hpt) < 1 or gqa % int(hpt):
+        raise ValueError("indexed QSA heads per threadgroup must divide GQA")
+    required_threads = int(hpt) * 32
+    if threads != required_threads:
+        raise ValueError("indexed QSA pass 1 requires one SIMD group per head")
+    head_slices = gqa // int(hpt)
+    if compact.causal_mask is None:
+        mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
+        has_mask = False
+    else:
+        mask = compact.causal_mask
+        if (
+            mask.ndim != 4
+            or int(mask.shape[1]) != 1
+            or int(mask.shape[2]) != length
+            or int(mask.shape[3]) != total
+            or mask.dtype != mx.bool_
+        ):
+            raise ValueError(
+                "private-delta QSA mask must be [B|1,1,L,T] bool"
+            )
+        if int(mask.shape[0]) not in (1, batch):
+            raise ValueError("private-delta QSA mask batch must be 1 or B")
+        if int(mask.shape[0]) == 1 and batch > 1:
+            mask = mx.broadcast_to(mask, (batch, 1, length, total))
+        has_mask = True
+    return _private_delta_partition_kernel()(
+        inputs=[
+            q,
+            base_k,
+            base_v,
+            delta_k,
+            delta_v,
+            mx.contiguous(delta_lengths.astype(mx.uint32)),
+            mx.contiguous(base_counts),
+            mx.contiguous(ids.astype(mx.uint32)),
+            mx.contiguous(counts.astype(mx.uint32)),
+            mx.contiguous(n_sel.astype(mx.uint32)),
+            mx.contiguous(q_pos.astype(mx.int32)),
+            mask,
+            mx.array([scale], dtype=mx.float32),
+            mx.array(
+                [length, total, u_width, int(base_k.shape[2])],
+                dtype=mx.int32,
+            ),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("D", dim),
+            ("NQH", nqh),
+            ("NKVH", nkh),
+            ("GQA", gqa),
+            ("BS", int(compact.block_size)),
+            ("S", int(splits)),
+            ("HPT", int(hpt)),
+            ("BLOCKS", _SDPA_BLOCKS),
+            ("HAS_MASK", int(has_mask)),
+        ],
+        grid=(threads, length, batch * nkh * splits * head_slices),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS),
+            (batch, nqh, length, _SDPA_BLOCKS, dim),
+            (1,),
+        ],
+        output_dtypes=[mx.float32, mx.float32, q.dtype, mx.uint32],
+    )
+
+
 def _quantized_partition_dispatch(
     q,
     q_keys,
@@ -1400,6 +1732,98 @@ def _record_merge_fallback() -> None:
     with _STATUS_LOCK:
         _STATUS_COUNTS["merge_fallback"] += 1
         _STATUS_FALLBACKS += 1
+
+
+def qwen4_qsa_indexed_private_delta_attention(
+    q,
+    base_k,
+    base_v,
+    delta_k,
+    delta_v,
+    delta_lengths,
+    compact,
+    *,
+    scale: float,
+    splits: int | None = None,
+    hpt: int | None = None,
+):
+    """Read one shared QSA prefix plus private suffixes in source phases."""
+
+    mlx_version = str(getattr(mx, "__version__", "unknown"))
+    allow_unverified = (
+        os.environ.get("MLX_QWEN4_QSA_INDEXED_ALLOW_UNVERIFIED_MLX") == "1"
+    )
+    if mlx_version not in _EXACT_MLX_BUILDS and not allow_unverified:
+        raise QSAIndexedProbeDeclined(
+            f"indexed QSA exactness is unproven on mlx {mlx_version}",
+            reason="mlx_build_unverified",
+        )
+    header_verified, _, header_reason = _sdpa_header_state()
+    if not header_verified and not allow_unverified:
+        raise QSAIndexedProbeDeclined(
+            "indexed QSA exactness clones the installed sdpa_vector.h "
+            f"({header_reason})",
+            reason=header_reason,
+        )
+    if not indexed_kernel_available():
+        raise QSAIndexedProbeDeclined("indexed QSA Metal runtime is unavailable")
+    arrays = (q, base_k, base_v, delta_k, delta_v)
+    if any(value.ndim != 4 for value in arrays):
+        raise ValueError("private-delta QSA requires rank-4 q/base/delta tensors")
+    if base_k.shape != base_v.shape or delta_k.shape != delta_v.shape:
+        raise ValueError("private-delta QSA K/V geometries must match")
+    if int(base_k.shape[0]) != 1:
+        raise ValueError("private-delta QSA base must have one immutable row")
+    batch, nqh, length, dim = map(int, q.shape)
+    if int(delta_k.shape[0]) != batch:
+        raise ValueError("private-delta QSA needs one suffix per query row")
+    if base_k.shape[1] != delta_k.shape[1] or base_k.shape[3] != delta_k.shape[3]:
+        raise ValueError("private-delta QSA base and suffix layouts differ")
+    if dim != int(base_k.shape[3]) or dim != 256:
+        raise QSAIndexedProbeDeclined("private-delta QSA exact mode requires D=256")
+    if any(value.dtype != q.dtype for value in arrays[1:]):
+        raise ValueError("private-delta QSA requires one unquantized dtype")
+    if delta_lengths.ndim != 1 or int(delta_lengths.shape[0]) != batch:
+        raise ValueError("private-delta QSA lengths must have shape [B]")
+    base_tokens = int(base_k.shape[2])
+    delta_width = int(delta_k.shape[2])
+    if base_tokens % _BLOCK_SIZE:
+        raise ValueError("private-delta QSA base must end on a four-token block")
+    if base_tokens + delta_width != int(compact.physical_width):
+        raise ValueError("private-delta QSA storage does not match logical width")
+    if int(compact.block_size) != _BLOCK_SIZE:
+        raise ValueError("private-delta QSA requires block size 4")
+    nkh = int(base_k.shape[1])
+    if nkh < 1 or nqh % nkh or nqh // nkh != 12:
+        raise QSAIndexedProbeDeclined("private-delta QSA requires GQA=12")
+    _, _, _, u_width, _, _, _ = compact_blocks_to_kernel_inputs(compact)
+    token_width = u_width * _BLOCK_SIZE
+    if token_width <= 1024 or token_width > 8192:
+        raise QSAIndexedProbeDeclined(
+            "private-delta QSA requires the MLX two-pass SDPA geometry"
+        )
+    split_count = indexed_splits_for(u_width) if splits is None else int(splits)
+    if split_count not in _SPLIT_CANDIDATES:
+        allowed = ", ".join(map(str, reversed(_SPLIT_CANDIDATES)))
+        raise ValueError(f"indexed QSA splits must be one of {allowed}")
+    heads_per_group = indexed_hpt_for(12) if hpt is None else validate_hpt(hpt, 12)
+    partials = _private_delta_partition_dispatch(
+        q,
+        base_k,
+        base_v,
+        delta_k,
+        delta_v,
+        delta_lengths,
+        compact,
+        scale=scale,
+        threads=heads_per_group * 32,
+        splits=split_count,
+        hpt=heads_per_group,
+    )
+    output, counter = _combine_sdpa_partials(
+        *partials, output_dtype=q.dtype
+    )
+    return mx.depends(output, counter)
 
 
 def qwen4_qsa_indexed_attention(
@@ -1800,6 +2224,8 @@ __all__ = [
     "qsa_indexed_enabled",
     "qsa_indexed_quantized_cache_config",
     "qwen4_qsa_indexed_attention",
+    "qwen4_qsa_indexed_private_delta_attention",
+    "qwen4_qsa_indexed_private_delta_reference",
     "qwen4_qsa_indexed_quantized_attention",
     "qwen4_qsa_indexed_quantized_reference",
     "qwen4_qsa_indexed_reference",
