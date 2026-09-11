@@ -53,6 +53,10 @@ from .models.cache import (
     trim_prompt_cache,
     trim_ragged_prompt_cache,
 )
+from .cow_cache import (
+    mtp_boundary_cow_enabled,
+    snapshot_prompt_cache_descriptors,
+)
 from .sample_utils import LaneRNG, draw_key, make_sampler, make_transformed_logprobs
 from .spec_policy import draft_depth_for
 from .tokenizer_utils import TokenizerWrapper
@@ -1883,8 +1887,17 @@ def prepare_self_mtp_lane(
     record_prefix_fanout: bool = False,
     diagnostic_stages: Optional[Dict[str, float]] = None,
     fused_gdn_catchup: bool = False,
+    prompt_boundary_out: Optional[dict] = None,
 ) -> Tuple[DetachedSelfMTPLane, MTPToken]:
-    """Prefill one canonical persistent self-MTP lane without attaching it."""
+    """Prefill one canonical persistent self-MTP lane without attaching it.
+
+    When ``prompt_boundary_out`` is supplied, capture an independent exact
+    checkpoint immediately before the final prompt token is consumed.  That
+    is the APC-compatible boundary: the target covers ``P - 1`` tokens, the
+    draft covers ``P - 2``, and ``seed_h`` is the hidden state for token
+    ``P - 2``.  No speculative proposal has been opened at this point, so a
+    rejected draft can never leak into this snapshot.
+    """
     if getattr(model, "mtp", None) is None:
         raise ValueError("model has no MTP head")
     if max_tokens <= 0:
@@ -1964,6 +1977,78 @@ def prepare_self_mtp_lane(
             y = y[n:]
             mx.clear_cache()
             finish_diagnostic_stage("cache_clear_ms")
+        if prompt_boundary_out is not None and prev_h is not None:
+            covered_tokens = max(
+                (int(getattr(c, "offset", 0)) for c in target_cache),
+                default=0,
+            )
+            draft_covered = max(
+                (int(getattr(c, "offset", 0)) for c in draft_cache),
+                default=0,
+            )
+            if covered_tokens > 0 and draft_covered == covered_tokens - 1:
+                # Evaluate before snapshotting so the retained checkpoint owns
+                # a stable committed graph. Plane-segmented descriptor COW is
+                # the default; unsupported graphs fail safely to deepcopy.
+                values = [c.state for c in target_cache]
+                values.extend(c.state for c in draft_cache)
+                values.append(prev_h)
+                if lane_rng is not None:
+                    values.append(lane_rng.key)
+                mx.eval(*values)
+                snapshot_started_ns = time.perf_counter_ns()
+                snapshot_mode = "deepcopy_fallback"
+                try:
+                    if not mtp_boundary_cow_enabled():
+                        raise RuntimeError("MTP boundary descriptor COW disabled")
+                    saved_target, saved_sidecar, snapshot_receipt = (
+                        snapshot_prompt_cache_descriptors(
+                            target_cache,
+                            (
+                                draft_cache,
+                                prev_h,
+                                None if lane_rng is None else lane_rng.key,
+                            ),
+                        )
+                    )
+                    saved_draft, saved_seed, saved_rng_key = saved_sidecar
+                    snapshot_mode = "descriptor_cow"
+                except Exception:
+                    saved_target = copy.deepcopy(target_cache)
+                    saved_draft = copy.deepcopy(draft_cache)
+                    saved_seed = copy.deepcopy(prev_h)
+                    saved_rng_key = (
+                        None if lane_rng is None else copy.deepcopy(lane_rng.key)
+                    )
+                    snapshot_receipt = {
+                        "snapshot_ns": int(
+                            time.perf_counter_ns() - snapshot_started_ns
+                        ),
+                        "snapshot_bytes": int(
+                            sum(int(getattr(c, "nbytes", 0)) for c in saved_target)
+                            + sum(
+                                int(getattr(c, "nbytes", 0)) for c in saved_draft
+                            )
+                            + int(getattr(saved_seed, "nbytes", 0))
+                            + int(getattr(saved_rng_key, "nbytes", 0))
+                        ),
+                    }
+                saved_values = [c.state for c in saved_target]
+                saved_values.extend(c.state for c in saved_draft)
+                saved_values.append(saved_seed)
+                if saved_rng_key is not None:
+                    saved_values.append(saved_rng_key)
+                mx.eval(*saved_values)
+                prompt_boundary_out.update(
+                    target_cache=saved_target,
+                    mtp_state=(saved_draft, saved_seed),
+                    covered_tokens=covered_tokens,
+                    rng_key=saved_rng_key,
+                    rng_draws=(0 if lane_rng is None else int(lane_rng.draws)),
+                    committed_only=True,
+                    snapshot_mode=snapshot_mode,
+                    **snapshot_receipt,
+                )
         if prev_h is not None:
             model.mtp_step(prev_h, y[None], draft_cache)
             if diagnostic_stages is not None:

@@ -24,6 +24,7 @@ from mlx_lm.hybrid_speculative import (
     require_only_near_tie_greedy_flips,
     self_mtp_generate_step,
 )
+from mlx_lm.apc import AutomaticPrefixCache, MTPAPCSidecar
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen3_5 import TextModel
 from mlx_lm.sample_utils import LaneRNG
@@ -145,6 +146,95 @@ class TestQwen35ForcedAcceptanceCacheEquality(_CPUCase):
                 )
             if isinstance(got, KVCache):
                 self.assertEqual(got.offset, want.offset)
+
+    def test_prompt_boundary_snapshot_is_retryable_and_rejection_isolated(self):
+        prompt = list(range(1, 13))
+        boundary = {}
+        detached, _first = prepare_self_mtp_lane(
+            mx.array(prompt, mx.uint32),
+            self.model,
+            uid=91,
+            max_tokens=8,
+            prompt_cache=None,
+            mtp_state=None,
+            lane_rng=LaneRNG(791),
+            num_draft=2,
+            sampling_temp=0.8,
+            sampling_top_p=1.0,
+            sampling_top_k=8,
+            sampling_min_p=0.0,
+            accept_rule="residual",
+            logits_processors=[],
+            prefill_step_size=4,
+            share_qsa_indices=False,
+            prompt_boundary_out=boundary,
+        )
+        self.assertTrue(boundary["committed_only"])
+        self.assertEqual(boundary["snapshot_mode"], "descriptor_cow")
+        self.assertEqual(boundary["covered_tokens"], len(prompt) - 1)
+        self.assertEqual(
+            max(getattr(c, "offset", 0) for c in boundary["target_cache"]),
+            len(prompt) - 1,
+        )
+        self.assertEqual(
+            max(getattr(c, "offset", 0) for c in boundary["mtp_state"][0]),
+            len(prompt) - 2,
+        )
+
+        frozen = [
+            np.array(array)
+            for cache in (
+                boundary["target_cache"] + boundary["mtp_state"][0]
+            )
+            for array in _tree_arrays(cache.state)
+        ]
+        batch = attach_self_mtp_lanes(self.model, None, [detached])
+
+        def reject_all(logprobs, *_args, **_kwargs):
+            return 0, int(mx.argmax(logprobs[0]).item())
+
+        with patch(
+            "mlx_lm.hybrid_speculative._batched_residual_verify",
+            side_effect=reject_all,
+        ):
+            proposal = propose_batched_self_mtp(self.model, batch)
+        self.assertGreater(len(proposal.outputs[0]), 0)
+        commit_batched_self_mtp(
+            batch,
+            proposal,
+            emitted_counts=[1],
+            terminal=[False],
+        )
+        current = [
+            np.array(array)
+            for cache in (
+                boundary["target_cache"] + boundary["mtp_state"][0]
+            )
+            for array in _tree_arrays(cache.state)
+        ]
+        self.assertEqual(len(current), len(frozen))
+        for got, want in zip(current, frozen):
+            np.testing.assert_array_equal(got, want)
+
+        apc = AutomaticPrefixCache(max_size=4)
+        sidecar = MTPAPCSidecar(
+            boundary["mtp_state"],
+            boundary["covered_tokens"],
+            rng_key=boundary["rng_key"],
+            rng_draws=boundary["rng_draws"],
+        )
+        apc.insert_cache(
+            "qwen35",
+            prompt[: boundary["covered_tokens"]],
+            boundary["target_cache"],
+            sidecar=sidecar,
+        )
+        hit = apc.lookup("qwen35", prompt)
+        self.assertTrue(hit.hit)
+        self.assertEqual(hit.hit_kind, "mtp_sidecar")
+        self.assertEqual(hit.cached_tokens, len(prompt) - 1)
+        self.assertEqual(hit.remaining_tokens, prompt[-1:])
+        self.assertIsNotNone(hit.sidecar)
 
     def test_all_forced_acceptance_vectors_match_independent_lanes(self):
         prompts = ([1, 2, 3, 4, 5], [7, 8, 9, 10, 11, 12])

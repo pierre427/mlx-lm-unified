@@ -31,11 +31,14 @@ from typing import Any, Hashable, Iterable, Optional
 import mlx.core as mx
 
 from .cache_planes import (
+    CacheLayerSegment,
     CachePlaneFingerprint,
     CachePlaneKind,
     CachePlaneOwner,
+    CacheSegmentKey,
     CompiledScheduleMetadata,
     LayeredCacheManifest,
+    LayeredSegmentManifest,
     PLEResidencyHints,
     PromptHostPlane,
 )
@@ -59,6 +62,19 @@ def cow_cache_enabled(value: Optional[bool] = None) -> bool:
     if value is not None:
         return bool(value)
     return os.environ.get("MLX_LM_APC_COW_BRANCH", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def mtp_boundary_cow_enabled(value: Optional[bool] = None) -> bool:
+    """Resolve the committed MTP-boundary snapshot gate. Default is on."""
+
+    if value is not None:
+        return bool(value)
+    return os.environ.get("MLX_LM_MTP_BOUNDARY_COW", "1").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -99,6 +115,17 @@ class COWDevicePlaneDescriptor:
 
     classes: tuple[str, ...]
     layout_digest: str
+    logical_bytes: int
+
+
+@dataclass(frozen=True)
+class COWDeviceSegmentDescriptor:
+    """APCv2 layer-local span; device buffers remain owner-private."""
+
+    layer_index: int
+    role: str
+    token_start: int
+    token_stop: int
     logical_bytes: int
 
 
@@ -321,6 +348,122 @@ def _layout_identity(values: Iterable[Any]) -> str:
             )
         )
     return hashlib.sha256(repr(tuple(geometry)).encode()).hexdigest()
+
+
+def _layer_segment_specs(
+    cache: Any,
+    *,
+    layer_index: int,
+    covered_tokens: int,
+    tail_tokens: int = 256,
+    draft: bool = False,
+) -> list[tuple[CachePlaneKind, str, int, int, int, tuple[tuple[str, str], ...]]]:
+    """Describe conservative APCv2 segments for one concrete cache layer."""
+
+    plane_name = _plane_for_cache(cache, draft=draft)
+    if draft:
+        kinds = [(CachePlaneKind.MTP_DRAFT, cache, ())]
+    elif plane_name == "qsa_summary":
+        kinds = []
+        for kind in (CachePlaneKind.ATTENTION_KV, CachePlaneKind.QSA_SUMMARY):
+            projection, compatibility = _qsa_plane_projection(cache, kind)
+            kinds.append((kind, projection, compatibility))
+    else:
+        kind = _plane_kind(plane_name)
+        kinds = [] if kind is None else [(kind, cache, ())]
+
+    offset = int(getattr(cache, "offset", covered_tokens) or covered_tokens)
+    offset = max(offset, 0)
+    specs = []
+    for kind, projection, compatibility in kinds:
+        logical_bytes = _tree_nbytes(projection)
+        if kind == CachePlaneKind.GDN_RECURRENT:
+            spans = [("state", 0, offset, logical_bytes)]
+        elif kind == CachePlaneKind.ATTENTION_RING:
+            retained = int(
+                getattr(cache, "max_size", 0)
+                or getattr(cache, "window_size", 0)
+                or min(offset, tail_tokens)
+            )
+            spans = [
+                ("window", max(0, offset - retained), offset, logical_bytes)
+            ]
+        else:
+            split = max(0, offset - int(tail_tokens))
+            spans = []
+            if split > 0:
+                prefix_bytes = int(logical_bytes * split / max(offset, 1))
+                spans.append(("prefix", 0, split, prefix_bytes))
+            tail_bytes = logical_bytes - sum(span[3] for span in spans)
+            spans.append(("tail", split, offset, tail_bytes))
+        for role, start, stop, nbytes in spans:
+            specs.append(
+                (kind, role, start, stop, nbytes, compatibility)
+            )
+    return specs
+
+
+def _build_layer_segment_manifest(
+    source_cache: Iterable[Any],
+    source_sidecar: Any,
+    *,
+    covered_tokens: int,
+) -> LayeredSegmentManifest:
+    segments = []
+    for layer_index, cache in enumerate(source_cache):
+        specs = _layer_segment_specs(
+            cache,
+            layer_index=layer_index,
+            covered_tokens=covered_tokens,
+        )
+        for segment_index, (kind, role, start, stop, nbytes, compatibility) in enumerate(specs):
+            key = CacheSegmentKey(
+                kind, layer_index, segment_index, start, stop, role
+            )
+            fingerprint = CachePlaneFingerprint.from_fields(
+                kind,
+                schema_version=2,
+                layer=layer_index,
+                segment=segment_index,
+                role=role,
+                token_start=start,
+                token_stop=stop,
+                cache_class=type(cache).__name__,
+                compatibility=compatibility,
+            )
+            segments.append(CacheLayerSegment(key, fingerprint, nbytes))
+
+    sidecar_state = getattr(source_sidecar, "state", source_sidecar)
+    draft_cache = (
+        sidecar_state[0]
+        if isinstance(sidecar_state, (list, tuple)) and sidecar_state
+        else None
+    )
+    if isinstance(draft_cache, (list, tuple)):
+        for layer_index, cache in enumerate(draft_cache):
+            specs = _layer_segment_specs(
+                cache,
+                layer_index=layer_index,
+                covered_tokens=max(0, covered_tokens - 1),
+                draft=True,
+            )
+            for segment_index, (kind, role, start, stop, nbytes, compatibility) in enumerate(specs):
+                key = CacheSegmentKey(
+                    kind, layer_index, segment_index, start, stop, role
+                )
+                fingerprint = CachePlaneFingerprint.from_fields(
+                    kind,
+                    schema_version=2,
+                    layer=layer_index,
+                    segment=segment_index,
+                    role=role,
+                    token_start=start,
+                    token_stop=stop,
+                    cache_class=type(cache).__name__,
+                    compatibility=compatibility,
+                )
+                segments.append(CacheLayerSegment(key, fingerprint, nbytes))
+    return LayeredSegmentManifest(segments)
 
 
 def _validate_stable_source(prompt_cache: Iterable[Any]) -> None:
@@ -731,6 +874,8 @@ class COWCacheOwner:
         source_sidecar: Any,
         metadata: COWPromptMetadata,
         telemetry: COWCacheTelemetry,
+        *,
+        layer_segments: bool = False,
     ) -> None:
         self.lineage_id = uuid.uuid4().hex
         self.metadata = metadata
@@ -831,6 +976,21 @@ class COWCacheOwner:
                 )
             )
         self.plane_manifest = LayeredCacheManifest(owners)
+        self.segment_manifest = (
+            _build_layer_segment_manifest(
+                self._source_cache,
+                source_sidecar,
+                covered_tokens=int(
+                    getattr(
+                        source_sidecar,
+                        "covered_tokens",
+                        len(metadata.tokens),
+                    )
+                ),
+            )
+            if layer_segments
+            else LayeredSegmentManifest()
+        )
 
     @property
     def generation(self) -> int:
@@ -859,6 +1019,10 @@ class COWCacheOwner:
                 self._generation += 1
                 self.telemetry.add("invalidations")
                 self.plane_manifest.invalidate_all("owner_invalidated")
+                for segment in self.segment_manifest.segments:
+                    self.segment_manifest.invalidate(
+                        segment.key, "owner_invalidated"
+                    )
             if self._pins == 0:
                 self._release_source_locked()
             return self._generation
@@ -871,10 +1035,21 @@ class COWCacheOwner:
             generation = self.plane_manifest.invalidate(kind, reason)
             if generation is not None:
                 self._invalid_planes[kind] = reason
+                self.segment_manifest.invalidate_plane(kind, reason)
         return generation
 
+    def invalidate_segment(self, key: CacheSegmentKey, reason: str) -> bool:
+        """Invalidate one APCv2 segment and conservatively block its plane."""
+
+        with self._lock:
+            changed = self.segment_manifest.invalidate(key, reason)
+            if changed:
+                self._invalid_planes.setdefault(key.kind, str(reason))
+                self.plane_manifest.invalidate(key.kind, reason)
+            return changed
+
     def _target_blocked_locked(self) -> bool:
-        return any(
+        return self.segment_manifest.invalid_required(include_mtp=False) or any(
             kind in self._TARGET_BLOCKING_PLANES for kind in self._invalid_planes
         )
 
@@ -905,6 +1080,9 @@ class COWCacheOwner:
             stats[kind.value]["classes"] = descriptor.classes
             stats[kind.value]["layout_digest"] = descriptor.layout_digest
         return stats
+
+    def segment_stats(self) -> dict[str, Any]:
+        return self.segment_manifest.summary()
 
     def branch(self, *, expected_generation: int) -> "COWPromptCacheBranch":
         started = time.perf_counter_ns()
@@ -1140,6 +1318,7 @@ class COWPromptCacheBranch(list):
         self.cow_sidecar = sidecar
         self.cow_prep_telemetry = dataclasses.asdict(receipt)
         self.cow_plane_stats = owner.plane_stats()
+        self.cow_segment_stats = owner.segment_stats()
         self._close_lock = threading.Lock()
         self._closed = False
         self._finalizer = weakref.finalize(self, owner._release_pin)
@@ -1279,6 +1458,7 @@ def freeze_prompt_cache(
     ple_hints: PLEResidencyHints | None = None,
     compiled_schedule: CompiledScheduleMetadata | None = None,
     telemetry: Optional[COWCacheTelemetry] = None,
+    layer_segments: bool = False,
 ) -> tuple[COWFrozenPromptCache, Any]:
     """Freeze target and optional MTP state without copying MLX buffers."""
 
@@ -1325,12 +1505,62 @@ def freeze_prompt_cache(
         ple_hints=ple_hints,
         compiled_schedule=compiled_schedule,
     )
-    owner = COWCacheOwner(source_cache, source_sidecar, metadata, telemetry)
+    owner = COWCacheOwner(
+        source_cache,
+        source_sidecar,
+        metadata,
+        telemetry,
+        layer_segments=layer_segments,
+    )
     frozen = COWFrozenPromptCache(source_cache, owner)
     telemetry.add("sources")
     telemetry.add("source_bytes", _tree_nbytes(source_cache) + _tree_nbytes(source_sidecar))
     telemetry.add("freeze_ns", time.perf_counter_ns() - started)
     return frozen, source_sidecar
+
+
+def snapshot_prompt_cache_descriptors(
+    prompt_cache: Iterable[Any],
+    sidecar: Any = None,
+) -> tuple[list[Any], Any, dict[str, int]]:
+    """Capture one committed boundary as independent plane descriptors.
+
+    Python/cache objects are cloned, while immutable MLX buffers remain
+    descriptor aliases. Subsequent live-cache updates rebind only the live
+    graph, so target, MTP draft, hidden seed, and RNG remain exact at capture.
+    """
+
+    telemetry = COWCacheTelemetry()
+    started = time.perf_counter_ns()
+    prompt_cache = list(prompt_cache)
+    _validate_stable_source(prompt_cache)
+    sidecar_state = getattr(sidecar, "state", sidecar)
+    if isinstance(sidecar_state, (list, tuple)) and sidecar_state:
+        draft_cache = sidecar_state[0]
+        if isinstance(draft_cache, (list, tuple)):
+            _validate_stable_source(draft_cache)
+    memo: dict[int, Any] = {}
+    snapshot = [
+        _clone_graph(
+            item,
+            telemetry=telemetry,
+            plane=_plane_for_cache(item),
+            attach_tokens=False,
+            memo=memo,
+        )
+        for item in prompt_cache
+    ]
+    snapshot_sidecar = _clone_graph(
+        sidecar,
+        telemetry=telemetry,
+        plane="draft_mtp",
+        attach_tokens=False,
+        memo=memo,
+    )
+    return snapshot, snapshot_sidecar, {
+        "snapshot_ns": int(time.perf_counter_ns() - started),
+        "snapshot_bytes": int(_tree_nbytes((snapshot, snapshot_sidecar))),
+    }
 
 
 def restore_prompt_cache(prompt_cache: Any) -> COWPromptCacheBranch:
@@ -1370,7 +1600,9 @@ __all__ = [
     "COWPromptMetadata",
     "cow_cache_enabled",
     "freeze_prompt_cache",
+    "mtp_boundary_cow_enabled",
     "note_cache_mutation",
     "record_fallback_deepcopy",
     "restore_prompt_cache",
+    "snapshot_prompt_cache_descriptors",
 ]

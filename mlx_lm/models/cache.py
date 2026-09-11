@@ -5707,9 +5707,11 @@ class LRUPromptCache:
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
-        # If it is a trimmable cache remove all prefixes cause they just take
-        # space
-        if can_trim_prompt_cache(prompt_cache):
+        # Ordinary trimmable target caches subsume their shorter prefixes.
+        # A speculative sidecar does not: its draft/recurrent state is valid
+        # only at the exact jointly-captured boundary.  Keep those checkpoints
+        # even when a later target cache is itself arbitrarily trimmable.
+        if can_trim_prompt_cache(prompt_cache) and sidecar is None:
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes

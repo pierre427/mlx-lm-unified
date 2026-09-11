@@ -29,6 +29,42 @@ class CachePlaneKind(str, Enum):
     COMPILED_SCHEDULE = "compiled_schedule"
 
 
+@dataclass(frozen=True, order=True)
+class CacheSegmentKey:
+    """Stable address of one layer-local token/state segment in APCv2."""
+
+    kind: CachePlaneKind
+    layer_index: int
+    segment_index: int
+    token_start: int
+    token_stop: int
+    role: str
+
+    def __post_init__(self) -> None:
+        if self.layer_index < 0 or self.segment_index < 0:
+            raise ValueError("cache segment indices must be non-negative")
+        if not 0 <= self.token_start <= self.token_stop:
+            raise ValueError("invalid cache segment token span")
+        if not self.role:
+            raise ValueError("cache segment role is required")
+
+
+@dataclass(frozen=True)
+class CacheLayerSegment:
+    """One independently accounted APCv2 layer segment."""
+
+    key: CacheSegmentKey
+    fingerprint: "CachePlaneFingerprint"
+    logical_bytes: int
+    required: bool = True
+
+    def __post_init__(self) -> None:
+        if self.fingerprint.kind != self.key.kind:
+            raise ValueError("cache segment kind and fingerprint disagree")
+        if self.logical_bytes < 0:
+            raise ValueError("cache segment bytes must be non-negative")
+
+
 @dataclass(frozen=True)
 class CachePlaneFingerprint:
     """Exact compatibility key for one independently reusable plane."""
@@ -341,6 +377,78 @@ class LayeredCacheManifest:
         return {kind.value: owner.stats() for kind, owner in self._owners.items()}
 
 
+class LayeredSegmentManifest:
+    """APCv2 layer/segment ownership under one atomic cache generation.
+
+    Segment invalidation is represented independently, but callers may still
+    conservatively reject the whole correctness-bearing target boundary. This
+    lets model integrations become more selective without changing the stored
+    format or weakening today's restore contract.
+    """
+
+    def __init__(self, segments: Iterable[CacheLayerSegment] = ()) -> None:
+        self._segments: dict[CacheSegmentKey, CacheLayerSegment] = {}
+        self._invalid: dict[CacheSegmentKey, str] = {}
+        for segment in segments:
+            self.add(segment)
+
+    def add(self, segment: CacheLayerSegment) -> None:
+        if segment.key in self._segments:
+            raise ValueError(f"duplicate cache segment: {segment.key!r}")
+        self._segments[segment.key] = segment
+
+    def invalidate(self, key: CacheSegmentKey, reason: str) -> bool:
+        if key not in self._segments:
+            return False
+        if not reason:
+            raise ValueError("cache segment invalidation needs a reason")
+        self._invalid.setdefault(key, str(reason))
+        return True
+
+    def invalidate_plane(self, kind: CachePlaneKind, reason: str) -> int:
+        changed = 0
+        for key in self._segments:
+            if key.kind == kind and key not in self._invalid:
+                self._invalid[key] = str(reason)
+                changed += 1
+        return changed
+
+    def invalid_required(self, *, include_mtp: bool = True) -> bool:
+        return any(
+            segment.required
+            and key in self._invalid
+            and (include_mtp or key.kind != CachePlaneKind.MTP_DRAFT)
+            for key, segment in self._segments.items()
+        )
+
+    def summary(self) -> dict[str, Any]:
+        by_plane: dict[str, dict[str, int]] = {}
+        layers = set()
+        for key, segment in self._segments.items():
+            layers.add((key.kind.value, key.layer_index))
+            values = by_plane.setdefault(
+                key.kind.value,
+                {"layers": 0, "segments": 0, "logical_bytes": 0, "invalid": 0},
+            )
+            values["segments"] += 1
+            values["logical_bytes"] += int(segment.logical_bytes)
+            values["invalid"] += int(key in self._invalid)
+        for plane, values in by_plane.items():
+            values["layers"] = sum(1 for kind, _ in layers if kind == plane)
+        return {
+            "schema": "apcv2.layer-segments.v1",
+            "layers": len({layer for _, layer in layers}),
+            "plane_layers": len(layers),
+            "segments": len(self._segments),
+            "invalid_segments": len(self._invalid),
+            "by_plane": by_plane,
+        }
+
+    @property
+    def segments(self) -> tuple[CacheLayerSegment, ...]:
+        return tuple(self._segments.values())
+
+
 class PromptHostPlaneCache:
     """Small independent LRU for pre-device render/tokenization reuse."""
 
@@ -449,13 +557,16 @@ class PromptHostPlaneCache:
 
 
 __all__ = [
+    "CacheLayerSegment",
     "CachePlaneFallback",
     "CachePlaneFingerprint",
     "CachePlaneKind",
     "CachePlaneLease",
     "CachePlaneOwner",
+    "CacheSegmentKey",
     "CompiledScheduleMetadata",
     "LayeredCacheManifest",
+    "LayeredSegmentManifest",
     "PLEResidencyHints",
     "PromptCacheKeyProvenance",
     "PromptHostPlane",

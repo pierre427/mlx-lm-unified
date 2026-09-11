@@ -15,6 +15,7 @@ DECODE_LANE_LOG = _collections.deque(maxlen=64)
 # Completed continuous self-MTP requests, exposed read-only for operators.
 # A configured flag is not proof of engagement; these receipts are.
 SELF_MTP_RECEIPTS = _collections.deque(maxlen=64)
+SELF_MTP_APC_COUNTERS = _collections.Counter()
 # Reached-path cache-capsule receipts. Configuration alone is not engagement.
 CACHE_CAPSULE_LOG = _collections.deque(maxlen=64)
 from .megakernel_lane import megakernel_lane_enabled, _text_model as megakernel_text_model
@@ -54,7 +55,12 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
-from .apc import AutomaticPrefixCache, MTPAPCSidecar, _walk_cache_entries
+from .apc import (
+    AutomaticPrefixCache,
+    AutomaticPrefixCacheV2,
+    MTPAPCSidecar,
+    _walk_cache_entries,
+)
 from .cache_capsule import (
     CacheCapsuleError,
     CacheCapsulePool,
@@ -2337,6 +2343,41 @@ class ResponseGenerator:
         self._generation_thread = Thread(target=self._run_generation)
         self._generation_thread.start()
 
+    def _configure_apc_for_model(self, model) -> None:
+        """Select APCv2 only for a model that declares its segment layout."""
+
+        layout_name = getattr(model, "apc_v2_layout", None)
+        current_v2 = isinstance(self.prompt_cache, AutomaticPrefixCacheV2)
+        desired_v2 = bool(layout_name)
+        if current_v2 == desired_v2 and (
+            not desired_v2 or self.prompt_cache.layout_name == layout_name
+        ):
+            return
+        if len(self.prompt_cache):
+            self.prompt_cache.clear()
+        old_capsule_pool = self._cache_capsule_pool
+        if old_capsule_pool is not None:
+            old_capsule_pool.close()
+        max_size = int(self.prompt_cache.max_size)
+        max_bytes = int(self.prompt_cache.max_bytes)
+        self.prompt_cache = (
+            AutomaticPrefixCacheV2(
+                max_size=max_size,
+                max_bytes=max_bytes,
+                layout_name=str(layout_name),
+            )
+            if desired_v2
+            else AutomaticPrefixCache(max_size=max_size, max_bytes=max_bytes)
+        )
+        self._cache_capsule_pool = CacheCapsulePool(
+            self.prompt_cache.capsule_generation
+        )
+        logging.info(
+            "Configured %s for model cache layout %s",
+            "APCv2" if desired_v2 else "legacy APC",
+            layout_name or "legacy",
+        )
+
     def _run_generation(self):
         """Thread body. Keeps the reason generation stopped, so that
         health_report can name it instead of only reporting a dead thread."""
@@ -2856,6 +2897,9 @@ class ResponseGenerator:
 
         # Load the default model if it is given
         self.model_provider.load_default()
+        configure_apc = getattr(self, "_configure_apc_for_model", None)
+        if self.model_provider.model is not None and callable(configure_apc):
+            configure_apc(self.model_provider.model)
 
         current_model = None
         current_sampling = None
@@ -3057,6 +3101,11 @@ class ResponseGenerator:
                     except Exception as e:
                         rqueue.put(e)
                         continue
+                    configure_apc = getattr(
+                        self, "_configure_apc_for_model", None
+                    )
+                    if callable(configure_apc):
+                        configure_apc(model)
 
                     if compiled_decode_enabled() and getattr(args, "n", 1) == 1:
                         try:
@@ -3240,6 +3289,49 @@ class ResponseGenerator:
                     for r in prompt_responses:
                         result = batch_results[r.uid]
                         result["rqueue"].put(r.progress)
+                        if r.end_of_prompt and result.get("mtp"):
+                            boundary = batch_generator.pop_mtp_prompt_boundary(
+                                r.uid
+                            )
+                            if boundary is not None and boundary.get(
+                                "committed_only", False
+                            ):
+                                sidecar = MTPAPCSidecar(
+                                    boundary["mtp_state"],
+                                    int(boundary["covered_tokens"]),
+                                    rng_key=boundary.get("rng_key"),
+                                    rng_draws=int(
+                                        boundary.get("rng_draws", 0) or 0
+                                    ),
+                                )
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    boundary["tokens"],
+                                    boundary["target_cache"],
+                                    cache_type="assistant",
+                                    sidecar=sidecar,
+                                )
+                                SELF_MTP_APC_COUNTERS["prompt_boundary_stores"] += 1
+                                SELF_MTP_APC_COUNTERS[
+                                    "prompt_boundary_tokens"
+                                ] += int(boundary["covered_tokens"])
+                                SELF_MTP_APC_COUNTERS[
+                                    f"prompt_boundary_{boundary.get('snapshot_mode', 'unknown')}"
+                                ] += 1
+                                SELF_MTP_APC_COUNTERS[
+                                    "prompt_boundary_snapshot_ns"
+                                ] += int(boundary.get("snapshot_ns", 0) or 0)
+                                SELF_MTP_APC_COUNTERS[
+                                    "prompt_boundary_snapshot_bytes"
+                                ] += int(
+                                    boundary.get("snapshot_bytes", 0) or 0
+                                )
+                            elif boundary is not None:
+                                # Fail closed: an experimental producer must
+                                # never publish an open/uncommitted proposal.
+                                SELF_MTP_APC_COUNTERS[
+                                    "uncommitted_boundaries_dropped"
+                                ] += 1
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
@@ -3342,6 +3434,10 @@ class ResponseGenerator:
                                     cache_type="assistant",
                                     sidecar=sidecar,
                                 )
+                                if sidecar is not None:
+                                    SELF_MTP_APC_COUNTERS[
+                                        "completion_boundary_stores"
+                                    ] += 1
                             else:
                                 self.prompt_cache.insert_cache(
                                     current_model_key,
@@ -5335,6 +5431,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
                 "receipts": receipts,
                 "engaged_requests": len(receipts),
+                "apc_boundaries": dict(SELF_MTP_APC_COUNTERS),
                 "segmented": segmented_self_mtp_stats(),
             }
             encoded = json.dumps(payload, default=str).encode()

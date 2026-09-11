@@ -91,6 +91,7 @@ class APCLookup:
     prep_telemetry: Any = None
     prompt_host: Optional[PromptHostPlane] = None
     capsule_generation: Optional[int] = None
+    segment_manifest: Any = None
 
 
 @dataclass
@@ -332,6 +333,9 @@ class AutomaticPrefixCache(LRUPromptCache):
                         None,
                     ),
                     capsule_generation=self._capsule_generation.current,
+                    segment_manifest=getattr(
+                        restored_cache, "cow_segment_stats", None
+                    ),
                 )
         try:
             cache, remaining = super().fetch_nearest_cache(key, tokens)
@@ -382,6 +386,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                 getattr(cache, "cow_metadata", None), "prompt_host", None
             ),
             capsule_generation=self._capsule_generation.current,
+            segment_manifest=getattr(cache, "cow_segment_stats", None),
         )
 
     def store(
@@ -436,6 +441,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                     ple_hints=ple_hints,
                     compiled_schedule=compiled_schedule,
                     telemetry=self._cow_telemetry,
+                    layer_segments=getattr(self, "_layer_segments", False),
                 )
             except Exception:
                 # Product safety is the incumbent behavior. An unsupported
@@ -596,6 +602,72 @@ class AutomaticPrefixCache(LRUPromptCache):
                 entry.prompt_cache.close()
 
 
+class AutomaticPrefixCacheV2(AutomaticPrefixCache):
+    """Model-declared APC with atomic layer/segment descriptor ownership."""
+
+    schema_version = 2
+
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        *,
+        layout_name: str,
+    ) -> None:
+        if not layout_name:
+            raise ValueError("APCv2 requires a model cache-layout declaration")
+        super().__init__(
+            max_size=max_size,
+            max_bytes=max_bytes,
+            cow_branching=True,
+        )
+        self._layer_segments = True
+        self.layout_name = str(layout_name)
+
+    @property
+    def apc_stats(self):
+        with self._apc_lock:
+            stats = super().apc_stats
+            aggregate = {
+                "schema": "apcv2.layer-segments.v1",
+                "entries": 0,
+                "fallback_entries": 0,
+                "layers": 0,
+                "plane_layers": 0,
+                "segments": 0,
+                "logical_bytes": 0,
+                "by_plane": {},
+            }
+            for entry in _iter_trie_entries(self._trie):
+                frozen = entry.prompt_cache
+                if not isinstance(frozen, COWFrozenPromptCache):
+                    aggregate["fallback_entries"] += 1
+                    continue
+                summary = frozen.cow_owner.segment_stats()
+                aggregate["entries"] += 1
+                for key in ("layers", "plane_layers", "segments"):
+                    aggregate[key] += int(summary.get(key, 0))
+                for plane, values in summary.get("by_plane", {}).items():
+                    combined = aggregate["by_plane"].setdefault(
+                        plane,
+                        {
+                            "layers": 0,
+                            "segments": 0,
+                            "logical_bytes": 0,
+                            "invalid": 0,
+                        },
+                    )
+                    for key in combined:
+                        combined[key] += int(values.get(key, 0))
+                    aggregate["logical_bytes"] += int(
+                        values.get("logical_bytes", 0)
+                    )
+            stats["version"] = 2
+            stats["layout_name"] = self.layout_name
+            stats["layer_segments"] = aggregate
+            return stats
+
+
 # Short public spelling for server integrations.
 APC = AutomaticPrefixCache
 
@@ -606,6 +678,7 @@ __all__ = [
     "APCKey",
     "APCLookup",
     "AutomaticPrefixCache",
+    "AutomaticPrefixCacheV2",
     "MTPAPCSidecar",
     "inspect_apc_capabilities",
 ]

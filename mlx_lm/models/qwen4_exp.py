@@ -5752,6 +5752,8 @@ class Qwen4ExpTextModel(PipelineMixin, nn.Module):
 
 
 class TextModel(nn.Module):
+    apc_v2_layout = "qwen4-exp-layer-segments-v1"
+
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
@@ -5992,6 +5994,8 @@ class ModelArgs(BaseModelArgs):
 
 
 class Model(nn.Module):
+    apc_v2_layout = "qwen4-exp-layer-segments-v1"
+
     # Qwen4ArraysCache restores PLE token history + ShortConv and GDN
     # convolution + recurrence as one atomic record.
     supports_speculative_rollback = True

@@ -4097,6 +4097,10 @@ class BatchGenerator:
         self._mtp_states = {}
         self._mtp_lane_rngs = {}
         self._mtp_configs = {}
+        # Exact P-1 target/draft snapshots captured before a joining lane's
+        # final prompt token is consumed.  The server pops each snapshot at
+        # end-of-prompt and transfers ownership to APC.
+        self._mtp_prompt_boundaries = {}
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -4129,6 +4133,10 @@ class BatchGenerator:
         generation_batch = getattr(self, "_generation_batch", None)
         if isinstance(generation_batch, MTPGenerationBatch):
             generation_batch.close()
+        # These snapshots have not yet been transferred to APC. Releasing the
+        # last references here prevents an interrupted prompt from pinning a
+        # full target+draft prefix until GC happens to collect the generator.
+        getattr(self, "_mtp_prompt_boundaries", {}).clear()
 
     def __del__(self):
         self.close()
@@ -4424,6 +4432,7 @@ class BatchGenerator:
                 for processor in processors
             ]
             _prefetch_known_mtp_tail(self.model, history, prompt, config)
+            prompt_boundary = {}
             lane, first = prepare_self_mtp_lane(
                 mx.array(prompt, dtype=mx.uint32),
                 self.model,
@@ -4445,6 +4454,7 @@ class BatchGenerator:
                 share_qsa_indices=bool(config.get("share_qsa_indices", False)),
                 diagnostic_stages=config.get("_diagnostic_prepare_stages"),
                 fused_gdn_catchup=bool(config.get("fused_gdn_catchup", False)),
+                prompt_boundary_out=prompt_boundary,
             )
             lane.lane.token_prefix = mx.array(history + prompt, dtype=mx.uint32)
             lane.lane.logits_processors = processors
@@ -4453,6 +4463,12 @@ class BatchGenerator:
             stop_matchers.append(matcher)
             total = len(history) + len(prompt)
             progress.append(PromptProcessingBatch.Response(uid, (total, total), True, True))
+            if prompt_boundary:
+                covered = int(prompt_boundary["covered_tokens"])
+                full_prompt = history + prompt
+                if covered <= len(full_prompt):
+                    prompt_boundary["tokens"] = list(full_prompt[:covered])
+                    self._mtp_prompt_boundaries[uid] = prompt_boundary
         configured_segmented = _segment_aware_live_tip_enabled(self.self_mtp)
         existing_rows = bool(self._generation_batch.mtp_cycle_state())
         segmented_join = configured_segmented and (
@@ -4620,6 +4636,10 @@ class BatchGenerator:
                     )
         return results
 
+    def pop_mtp_prompt_boundary(self, uid: int):
+        """Transfer one committed prompt-boundary checkpoint to the server."""
+        return self._mtp_prompt_boundaries.pop(int(uid), None)
+
     def remove(self, uids, return_prompt_caches=False):
         caches = {}
         if return_prompt_caches:
@@ -4632,6 +4652,8 @@ class BatchGenerator:
             set(range(len(self._plain_fallback_batch))),
         )
         found = self._find_uids(uids)
+        for uid in uids:
+            self._mtp_prompt_boundaries.pop(uid, None)
         for stage, idx in found.values():
             if idx >= 0:
                 keep[stage].remove(idx)
@@ -4670,6 +4692,14 @@ class BatchGenerator:
             for leaf in state[0]
         )
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
+        total += sum(
+            int(getattr(leaf, "nbytes", 0))
+            for snapshot in getattr(self, "_mtp_prompt_boundaries", {}).values()
+            for leaf in (
+                list(snapshot.get("target_cache", ()))
+                + list((snapshot.get("mtp_state") or ((), None))[0])
+            )
+        )
         if self.self_mtp is None:
             total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
         else:

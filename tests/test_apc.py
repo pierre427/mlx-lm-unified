@@ -131,6 +131,48 @@ class TestAutomaticPrefixCache(unittest.TestCase):
         branch = apc.lookup(key, [1, 9, 10])
         self.assertIsNone(branch.sidecar)
 
+    def test_later_sidecar_does_not_prune_exact_mtp_prompt_boundary(self):
+        apc = AutomaticPrefixCache(max_size=4)
+        key = APCKey("qwen4")
+        prompt_tokens = [1, 2, 3]
+        completion_tokens = prompt_tokens + [4, 5]
+        prompt_sidecar = MTPAPCSidecar(
+            ([_state(KVCache(), 1)], mx.zeros((1, 1, 4), mx.float32)),
+            covered_tokens=2,
+        )
+        completion_sidecar = MTPAPCSidecar(
+            ([_state(KVCache(), 4)], mx.ones((1, 1, 4), mx.float32)),
+            covered_tokens=5,
+        )
+
+        # Both target caches are arbitrarily trimmable, but their MTP state is
+        # exact-boundary-only.  Inserting the longer completion must preserve
+        # the shorter checkpoint needed to retry the original prompt.
+        apc.store(
+            key,
+            prompt_tokens[:2],
+            [_state(KVCache(), 2)],
+            sidecar=prompt_sidecar,
+        )
+        apc.store(
+            key,
+            completion_tokens,
+            [_state(KVCache(), 5)],
+            sidecar=completion_sidecar,
+        )
+
+        prompt_hit = apc.lookup(key, prompt_tokens)
+        self.assertTrue(prompt_hit.hit)
+        self.assertEqual(prompt_hit.hit_kind, "mtp_sidecar")
+        self.assertEqual(prompt_hit.cached_tokens, 2)
+        self.assertEqual(prompt_hit.remaining_tokens, [3])
+
+        continuation_hit = apc.lookup(key, completion_tokens + [6])
+        self.assertTrue(continuation_hit.hit)
+        self.assertEqual(continuation_hit.hit_kind, "mtp_sidecar")
+        self.assertEqual(continuation_hit.cached_tokens, 5)
+        self.assertEqual(continuation_hit.remaining_tokens, [6])
+
 
 if __name__ == "__main__":
     unittest.main()
