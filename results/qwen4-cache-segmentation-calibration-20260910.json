@@ -1,0 +1,685 @@
+{
+  "boundary_receipts": {
+    "2048": {
+      "incomplete_tail_tokens": 0,
+      "qsa": {
+        "block_topk": 512,
+        "complete_blocks": 512,
+        "dense_shortcircuit": true,
+        "incomplete_tail_tokens": 0,
+        "token_count": 2048
+      },
+      "segment_stops": [
+        256,
+        512,
+        768,
+        1024,
+        1280,
+        1536,
+        1792,
+        2048
+      ]
+    },
+    "2051": {
+      "incomplete_tail_tokens": 3,
+      "qsa": {
+        "block_topk": 512,
+        "complete_blocks": 512,
+        "dense_shortcircuit": true,
+        "incomplete_tail_tokens": 3,
+        "token_count": 2051
+      },
+      "segment_stops": [
+        256,
+        512,
+        768,
+        1024,
+        1280,
+        1536,
+        1792,
+        2048
+      ]
+    },
+    "2052": {
+      "incomplete_tail_tokens": 0,
+      "qsa": {
+        "block_topk": 512,
+        "complete_blocks": 513,
+        "dense_shortcircuit": false,
+        "incomplete_tail_tokens": 0,
+        "token_count": 2052
+      },
+      "segment_stops": [
+        256,
+        512,
+        768,
+        1024,
+        1280,
+        1536,
+        1792,
+        2048,
+        2052
+      ]
+    }
+  },
+  "decision": "research candidates only; retain all production defaults",
+  "elapsed_s": 28.63702187500894,
+  "memory_budget_bytes": 805306368,
+  "pareto_front": [
+    "blocks=128,inline=2048,depth=4",
+    "blocks=128,inline=8192,depth=8",
+    "blocks=16,inline=2048,depth=4",
+    "blocks=16,inline=8192,depth=4",
+    "blocks=256,inline=2048,depth=8",
+    "blocks=256,inline=8192,depth=4",
+    "blocks=64,inline=2048,depth=4",
+    "blocks=64,inline=8192,depth=4"
+  ],
+  "pareto_recommendations": {
+    "balanced_low_latency_candidate": "blocks=256,inline=2048,depth=8",
+    "higher_hit_knee_candidate": "blocks=128,inline=2048,depth=8",
+    "highest_hit_rate": [
+      "blocks=16,inline=2048,depth=4"
+    ],
+    "lowest_fragmentation": [
+      "blocks=256,inline=8192,depth=4"
+    ],
+    "lowest_host_latency": [
+      "blocks=256,inline=8192,depth=4"
+    ],
+    "lowest_retained_bytes": [
+      "blocks=256,inline=2048,depth=8"
+    ],
+    "most_recomputation_avoided": [
+      "blocks=16,inline=2048,depth=4"
+    ],
+    "selection_rule": "within 1.05x/2x minimum measured host latency, maximize hit rate, then minimize compactions and retained bytes"
+  },
+  "plane_budgets": {
+    "attention_kv": 362387865,
+    "attention_ring": 80530636,
+    "gdn_recurrent": 201326592,
+    "mtp_draft": 40265318,
+    "prompt_host": 40265318,
+    "qsa_summary": 80530636
+  },
+  "qwen4_geometry": {
+    "bytes_per_element": 2,
+    "full_attention_stride": 4,
+    "head_dim": 256,
+    "indexer_budget": 2048,
+    "indexer_compress_ratio": 4,
+    "indexer_head_dim": 128,
+    "indexer_kv_heads": 1,
+    "layers": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_value_heads": 48,
+    "mtp_layers": 1,
+    "num_kv_heads": 2
+  },
+  "raw_timings": {
+    "blocks=128,inline=2048,depth=4": {
+      "compression_cost_ms": [
+        7.567459,
+        7.552762,
+        7.552184
+      ],
+      "host_latency_ms": [
+        67.983083,
+        68.261208,
+        68.186292
+      ]
+    },
+    "blocks=128,inline=2048,depth=8": {
+      "compression_cost_ms": [
+        7.601055,
+        7.586104,
+        7.555816
+      ],
+      "host_latency_ms": [
+        68.225625,
+        68.230167,
+        68.343333
+      ]
+    },
+    "blocks=128,inline=8192,depth=4": {
+      "compression_cost_ms": [
+        7.333581,
+        7.422549,
+        7.458815
+      ],
+      "host_latency_ms": [
+        67.744667,
+        68.683,
+        68.867834
+      ]
+    },
+    "blocks=128,inline=8192,depth=8": {
+      "compression_cost_ms": [
+        7.39542,
+        7.336325,
+        7.527088
+      ],
+      "host_latency_ms": [
+        68.367375,
+        67.896292,
+        69.562583
+      ]
+    },
+    "blocks=16,inline=2048,depth=4": {
+      "compression_cost_ms": [
+        8.017084,
+        7.988372,
+        7.965819
+      ],
+      "host_latency_ms": [
+        2057.562584,
+        2068.256292,
+        2073.800834
+      ]
+    },
+    "blocks=16,inline=2048,depth=8": {
+      "compression_cost_ms": [
+        8.047756,
+        8.413721,
+        8.171192
+      ],
+      "host_latency_ms": [
+        2078.615708,
+        2134.886458,
+        2077.854625
+      ]
+    },
+    "blocks=16,inline=8192,depth=4": {
+      "compression_cost_ms": [
+        7.822933,
+        7.946702,
+        7.903784
+      ],
+      "host_latency_ms": [
+        2078.114125,
+        2082.582334,
+        2086.725167
+      ]
+    },
+    "blocks=16,inline=8192,depth=8": {
+      "compression_cost_ms": [
+        7.898315,
+        7.861695,
+        7.877413
+      ],
+      "host_latency_ms": [
+        2084.413333,
+        2087.160042,
+        2093.022417
+      ]
+    },
+    "blocks=256,inline=2048,depth=4": {
+      "compression_cost_ms": [
+        7.602757,
+        7.628589,
+        7.528575
+      ],
+      "host_latency_ms": [
+        37.639833,
+        37.501458,
+        37.203625
+      ]
+    },
+    "blocks=256,inline=2048,depth=8": {
+      "compression_cost_ms": [
+        7.640551,
+        7.520473,
+        7.516057
+      ],
+      "host_latency_ms": [
+        38.100125,
+        37.20625,
+        37.392958
+      ]
+    },
+    "blocks=256,inline=8192,depth=4": {
+      "compression_cost_ms": [
+        7.392036,
+        7.304792,
+        7.294324
+      ],
+      "host_latency_ms": [
+        37.108208,
+        36.900917,
+        37.023375
+      ]
+    },
+    "blocks=256,inline=8192,depth=8": {
+      "compression_cost_ms": [
+        7.371238,
+        7.322107,
+        7.337294
+      ],
+      "host_latency_ms": [
+        37.291,
+        36.835833,
+        37.086375
+      ]
+    },
+    "blocks=64,inline=2048,depth=4": {
+      "compression_cost_ms": [
+        7.67078,
+        7.579881,
+        7.629501
+      ],
+      "host_latency_ms": [
+        178.549042,
+        178.17,
+        178.638291
+      ]
+    },
+    "blocks=64,inline=2048,depth=8": {
+      "compression_cost_ms": [
+        7.698959,
+        7.710814,
+        7.616722
+      ],
+      "host_latency_ms": [
+        178.785833,
+        180.523417,
+        179.051542
+      ]
+    },
+    "blocks=64,inline=8192,depth=4": {
+      "compression_cost_ms": [
+        7.413435,
+        7.500033,
+        7.43253
+      ],
+      "host_latency_ms": [
+        178.044166,
+        178.684,
+        178.571375
+      ]
+    },
+    "blocks=64,inline=8192,depth=8": {
+      "compression_cost_ms": [
+        7.457504,
+        7.524387,
+        7.454585
+      ],
+      "host_latency_ms": [
+        178.610333,
+        180.905042,
+        179.714541
+      ]
+    }
+  },
+  "recompute_cost_model": {
+    "kind": "model-free eviction proxy",
+    "memory_bandwidth_bytes_per_us": 50000,
+    "warning": "not a measured GPU recomputation time"
+  },
+  "repetitions": 3,
+  "rows": [
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 805,
+      "compression_cost_ms": 7.988372,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 2570496,
+      "hit_rate": 0.4430741689251349,
+      "host_latency_ms": 2068.256292,
+      "label": "blocks=16,inline=2048,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 103,
+      "partial_hit_rate": 0.08940972222222222,
+      "recomputation_avoided_us": 498530.32983154606,
+      "retained_bytes": 579466728,
+      "segment_hits": 17820,
+      "segment_misses": 22399,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 477,
+      "compression_cost_ms": 8.171192,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 2570496,
+      "hit_rate": 0.4430741689251349,
+      "host_latency_ms": 2078.615708,
+      "label": "blocks=16,inline=2048,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 103,
+      "partial_hit_rate": 0.08940972222222222,
+      "recomputation_avoided_us": 498530.32983154606,
+      "retained_bytes": 579466728,
+      "segment_hits": 17820,
+      "segment_misses": 22399,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 802,
+      "compression_cost_ms": 7.903784,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 2513152,
+      "hit_rate": 0.430687911361846,
+      "host_latency_ms": 2082.582334,
+      "label": "blocks=16,inline=8192,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 102,
+      "partial_hit_rate": 0.08854166666666667,
+      "recomputation_avoided_us": 498366.5044715451,
+      "retained_bytes": 579499496,
+      "segment_hits": 16948,
+      "segment_misses": 22403,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 463,
+      "compression_cost_ms": 7.877413,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 2513152,
+      "hit_rate": 0.430687911361846,
+      "host_latency_ms": 2087.160042,
+      "label": "blocks=16,inline=8192,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 102,
+      "partial_hit_rate": 0.08854166666666667,
+      "recomputation_avoided_us": 498366.5044715451,
+      "retained_bytes": 579499496,
+      "segment_hits": 16948,
+      "segment_misses": 22403,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 768,
+      "compression_cost_ms": 7.629501,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 662016,
+      "hit_rate": 0.4398499855755361,
+      "host_latency_ms": 178.549042,
+      "label": "blocks=64,inline=2048,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 97,
+      "partial_hit_rate": 0.0842013888888889,
+      "recomputation_avoided_us": 494955.0590066634,
+      "retained_bytes": 576947560,
+      "segment_hits": 4574,
+      "segment_misses": 5825,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 384,
+      "compression_cost_ms": 7.698959,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 662016,
+      "hit_rate": 0.4398499855755361,
+      "host_latency_ms": 179.051542,
+      "label": "blocks=64,inline=2048,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 97,
+      "partial_hit_rate": 0.0842013888888889,
+      "recomputation_avoided_us": 494955.0590066634,
+      "retained_bytes": 576947560,
+      "segment_hits": 4574,
+      "segment_misses": 5825,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 768,
+      "compression_cost_ms": 7.43253,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 647680,
+      "hit_rate": 0.42869744192884446,
+      "host_latency_ms": 178.571375,
+      "label": "blocks=64,inline=8192,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 96,
+      "partial_hit_rate": 0.08333333333333333,
+      "recomputation_avoided_us": 494791.23364666273,
+      "retained_bytes": 576980328,
+      "segment_hits": 4374,
+      "segment_misses": 5829,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 384,
+      "compression_cost_ms": 7.457504,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 647680,
+      "hit_rate": 0.42869744192884446,
+      "host_latency_ms": 179.714541,
+      "label": "blocks=64,inline=8192,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 96,
+      "partial_hit_rate": 0.08333333333333333,
+      "recomputation_avoided_us": 494791.23364666273,
+      "retained_bytes": 576980328,
+      "segment_hits": 4374,
+      "segment_misses": 5829,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 768,
+      "compression_cost_ms": 7.552762,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 345088,
+      "hit_rate": 0.43767211308977416,
+      "host_latency_ms": 68.186292,
+      "label": "blocks=128,inline=2048,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 99,
+      "partial_hit_rate": 0.0859375,
+      "recomputation_avoided_us": 493409.28054000216,
+      "retained_bytes": 576939352,
+      "segment_hits": 2384,
+      "segment_misses": 3063,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 384,
+      "compression_cost_ms": 7.586104,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 345088,
+      "hit_rate": 0.43767211308977416,
+      "host_latency_ms": 68.230167,
+      "label": "blocks=128,inline=2048,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 99,
+      "partial_hit_rate": 0.0859375,
+      "recomputation_avoided_us": 493409.28054000216,
+      "retained_bytes": 576939352,
+      "segment_hits": 2384,
+      "segment_misses": 3063,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 768,
+      "compression_cost_ms": 7.422549,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 337920,
+      "hit_rate": 0.4281185903412269,
+      "host_latency_ms": 68.683,
+      "label": "blocks=128,inline=8192,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 98,
+      "partial_hit_rate": 0.08506944444444445,
+      "recomputation_avoided_us": 493245.4551800017,
+      "retained_bytes": 576972120,
+      "segment_hits": 2296,
+      "segment_misses": 3067,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 384,
+      "compression_cost_ms": 7.39542,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 337920,
+      "hit_rate": 0.4281185903412269,
+      "host_latency_ms": 68.367375,
+      "label": "blocks=128,inline=8192,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 98,
+      "partial_hit_rate": 0.08506944444444445,
+      "recomputation_avoided_us": 493245.4551800017,
+      "retained_bytes": 576972120,
+      "segment_hits": 2296,
+      "segment_misses": 3067,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 768,
+      "compression_cost_ms": 7.602757,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 190208,
+      "hit_rate": 0.42153947803105385,
+      "host_latency_ms": 37.501458,
+      "label": "blocks=256,inline=2048,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 86,
+      "partial_hit_rate": 0.07465277777777778,
+      "recomputation_avoided_us": 484603.11864000524,
+      "retained_bytes": 554632912,
+      "segment_hits": 1276,
+      "segment_misses": 1751,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 536850,
+      "bytes_before": 4564480,
+      "compactions": 384,
+      "compression_cost_ms": 7.520473,
+      "compression_ratio": 8.50233771071994,
+      "events": 1152,
+      "fragmentation_bytes": 190208,
+      "hit_rate": 0.42153947803105385,
+      "host_latency_ms": 37.392958,
+      "label": "blocks=256,inline=2048,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 86,
+      "partial_hit_rate": 0.07465277777777778,
+      "recomputation_avoided_us": 484603.11864000524,
+      "retained_bytes": 554632912,
+      "segment_hits": 1276,
+      "segment_misses": 1751,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 768,
+      "compression_cost_ms": 7.304792,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 186624,
+      "hit_rate": 0.4148049349783261,
+      "host_latency_ms": 37.023375,
+      "label": "blocks=256,inline=8192,depth=4",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 85,
+      "partial_hit_rate": 0.07378472222222222,
+      "recomputation_avoided_us": 484439.2932800049,
+      "retained_bytes": 554665680,
+      "segment_hits": 1244,
+      "segment_misses": 1755,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    },
+    {
+      "bytes_after": 641882,
+      "bytes_before": 4564480,
+      "compactions": 384,
+      "compression_cost_ms": 7.337294,
+      "compression_ratio": 7.111088954044513,
+      "events": 1152,
+      "fragmentation_bytes": 186624,
+      "hit_rate": 0.4148049349783261,
+      "host_latency_ms": 37.086375,
+      "label": "blocks=256,inline=8192,depth=8",
+      "mean_reuse_distance": 47.505208333333336,
+      "p95_reuse_distance": 91,
+      "partial_hit_events": 85,
+      "partial_hit_rate": 0.07378472222222222,
+      "recomputation_avoided_us": 484439.2932800049,
+      "retained_bytes": 554665680,
+      "segment_hits": 1244,
+      "segment_misses": 1755,
+      "shared_branch_bytes_avoided": 49468191120,
+      "trace_digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6"
+    }
+  ],
+  "schema": "qwen4-cache-segmentation-calibration-v1",
+  "scope": "CPU/model-free synthetic replay; no production default change",
+  "trace": {
+    "digest": "accc478e592961b027c36b898e137f079ea1f6e1d28f39623ea5d48dd4d43ac6",
+    "events": 1152,
+    "path": "results/qwen4-cache-segmentation-trace-20260910.json",
+    "seed": 427,
+    "sessions": 16,
+    "turns": 12
+  }
+}

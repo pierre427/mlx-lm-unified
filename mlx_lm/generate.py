@@ -3125,6 +3125,40 @@ class _PausedMTPGenerationLane:
     num_tokens: int
 
 
+def _segment_aware_live_tip_enabled(config: Optional[Mapping[str, Any]]) -> bool:
+    if config is None:
+        return False
+    from .segmented_self_mtp import segmented_self_mtp_enabled
+
+    explicit = config.get("segment_aware_live_tip") if (
+        "segment_aware_live_tip" in config
+    ) else None
+    return segmented_self_mtp_enabled(explicit)
+
+
+def _close_segmented_detached(detached: Any, *, release_cache: bool) -> None:
+    """Release a detached lane's ledger and, when discarded, COW owner pin."""
+
+    first_error = None
+    transaction = getattr(detached, "segment_transaction", None)
+    if transaction is not None:
+        try:
+            transaction.close()
+        except BaseException as error:
+            first_error = error
+        detached.segment_transaction = None
+    if release_cache:
+        close_target = getattr(detached.caches.target, "close", None)
+        if callable(close_target):
+            try:
+                close_target()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
+
+
 class MTPGenerationBatch:
     """Scheduler wrapper for Agent A's batched self-MTP transaction."""
 
@@ -3138,6 +3172,7 @@ class MTPGenerationBatch:
         stop_matchers: Sequence[StopSequenceMatcher],
         *,
         prepared_caches: Optional[Any] = None,
+        segmented_live_tip: bool = False,
         mtp_admission: Optional[
             Callable[
                 [Sequence[Tuple[int, int, int, bool, float]]],
@@ -3152,13 +3187,26 @@ class MTPGenerationBatch:
 
         from .hybrid_speculative import (
             BatchedSelfMTPState,
+            SegmentedSelfMTPState,
             SelfMTPCachePair,
             attach_prebatched_self_mtp_lanes,
+            attach_segmented_self_mtp_lanes,
             attach_self_mtp_lanes,
         )
 
         self.model = model
-        if prepared_caches is not None:
+        self.segmented_live_tip = bool(segmented_live_tip)
+        if self.segmented_live_tip and prepared_caches is not None:
+            raise ValueError("segmented B1 state cannot accept a physical B2 cache")
+        if self.segmented_live_tip:
+            self.state = (
+                attach_segmented_self_mtp_lanes(
+                    model, None, list(detached_lanes)
+                )
+                if detached_lanes
+                else SegmentedSelfMTPState([], [], [], 0)
+            )
+        elif prepared_caches is not None:
             if not isinstance(prepared_caches, SelfMTPCachePair):
                 raise TypeError("prepared_caches must be a SelfMTPCachePair")
             self.state = attach_prebatched_self_mtp_lanes(
@@ -3185,14 +3233,27 @@ class MTPGenerationBatch:
 
     @property
     def prompt_cache(self):
+        if self.segmented_live_tip:
+            return [
+                cache
+                for pair in self.state.row_caches
+                for cache in pair.target
+            ]
         return self.state.caches.target
 
     @property
     def cache_nbytes(self):
-        total = sum(
-            cache.nbytes
-            for cache in self.state.caches.target + self.state.caches.draft
-        )
+        if self.segmented_live_tip:
+            total = sum(
+                cache.nbytes
+                for pair in self.state.row_caches
+                for cache in pair.target + pair.draft
+            )
+        else:
+            total = sum(
+                cache.nbytes
+                for cache in self.state.caches.target + self.state.caches.draft
+            )
         total += sum(
             cache.nbytes
             for paused in self._paused.values()
@@ -3216,23 +3277,36 @@ class MTPGenerationBatch:
         return [int(token) for token in values]
 
     def mtp_cycle_state(self):
-        active_bytes = sum(
-            cache.nbytes
-            for cache in self.state.caches.target + self.state.caches.draft
-        )
-        active_cache_gib = (
-            active_bytes / max(len(self.state.lanes), 1) / float(1 << 30)
-        )
-        rows = [
-            (
-                lane.uid,
-                len(self._prefix_tokens(lane)) + 1,
-                lane.num_draft,
-                True,
-                active_cache_gib,
+        if self.segmented_live_tip:
+            rows = [
+                (
+                    lane.uid,
+                    len(self._prefix_tokens(lane)) + 1,
+                    lane.num_draft,
+                    True,
+                    sum(cache.nbytes for cache in pair.target + pair.draft)
+                    / float(1 << 30),
+                )
+                for lane, pair in zip(self.state.lanes, self.state.row_caches)
+            ]
+        else:
+            active_bytes = sum(
+                cache.nbytes
+                for cache in self.state.caches.target + self.state.caches.draft
             )
-            for lane in self.state.lanes
-        ]
+            active_cache_gib = (
+                active_bytes / max(len(self.state.lanes), 1) / float(1 << 30)
+            )
+            rows = [
+                (
+                    lane.uid,
+                    len(self._prefix_tokens(lane)) + 1,
+                    lane.num_draft,
+                    True,
+                    active_cache_gib,
+                )
+                for lane in self.state.lanes
+            ]
         rows.extend(
             (
                 uid,
@@ -3309,7 +3383,10 @@ class MTPGenerationBatch:
     def _attach_packages(self, packages: Sequence[_PausedMTPGenerationLane]):
         if not packages:
             return
-        from .hybrid_speculative import attach_self_mtp_lanes
+        from .hybrid_speculative import (
+            attach_segmented_self_mtp_lanes,
+            attach_self_mtp_lanes,
+        )
 
         if self.state.lanes:
             depths = {lane.num_draft for lane in self.state.lanes}
@@ -3318,7 +3395,12 @@ class MTPGenerationBatch:
             depth = depths.pop()
             for package in packages:
                 package.detached.lane.num_draft = depth
-        self.state = attach_self_mtp_lanes(
+        attach = (
+            attach_segmented_self_mtp_lanes
+            if self.segmented_live_tip
+            else attach_self_mtp_lanes
+        )
+        self.state = attach(
             self.model, self.state, [package.detached for package in packages]
         )
         self.stop_matchers.extend(package.stop_matcher for package in packages)
@@ -3356,9 +3438,31 @@ class MTPGenerationBatch:
         ready, self._plain_ready = self._plain_ready, []
         return ready
 
+    def close(self):
+        first_error = None
+        if self.segmented_live_tip:
+            from .hybrid_speculative import close_segmented_self_mtp_state
+
+            try:
+                close_segmented_self_mtp_state(self.state)
+            except BaseException as error:
+                first_error = error
+        for package in [*self._paused.values(), *self._plain_ready]:
+            try:
+                _close_segmented_detached(package.detached, release_cache=True)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        self._paused.clear()
+        self._plain_ready.clear()
+        if first_error is not None:
+            raise first_error
+
     def extend(self, batch):
         if not isinstance(batch, MTPGenerationBatch):
             raise TypeError("MTPGenerationBatch can extend only another MTP batch")
+        if self.segmented_live_tip != batch.segmented_live_tip:
+            raise ValueError("cannot mix segmented and physical self-MTP batches")
         packages = batch._detach_packages(range(len(batch)))
         packages.extend(batch._paused.values())
         batch._paused.clear()
@@ -3387,7 +3491,8 @@ class MTPGenerationBatch:
     def filter(self, keep: List[int]):
         keep = sorted(set(keep))
         drop = [i for i in range(len(self)) if i not in set(keep)]
-        self._detach_packages(drop)
+        for package in self._detach_packages(drop):
+            _close_segmented_detached(package.detached, release_cache=True)
 
     def extract_uid(self, uid: int):
         if uid in self.uids:
@@ -3401,9 +3506,13 @@ class MTPGenerationBatch:
     def remove_uids(self, uids):
         requested = set(uids)
         drop = [i for i, uid in enumerate(self.uids) if uid in requested]
-        self._detach_packages(drop)
+        packages = self._detach_packages(drop)
+        for package in packages:
+            _close_segmented_detached(package.detached, release_cache=True)
         for uid in requested:
-            self._paused.pop(uid, None)
+            package = self._paused.pop(uid, None)
+            if package is not None:
+                _close_segmented_detached(package.detached, release_cache=True)
 
     @staticmethod
     def _finish_reason(
@@ -3438,12 +3547,17 @@ class MTPGenerationBatch:
                 / max(int(lane.stats.draft_proposed), 1)
             )
             response.mtp_receipt = {
-                "route": "continuous_batched_self_mtp",
+                "route": (
+                    "segmented_b1_self_mtp"
+                    if self.segmented_live_tip
+                    else "continuous_batched_self_mtp"
+                ),
                 "num_draft": int(lane.num_draft),
                 "accept_rule": str(lane.accept_rule),
                 "sampling_temperature": float(lane.sampling_temp),
                 "stats": stats,
             }
+            _close_segmented_detached(package.detached, release_cache=False)
 
     def _emit_initial(self):
         responses = []
@@ -3544,8 +3658,21 @@ class MTPGenerationBatch:
         return responses
 
     @classmethod
-    def empty(cls, model, *, mtp_admission=None):
-        return cls(model, [], [], [], mtp_admission=mtp_admission)
+    def empty(
+        cls,
+        model,
+        *,
+        mtp_admission=None,
+        segmented_live_tip: bool = False,
+    ):
+        return cls(
+            model,
+            [],
+            [],
+            [],
+            mtp_admission=mtp_admission,
+            segmented_live_tip=segmented_live_tip,
+        )
 
 
 class BatchGenerator:
@@ -3727,7 +3854,9 @@ class BatchGenerator:
             self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
         else:
             self._generation_batch = MTPGenerationBatch.empty(
-                self.model, mtp_admission=self.mtp_admission
+                self.model,
+                mtp_admission=self.mtp_admission,
+                segmented_live_tip=_segment_aware_live_tip_enabled(self.self_mtp),
             )
         self._plain_fallback_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
@@ -3764,6 +3893,9 @@ class BatchGenerator:
             mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
+        generation_batch = getattr(self, "_generation_batch", None)
+        if isinstance(generation_batch, MTPGenerationBatch):
+            generation_batch.close()
 
     def __del__(self):
         self.close()
@@ -4092,6 +4224,7 @@ class BatchGenerator:
                 initial,
                 stop_matchers,
                 mtp_admission=self.mtp_admission,
+                segmented_live_tip=_segment_aware_live_tip_enabled(self.self_mtp),
             ),
             progress,
         )
@@ -4159,9 +4292,13 @@ class BatchGenerator:
                     response.rng_draws = (
                         lane.rng.draws if lane.rng is not None else 0
                     )
+                    _close_segmented_detached(
+                        package.detached, release_cache=False
+                    )
                     continue
             remaining = lane.max_tokens - lane.ntoks
             if remaining <= 0:
+                _close_segmented_detached(package.detached, release_cache=True)
                 continue
             plain = GenerationBatch(
                 self.model,
@@ -4177,6 +4314,7 @@ class BatchGenerator:
             )
             plain._matcher_states[0] = matcher_state
             self._plain_fallback_batch.extend(plain)
+            _close_segmented_detached(package.detached, release_cache=True)
         return responses
 
     def mtp_cycle_state(self):
@@ -4574,6 +4712,10 @@ class BatchGenerator:
             self.completion_batch_size - occupied,
             len(self._unprocessed_sequences),
         )
+        if _segment_aware_live_tip_enabled(self.self_mtp):
+            # This first production gate is deliberately N=2. Keep dynamic
+            # admission from silently growing a wider independent-B1 cohort.
+            n = min(n, max(0, 2 - occupied))
         n = self._budget_admissible(n)
         n = self._admit_mtp_joining(n)
         if n > 0:
@@ -4818,8 +4960,15 @@ class ParallelSampleGenerator:
                 prepare_self_mtp_lane,
             )
 
+            segmented_requested = _segment_aware_live_tip_enabled(config)
+            if segmented_requested and n != 2:
+                raise ValueError(
+                    "segment-aware live-tip self-MTP is qualified only for N=2"
+                )
             fanout_requested = bool(config.get("gdn_prefix_fanout", False))
-            fanout_candidate = fanout_requested and n == 2
+            fanout_candidate = (
+                fanout_requested and n == 2 and not segmented_requested
+            )
             if fanout_requested:
                 from .gdn_prefix_fanout import _note_serving_event
 
@@ -4942,33 +5091,55 @@ class ParallelSampleGenerator:
                     matchers,
                     prepared_caches=prepared_caches,
                     mtp_admission=mtp_admission,
+                    segmented_live_tip=segmented_requested,
                 )
                 if prepared_caches is not None:
                     _note_serving_event("engaged")
             except Exception as error:
-                if prepared_caches is None:
-                    raise
-                logging.warning(
-                    "GDN prefix fan-out attach declined; rebuilding through "
-                    "the ordinary self-MTP merge: %s",
-                    error,
-                )
-                _note_serving_event("declined_error")
-                fallback_lanes = [canonical]
-                for lane in lanes[1:]:
-                    fallback_lanes.append(
-                        DetachedSelfMTPLane(
-                            lane=lane.lane,
-                            caches=copy.deepcopy(canonical.caches),
-                        )
+                if segmented_requested:
+                    from .segmented_self_mtp import note_segmented_self_mtp
+
+                    logging.warning(
+                        "Segment-aware B1 self-MTP declined; rebuilding through "
+                        "the ordinary physical batch: %s",
+                        error,
                     )
-                generation_batch = MTPGenerationBatch(
-                    model,
-                    fallback_lanes,
-                    first_outputs,
-                    matchers,
-                    mtp_admission=mtp_admission,
-                )
+                    note_segmented_self_mtp("declined")
+                    note_segmented_self_mtp("failures")
+                    note_segmented_self_mtp("fallback_physical_b2")
+                    note_segmented_self_mtp("physical_b2_formations")
+                    generation_batch = MTPGenerationBatch(
+                        model,
+                        lanes,
+                        first_outputs,
+                        matchers,
+                        mtp_admission=mtp_admission,
+                        segmented_live_tip=False,
+                    )
+                elif prepared_caches is None:
+                    raise
+                else:
+                    logging.warning(
+                        "GDN prefix fan-out attach declined; rebuilding through "
+                        "the ordinary self-MTP merge: %s",
+                        error,
+                    )
+                    _note_serving_event("declined_error")
+                    fallback_lanes = [canonical]
+                    for lane in lanes[1:]:
+                        fallback_lanes.append(
+                            DetachedSelfMTPLane(
+                                lane=lane.lane,
+                                caches=copy.deepcopy(canonical.caches),
+                            )
+                        )
+                    generation_batch = MTPGenerationBatch(
+                        model,
+                        fallback_lanes,
+                        first_outputs,
+                        matchers,
+                        mtp_admission=mtp_admission,
+                    )
             self._generator._generation_batch = generation_batch
             uids = list(range(n))
         self._index = {uid: i for i, uid in enumerate(uids)}

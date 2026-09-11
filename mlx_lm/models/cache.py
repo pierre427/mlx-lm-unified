@@ -5512,6 +5512,43 @@ def _mark_prompt_cache_restored(prompt_cache):
 
 
 def _copy_prompt_cache_for_restore(prompt_cache):
+    # Keep the legacy function as the one restoration seam. Automatic APC can
+    # store a descriptor-only COW source while disk caches and the default
+    # configuration retain the historical deepcopy behavior.
+    if not getattr(prompt_cache, "_cow_frozen", False):
+        restored = copy.deepcopy(prompt_cache)
+        _mark_prompt_cache_restored(restored)
+        return restored
+    try:
+        from ..cow_cache import (
+            COWCacheStale,
+            COWFrozenPromptCache,
+            record_fallback_deepcopy,
+            restore_prompt_cache,
+        )
+    except ImportError:
+        COWFrozenPromptCache = ()
+    if isinstance(prompt_cache, COWFrozenPromptCache):
+        started = __import__("time").perf_counter_ns()
+        telemetry = prompt_cache.cow_owner.telemetry
+        try:
+            restored = restore_prompt_cache(prompt_cache)
+        except COWCacheStale:
+            raise
+        except Exception:
+            # A concurrent invalidation or unsupported late object falls back
+            # to the already-frozen Python graph. Converting to list prevents
+            # deepcopy from invoking the branch protocol recursively.
+            restored = copy.deepcopy(list(prompt_cache))
+            record_fallback_deepcopy(
+                prompt_cache,
+                telemetry,
+                __import__("time").perf_counter_ns() - started,
+            )
+        _mark_prompt_cache_restored(restored)
+        return restored
+    # A falsely-marked third-party list is not a COW source. Preserve the
+    # historical behavior rather than importing a protocol it did not join.
     restored = copy.deepcopy(prompt_cache)
     _mark_prompt_cache_restored(restored)
     return restored

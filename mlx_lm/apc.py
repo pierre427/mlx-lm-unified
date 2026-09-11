@@ -13,11 +13,25 @@ copy-on-write sharing.
 from __future__ import annotations
 
 import copy
+import threading
 from dataclasses import dataclass
 from typing import Any, Hashable, Iterable, List, Optional
 
 import mlx.core as mx
 
+from .cow_cache import (
+    COWCacheStale,
+    COWCacheTelemetry,
+    COWFrozenPromptCache,
+    COWPromptCacheBranch,
+    cow_cache_enabled,
+    freeze_prompt_cache,
+)
+from .cache_planes import (
+    CompiledScheduleMetadata,
+    PLEResidencyHints,
+    PromptHostPlane,
+)
 from .models.cache import (
     _copy_prompt_cache_for_restore,
     _mark_prompt_cache_restored,
@@ -73,6 +87,8 @@ class APCLookup:
     miss_reason: Optional[str]
     native: Any = None
     sidecar: Any = None
+    prep_telemetry: Any = None
+    prompt_host: Optional[PromptHostPlane] = None
 
 
 @dataclass
@@ -173,8 +189,17 @@ class AutomaticPrefixCache(LRUPromptCache):
 
     _STAT_KEYS = ("lookups", "hits", "misses", "cached_tokens", "stores")
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        *,
+        cow_branching: Optional[bool] = None,
+    ):
         super().__init__(max_size=max_size, max_bytes=max_bytes)
+        self._apc_lock = threading.RLock()
+        self._cow_branching = cow_cache_enabled(cow_branching)
+        self._cow_telemetry = COWCacheTelemetry()
         self._apc_stats = {key: 0 for key in self._STAT_KEYS}
         # Totals for the whole process. ``_apc_stats`` counts only the entries
         # the live cache could still serve, so it restarts at every clear.
@@ -201,6 +226,13 @@ class AutomaticPrefixCache(LRUPromptCache):
         )
 
     def lookup(self, key: Hashable, tokens: Iterable[int]) -> APCLookup:
+        # Search, candidate selection, restoration, and hit accounting must
+        # observe one trie generation. clear()/trim_to()/store() use the same
+        # lock, so a live reader gets either the old hit or the new miss.
+        with self._apc_lock:
+            return self._lookup_locked(key, tokens)
+
+    def _lookup_locked(self, key: Hashable, tokens: Iterable[int]) -> APCLookup:
         tokens = [int(token) for token in tokens]
         trie_result = self._trie.search(key, tokens)
         # A target cache may only compose with an MTP sidecar at the exact
@@ -242,21 +274,61 @@ class AutomaticPrefixCache(LRUPromptCache):
             covered, entry, sidecar = max(
                 sidecar_candidates, key=lambda item: item[0]
             )
+            try:
+                restored_cache = _copy_prompt_cache_for_restore(
+                    entry.prompt_cache
+                )
+            except COWCacheStale:
+                self._apc_stats["lookups"] += 1
+                self._apc_stats["misses"] += 1
+                return APCLookup(
+                    None,
+                    tokens,
+                    0,
+                    False,
+                    None,
+                    "stale_cow_generation",
+                )
             self._apc_stats["lookups"] += 1
             self._apc_stats["hits"] += 1
             self._apc_stats["cached_tokens"] += covered
-            restored_sidecar = copy.deepcopy(sidecar)
-            _mark_prompt_cache_restored(restored_sidecar.state[0])
-            return APCLookup(
-                _copy_prompt_cache_for_restore(entry.prompt_cache),
-                tokens[covered:],
-                covered,
-                True,
-                "mtp_sidecar",
-                None,
-                sidecar=restored_sidecar,
-            )
-        cache, remaining = super().fetch_nearest_cache(key, tokens)
+            restored_sidecar = getattr(restored_cache, "cow_sidecar", None)
+            if (
+                isinstance(restored_cache, COWPromptCacheBranch)
+                and restored_sidecar is None
+            ):
+                # The target plane remains reusable when only the MTP plane
+                # was invalidated. Drop this provisional sidecar-path branch
+                # and retry below through the ordinary target-only lookup.
+                restored_cache.close()
+            else:
+                if restored_sidecar is None:
+                    restored_sidecar = copy.deepcopy(sidecar)
+                _mark_prompt_cache_restored(restored_sidecar.state[0])
+                return APCLookup(
+                    restored_cache,
+                    tokens[covered:],
+                    covered,
+                    True,
+                    "mtp_sidecar",
+                    None,
+                    sidecar=restored_sidecar,
+                    prep_telemetry=getattr(
+                        restored_cache, "cow_prep_telemetry", None
+                    ),
+                    prompt_host=getattr(
+                        getattr(restored_cache, "cow_metadata", None),
+                        "prompt_host",
+                        None,
+                    ),
+                )
+        try:
+            cache, remaining = super().fetch_nearest_cache(key, tokens)
+        except COWCacheStale:
+            cache, remaining = None, tokens
+            stale_generation = True
+        else:
+            stale_generation = False
         cached_tokens = len(tokens) - len(remaining) if cache is not None else 0
         hit = cache is not None and cached_tokens > 0
 
@@ -273,18 +345,32 @@ class AutomaticPrefixCache(LRUPromptCache):
                 trie_result.longer is not None
                 and trie_result.common_prefix > short_length
             )
-            reason = (
-                "untrimmable_branch"
-                if has_unusable_branch
-                else "no_compatible_prefix"
-            )
+            if stale_generation:
+                reason = "stale_cow_generation"
+            else:
+                reason = (
+                    "untrimmable_branch"
+                    if has_unusable_branch
+                    else "no_compatible_prefix"
+                )
         elif trie_result.exact is not None:
             kind = "exact"
             reason = None
         else:
             kind = "prefix"
             reason = None
-        return APCLookup(cache, remaining, cached_tokens, hit, kind, reason)
+        return APCLookup(
+            cache,
+            remaining,
+            cached_tokens,
+            hit,
+            kind,
+            reason,
+            prep_telemetry=getattr(cache, "cow_prep_telemetry", None),
+            prompt_host=getattr(
+                getattr(cache, "cow_metadata", None), "prompt_host", None
+            ),
+        )
 
     def store(
         self,
@@ -294,17 +380,85 @@ class AutomaticPrefixCache(LRUPromptCache):
         *,
         cache_type: str = "assistant",
         sidecar: Any = None,
+        prompt_host: Optional[PromptHostPlane] = None,
+        ple_hints: Optional[PLEResidencyHints] = None,
+        compiled_schedule: Optional[CompiledScheduleMetadata] = None,
     ) -> APCCapabilities:
+        with self._apc_lock:
+            return self._store_locked(
+                key,
+                tokens,
+                prompt_cache,
+                cache_type=cache_type,
+                sidecar=sidecar,
+                prompt_host=prompt_host,
+                ple_hints=ple_hints,
+                compiled_schedule=compiled_schedule,
+            )
+
+    def _store_locked(
+        self,
+        key: Hashable,
+        tokens: Iterable[int],
+        prompt_cache: List[Any],
+        *,
+        cache_type: str = "assistant",
+        sidecar: Any = None,
+        prompt_host: Optional[PromptHostPlane] = None,
+        ple_hints: Optional[PLEResidencyHints] = None,
+        compiled_schedule: Optional[CompiledScheduleMetadata] = None,
+    ) -> APCCapabilities:
+        tokens = [int(token) for token in tokens]
         capabilities = inspect_apc_capabilities(prompt_cache)
         if not capabilities.exact_prefix:
             return capabilities
+        if self._cow_branching:
+            try:
+                prompt_cache, sidecar = freeze_prompt_cache(
+                    prompt_cache,
+                    key=key,
+                    tokens=tokens,
+                    cache_type=cache_type,
+                    sidecar=sidecar,
+                    prompt_host=prompt_host,
+                    ple_hints=ple_hints,
+                    compiled_schedule=compiled_schedule,
+                    telemetry=self._cow_telemetry,
+                )
+            except Exception:
+                # Product safety is the incumbent behavior. An unsupported
+                # cache-local field must not turn a valid store into a serving
+                # failure.
+                self._cow_telemetry.add("freeze_failures")
+        cow_source = (
+            prompt_cache
+            if isinstance(prompt_cache, COWFrozenPromptCache)
+            else None
+        )
+        before = (
+            {id(entry): entry for entry in _iter_trie_entries(self._trie)}
+            if self._cow_branching
+            else {}
+        )
         super().insert_cache(
             key,
-            [int(token) for token in tokens],
+            tokens,
             prompt_cache,
             cache_type=cache_type,
             sidecar=sidecar,
         )
+        if before or cow_source is not None:
+            live_entries = list(_iter_trie_entries(self._trie))
+            live = {id(entry) for entry in live_entries}
+            for ident, entry in before.items():
+                if ident not in live and isinstance(
+                    entry.prompt_cache, COWFrozenPromptCache
+                ):
+                    entry.prompt_cache.close()
+            if cow_source is not None and not any(
+                entry.prompt_cache is cow_source for entry in live_entries
+            ):
+                cow_source.close()
         self._apc_stats["stores"] += 1
         return capabilities
 
@@ -320,6 +474,9 @@ class AutomaticPrefixCache(LRUPromptCache):
         *,
         cache_type: str = "assistant",
         sidecar: Any = None,
+        prompt_host: Optional[PromptHostPlane] = None,
+        ple_hints: Optional[PLEResidencyHints] = None,
+        compiled_schedule: Optional[CompiledScheduleMetadata] = None,
     ):
         return self.store(
             model,
@@ -327,6 +484,9 @@ class AutomaticPrefixCache(LRUPromptCache):
             prompt_cache,
             cache_type=cache_type,
             sidecar=sidecar,
+            prompt_host=prompt_host,
+            ple_hints=ple_hints,
+            compiled_schedule=compiled_schedule,
         )
 
     def clear(self, *, release_memory: bool = True) -> dict:
@@ -343,6 +503,10 @@ class AutomaticPrefixCache(LRUPromptCache):
         request that is already generating from storing its own result
         afterwards; drain first when that matters.
         """
+        with self._apc_lock:
+            return self._clear_locked(release_memory=release_memory)
+
+    def _clear_locked(self, *, release_memory: bool = True) -> dict:
         entries = list(_iter_trie_entries(self._trie))
         report = {
             "entries": len(entries),
@@ -358,6 +522,12 @@ class AutomaticPrefixCache(LRUPromptCache):
         self._lru = fresh_lru
         self._n_bytes = 0
         self._n_bytes_by_type = {key: 0 for key in fresh_lru._ordering}
+
+        # Invalidate COW generations before detaching their source lists. Live
+        # branches pin descriptors until explicit or GC release.
+        for entry in entries:
+            if isinstance(entry.prompt_cache, COWFrozenPromptCache):
+                entry.prompt_cache.close()
 
         # Release the arrays the detached entries still hold. Rebind, never
         # mutate in place: a caller may hold the same list.
@@ -378,12 +548,35 @@ class AutomaticPrefixCache(LRUPromptCache):
 
     @property
     def apc_stats(self):
-        stats = dict(self._apc_stats)
-        stats["clears"] = self._apc_clears
-        stats["lifetime"] = dict(self._apc_lifetime)
-        for key in self._STAT_KEYS:
-            stats["lifetime"][key] += self._apc_stats[key]
-        return stats
+        with self._apc_lock:
+            stats = dict(self._apc_stats)
+            stats["clears"] = self._apc_clears
+            stats["lifetime"] = dict(self._apc_lifetime)
+            for key in self._STAT_KEYS:
+                stats["lifetime"][key] += self._apc_stats[key]
+            stats["cow_enabled"] = self._cow_branching
+            stats["cow"] = self._cow_telemetry.snapshot()
+            return stats
+
+    def trim_to(
+        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
+    ):
+        with self._apc_lock:
+            return self._trim_to_locked(
+                n_sequences=n_sequences, n_bytes=n_bytes
+            )
+
+    def _trim_to_locked(
+        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
+    ):
+        before = {id(entry): entry for entry in _iter_trie_entries(self._trie)}
+        super().trim_to(n_sequences=n_sequences, n_bytes=n_bytes)
+        live = {id(entry) for entry in _iter_trie_entries(self._trie)}
+        for ident, entry in before.items():
+            if ident not in live and isinstance(
+                entry.prompt_cache, COWFrozenPromptCache
+            ):
+                entry.prompt_cache.close()
 
 
 # Short public spelling for server integrations.
