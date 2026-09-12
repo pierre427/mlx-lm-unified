@@ -1108,6 +1108,45 @@ def test_private_delta_late_decline_consumes_existing_selection_once(monkeypatch
     }
 
 
+def test_segmented_qsa_zero_length_row_uses_pre_o_width():
+    from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+    from mlx_lm.segmented_batch_cache import SegmentedBatchQSAKVCache
+
+    model = _tiny_qwen4_model()
+    source_attention = model.language_model.model.layers[1].self_attn
+    rows = [
+        QSAKVCache(source_attention.indexer.summary_identity),
+        QSAKVCache(source_attention.indexer.summary_identity),
+    ]
+
+    class WiderPreOAttention:
+        num_heads = 3
+        head_dim = 16
+
+        def _project_segmented_qsa(self, hidden):
+            return (hidden, hidden, hidden, hidden)
+
+        def __call__(self, hidden, _mask, _cache, *, _projected, _return_pre_o):
+            assert _return_pre_o
+            shape = (*hidden.shape[:-1], self.num_heads * self.head_dim)
+            return mx.ones(shape, hidden.dtype), mx.zeros(shape, hidden.dtype)
+
+        @staticmethod
+        def o_proj(value):
+            return value
+
+    segmented = SegmentedBatchQSAKVCache(rows, shared_qsa_prefix=False)
+    segmented.prepare(lengths=[3, 0], right_padding=[0, 3])
+    hidden = mx.random.normal((2, 3, 32), key=mx.random.key(1001))
+    actual = segmented.segmented_attention(WiderPreOAttention(), hidden, None)
+    mx.eval(actual)
+
+    assert actual.shape == (2, 3, 48)
+    assert mx.allclose(actual[0], mx.full((3, 48), 0.5)).item()
+    assert mx.array_equal(actual[1], mx.zeros((3, 48))).item()
+
+
 def test_exact_set_preflight_decline_uses_proven_private_path(monkeypatch):
     from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
     from mlx_lm.models.qwen4_exp import QSAKVCache

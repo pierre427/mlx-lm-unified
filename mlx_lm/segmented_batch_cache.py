@@ -253,8 +253,17 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         gates = []
         for index, (row, valid) in enumerate(zip(self.rows, self._step_lengths)):
             if valid == 0:
-                outputs.append(mx.zeros_like(hidden[index : index + 1]))
-                gates.append(mx.zeros_like(hidden[index : index + 1]))
+                # QSA's pre-o projection width is num_heads * head_dim and is
+                # not necessarily the model hidden width (Flash-Next is
+                # 6144 versus 2560).  A retired/ragged row still has to occupy
+                # that pre-o shape so it can concatenate with active rows.
+                pre_o_shape = (
+                    1,
+                    width,
+                    int(attention.num_heads) * int(attention.head_dim),
+                )
+                outputs.append(mx.zeros(pre_o_shape, dtype=hidden.dtype))
+                gates.append(mx.zeros(pre_o_shape, dtype=hidden.dtype))
                 continue
             row_hidden = hidden[index : index + 1, :valid]
             row_mask = row.make_mask(
