@@ -5,6 +5,7 @@ import pytest
 from benchmarks.qwen4_live_tip_branch_gate import (
     ARMS,
     BRANCH_MODES,
+    _cache_geometry,
     arm_order,
     build_plan,
     _token_digest,
@@ -74,6 +75,25 @@ def test_arm_order_counterbalances():
 
 def test_prefix_attestation_digest_is_order_sensitive():
     assert _token_digest([[1, 2], [3]]) != _token_digest([[2, 1], [3]])
+
+
+def test_cache_geometry_accepts_segmented_compute_view():
+    class Cache:
+        nbytes = 7
+        keys = None
+        values = None
+
+    class Pair:
+        target = [Cache()]
+        draft = [Cache()]
+
+    class SegmentedState:
+        _segmented_caches = Pair()
+
+    geometry = _cache_geometry(SegmentedState())
+    assert geometry["target"][0]["type"] == "Cache"
+    assert geometry["target"][0]["nbytes"] == 7
+    assert geometry["draft"][0]["type"] == "Cache"
 
 
 @pytest.mark.parametrize(

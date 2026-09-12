@@ -173,15 +173,23 @@ def _mlx_memory(mx: Any) -> dict[str, int]:
 
 
 def _cache_geometry(batch: Any) -> dict[str, Any]:
-    """Host-only structural fingerprint of the steady physical cache."""
+    """Host-only structural fingerprint of the steady cache representation."""
 
     def shape(value):
         return None if value is None else list(value.shape)
 
+    cache_pair = getattr(batch, "caches", None)
+    if cache_pair is None:
+        cache_pair = getattr(batch, "_segmented_caches", None)
+    if cache_pair is None:
+        raise TypeError(
+            f"{type(batch).__name__} exposes neither physical nor segmented caches"
+        )
+
     result = {}
     for name, caches in (
-        ("target", batch.caches.target),
-        ("draft", batch.caches.draft),
+        ("target", cache_pair.target),
+        ("draft", cache_pair.draft),
     ):
         layers = []
         for cache in caches:
