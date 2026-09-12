@@ -25,6 +25,9 @@ def args(**overrides):
         reps=3,
         prefill_step_size=512,
         cooldown_seconds=0.0,
+        minimum_system_free_percent=25,
+        maximum_swap_growth_mb=16.0,
+        max_drift=0.05,
         seed=20260910,
         share_qsa_indices=True,
         out="unused.json",
@@ -58,6 +61,11 @@ def test_plan_is_paired_rotated_and_model_free():
         {"num_draft": 0, "share_qsa_indices": False},
         {"reps": 0},
         {"cooldown_seconds": -1.0},
+        {"minimum_system_free_percent": -1},
+        {"minimum_system_free_percent": 101},
+        {"maximum_swap_growth_mb": -1},
+        {"max_drift": -0.1},
+        {"max_drift": 1.1},
     ],
 )
 def test_plan_refuses_invalid_schedule(overrides):
@@ -109,3 +117,18 @@ def test_token_id_padding_preserves_stable_suffix():
         FakeTokenizer(), [1, 2, 10, 11], [1, 2, 3, 10, 11], 6
     )
     assert result == [1, 2, 7, 7, 10, 11]
+
+
+def test_system_guard_parsers_and_thresholds():
+    snapshot = {
+        "memory_pressure": {"stdout": "System-wide memory free percentage: 42%"},
+        "swapusage": {"stdout": "total = 8.00G used = 1.50G free = 6.50G"},
+        "pmset_therm": {
+            "returncode": 0,
+            "stdout": "Note: No thermal warning level has been recorded",
+        },
+    }
+    assert MODULE.free_percent(snapshot) == 42
+    assert MODULE.swap_bytes(snapshot) == int(1.5 * 1024**3)
+    assert MODULE.thermal_healthy(snapshot)
+    MODULE.require_system_guard(snapshot, args())

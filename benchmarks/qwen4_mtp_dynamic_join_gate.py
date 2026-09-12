@@ -8,10 +8,11 @@ with a subset of lanes and attaches the remainder at a deterministic cycle
 boundary. Promotion requires exact per-request token IDs across schedules and
 direct evidence that shared QSA was both requested and reused after the join.
 
-This runner does not manage a service, GPU lease, or thermal cooldown. The
-operator owns those boundaries. The aggregate throughput clock excludes the
-identical sequential prefill phase so it measures the continuous transaction;
-the receipt also records prefill and total wall time separately.
+The operator owns the external GPU lease. The runner itself enforces cooldown,
+thermal, free-memory, swap-growth, drift, and segmented-ownership gates. The
+aggregate throughput clock excludes the identical sequential prefill phase so
+it measures the continuous transaction; the receipt also records prefill and
+total wall time separately.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import statistics
 import subprocess
 import time
@@ -97,6 +99,49 @@ def system_snapshot() -> dict[str, Any]:
     return result
 
 
+def free_percent(snapshot: dict[str, Any]) -> int | None:
+    match = re.search(
+        r"System-wide memory free percentage:\s*(\d+)%",
+        snapshot["memory_pressure"]["stdout"],
+    )
+    return None if match is None else int(match.group(1))
+
+
+def swap_bytes(snapshot: dict[str, Any]) -> int | None:
+    match = re.search(
+        r"used\s*=\s*([0-9.]+)([KMG])", snapshot["swapusage"]["stdout"]
+    )
+    if match is None:
+        return None
+    scale = {"K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2)]
+    return int(float(match.group(1)) * scale)
+
+
+def thermal_healthy(snapshot: dict[str, Any]) -> bool:
+    therm = snapshot["pmset_therm"]
+    if therm["returncode"] != 0:
+        return False
+    return all(
+        line.lower().startswith("note: no ")
+        for line in therm["stdout"].splitlines()
+        if "warning level has been recorded" in line.lower()
+    )
+
+
+def require_system_guard(snapshot: dict[str, Any], args: argparse.Namespace) -> None:
+    free = free_percent(snapshot)
+    swap = swap_bytes(snapshot)
+    if free is None or free < args.minimum_system_free_percent:
+        raise MemoryError(
+            f"system free memory {free!r}% is below "
+            f"{args.minimum_system_free_percent}%"
+        )
+    if swap is None:
+        raise RuntimeError("cannot read swap usage")
+    if not thermal_healthy(snapshot):
+        raise RuntimeError("thermal warning is active")
+
+
 def arm_order(repetition: int) -> list[str]:
     return list(ARMS if repetition % 2 else reversed(ARMS))
 
@@ -121,6 +166,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("reps must be positive")
     if args.cooldown_seconds < 0:
         raise ValueError("cooldown-seconds cannot be negative")
+    if not 0 <= args.minimum_system_free_percent <= 100:
+        raise ValueError("minimum-system-free-percent must be in [0, 100]")
+    if args.maximum_swap_growth_mb < 0:
+        raise ValueError("maximum-swap-growth-mb cannot be negative")
+    if not 0 <= args.max_drift <= 1:
+        raise ValueError("max-drift must be in [0, 1]")
     return {
         "schema": f"{SCHEMA}.plan",
         "created_at_utc": utc_now(),
@@ -137,6 +188,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "repetitions": args.reps,
         "prefill_step_size": args.prefill_step_size,
         "share_qsa_indices": args.share_qsa_indices,
+        "minimum_system_free_percent": args.minimum_system_free_percent,
+        "maximum_swap_growth_mb": args.maximum_swap_growth_mb,
+        "max_drift": args.max_drift,
         "arms": list(ARMS),
         "orders": [arm_order(rep) for rep in range(1, args.reps + 1)],
         "correctness_gate": "exact per-UID token IDs, fixed cohort versus dynamic join",
@@ -310,15 +364,17 @@ def first_divergence(left: list[int], right: list[int]) -> int | None:
 def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: str):
     import mlx.core as mx
     from mlx_lm.hybrid_speculative import (
-        attach_self_mtp_lanes,
+        attach_segmented_self_mtp_lanes,
         commit_batched_self_mtp,
         detach_self_mtp_lanes,
         prepare_self_mtp_lane,
         propose_batched_self_mtp,
     )
     from mlx_lm.sample_utils import LaneRNG
+    from mlx_lm.segmented_self_mtp import segmented_self_mtp_stats
 
     mx.reset_peak_memory()
+    segmented_before = segmented_self_mtp_stats(reset=False)
     started = time.perf_counter()
     prepared = []
     traces: dict[int, list[int]] = {}
@@ -346,10 +402,12 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
     prepared_at = time.perf_counter()
 
     if arm == "fixed_cohort":
-        batch = attach_self_mtp_lanes(model, None, prepared)
+        batch = attach_segmented_self_mtp_lanes(model, None, prepared)
         pending = []
     else:
-        batch = attach_self_mtp_lanes(model, None, prepared[: args.initial_lanes])
+        batch = attach_segmented_self_mtp_lanes(
+            model, None, prepared[: args.initial_lanes]
+        )
         pending = prepared[args.initial_lanes :]
 
     transaction_started = time.perf_counter()
@@ -361,7 +419,7 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
             if arm == "dynamic_join" and pending and cycle >= args.join_after_cycles:
                 epoch_before = int(batch.membership_epoch)
                 uids_before = [int(lane.uid) for lane in batch.lanes]
-                batch = attach_self_mtp_lanes(model, batch, pending)
+                batch = attach_segmented_self_mtp_lanes(model, batch, pending)
                 qsa.mark_join()
                 join_receipt = {
                     "cycle": cycle,
@@ -417,6 +475,12 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
     total_wall = transaction_finished - started
     total_tokens = sum(len(row) for row in traces.values())
     decode_tokens = total_tokens - args.lanes
+    segmented_after = segmented_self_mtp_stats(reset=False)
+    segmented_delta = {
+        key: int(value) - int(segmented_before.get(key, 0))
+        for key, value in segmented_after.items()
+        if isinstance(value, int) and isinstance(segmented_before.get(key, 0), int)
+    }
     return {
         "arm": arm,
         "prepare_wall_s": prepared_at - started,
@@ -433,6 +497,7 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
         "lane_mtp": {str(uid): row for uid, row in final_stats.items()},
         "qsa_share": qsa.receipt(),
         "join": join_receipt,
+        "segmented_delta": segmented_delta,
     }
 
 
@@ -503,20 +568,39 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         run_schedule(model, warm_prompts, warm_args, arm)
         mx.clear_cache()
 
+    previous_by_arm = {}
     for repetition in range(1, args.reps + 1):
-        if repetition > 1 and args.cooldown_seconds:
-            time.sleep(args.cooldown_seconds)
         order = arm_order(repetition)
-        before = system_snapshot()
         pair = {}
         for ordinal, arm in enumerate(order):
+            if args.cooldown_seconds:
+                time.sleep(args.cooldown_seconds)
+            before = system_snapshot()
+            require_system_guard(before, args)
+            swap_before = swap_bytes(before)
             row = run_schedule(model, prompts, args, arm)
+            after = system_snapshot()
+            require_system_guard(after, args)
+            growth = int(swap_bytes(after)) - int(swap_before)
+            if growth > args.maximum_swap_growth_mb * 1024**2:
+                raise MemoryError(f"swap grew by {growth} bytes")
             row.update(
                 repetition=repetition,
                 order=order,
                 order_ordinal=ordinal,
                 completed_at_utc=utc_now(),
+                system_before=before,
+                system_after=after,
+                swap_growth_bytes=growth,
             )
+            previous = previous_by_arm.get(arm)
+            row["same_arm_drift_fraction"] = (
+                None
+                if previous is None
+                else abs(row["aggregate_decode_tps"] - previous)
+                / max(previous, 1e-12)
+            )
+            previous_by_arm[arm] = row["aggregate_decode_tps"]
             artifact["rows"].append(row)
             pair[arm] = row
             atomic_write(output, artifact)
@@ -537,10 +621,13 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         dynamic["transaction_tps_ratio_vs_fixed"] = (
             dynamic["aggregate_decode_tps"] / fixed["aggregate_decode_tps"]
         )
-        after = system_snapshot()
+        drifts = [
+            row["same_arm_drift_fraction"]
+            for row in pair.values()
+            if row["same_arm_drift_fraction"] is not None
+        ]
         for row in pair.values():
-            row["pair_system_before"] = before
-            row["pair_system_after"] = after
+            row["drift_accepted"] = all(value <= args.max_drift for value in drifts)
         atomic_write(output, artifact)
 
     artifact["summary"] = summarize(artifact["rows"])
@@ -555,9 +642,16 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         and row["qsa_share"]["post_join_reuse_observed"] > 0
         for row in dynamic_rows
     )
+    drift_ok = all(row.get("drift_accepted", False) for row in artifact["rows"])
+    ownership_ok = all(
+        row["segmented_delta"].get("true_batched_engaged", 0) > 0
+        and row["segmented_delta"].get("b1_target_forwards", 0) == 0
+        for row in artifact["rows"]
+    )
+    qualified = exact and engaged and drift_ok and ownership_ok
     print(json.dumps(artifact["summary"], indent=2, sort_keys=True))
-    print(f"VERDICT: {'QUALIFIED' if exact and engaged else 'REJECTED'}")
-    return 0 if exact and engaged else 2
+    print(f"VERDICT: {'QUALIFIED' if qualified else 'REJECTED'}")
+    return 0 if qualified else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -573,6 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--prefill-step-size", type=int, default=512)
     parser.add_argument("--cooldown-seconds", type=float, default=0.0)
+    parser.add_argument("--minimum-system-free-percent", type=int, default=25)
+    parser.add_argument("--maximum-swap-growth-mb", type=float, default=16.0)
+    parser.add_argument("--max-drift", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument(
         "--share-qsa-indices",
