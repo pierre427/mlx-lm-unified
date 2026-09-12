@@ -1377,15 +1377,12 @@ def _pld_snapshot(caches):
       pushes the cache past the window, a later trim()-rewind desyncs the buffer
       from the mask and crashes attention (mask K-len != cached K-len). Copying is
       always correct.
-    - ArraysCache: snapshotted by the length of its recorded rollback window.
-      Rewind trims the forward delta recorded by recurrent layers while
-      speculation mode is active.
+    - ArraysCache: snapshotted by its epoch-bound speculative position.  The
+      rollback deque is bounded, so its retained-span sum is not monotonic
+      once old records are evicted and cannot serve as a position marker.
     - CacheList: recursed element-wise.
     Any other cache type is unsupported; prompt-lookup decoding raises rather
     than risk a silently-wrong rewind."""
-    def array_rollback_total(c):
-        return sum(r[0] for r in getattr(c, "_rollbacks", ()))
-
     def snap_one(c):
         if isinstance(c, CacheList):
             return ("list", [snap_one(sub) for sub in c.caches])
@@ -1395,7 +1392,7 @@ def _pld_snapshot(caches):
                     "prompt-lookup decoding requires ArraysCache speculation "
                     "recording to be active."
                 )
-            return ("array_trim", array_rollback_total(c))
+            return ("array_marker", c.rollback_marker())
         if isinstance(c, RotatingKVCache):
             k = None if c.keys is None else mx.array(c.keys)
             v = None if c.values is None else mx.array(c.values)
@@ -1465,15 +1462,12 @@ def _pld_start_speculation(caches, rollback_window):
 
 
 def _pld_rewind(caches, snaps):
-    def array_rollback_total(c):
-        return sum(r[0] for r in getattr(c, "_rollbacks", ()))
-
     def rewind_one(c, s):
         if s[0] == "list":
             for sub, subsnap in zip(c.caches, s[1]):
                 rewind_one(sub, subsnap)
-        elif s[0] == "array_trim":
-            c.trim(array_rollback_total(c) - s[1])
+        elif s[0] == "array_marker":
+            c.rewind_to_rollback_marker(s[1])
         elif s[0] == "trim":
             c.trim(c.offset - s[1])
         else:

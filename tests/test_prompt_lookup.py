@@ -10,6 +10,11 @@ import unittest
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# Generation owns a module-level execution stream, so select CPU before
+# importing it for this CPU-only correctness suite.
+mx.set_default_device(mx.cpu)
+
 from mlx_lm import load
 from mlx_lm.generate import (
     _pld_offset,
@@ -126,6 +131,69 @@ class TestCacheHelpers(unittest.TestCase):
         _pld_rewind([c], snap)
         self.assertEqual(sum(r[0] for r in c._rollbacks), 2)
         self.assertEqual(c.cache[0].tolist(), [2])
+
+    def test_arrays_cache_snapshot_survives_bounded_history_eviction(self):
+        c = ArraysCache(size=1)
+        c.cache = [mx.array([0])]
+        c.start_speculation(rollback_window=4)
+        for position in range(1, 9):
+            before = position - 1
+            c.record_rollback(
+                1,
+                lambda m, before=before: [mx.array([before + m])],
+                [mx.array([before])],
+            )
+            c.cache = [mx.array([position])]
+        self.assertLess(sum(record.span for record in c._rollbacks), 8)
+
+        snap = _pld_snapshot([c])
+        c.record_rollback(
+            3,
+            lambda m: [mx.array([8 + m])],
+            [mx.array([8])],
+        )
+        c.cache = [mx.array([11])]
+        _pld_rewind([c], snap)
+        self.assertEqual(c.cache[0].tolist(), [8])
+        self.assertEqual(c.rollback_marker(), snap[0][1])
+
+    def test_arrays_cache_marker_refuses_future_stale_and_over_rewind(self):
+        c = ArraysCache(size=1)
+        c.cache = [mx.array([0])]
+        c.start_speculation(rollback_window=4)
+        start = c.rollback_marker()
+        for position in range(1, 7):
+            before = position - 1
+            c.record_rollback(
+                1,
+                lambda m, before=before: [mx.array([before + m])],
+                [mx.array([before])],
+            )
+            c.cache = [mx.array([position])]
+        with self.assertRaisesRegex(RuntimeError, "ahead of live state"):
+            c.rewind_to_rollback_marker((start[0], 7))
+        with self.assertRaisesRegex(ValueError, "negative position"):
+            c.rewind_to_rollback_marker((start[0], -1))
+        with self.assertRaisesRegex(RuntimeError, "only 4 tokens"):
+            c.rewind_to_rollback_marker(start)
+        c.stop_speculation()
+        with self.assertRaisesRegex(RuntimeError, "stale epoch"):
+            c.rewind_to_rollback_marker(start)
+
+    def test_cachelist_snapshot_uses_arrays_epoch_marker(self):
+        arrays = ArraysCache(size=1)
+        arrays.cache = [mx.array([0])]
+        kv = KVCache()
+        kv.offset = 0
+        cache = CacheList(arrays, kv)
+        cache.start_speculation(rollback_window=4)
+        snap = _pld_snapshot([cache])
+        arrays.record_rollback(2, lambda m: [mx.array([m])], [mx.array([0])])
+        arrays.cache = [mx.array([2])]
+        kv.offset = 2
+        _pld_rewind([cache], snap)
+        self.assertEqual(arrays.cache[0].tolist(), [0])
+        self.assertEqual(kv.offset, 0)
 
 
 class _LifecycleCache:

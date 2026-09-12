@@ -2430,6 +2430,13 @@ class ArraysCache(_BaseCache):
         instance.speculating = False
         instance._rollbacks = deque()
         instance._rollback_window = cls._ROLLBACK_WINDOW
+        # A PLD snapshot needs a position that survives eviction from the
+        # bounded rollback deque. The retained-span sum is not such a
+        # position: after old records are pruned it can stay flat or move
+        # backwards after a new verify forward. Track live row positions
+        # separately, paired with an epoch so stale snapshots fail closed.
+        instance._rollback_epoch = 0
+        instance._rollback_positions = []
         # Set when the records were dropped because they no longer describe
         # the live rows (a batch membership change); reported by trim().
         instance._rollback_invalid_reason = None
@@ -2471,10 +2478,53 @@ class ArraysCache(_BaseCache):
             ),
         )
         self._rollbacks.clear()
+        self._rollback_epoch += 1
+        self._rollback_positions = [0] * self.batch_size
 
     def stop_speculation(self):
         self.speculating = False
         self._rollbacks.clear()
+        self._rollback_epoch += 1
+        self._rollback_positions = []
+
+    def rollback_marker(self):
+        """Return an epoch-bound position for single-row PLD rollback."""
+        if not self.speculating:
+            raise RuntimeError("ArraysCache rollback recording is not active")
+        if self.batch_size != 1 or len(self._rollback_positions) != 1:
+            raise RuntimeError(
+                "ArraysCache PLD rollback markers require exactly one live row"
+            )
+        return self._rollback_epoch, self._rollback_positions[0]
+
+    def rewind_to_rollback_marker(self, marker):
+        """Rewind to a marker without relying on retained deque totals."""
+        if (
+            not isinstance(marker, (tuple, list))
+            or len(marker) != 2
+            or not all(isinstance(value, int) for value in marker)
+        ):
+            raise ValueError(f"Invalid ArraysCache rollback marker: {marker!r}")
+        epoch, position = marker
+        if position < 0:
+            raise ValueError(
+                f"ArraysCache rollback marker has a negative position: {position}"
+            )
+        if not self.speculating or epoch != self._rollback_epoch:
+            raise RuntimeError(
+                "ArraysCache rollback marker belongs to an inactive or stale epoch"
+            )
+        if self.batch_size != 1 or len(self._rollback_positions) != 1:
+            raise RuntimeError(
+                "ArraysCache PLD rollback markers require exactly one live row"
+            )
+        current = self._rollback_positions[0]
+        if position > current:
+            raise RuntimeError(
+                f"ArraysCache rollback marker is ahead of live state: "
+                f"{position} > {current}"
+            )
+        return self.trim(current - position)
 
     def _host_vector(self, field, cached):
         value = getattr(self, field)
@@ -2559,6 +2609,17 @@ class ArraysCache(_BaseCache):
                 metadata when omitted, so a layer never does the arithmetic.
         """
         depths = self._record_depths(num_tokens, depths)
+        batch = self.batch_size
+        if len(self._rollback_positions) != batch:
+            raise RuntimeError(
+                "ArraysCache rollback positions do not match the live batch; "
+                "restart speculation after changing membership"
+            )
+        advances = [num_tokens] * batch if depths is None else depths
+        self._rollback_positions = [
+            position + advance
+            for position, advance in zip(self._rollback_positions, advances)
+        ]
         self._rollback_invalid_reason = None
         self._rollbacks.append(
             _RollbackRecord(num_tokens, fn, snapshot, per_row_fn, depths)
@@ -2650,9 +2711,11 @@ class ArraysCache(_BaseCache):
         later trim into a loud failure instead of a wrong-shaped restore.
         """
         self._clear_staged_rollback()
-        if self._rollbacks:
+        if self._rollbacks or self._rollback_positions:
             self._rollbacks.clear()
             self._rollback_invalid_reason = reason
+            self._rollback_epoch += 1
+            self._rollback_positions = []
 
     def _clear_staged_rollback(self):
         """Drop a rollback staged by an interrupted forward.
@@ -2670,6 +2733,10 @@ class ArraysCache(_BaseCache):
         if min(capacity, default=0) < n:
             raise self._rollback_budget_error(n, min(capacity, default=0))
         self._rewind_rows([n] * batch, batch, prefer_per_row=False)
+        if len(self._rollback_positions) == batch:
+            self._rollback_positions = [
+                position - n for position in self._rollback_positions
+            ]
         return n
 
     def supports_ragged_trim(self):
@@ -2777,6 +2844,11 @@ class ArraysCache(_BaseCache):
         if max(drops, default=0) == 0:
             return drops
         self._rewind_rows(list(drops), self.batch_size, prefer_per_row=True)
+        if len(self._rollback_positions) == self.batch_size:
+            self._rollback_positions = [
+                position - drop
+                for position, drop in zip(self._rollback_positions, drops)
+            ]
         return drops
 
     def state_checkpoint(self, positions: List[int], force: bool = False):
@@ -2838,6 +2910,8 @@ class ArraysCache(_BaseCache):
             lane.pop()
         # Any speculative rollbacks describe the discarded suffix.
         self._rollbacks.clear()
+        self._rollback_epoch += 1
+        self._rollback_positions = []
         return num_tokens
 
     @property

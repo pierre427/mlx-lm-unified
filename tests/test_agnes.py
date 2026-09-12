@@ -12,7 +12,7 @@ from mlx_lm.apc import APCKey, AutomaticPrefixCache, AutomaticPrefixCacheV2
 from mlx_lm.cache_planes import CachePlaneKind
 from mlx_lm.generate import generate_step, prompt_lookup_generate_step
 from mlx_lm.models import agnes
-from mlx_lm.models.cache import record_state_checkpoints
+from mlx_lm.models.cache import KVCache, record_state_checkpoints
 from mlx_lm.models.qwen3_5 import fuse_gated_delta_net_projections
 from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
 from mlx_lm.prompt_lookup import HybridStats
@@ -351,6 +351,74 @@ class TestAgnes(unittest.TestCase):
             1,
         )
         hit.cache.close()
+
+    def test_prompt_lookup_rejections_remain_exact_beyond_rollback_window(self):
+        model = agnes.Model(self.make_args(max_position_embeddings=512))
+        model.eval()
+        mx.eval(model.parameters())
+        prompt = list(range(16)) * 4
+        sampler = make_sampler(temp=0.0)
+
+        plain_cache = model.make_cache()
+        plain = list(
+            generate_step(
+                mx.array(prompt),
+                model,
+                max_tokens=160,
+                sampler=sampler,
+                prompt_cache=plain_cache,
+                prefill_step_size=2048,
+            )
+        )
+        plain_tokens = [int(item[0]) for item in plain]
+
+        class PartialRejectProposer:
+            def observe(self, token):
+                pass
+
+            def propose(self, sequence, max_span, prompt_length):
+                generated = len(sequence) - prompt_length
+                proposal = plain_tokens[generated : generated + max_span]
+                if len(proposal) > 1:
+                    proposal[1] = (proposal[1] + 1) % 32
+                return proposal
+
+        pld_cache = model.make_cache()
+        pld_stats = HybridStats()
+        pld = list(
+            prompt_lookup_generate_step(
+                mx.array(prompt),
+                model,
+                max_tokens=160,
+                sampler=sampler,
+                prompt_cache=pld_cache,
+                backend=PartialRejectProposer(),
+                num_draft=4,
+                adaptive=False,
+                rate_gate=False,
+                stats=pld_stats,
+            )
+        )
+        self.assertEqual([int(item[0]) for item in pld], plain_tokens)
+        self.assertGreater(pld_stats.retrieval_accepted, 0)
+        self.assertGreater(
+            pld_stats.retrieval_proposed, pld_stats.retrieval_accepted
+        )
+
+        for layer, (actual, reference) in enumerate(zip(pld_cache, plain_cache)):
+            if isinstance(actual, KVCache):
+                self.assertEqual(actual.offset, reference.offset, f"layer {layer}")
+                actual_state = actual.keys_and_values()
+                reference_state = reference.keys_and_values()
+            else:
+                actual_state = actual.cache
+                reference_state = reference.cache
+            for slot, (a, b) in enumerate(zip(actual_state, reference_state)):
+                mx.eval(a, b)
+                self.assertTrue(
+                    mx.allclose(a, b, rtol=2e-4, atol=2e-4),
+                    f"layer {layer} slot {slot}",
+                )
 
     def test_sanitize_raw_then_native_does_not_shift_norm_twice(self):
         raw_model = agnes.Model(self.make_args(mtp_num_hidden_layers=1))
