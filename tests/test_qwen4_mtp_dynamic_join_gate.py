@@ -28,6 +28,8 @@ def args(**overrides):
         minimum_system_free_percent=25,
         maximum_swap_growth_mb=16.0,
         max_drift=0.05,
+        cancel_uid=None,
+        cancel_after_tokens=32,
         seed=20260910,
         share_qsa_indices=True,
         out="unused.json",
@@ -66,6 +68,10 @@ def test_plan_is_paired_rotated_and_model_free():
         {"maximum_swap_growth_mb": -1},
         {"max_drift": -0.1},
         {"max_drift": 1.1},
+        {"cancel_uid": -1},
+        {"cancel_uid": 2},
+        {"cancel_uid": 0, "cancel_after_tokens": 1},
+        {"cancel_uid": 0, "cancel_after_tokens": 128},
     ],
 )
 def test_plan_refuses_invalid_schedule(overrides):

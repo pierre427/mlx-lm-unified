@@ -162,6 +162,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     minimum_live_join = 1 + (args.num_draft + 1) * args.join_after_cycles
     if args.max_tokens <= minimum_live_join:
         raise ValueError("max-tokens is too small to guarantee a live join")
+    if args.cancel_uid is not None and not 0 <= args.cancel_uid < args.lanes:
+        raise ValueError("cancel-uid must name a configured lane")
+    if args.cancel_uid is not None and not 1 < args.cancel_after_tokens < args.max_tokens:
+        raise ValueError("cancel-after-tokens must be inside the output budget")
     if args.reps < 1:
         raise ValueError("reps must be positive")
     if args.cooldown_seconds < 0:
@@ -184,6 +188,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "joining_lanes": args.lanes - args.initial_lanes,
         "join_after_cycles": args.join_after_cycles,
         "max_tokens_per_lane": args.max_tokens,
+        "cancel_uid": args.cancel_uid,
+        "cancel_after_tokens": args.cancel_after_tokens,
         "num_draft": args.num_draft,
         "repetitions": args.reps,
         "prefill_step_size": args.prefill_step_size,
@@ -414,6 +420,9 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
     cycle = 0
     join_receipt = None
     final_stats = {}
+    cancelled_uids = set()
+    cancellation_receipts = []
+    reconstruction_epochs = []
     with QSAShareCounter(model) as qsa:
         while batch.lanes or pending:
             if arm == "dynamic_join" and pending and cycle >= args.join_after_cycles:
@@ -447,10 +456,45 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
                 emitted_counts=emitted_counts,
                 terminal=terminal,
             )
-            leaving = [index for index, done in enumerate(terminal) if done]
+            cancel_indices = []
+            if args.cancel_uid is not None and args.cancel_uid not in cancelled_uids:
+                for index, lane in enumerate(batch.lanes):
+                    if (
+                        lane.uid == args.cancel_uid
+                        and not terminal[index]
+                        and len(traces[lane.uid]) >= args.cancel_after_tokens
+                    ):
+                        cancel_indices.append(index)
+            leaving = sorted(
+                {
+                    *(
+                        index
+                        for index, done in enumerate(terminal)
+                        if done
+                    ),
+                    *cancel_indices,
+                }
+            )
             if leaving:
+                before_uids = [int(lane.uid) for lane in batch.lanes]
                 batch, detached = detach_self_mtp_lanes(model, batch, leaving)
+                after_uids = [int(lane.uid) for lane in batch.lanes]
+                if after_uids:
+                    reconstruction_epochs.append(int(batch.membership_epoch))
                 for item in detached:
+                    cancelled = item.lane.uid in {
+                        before_uids[index] for index in cancel_indices
+                    }
+                    if cancelled:
+                        cancelled_uids.add(item.lane.uid)
+                        cancellation_receipts.append(
+                            {
+                                "uid": int(item.lane.uid),
+                                "cycle": cycle,
+                                "tokens": len(traces[item.lane.uid]),
+                                "proposal_open": bool(batch.proposal_open),
+                            }
+                        )
                     stats = item.lane.stats
                     final_stats[item.lane.uid] = {
                         "cycles": int(stats.cycles),
@@ -461,14 +505,21 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
                             if stats.draft_proposed
                             else None
                         ),
+                        "cancelled": cancelled,
                     }
             cycle += 1
 
     transaction_finished = time.perf_counter()
     if pending:
         raise RuntimeError("dynamic join did not occur")
-    if any(len(row) != args.max_tokens for row in traces.values()):
+    if any(
+        len(row) != args.max_tokens
+        for uid, row in traces.items()
+        if uid not in cancelled_uids
+    ):
         raise RuntimeError("one or more lanes did not reach max-tokens")
+    if args.cancel_uid is not None and cancelled_uids != {args.cancel_uid}:
+        raise RuntimeError("configured cancellation did not occur")
     if len(final_stats) != args.lanes:
         raise RuntimeError("one or more terminal lane receipts are missing")
     transaction_wall = transaction_finished - transaction_started
@@ -498,6 +549,12 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
         "qsa_share": qsa.receipt(),
         "join": join_receipt,
         "segmented_delta": segmented_delta,
+        "churn": {
+            "cancellations": cancellation_receipts,
+            "reconstruction_epochs": reconstruction_epochs,
+            "empty_cohort": not batch.lanes,
+            "joined": join_receipt is not None if arm == "dynamic_join" else False,
+        },
     }
 
 
@@ -648,7 +705,18 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         and row["segmented_delta"].get("b1_target_forwards", 0) == 0
         for row in artifact["rows"]
     )
-    qualified = exact and engaged and drift_ok and ownership_ok
+    churn_ok = all(
+        row["churn"]["empty_cohort"]
+        and (
+            args.cancel_uid is None
+            or (
+                len(row["churn"]["cancellations"]) == 1
+                and bool(row["churn"]["reconstruction_epochs"])
+            )
+        )
+        for row in artifact["rows"]
+    )
+    qualified = exact and engaged and drift_ok and ownership_ok and churn_ok
     print(json.dumps(artifact["summary"], indent=2, sort_keys=True))
     print(f"VERDICT: {'QUALIFIED' if qualified else 'REJECTED'}")
     return 0 if qualified else 2
@@ -670,6 +738,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-system-free-percent", type=int, default=25)
     parser.add_argument("--maximum-swap-growth-mb", type=float, default=16.0)
     parser.add_argument("--max-drift", type=float, default=0.05)
+    parser.add_argument("--cancel-uid", type=int)
+    parser.add_argument("--cancel-after-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument(
         "--share-qsa-indices",
