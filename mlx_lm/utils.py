@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import logging
 import os
 import resource
 import shutil
@@ -73,6 +74,8 @@ MODEL_REMAPPING = {
 MODEL_ARCHITECTURE_REMAPPING = {}
 
 MAX_FILE_SIZE_GB = 5
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_size(x):
@@ -366,6 +369,57 @@ def _carry_fused_gate_up_overrides(config: dict, weights: dict) -> int:
     return added
 
 
+def _maybe_fuse_agnes_gdn_projections(model: nn.Module, config: dict) -> None:
+    """Apply the verified Agnes projection fusion after weight loading."""
+    if config.get("model_type") != "agnes":
+        return
+
+    setting = os.environ.get("MLX_AGNES_GDN_PROJ_FUSION", "1")
+    if setting == "0":
+        return
+    if setting != "1":
+        raise ValueError("MLX_AGNES_GDN_PROJ_FUSION must be 0 or 1")
+
+    layers = list(model.layers)
+    expected = sum(bool(getattr(layer, "is_linear", False)) for layer in layers)
+    configured = config.get("text_config", config).get("layer_types")
+    if configured is not None:
+        configured_count = sum(
+            layer_type == "agnes_delta_attention" for layer_type in configured
+        )
+        if configured_count != expected:
+            raise RuntimeError(
+                "Agnes GDN layer plan differs between config and model: "
+                f"{configured_count} != {expected}"
+            )
+
+    model.agnes_gdn_projection_fusion_load_hook_reached = 1
+    model.agnes_gdn_projection_fusion_layers = 0
+    if not config.get("quantization") and not config.get("quantization_config"):
+        model.agnes_gdn_projection_fusion_status = "skipped_unquantized"
+        logger.info("Agnes GDN projection fusion skipped for an unquantized model")
+        return
+    if expected == 0:
+        raise RuntimeError("Quantized Agnes model has no GDN layers")
+
+    from .models.qwen3_5 import fuse_gated_delta_net_projections
+
+    returned = fuse_gated_delta_net_projections(model, enabled=True)
+    actual = sum(
+        hasattr(layer.delta_attn, "in_proj_fused")
+        for layer in layers
+        if getattr(layer, "is_linear", False)
+    )
+    if returned != expected or actual != expected:
+        raise RuntimeError(
+            "Agnes GDN projection fusion reached "
+            f"{returned}/{actual} layers, expected {expected}/{expected}"
+        )
+    model.agnes_gdn_projection_fusion_layers = actual
+    model.agnes_gdn_projection_fusion_status = "enabled"
+    logger.info("Agnes GDN projection fusion enabled for %d layers", actual)
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -562,6 +616,7 @@ def load_model(
 
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
+    _maybe_fuse_agnes_gdn_projections(model, config)
 
     if not lazy:
         mx.eval(model.parameters())
