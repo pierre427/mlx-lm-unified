@@ -8,6 +8,9 @@ host="${AGNES_HOST:-127.0.0.1}"
 port="${AGNES_PORT:-8324}"
 reasoning_effort="${AGNES_REASONING_EFFORT:-xhigh}"
 
+# Quantized Agnes loads use verified GDN projection fusion by default.
+# Set MLX_AGNES_GDN_PROJ_FUSION=0 for an explicit stock-projection comparison.
+
 # The Agnes template spells its highest tier xhigh. Accept the common OpenAI
 # spelling as a launcher convenience while passing the native value through.
 if [[ "${reasoning_effort}" == "high" ]]; then
