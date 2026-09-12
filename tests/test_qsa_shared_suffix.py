@@ -50,6 +50,16 @@ def test_rows_share_one_aligned_immutable_base_by_identity():
         QSAImmutableBase.from_cache(source, layout_id="qsa-f32-d3", length=7)
 
 
+def test_pooled_base_records_coverage_without_optional_apc_identity():
+    source = _source_cache()
+    source._qsa_summary_identity = None
+
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-f32-d3")
+
+    assert base.pooled_keys.shape[1] == 2
+    assert base.summary_identity == {"complete_blocks": 2}
+
+
 def test_normal_append_allocates_only_private_suffix_and_never_joins_prefix():
     base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
     row = SharedSuffixQSAKVCache(base)

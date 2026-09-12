@@ -40,9 +40,10 @@ def _coverage(identity: dict[str, Any] | None) -> int:
 def _with_coverage(
     identity: dict[str, Any] | None, complete_blocks: int
 ) -> dict[str, Any] | None:
-    if identity is None:
-        return None
-    result = dict(identity)
+    # The pooled-key cache can be enabled independently of persisted APC
+    # summary identities. Preserve its coverage with a minimal local payload;
+    # summary-enabled sources retain their full producer identity.
+    result = {} if identity is None else dict(identity)
     result["complete_blocks"] = int(complete_blocks)
     return result
 
