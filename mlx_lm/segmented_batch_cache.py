@@ -181,6 +181,7 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         from .segmented_self_mtp import qsa_private_delta_enabled
 
         length = int(hidden.shape[1])
+        self._arm_row_qsa_share()
         private_candidate = (
             qsa_private_delta_enabled()
             and self._private_delta_base_tokens is not None
@@ -240,9 +241,11 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
                             "declined", reason=exact_reason
                         )
                         exact_set_fold = False
-                return self._private_delta_attention(
+                output = self._private_delta_attention(
                     attention, hidden, exact_set_fold=exact_set_fold
                 )
+                self._capture_row_qsa_share()
+                return output
             note_qsa_private_delta_event(
                 "declined", width=length, reason=reason
             )
@@ -286,10 +289,37 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         self._bump("segmented_attention_calls")
         self._bump("independent_lineages_consumed", len(self.rows))
         self._bump("row_state_splits", len(self.rows))
+        self._capture_row_qsa_share()
         self._refresh_geometry()
         output = mx.concatenate(outputs, axis=0)
         gate = mx.concatenate(gates, axis=0)
         return attention.o_proj(output * mx.sigmoid(gate))
+
+    def _arm_row_qsa_share(self):
+        """Mirror a batched MTP share cycle onto its independent QSA rows."""
+        if not self._mtp_share_topk:
+            return
+        shared = self._mtp_shared_topk
+        if shared is not None and int(shared.shape[0]) != len(self.rows):
+            raise RuntimeError("segmented QSA shared top-k batch size changed")
+        for index, row in enumerate(self.rows):
+            row._mtp_share_topk = True
+            row._mtp_shared_topk = (
+                None
+                if shared is None
+                else mx.contiguous(shared[index : index + 1])
+            )
+
+    def _capture_row_qsa_share(self):
+        """Expose per-lineage selections on the batched cycle receipt/state."""
+        if not self._mtp_share_topk:
+            return
+        selected = [row._mtp_shared_topk for row in self.rows]
+        self._mtp_shared_topk = (
+            mx.concatenate(selected, axis=0)
+            if selected and all(value is not None for value in selected)
+            else None
+        )
 
     def _private_delta_attention(
         self, attention, hidden: mx.array, *, exact_set_fold: bool = False
@@ -621,6 +651,9 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
     def release_qsa_cycle(self, _who: str, *, keep_shared=False, **_kwargs):
         shared = self._mtp_shared_topk if keep_shared else None
         share = self._mtp_share_topk if keep_shared else False
+        if not keep_shared:
+            for row in self.rows:
+                row.release_qsa_cycle(_who)
         self._mtp_share_topk = share
         self._mtp_shared_topk = shared
         self._qsa_pooled_keys = None

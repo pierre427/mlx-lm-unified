@@ -1729,7 +1729,24 @@ def test_true_batched_segmented_shared_qsa_cycle_is_disarmed():
         for uid, prompt in enumerate(([1, 2, 3, 4], [5, 6, 7, 8, 9]))
     ]
     state = attach_segmented_self_mtp_lanes(model, None, detached)
+    original_mtp_step = model.mtp_step
+    mtp_calls = 0
+
+    def checked_mtp_step(hidden, tokens, cache):
+        nonlocal mtp_calls
+        qsa = cache[0]
+        if mtp_calls == 1:
+            assert qsa._mtp_shared_topk is not None
+            assert qsa._mtp_shared_topk.shape[0] == 2
+            assert all(row._mtp_shared_topk is not None for row in qsa.rows)
+        output = original_mtp_step(hidden, tokens, cache)
+        mtp_calls += 1
+        return output
+
+    model.mtp_step = checked_mtp_step
     proposal = propose_batched_self_mtp(model, state)
+    model.mtp_step = original_mtp_step
+    assert mtp_calls == 2
     assert state._batched_state is not None
     qsa = state._batched_state.caches.draft[0]
     assert qsa._mtp_share_topk is False
