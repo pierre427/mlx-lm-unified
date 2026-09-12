@@ -360,8 +360,10 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
         )
     if profile == "shared_suffix":
         shared_expected = {
-            "shared_qsa_rows": 28,
-            "shared_qsa_materializations": 28,
+            # Flash-Next has one QSA layer every four decoder layers: 12
+            # target layers, each split/materialized for two sibling rows.
+            "shared_qsa_rows": 24,
+            "shared_qsa_materializations": 24,
         }
         mismatches.update(
             {
