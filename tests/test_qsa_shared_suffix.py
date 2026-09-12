@@ -413,3 +413,41 @@ def test_batched_shared_base_scoring_matches_two_row_selection():
             actual.raw_block_ids, expected.raw_block_ids
         ).item()
         assert mx.array_equal(actual.dense_mask(), expected.dense_mask()).item()
+
+
+@pytest.mark.parametrize("lengths", ([3, 1], [3, 3]))
+def test_shared_suffix_fallback_uses_stock_indexed_dispatch(lengths, monkeypatch):
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    mx.random.seed(104)
+    args, attention, source, stocks = _attention_source_and_stock_rows(2)
+    base = QSAImmutableBase.from_cache(source, layout_id="stock-dispatch-fallback")
+    rows = [SharedSuffixQSAKVCache(base) for _ in range(2)]
+    hidden = mx.random.normal((2, 3, args.hidden_size))
+
+    dispatched = []
+
+    def indexed(q, k, v, *_args, **_kwargs):
+        dispatched.append((q, k, v))
+        return q
+
+    with (
+        patch("mlx_lm.models.qwen4_exp.decide_qsa_indexed_admission",
+              return_value=(True, "test_dispatch")),
+        patch("mlx_lm.models.qwen4_exp._dispatch_qsa_indexed_with_optional_capture",
+              side_effect=indexed) as dispatch,
+        patch("mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_preflight",
+              return_value=(False, "test_preflight_decline")),
+    ):
+        expected = _stock_segmented_output(attention, stocks, hidden, lengths)
+        assert dispatch.call_count == 2
+        dispatch.reset_mock()
+        segmented = SegmentedBatchQSAKVCache(rows)
+        segmented.prepare(lengths=lengths, right_padding=[3 - n for n in lengths])
+        actual = segmented.segmented_attention(attention, hidden, None)
+        mx.eval(expected, actual)
+        assert dispatch.call_count == 2
+    for stock, shared in zip(dispatched[:2], dispatched[2:]):
+        assert all(mx.array_equal(a, b).item() for a, b in zip(stock, shared))
+    assert mx.array_equal(actual, expected).item()
+    assert [row.offset for row in rows] == [8 + n for n in lengths]
+    assert [row.index_keys.shape[1] for row in rows] == list(lengths)

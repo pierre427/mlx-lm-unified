@@ -344,13 +344,13 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         """Fail closed through the split-aware B1 selector.
 
         Ragged rows and a private-delta path that declines before mutation
-        cannot re-enter ``Attention``: its stock indexer and cache append APIs
-        intentionally reject shared-suffix storage. Append the row-private
-        ledgers once, materialize only the temporary dense consumer view, and
+        cannot use stock indexer/cache append APIs on shared-suffix storage.
+        Append the row-private
+        ledgers once, materialize only the temporary stock consumer view, and
         leave the authoritative row as immutable-base plus suffix.
         """
 
-        qg, k_flat, v_flat, projected_qk = projected
+        _qg, k_flat, v_flat, projected_qk = projected
         batch, length, _ = hidden.shape
         if batch != 1:
             raise RuntimeError("shared-suffix fallback requires one request row")
@@ -370,32 +370,29 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             row,
             projected_qk=projected_qk,
         )
-        q, gate = mx.split(
-            qg.reshape(batch, length, attention.num_heads, -1), 2, axis=-1
-        )
-        gate = gate.reshape(batch, length, -1)
         k = k_flat.reshape(
             batch, length, attention.num_kv_heads, attention.head_dim
         )
         v = v_flat.reshape(
             batch, length, attention.num_kv_heads, attention.head_dim
         )
-        q = attention.q_norm(q).transpose(0, 2, 1, 3)
         k = attention.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
-        q, k = attention.rope(q, offset=offset), attention.rope(k, offset=offset)
+        k = attention.rope(k, offset=offset)
         row.append_kv(k, v)
         dense_cache, _receipt = row.materialize_to_qsa()
         keys, values = dense_cache.keys_and_values()
-        output = qsa_dense_attention_from_selection(
-            q,
-            keys,
-            values,
-            selection,
+        # Resume stock dispatch after the one authoritative append. At 16K,
+        # M=3 normally uses indexed QSA; forcing dense SDPA changes its bits.
+        return attention(
+            hidden,
+            row_mask,
             dense_cache,
-            scale=attention.scale,
+            _projected=projected,
+            _return_pre_o=True,
+            _selection=selection,
+            _fetched_kv=(keys, values),
         )
-        return output.transpose(0, 2, 1, 3).reshape(batch, length, -1), gate
 
     def _private_delta_attention(
         self, attention, hidden: mx.array, *, exact_set_fold: bool = False

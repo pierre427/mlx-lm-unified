@@ -5691,7 +5691,11 @@ class Attention(nn.Module):
         *,
         _projected=None,
         _return_pre_o=False,
+        _selection=None,
+        _fetched_kv=None,
     ):
+        if (_selection is None) != (_fetched_kv is None):
+            raise ValueError("existing QSA selection and fetched K/V must be paired")
         segmented_consumer = getattr(cache, "segmented_attention", None)
         if segmented_consumer is not None and _projected is None:
             return segmented_consumer(self, x, mask)
@@ -5710,7 +5714,11 @@ class Attention(nn.Module):
                     [width_q, width_q + width_kv, width_q + 2 * width_kv],
                     axis=-1,
                 )
-        selection = self.indexer(x, mask, cache, projected_qk=fused_index_qk)
+        selection = (
+            self.indexer(x, mask, cache, projected_qk=fused_index_qk)
+            if _selection is None
+            else _selection
+        )
         # Route the sparse path through the NAX block-sparse kernel when armed.
         # Guarded prefill admission owns multi-token queries. The default-off
         # direct bench lever is separate and limited to sparse M=1 decode.
@@ -5831,9 +5839,15 @@ class Attention(nn.Module):
         q = self.q_norm(q).transpose(0, 2, 1, 3)
         k = self.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
-        offset = 0 if cache is None else cache.offset
+        offset = (
+            _selection.offset
+            if _fetched_kv is not None
+            else 0 if cache is None else cache.offset
+        )
         q, k = self.rope(q, offset=offset), self.rope(k, offset=offset)
-        if cache is not None:
+        if _fetched_kv is not None:
+            k, v = _fetched_kv
+        elif cache is not None:
             k, v = cache.update_and_fetch(k, v)
         if use_nax:
             ids, counts, n_sel, u_width, q_pos, left_pad, total = (
