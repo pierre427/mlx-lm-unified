@@ -65,6 +65,12 @@ _ZERO = {
     "shared_qsa_materializations": 0,
     "shared_qsa_materialized_bytes": 0,
     "shared_qsa_batched_selections": 0,
+    "shared_qsa_policy_checks": 0,
+    "shared_qsa_policy_admitted": 0,
+    "shared_qsa_policy_declined": 0,
+    "shared_qsa_policy_context_tokens_cumulative": 0,
+    "shared_qsa_policy_remaining_tokens_cumulative": 0,
+    "shared_qsa_policy_cutoff_tokens_cumulative": 0,
     "exact_set_fold_requests": 0,
     "exact_set_fold_declines": 0,
     "exact_set_fold_preflight_declines": 0,
@@ -180,14 +186,52 @@ def qsa_private_delta_exact_set_fold_enabled() -> bool:
 
 
 def shared_qsa_suffix_enabled() -> bool:
-    """Use one immutable QSA base plus row-private physical suffixes."""
+    """Return whether shared QSA is available (forced on or auto policy)."""
 
-    return os.environ.get("MLX_LM_SHARED_QSA_SUFFIX", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return _shared_qsa_suffix_mode() != "off"
+
+
+def _shared_qsa_suffix_mode() -> str:
+    value = os.environ.get("MLX_LM_SHARED_QSA_SUFFIX", "auto").lower()
+    if value in {"1", "true", "yes", "on"}:
+        return "on"
+    if value in {"0", "false", "no", "off"}:
+        return "off"
+    if value == "auto":
+        return "auto"
+    raise ValueError("MLX_LM_SHARED_QSA_SUFFIX must be auto, on, or off")
+
+
+def shared_qsa_suffix_admission(
+    *, base_tokens: int, remaining_tokens: int
+) -> tuple[bool, str, int]:
+    """Apply the measured context/output-budget crossover for shared QSA."""
+
+    mode = _shared_qsa_suffix_mode()
+    base_tokens = max(0, int(base_tokens))
+    remaining_tokens = max(0, int(remaining_tokens))
+    if mode == "off":
+        return False, "forced_off", 0
+    if mode == "on":
+        return True, "forced_on", remaining_tokens
+    minimum_context = int(
+        os.environ.get("MLX_LM_SHARED_QSA_SUFFIX_MIN_CONTEXT", str(16 * 1024 - 4))
+    )
+    maximum_remaining = int(
+        os.environ.get("MLX_LM_SHARED_QSA_SUFFIX_MAX_REMAINING", "64")
+    )
+    if minimum_context < 0 or maximum_remaining < 0:
+        raise ValueError("shared QSA auto-policy limits must be non-negative")
+    # The measured break-even scales close to one output token per KiB of
+    # immutable context: 16K crosses between 12 and 22 emitted tokens, 32K is
+    # neutral around 34, and 64K wins at 38.  Ceil preserves block-aligned
+    # tips such as 16380/65532 while the cap avoids extrapolating past 64.
+    cutoff = min(maximum_remaining, (base_tokens + 1023) // 1024)
+    if base_tokens < minimum_context:
+        return False, "context_below_minimum", cutoff
+    if remaining_tokens > cutoff:
+        return False, "output_budget_above_cutoff", cutoff
+    return True, "auto_admitted", cutoff
 
 
 def note_segmented_self_mtp(key: str, amount: int = 1) -> None:
@@ -841,6 +885,7 @@ __all__ = [
     "qsa_private_delta_enabled",
     "qsa_private_delta_exact_set_fold_enabled",
     "shared_qsa_suffix_enabled",
+    "shared_qsa_suffix_admission",
     "note_qsa_private_delta_event",
     "note_qsa_exact_set_fold_event",
     "require_qsa_private_delta_engagement",

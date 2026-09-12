@@ -24,6 +24,7 @@ from mlx_lm.segmented_self_mtp import (
     require_true_batched_segmented_self_mtp_engagement,
     segmented_self_mtp_enabled,
     segmented_self_mtp_stats,
+    shared_qsa_suffix_admission,
 )
 from mlx_lm.models.qwen4_exp import QSAKVCache
 from mlx_lm.qsa_shared_suffix import SharedSuffixQSAKVCache
@@ -210,6 +211,31 @@ def test_shared_qsa_prefix_attestation_is_host_only_and_initial_cohort_scoped():
     assert detached[0].shared_qsa_prefix_id is None
     close_segmented_self_mtp_state(state)
     detached[0].segment_transaction.close()
+
+
+def test_shared_qsa_auto_policy_tracks_context_budget_crossover(monkeypatch):
+    monkeypatch.delenv("MLX_LM_SHARED_QSA_SUFFIX", raising=False)
+    assert shared_qsa_suffix_admission(
+        base_tokens=16 * 1024 - 4, remaining_tokens=16
+    ) == (True, "auto_admitted", 16)
+    assert shared_qsa_suffix_admission(
+        base_tokens=16 * 1024 - 4, remaining_tokens=17
+    ) == (False, "output_budget_above_cutoff", 16)
+    assert shared_qsa_suffix_admission(
+        base_tokens=32 * 1024 - 4, remaining_tokens=32
+    ) == (True, "auto_admitted", 32)
+    assert shared_qsa_suffix_admission(
+        base_tokens=64 * 1024 - 4, remaining_tokens=64
+    ) == (True, "auto_admitted", 64)
+
+    monkeypatch.setenv("MLX_LM_SHARED_QSA_SUFFIX", "0")
+    assert shared_qsa_suffix_admission(
+        base_tokens=64 * 1024, remaining_tokens=1
+    )[0] is False
+    monkeypatch.setenv("MLX_LM_SHARED_QSA_SUFFIX", "1")
+    assert shared_qsa_suffix_admission(
+        base_tokens=1, remaining_tokens=1000
+    )[0] is True
 
 
 def test_shared_qsa_suffix_materializes_on_detach_and_later_join(monkeypatch):

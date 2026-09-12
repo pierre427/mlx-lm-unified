@@ -2314,14 +2314,40 @@ def attach_segmented_self_mtp_lanes(
         from .models.qwen4_qsa_indexed import qwen4_qsa_private_delta_min_context
         from .segmented_self_mtp import (
             qsa_private_delta_enabled,
-            shared_qsa_suffix_enabled,
+            shared_qsa_suffix_admission,
         )
 
         query_length = int(joining[0].lane.num_draft) + 1
         minimum_context = qwen4_qsa_private_delta_min_context(query_length)
-        if shared_qsa_suffix_enabled() and qsa_private_delta_enabled():
+        target_groups = [item.caches.target for item in joining]
+        qsa_contexts = [
+            int(layer_rows[0].offset)
+            for layer_rows in zip(*target_groups)
+            if all(type(row) is QSAKVCache for row in layer_rows)
+        ]
+        base_tokens = min(qsa_contexts, default=0)
+        remaining_tokens = max(
+            item.lane.max_tokens - item.lane.ntoks for item in joining
+        )
+        admitted, _reason, cutoff = shared_qsa_suffix_admission(
+            base_tokens=base_tokens,
+            remaining_tokens=remaining_tokens,
+        )
+        note_segmented_self_mtp("shared_qsa_policy_checks")
+        note_segmented_self_mtp(
+            "shared_qsa_policy_admitted" if admitted else "shared_qsa_policy_declined"
+        )
+        note_segmented_self_mtp(
+            "shared_qsa_policy_context_tokens_cumulative", base_tokens
+        )
+        note_segmented_self_mtp(
+            "shared_qsa_policy_remaining_tokens_cumulative", remaining_tokens
+        )
+        note_segmented_self_mtp(
+            "shared_qsa_policy_cutoff_tokens_cumulative", cutoff
+        )
+        if admitted and qsa_private_delta_enabled():
             updates = []
-            target_groups = [item.caches.target for item in joining]
             for layer_index, layer_rows in enumerate(zip(*target_groups)):
                 if (
                     all(type(row) is QSAKVCache for row in layer_rows)
