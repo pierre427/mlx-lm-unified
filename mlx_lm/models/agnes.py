@@ -10,7 +10,6 @@ from .pipeline import PipelineMixin
 from .qwen3_5 import GatedDeltaNet
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 
-
 LAYER_GLOBAL = "agnes_global_attention"
 LAYER_DELTA = "agnes_delta_attention"
 LAYER_TYPES = (LAYER_GLOBAL, LAYER_DELTA)
@@ -114,9 +113,7 @@ class AgnesMLP(Qwen3NextMLP):
         super().__init__(args.hidden_size, intermediate_size)
         parallel_size = args.parallel_ffn_intermediate_size
         self.parallel_ffn = (
-            Qwen3NextMLP(args.hidden_size, parallel_size)
-            if parallel_size > 0
-            else None
+            Qwen3NextMLP(args.hidden_size, parallel_size) if parallel_size > 0 else None
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -211,9 +208,7 @@ class AgnesTextModel(PipelineMixin, nn.Module):
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
         if pipeline_rank < pipeline_size - 1:
-            hidden_states = mx.distributed.recv_like(
-                hidden_states, pipeline_rank + 1
-            )
+            hidden_states = mx.distributed.recv_like(hidden_states, pipeline_rank + 1)
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -237,6 +232,11 @@ class AgnesTextModel(PipelineMixin, nn.Module):
 
 
 class TextModel(nn.Module):
+    # The cache alternates recurrent GDN state and ordinary attention K/V.
+    # Declaring that stable topology lets the server select APCv2, whose
+    # layer-segment COW path keeps the two planes at one atomic token boundary.
+    apc_v2_layout = "agnes-hybrid-layer-segments-v1"
+
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
@@ -324,6 +324,8 @@ class ModelArgs(BaseModelArgs):
 
 
 class Model(nn.Module):
+    apc_v2_layout = "agnes-hybrid-layer-segments-v1"
+
     supports_speculative_rollback = True
 
     def __init__(self, args: ModelArgs):
@@ -364,9 +366,7 @@ class Model(nn.Module):
                 continue
 
             if key.startswith("model.language_model."):
-                key = key.replace(
-                    "model.language_model.", "language_model.model.", 1
-                )
+                key = key.replace("model.language_model.", "language_model.model.", 1)
             elif key.startswith("language_model."):
                 pass
             elif key.startswith("model."):

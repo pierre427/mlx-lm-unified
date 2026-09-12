@@ -4,8 +4,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from mlx_lm.apc import APCKey, AutomaticPrefixCache, AutomaticPrefixCacheV2
+from mlx_lm.cache_planes import CachePlaneKind
 from mlx_lm.models import agnes
+from mlx_lm.models.cache import record_state_checkpoints
+from mlx_lm.models.qwen3_5 import fuse_gated_delta_net_projections
 from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
+from mlx_lm.server import ResponseGenerator
 
 
 class TestAgnes(unittest.TestCase):
@@ -46,9 +51,7 @@ class TestAgnes(unittest.TestCase):
     def test_exact_layer_plan_parallel_ffn_and_cached_decode(self):
         model = agnes.Model(self.make_args())
         self.assertIsInstance(model.layers[0].delta_attn, agnes.GatedDeltaNet)
-        self.assertIsInstance(
-            model.layers[1].global_attn, agnes.Qwen3NextAttention
-        )
+        self.assertIsInstance(model.layers[1].global_attn, agnes.Qwen3NextAttention)
         self.assertIsNotNone(model.layers[0].mlp.parallel_ffn)
 
         tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
@@ -58,6 +61,196 @@ class TestAgnes(unittest.TestCase):
         decoded = mx.concatenate(steps, axis=1)
         mx.eval(full, decoded)
         self.assertTrue(mx.allclose(full, decoded, rtol=2e-4, atol=2e-4))
+
+    def test_apcv2_prefix_hit_miss_fork_and_cold_reuse_logits(self):
+        model = agnes.Model(self.make_args())
+        self.assertEqual(model.apc_v2_layout, "agnes-hybrid-layer-segments-v1")
+        self.assertEqual(
+            model.language_model.apc_v2_layout,
+            "agnes-hybrid-layer-segments-v1",
+        )
+        apc = AutomaticPrefixCacheV2(max_size=2, layout_name=model.apc_v2_layout)
+        key = APCKey(
+            "agnes-tiny",
+            revision="test-revision",
+            cache_layout_fingerprint=model.apc_v2_layout,
+        )
+        prefix = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+        miss = apc.lookup(key, prefix[0].tolist())
+        self.assertFalse(miss.hit)
+        self.assertEqual(miss.miss_reason, "no_compatible_prefix")
+
+        source = model.make_cache()
+        source_logits = model(prefix, cache=source)
+        mx.eval(source_logits, *[cache.state for cache in source])
+        capabilities = apc.store(key, prefix[0].tolist(), source)
+        self.assertEqual(capabilities.topology, "checkpointed_hybrid")
+
+        incompatible = apc.lookup(
+            APCKey(
+                "agnes-tiny",
+                revision="other-revision",
+                cache_layout_fingerprint=model.apc_v2_layout,
+            ),
+            [1, 2, 3, 4],
+        )
+        self.assertFalse(incompatible.hit)
+
+        suffix_a = mx.array([[4, 5]], dtype=mx.int32)
+        suffix_b = mx.array([[6, 7]], dtype=mx.int32)
+        hit = apc.lookup(key, [1, 2, 3, 4, 5])
+        self.assertTrue(hit.hit)
+        self.assertEqual(hit.cached_tokens, 3)
+        self.assertEqual(hit.remaining_tokens, [4, 5])
+        sibling = hit.cache.fork()
+
+        reused_a = model(suffix_a, cache=hit.cache)
+        reused_b = model(suffix_b, cache=sibling)
+        cold_a_cache = model.make_cache()
+        cold_b_cache = model.make_cache()
+        model(prefix, cache=cold_a_cache)
+        model(prefix, cache=cold_b_cache)
+        cold_a = model(suffix_a, cache=cold_a_cache)
+        cold_b = model(suffix_b, cache=cold_b_cache)
+        mx.eval(reused_a, reused_b, cold_a, cold_b)
+
+        # Compare the same prefill/decode split. A monolithic forward can use
+        # different kernels and is not the cache-reuse fidelity authority.
+        self.assertTrue(mx.array_equal(reused_a, cold_a))
+        self.assertTrue(mx.array_equal(reused_b, cold_b))
+
+        stats = apc.apc_stats
+        self.assertEqual(stats["version"], 2)
+        self.assertEqual(stats["layout_name"], model.apc_v2_layout)
+        self.assertEqual(stats["hits"], 1)
+        self.assertEqual(stats["misses"], 2)
+        self.assertEqual(stats["cached_tokens"], 3)
+        self.assertEqual(stats["layer_segments"]["fallback_entries"], 0)
+        self.assertEqual(
+            stats["layer_segments"]["by_plane"]["gdn_recurrent"]["layers"],
+            1,
+        )
+        self.assertEqual(
+            stats["layer_segments"]["by_plane"]["attention_kv"]["layers"],
+            1,
+        )
+        self.assertEqual(
+            stats["cow"]["planes"]["gdn_recurrent"]["materializations"],
+            2,
+        )
+        self.assertEqual(
+            stats["cow"]["planes"]["attention_kv"]["materializations"],
+            2,
+        )
+        hit.cache.close()
+        sibling.close()
+
+    def test_server_selects_apcv2_for_native_agnes(self):
+        response = ResponseGenerator.__new__(ResponseGenerator)
+        response.prompt_cache = AutomaticPrefixCache(max_size=3, max_bytes=123456)
+        response._cache_capsule_pool = None
+        model = agnes.Model(self.make_args())
+
+        response._configure_apc_for_model(model)
+
+        self.assertIsInstance(response.prompt_cache, AutomaticPrefixCacheV2)
+        self.assertEqual(response.prompt_cache.layout_name, model.apc_v2_layout)
+        self.assertEqual(response.prompt_cache.max_size, 3)
+        self.assertEqual(response.prompt_cache.max_bytes, 123456)
+        response._cache_capsule_pool.close()
+
+    def test_existing_gdn_projection_fusion_accepts_agnes_explicitly(self):
+        model = agnes.Model(
+            self.make_args(
+                hidden_size=32,
+                intermediate_size=64,
+                parallel_ffn_intermediate_size=32,
+                num_attention_heads=4,
+                num_key_value_heads=1,
+                head_dim=8,
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+            )
+        )
+        projection_names = (
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+        )
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, module: any(
+                path.endswith(name) for name in projection_names
+            ),
+        )
+        mx.eval(model.parameters())
+
+        # The inherited optimization remains default-off and reports the
+        # number of real Agnes delta layers it verified and rewrote.
+        self.assertEqual(fuse_gated_delta_net_projections(model), 0)
+        self.assertFalse(hasattr(model.layers[0].delta_attn, "in_proj_fused"))
+        self.assertEqual(fuse_gated_delta_net_projections(model, enabled=True), 1)
+        self.assertTrue(hasattr(model.layers[0].delta_attn, "in_proj_fused"))
+
+    def test_apcv2_checkpoint_trim_and_atomic_invalidation(self):
+        model = agnes.Model(self.make_args())
+        prefix = mx.array([[1, 2, 3]], dtype=mx.int32)
+        continuation = mx.array([[4, 5]], dtype=mx.int32)
+        source = model.make_cache()
+        prefix_logits = model(prefix, cache=source)
+        mx.eval(prefix_logits, *[cache.state for cache in source])
+        record_state_checkpoints(source, [3], force=True)
+        long_logits = model(continuation, cache=source)
+        mx.eval(long_logits, *[cache.state for cache in source])
+
+        apc = AutomaticPrefixCacheV2(max_size=2, layout_name=model.apc_v2_layout)
+        key = APCKey("agnes-trim")
+        stored_tokens = [1, 2, 3, 4, 5]
+        apc.store(key, stored_tokens, source)
+
+        # The requested branch diverges inside the stored entry. APCv2 must
+        # restore the GDN checkpoint and trim attention K/V to the same point.
+        hit = apc.lookup(key, [1, 2, 3, 9])
+        self.assertTrue(hit.hit)
+        self.assertEqual(hit.hit_kind, "prefix")
+        self.assertEqual(hit.cached_tokens, 3)
+        self.assertEqual(hit.remaining_tokens, [9])
+        self.assertEqual(
+            hit.segment_manifest["by_plane"]["gdn_recurrent"]["segments"],
+            1,
+        )
+        self.assertEqual(
+            hit.segment_manifest["by_plane"]["attention_kv"]["segments"],
+            1,
+        )
+
+        reused = model(
+            mx.array([hit.remaining_tokens], dtype=mx.int32), cache=hit.cache
+        )
+        cold_cache = model.make_cache()
+        model(prefix, cache=cold_cache)
+        cold = model(mx.array([[9]], dtype=mx.int32), cache=cold_cache)
+        mx.eval(reused, cold)
+        self.assertTrue(mx.array_equal(reused, cold))
+        hit.cache.close()
+
+        entry = apc._trie.get(key, stored_tokens)
+        owner = entry.prompt_cache.cow_owner
+        recurrent_segment = next(
+            segment
+            for segment in owner.segment_manifest.segments
+            if segment.key.kind == CachePlaneKind.GDN_RECURRENT
+        )
+        self.assertTrue(
+            owner.invalidate_segment(recurrent_segment.key, "test-stale-gdn")
+        )
+        invalidated = apc.lookup(key, [1, 2, 3, 10])
+        self.assertFalse(invalidated.hit)
+        self.assertEqual(invalidated.miss_reason, "stale_cow_generation")
 
     def test_sanitize_raw_then_native_does_not_shift_norm_twice(self):
         raw_model = agnes.Model(self.make_args(mtp_num_hidden_layers=1))
@@ -88,12 +281,8 @@ class TestAgnes(unittest.TestCase):
     def test_bfloat16_gated_norm_preserves_reference_operation_order(self):
         norm = Qwen3NextRMSNormGated(8, 1e-6)
         norm.weight = (mx.arange(8) / 16 + 0.75).astype(mx.bfloat16)
-        hidden = (mx.arange(16).reshape(1, 2, 8) / 13 - 0.4).astype(
-            mx.bfloat16
-        )
-        gate = (mx.arange(16).reshape(1, 2, 8) / 17 - 0.3).astype(
-            mx.bfloat16
-        )
+        hidden = (mx.arange(16).reshape(1, 2, 8) / 13 - 0.4).astype(mx.bfloat16)
+        gate = (mx.arange(16).reshape(1, 2, 8) / 17 - 0.3).astype(mx.bfloat16)
         actual = norm(hidden, gate)
         expected = (
             mx.fast.rms_norm(hidden, norm.weight, norm.eps).astype(mx.float32)
