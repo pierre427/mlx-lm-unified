@@ -55,6 +55,13 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .tool_protocol import (
+    ToolCallFormatter,
+    ToolCallValidator,
+    normalize_tool_history,
+    tool_finish_reason,
+    unsupported_constraint,
+)
 from .apc import (
     AutomaticPrefixCache,
     AutomaticPrefixCacheV2,
@@ -127,58 +134,6 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
-class ToolCallFormatter:
-    def __init__(self, tool_parser, tools, streaming=False):
-        self._idx = 0
-        self._tool_parser = tool_parser
-        self._tools = tools
-        self._streaming = streaming
-
-    def _format(self, tc):
-        # Copy before mutating -- `tc` is owned by the tool parser and may be
-        # reused/inspected by its caller; pop/assign must not touch it.
-        tc = dict(tc)
-        tc_id = tc.pop("id", None) or str(uuid.uuid4())
-        tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-        out = {
-            "function": tc,
-            "type": "function",
-            "id": tc_id,
-        }
-        if self._streaming:
-            out["index"] = self._idx
-            self._idx += 1
-        return out
-
-    def __call__(self, tool_calls):
-        if not tool_calls or self._tool_parser is None:
-            return []
-
-        result = []
-        for tool_text in tool_calls:
-            try:
-                parsed = self._tool_parser(tool_text, self._tools)
-            except (ValueError, json.JSONDecodeError) as e:
-                logging.warning(
-                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
-                    f"tool text was likely truncated mid-generation."
-                )
-                continue
-            if not isinstance(parsed, list):
-                parsed = [parsed]
-            for tc in parsed:
-                try:
-                    result.append(self._format(tc))
-                except (KeyError, TypeError, ValueError) as e:
-                    # One malformed call (e.g. missing "arguments") must not
-                    # discard the valid siblings already parsed from this block.
-                    logging.warning(
-                        f"Dropping malformed tool call ({type(e).__name__}: {e})"
-                    )
-                    continue
-        return result
-
-
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
     default_role_mapping = {
         "system_prompt": (
@@ -240,11 +195,8 @@ def process_message_content(messages):
         elif content is None:
             message["content"] = ""
 
-        if tool_calls := message.get("tool_calls"):
-            for tool_call in tool_calls:
-                if func := tool_call.get("function"):
-                    if isinstance(args := func.get("arguments"), str) and args:
-                        func["arguments"] = json.loads(args)
+        if message.get("tool_calls") is not None:
+            message["tool_calls"] = normalize_tool_history([message])[0]["tool_calls"]
 
 
 @dataclass
@@ -2129,9 +2081,7 @@ class _ChoiceAssembler:
                 self.tool_text += seg_text
             elif seg_state == "normal":
                 if self.prev_state == "tool":
-                    self.tool_calls.append(self.tool_text)
-                    self.tool_text = ""
-                    self.made_tool_call = True
+                    self._finish_tool_call()
                 self.text += seg_text
             self.prev_state = seg_state
 
@@ -2150,9 +2100,15 @@ class _ChoiceAssembler:
     def has_pending_stream_text(self):
         return bool(self.text or self.tool_calls or self.reasoning_text)
 
+    def _finish_tool_call(self):
+        calls = self.tool_formatter([self.tool_text])
+        self.tool_text = ""
+        self.tool_calls.extend(calls)
+        self.made_tool_call |= bool(calls)
+
     def take_stream_payload(self):
         """Return the text/tool/reasoning accumulated since the last chunk."""
-        payload = (self.text, self.tool_formatter(self.tool_calls), self.reasoning_text)
+        payload = (self.text, self.tool_calls, self.reasoning_text)
         self.reasoning_text = ""
         self.text = ""
         self.tool_calls = []
@@ -2163,10 +2119,8 @@ class _ChoiceAssembler:
             return
         self._finalized = True
         if self.prev_state == "tool" and self.tool_text:
-            self.tool_calls.append(self.tool_text)
-            self.made_tool_call = True
-        if self.finish_reason == "stop" and self.made_tool_call:
-            self.finish_reason = "tool_calls"
+            self._finish_tool_call()
+        self.finish_reason = tool_finish_reason(self.finish_reason, self.made_tool_call)
 
 
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -2497,8 +2451,17 @@ class ResponseGenerator:
     def _prompt_initial_state(tokenizer, prompt):
         initial_state = "normal"
         if tokenizer.has_thinking:
-            think_start = tokenizer.rfind_think_start(prompt)
-            think_end = tokenizer.rfind_think_end(prompt)
+            # Prior completed messages may contain literal or unclosed markers.
+            # Only the suffix after the last turn-ending token can pre-open
+            # reasoning for this completion. Preserve prefix continuation when
+            # no such boundary is present.
+            eos_ids = getattr(tokenizer, "eos_token_ids", ())
+            boundary = next(
+                (i + 1 for i in range(len(prompt) - 1, -1, -1) if prompt[i] in eos_ids),
+                0,
+            )
+            think_start = tokenizer.rfind_think_start(prompt, start=boundary)
+            think_end = tokenizer.rfind_think_end(prompt, start=boundary)
             if think_start > think_end:
                 initial_state = "reasoning"
         return initial_state
@@ -4584,6 +4547,18 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        constraint = unsupported_constraint(self.body)
+        if constraint:
+            self._bad_request(f"{constraint} constrained decoding is not supported")
+            return
+        try:
+            ToolCallValidator(self.body.get("tools"))
+            if self.path.endswith("/chat/completions") and "messages" in self.body:
+                self.body["messages"] = normalize_tool_history(self.body["messages"])
+        except ValueError as exc:
+            self._bad_request(str(exc))
+            return
+
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
@@ -5067,7 +5042,7 @@ class APIHandler(BaseHTTPRequestHandler):
         resp = self.generate_response(
             assembler.text,
             assembler.finish_reason,
-            tool_calls=assembler.tool_formatter(assembler.tool_calls),
+            tool_calls=assembler.tool_calls,
             reasoning_text=assembler.reasoning_text,
             index=assembler.index,
         )
@@ -5257,7 +5232,7 @@ class APIHandler(BaseHTTPRequestHandler):
                             top_tokens=a.top_tokens,
                             tokens=a.tokens,
                             reasoning_text=a.reasoning_text,
-                            tool_calls=a.tool_formatter(a.tool_calls),
+                            tool_calls=a.tool_calls,
                             index=a.index,
                         )
                         for a in assemblers

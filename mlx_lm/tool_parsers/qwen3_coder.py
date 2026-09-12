@@ -7,6 +7,9 @@ https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/qwen3coder_to
 
 import ast
 import json
+import logging
+import math
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 import regex as re
@@ -40,16 +43,18 @@ def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
 
 def _convert_param_value(param_value: str, param_name: str, param_config: dict) -> Any:
     """Convert parameter value based on its type in the schema."""
-    if param_value.lower() == "null":
-        return None
-
     if not (param := param_config.get(param_name, False)):
-        return param_value
+        return None if param_value.lower() == "null" else param_value
 
     # Resolve anyOf/oneOf/list-form unions to a concrete non-null type; an
     # unresolved schema is treated as a string (values returned verbatim).
     inferred = infer_type_from_json_schema(param)
     param_type = inferred.strip().lower() if inferred else "string"
+    if param_value.lower() == "null":
+        if _declares_null(param):
+            return None
+        if param_type not in _string_types:
+            raise ValueError(f"Null is not allowed for {param_name}")
     if param_type in _string_types:
         return param_value
     elif (
@@ -59,20 +64,26 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
         or param_type.startswith("short")
         or param_type.startswith("unsigned")
     ):
-        float_param_value = float(param_value)
-        int_param_value = int(float_param_value)
-        if float_param_value - int_param_value != 0:
+        try:
+            value = Decimal(param_value)
+        except InvalidOperation as exc:
+            raise ValueError(f"Invalid integer literal {param_value!r}") from exc
+        if not value.is_finite() or value != value.to_integral_value():
             raise ValueError(f"Invalid integer literal {param_value!r}")
-        return int_param_value
+        # Bound exponent expansion just as Python bounds decimal int strings.
+        if value and value.adjusted() >= 4300:
+            raise ValueError("Integer literal exceeds 4300 digits")
+        return int(value)
     elif param_type.startswith("num") or param_type.startswith("float"):
         float_param_value = float(param_value)
-        int_param_value = int(float_param_value)
-        return (
-            float_param_value
-            if (float_param_value - int_param_value) != 0
-            else int_param_value
-        )
+        if not math.isfinite(float_param_value):
+            raise ValueError(f"Invalid number literal {param_value!r}")
+        # Preserve integral JSON numbers exactly here too.
+        exact = Decimal(param_value)
+        return int(exact) if exact == exact.to_integral_value() else float_param_value
     elif param_type in _bool_types:
+        if param_value.lower() not in ("true", "false"):
+            raise ValueError(f"Invalid boolean literal {param_value!r}")
         return param_value.lower() == "true"
     else:
         if (
@@ -98,15 +109,37 @@ def _safe_literal_eval(param_value: str) -> Any:
         return param_value
 
 
+def _declares_null(schema):
+    if not isinstance(schema, dict):
+        return False
+    declared = schema.get("type")
+    if declared == "null" or isinstance(declared, list) and "null" in declared:
+        return True
+    return any(
+        _declares_null(branch)
+        for key in ("anyOf", "oneOf")
+        for branch in schema.get(key, [])
+    )
+
+
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     end_index = function_call_str.index(">")
     function_name = function_call_str[:end_index]
+    if not function_name.strip() or "<" in function_name:
+        raise ValueError("Malformed function name")
     param_config = _get_arguments_config(function_name, tools)
     parameters = function_call_str[end_index + 1 :]
     param_dict = {}
-    for match_text in _parameter_regex.findall(parameters):
+    cursor = 0
+    for match in _parameter_regex.finditer(parameters):
+        if parameters[cursor : match.start()].strip():
+            raise ValueError("Malformed parameter markup")
+        cursor = match.end()
+        match_text = match.group(1)
         idx = match_text.index(">")
         param_name = match_text[:idx]
+        if not param_name.strip() or "<" in param_name or param_name in param_dict:
+            raise ValueError("Malformed or duplicate parameter name")
         param_value = str(match_text[idx + 1 :])
         if param_value.startswith("\n"):
             param_value = param_value[1:]
@@ -116,6 +149,8 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
         param_dict[param_name] = _convert_param_value(
             param_value, param_name, param_config
         )
+    if parameters[cursor:].strip():
+        raise ValueError("Incomplete or malformed parameter markup")
     return dict(name=function_name, arguments=param_dict)
 
 
@@ -131,5 +166,12 @@ def parse_tool_call(
     matches = _function_regex.findall(model_output)
     if not matches:
         raise ValueError("No function provided.")
-    calls = [_parse_xml_function_call(m, tools) for m in matches]
+    calls = []
+    for match in matches:
+        try:
+            calls.append(_parse_xml_function_call(match, tools))
+        except ValueError as exc:
+            logging.warning("Dropping malformed Qwen function: %s", exc)
+    if not calls:
+        raise ValueError("No valid function provided.")
     return calls[0] if len(calls) == 1 else calls

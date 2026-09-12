@@ -31,6 +31,8 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "jsonschema>=4.18,<5",
+        "referencing>=0.28",
     ],
     packages=[
         "mlx_lm",
