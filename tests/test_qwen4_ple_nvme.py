@@ -1021,7 +1021,8 @@ class TestQwen4PleNvme(unittest.TestCase):
         # Simulate a fork: pretend another process created the pools. The
         # next lookup must rebuild fd + executors and still read correctly.
         # (In a real fork the parent keeps its own resources; here both
-        # live in one process, so release the pre-"fork" ones afterwards.)
+        # live in one process, so release the old executors afterwards;
+        # ownership recovery itself closes the inherited descriptor copy.)
         stale_pool, stale_prefetch, stale_fd = (
             table._pool,
             table._prefetch_pool,
@@ -1036,7 +1037,8 @@ class TestQwen4PleNvme(unittest.TestCase):
         self.assertEqual(table._owner_pid, _os.getpid())
         stale_pool.shutdown(wait=True)
         stale_prefetch.shutdown(wait=True)
-        _os.close(stale_fd)
+        with self.assertRaises(OSError):
+            _os.fstat(stale_fd)
 
         table.close()
         table.close()  # idempotent

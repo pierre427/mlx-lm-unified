@@ -61,6 +61,30 @@ DECODE_WORKERS = 16
 PREFILL_WORKERS = 64
 PREFETCH_WORKERS = 16
 
+# Serialize descriptor replacement with fork, without retaining table instances.
+_FORK_RESOURCE_LOCK = threading.RLock()
+
+
+def _before_fork():
+    _FORK_RESOURCE_LOCK.acquire()
+
+
+def _after_fork_parent():
+    _FORK_RESOURCE_LOCK.release()
+
+
+def _after_fork_child():
+    global _FORK_RESOURCE_LOCK
+    _FORK_RESOURCE_LOCK = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_parent,
+        after_in_child=_after_fork_child,
+    )
+
 
 @dataclass(frozen=True)
 class LookupStats:
@@ -427,10 +451,25 @@ class FileBackedShardedEmbedding(nn.Module):
         self._stat_cache_hits = 0
         self._stat_cache_misses = 0
         self._stat_cache_evictions = 0
-        self._open_resources()
+        with _FORK_RESOURCE_LOCK:
+            self._open_resources()
 
     def _open_resources(self):
-        self._owner_pid = os.getpid()
+        fd = os.open(self.sidecar_path, os.O_RDONLY)
+        pool = None
+        try:
+            pool = ThreadPoolExecutor(
+                max_workers=max(self.decode_workers, self.prefill_workers),
+                thread_name_prefix="ple-nvme",
+            )
+            prefetch_pool = ThreadPoolExecutor(
+                max_workers=PREFETCH_WORKERS, thread_name_prefix="ple-nvme-prefetch"
+            )
+        except BaseException:
+            if pool is not None:
+                pool.shutdown(wait=True)
+            os.close(fd)
+            raise
         # Fork safety: rebuilt (empty) in a forked child alongside the fd
         # and pools, so a lock held by a dead parent thread cannot leak in.
         self._lru = OrderedDict()
@@ -439,31 +478,44 @@ class FileBackedShardedEmbedding(nn.Module):
         # for the next foreground lookup; popped on hit, bounded.
         self._dq_cache = {}
         self._dq_lock = threading.Lock()
-        self._fd = os.open(self.sidecar_path, os.O_RDONLY)
-        self._pool = ThreadPoolExecutor(
-            max_workers=max(self.decode_workers, self.prefill_workers),
-            thread_name_prefix="ple-nvme",
-        )
+        self._fd = fd
+        self._pool = pool
         # Prefetch runs on its own pool so page-cache warming can never
         # queue behind (or ahead of) a foreground lookup.
-        self._prefetch_pool = ThreadPoolExecutor(
-            max_workers=PREFETCH_WORKERS, thread_name_prefix="ple-nvme-prefetch"
-        )
+        self._prefetch_pool = prefetch_pool
+        # Publish ownership only after every child resource is ready.
+        self._owner_pid = os.getpid()
 
-    def _check_owner(self) -> None:
+    def _check_owner(self, *, reopen: bool = True) -> None:
         """Rebuild fd/pools/LRU after a fork before touching any of them.
 
         A forked child inherits the parent's dict and possibly a lock held
         at fork time; every LRU-touching entry point calls this first (not
         only ``_submit``) so a complete cache hit or a prefetch membership
-        filter can never use the inherited state. The unlocked pid compare
-        is safe: it only ever races a fork of THIS process, which the
-        supported lifecycle excludes.
+        filter can never use the inherited state. The module lock is reset
+        in the child; inherited instance locks must never be acquired here.
         """
         if os.getpid() != self._owner_pid:
-            with self._lifecycle_lock:
+            with _FORK_RESOURCE_LOCK:
                 if os.getpid() != self._owner_pid:
-                    self._open_resources()
+                    inherited_fd = self._fd
+                    self._lifecycle_lock = threading.Lock()
+                    self._lru_lock = threading.Lock()
+                    self._dq_lock = threading.Lock()
+                    self._lru = OrderedDict()
+                    self._dq_cache = {}
+                    # Inherited executors have no live workers in this child.
+                    # Never call their shutdown(), which can take stale locks.
+                    self._fd = self._pool = self._prefetch_pool = None
+                    try:
+                        if reopen and not self._closed:
+                            self._open_resources()
+                        else:
+                            self._closed = True
+                            self._owner_pid = os.getpid()
+                    finally:
+                        if inherited_fd is not None:
+                            os.close(inherited_fd)
 
     def _submit(self, use_prefetch_pool: bool, fns, required: bool):
         """Submit ``fns`` atomically with the closed/fork check.
@@ -481,17 +533,17 @@ class FileBackedShardedEmbedding(nn.Module):
         returned futures may still run because close() drains the pools
         before closing it.
         """
+        self._check_owner()
         with self._lifecycle_lock:
             if self._closed:
                 if required:
                     raise RuntimeError("FileBackedShardedEmbedding is closed")
                 return []
-            if os.getpid() != self._owner_pid:
-                self._open_resources()
             pool = self._prefetch_pool if use_prefetch_pool else self._pool
             return [pool.submit(fn, self._fd) for fn in fns]
 
     def close(self):
+        self._check_owner(reopen=False)
         with self._lifecycle_lock:
             if self._closed:
                 return
@@ -502,9 +554,14 @@ class FileBackedShardedEmbedding(nn.Module):
         # fd closes.
         pool.shutdown(wait=True)
         prefetch_pool.shutdown(wait=True)
-        os.close(fd)
+        # Fork must see either the valid descriptor or the cleared slot.
+        with _FORK_RESOURCE_LOCK:
+            os.close(fd)
+            self._fd = self._pool = self._prefetch_pool = None
         with self._lru_lock:
             self._lru.clear()
+        with self._dq_lock:
+            self._dq_cache.clear()
 
     def __del__(self):
         try:
@@ -627,6 +684,9 @@ class FileBackedShardedEmbedding(nn.Module):
         return mx.dequantize(w, s, b, group_size=32, bits=4, mode="affine")
 
     def lookup_numpy(self, indices: np.ndarray) -> mx.array:
+        self._check_owner()
+        if self._closed:
+            raise RuntimeError("FileBackedShardedEmbedding is closed")
         # STUB (MLXUAG_STUB_PLE=1): skip the pread+dequant and return a
         # correctly-shaped zeros tensor. The GPU graph shape downstream is
         # unchanged, so the harness round-wall delta vs the real lookup is the
