@@ -100,8 +100,15 @@ def admit_qwen4_fused_gdn_decode(
     value_head_dim: int,
     conv_kernel: int,
     gate_activation: str,
+    architecture: str = "qwen4",
 ) -> FusedGdnAdmission:
-    """Pure structural admission check; safe to exercise without MLX eval."""
+    """Pure structural admission check; safe to exercise without MLX eval.
+
+    Agnes shares Qwen4's production recurrent geometry, but not its numerical
+    contract: it uses a swish output gate and the shared Qwen3.5 normalization
+    boundaries.  ``architecture`` keeps those two contracts explicit without
+    weakening Qwen4's sigmoid-only admission.
+    """
     if training:
         return FusedGdnAdmission(False, "training")
     if sharded:
@@ -116,7 +123,10 @@ def admit_qwen4_fused_gdn_decode(
     )
     if refusal is not None:
         return refusal
-    if gate_activation != "sigmoid":
+    expected_gate = {"qwen4": "sigmoid", "agnes": "swish"}.get(architecture)
+    if expected_gate is None:
+        return FusedGdnAdmission(False, f"unsupported architecture {architecture!r}")
+    if gate_activation != expected_gate:
         return FusedGdnAdmission(False, f"output gate {gate_activation!r}")
 
     geometry = (
@@ -248,8 +258,10 @@ _SOURCE = r"""
 
   threadgroup float sq[DK];
   threadgroup float sk[DK];
-  threadgroup T sq_squared[DK];
-  threadgroup T sk_squared[DK];
+  // Float storage can represent the Qwen4 bf16 squares exactly after their
+  // explicit cast while also serving Agnes' float-accumulating fast RMSNorm.
+  threadgroup float sq_squared[DK];
+  threadgroup float sk_squared[DK];
   threadgroup float sv[DV];
   threadgroup float sy[DV];
   threadgroup float shr[4];
@@ -294,44 +306,84 @@ _SOURCE = r"""
     T sp = mlx_softplus_fast(av);
     shr[2] = metal::precise::exp(
         -metal::precise::exp(float(A_log[hv])) * float(sp));
-    // Exhaustive bf16 sweep: mlx_sigmoid_precise<T> equals mx.sigmoid on
-    // every finite bf16 input; the fast form differs on one (x ~ -6.85).
-    shr[3] = float(mlx_sigmoid_precise(b[hv]));
+    if constexpr (AGNES_NUMERICS) {
+      // Shared Qwen3.5 widens b before the eager sigmoid.
+      shr[3] = mlx_sigmoid_precise<float>(float(b[hv]));
+    } else {
+      // Qwen4 materializes beta in the activation dtype.
+      shr[3] = float(mlx_sigmoid_precise(b[hv]));
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   for (uint d = tid; d < (uint)DK; d += NT) {
-    T qv = static_cast<T>(sq[d]);
-    T kv = static_cast<T>(sk[d]);
-    sq_squared[d] = static_cast<T>(qv * qv);
-    sk_squared[d] = static_cast<T>(kv * kv);
+    if constexpr (AGNES_NUMERICS) {
+      float qv = sq[d];
+      float kv = sk[d];
+      sq_squared[d] = qv * qv;
+      sk_squared[d] = kv * kv;
+    } else {
+      T qv = static_cast<T>(sq[d]);
+      T kv = static_cast<T>(sk[d]);
+      sq_squared[d] = float(static_cast<T>(qv * qv));
+      sk_squared[d] = float(static_cast<T>(kv * kv));
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (simdgroup_index_in_threadgroup == 0u) {
-    T pq = static_cast<T>(0), pk = static_cast<T>(0);
     uint base = 4u * lane;
-    for (int i = 0; i < 4; ++i) {
-      pq = static_cast<T>(sq_squared[base + i] + pq);
-      pk = static_cast<T>(sk_squared[base + i] + pk);
-    }
-    pq = static_cast<T>(simd_sum(float(pq)));
-    pk = static_cast<T>(simd_sum(float(pk)));
-    if (lane == 0u) {
-      T eps = static_cast<T>(1.0e-6f);
-      T qdenom = pq + eps;
-      T kdenom = pk + eps;
-      shr[0] = float(static_cast<T>(metal::precise::rsqrt(qdenom)));
-      shr[1] = float(static_cast<T>(metal::precise::rsqrt(kdenom)));
+    if constexpr (AGNES_NUMERICS) {
+      // This mirrors MLX rms_single_row for axis_size=128/N_READS=4:
+      // four float products per lane, then one simd_sum in float32.
+      float pq = 0.0f, pk = 0.0f;
+      for (int i = 0; i < 4; ++i) {
+        pq += sq_squared[base + i];
+        pk += sk_squared[base + i];
+      }
+      pq = simd_sum(pq);
+      pk = simd_sum(pk);
+      if (lane == 0u) {
+        constexpr float rms_eps = 1.0e-6f / float(DK);
+        shr[0] = metal::precise::rsqrt(pq / float(DK) + rms_eps);
+        shr[1] = metal::precise::rsqrt(pk / float(DK) + rms_eps);
+      }
+    } else {
+      T pq = static_cast<T>(0), pk = static_cast<T>(0);
+      for (int i = 0; i < 4; ++i) {
+        pq = static_cast<T>(static_cast<T>(sq_squared[base + i]) + pq);
+        pk = static_cast<T>(static_cast<T>(sk_squared[base + i]) + pk);
+      }
+      pq = static_cast<T>(simd_sum(float(pq)));
+      pk = static_cast<T>(simd_sum(float(pk)));
+      if (lane == 0u) {
+        T eps = static_cast<T>(1.0e-6f);
+        T qdenom = pq + eps;
+        T kdenom = pk + eps;
+        shr[0] = float(static_cast<T>(metal::precise::rsqrt(qdenom)));
+        shr[1] = float(static_cast<T>(metal::precise::rsqrt(kdenom)));
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  T qscale = static_cast<T>(0.08838834764831845f);
   for (uint d = tid; d < (uint)DK; d += NT) {
-    T q_normalized = static_cast<T>(static_cast<T>(sq[d]) * static_cast<T>(shr[0]));
-    T k_normalized = static_cast<T>(static_cast<T>(sk[d]) * static_cast<T>(shr[1]));
-    sq[d] = float(static_cast<T>(q_normalized * qscale));
-    sk[d] = float(k_normalized);
+    if constexpr (AGNES_NUMERICS) {
+      // normalize_gdn_qk expresses L2 normalization through fast RMSNorm,
+      // then applies 1/DK to q and 1/sqrt(DK) to k in activation dtype.
+      T q_rms = static_cast<T>(sq[d] * shr[0]);
+      T k_rms = static_cast<T>(sk[d] * shr[1]);
+      sq[d] = float(static_cast<T>(q_rms * static_cast<T>(1.0f / float(DK))));
+      sk[d] = float(static_cast<T>(
+          k_rms * static_cast<T>(0.08838834764831845f)));
+    } else {
+      T qscale = static_cast<T>(0.08838834764831845f);
+      T q_normalized = static_cast<T>(
+          static_cast<T>(sq[d]) * static_cast<T>(shr[0]));
+      T k_normalized = static_cast<T>(
+          static_cast<T>(sk[d]) * static_cast<T>(shr[1]));
+      sq[d] = float(static_cast<T>(q_normalized * qscale));
+      sk[d] = float(k_normalized);
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -371,9 +423,14 @@ _SOURCE = r"""
   for (uint d = tid; d < (uint)DV; d += NT) {
     T normalized = static_cast<T>(sy[d] * shr[0]);
     normalized = norm_weight[d] * normalized;
-    // Exhaustive bf16 sweep: the precise float32 sigmoid matches mx.sigmoid on
-    // every finite bf16-valued gate; the fast form differs on ~1% of them.
-    float x = float(normalized) * mlx_sigmoid_precise<float>(float(z[hv * DV + d]));
+    float zv = float(z[hv * DV + d]);
+    float gate = mlx_sigmoid_precise<float>(zv);
+    if constexpr (AGNES_NUMERICS) {
+      // Agnes' compiled _precise_swiglu uses nn.silu in float32. Runtime-built
+      // compiled spans lower that sigmoid to metal::exp, hence the fast form.
+      gate = zv * mlx_sigmoid_fast<float>(zv);
+    }
+    float x = float(normalized) * gate;
     output[hv * DV + d] = static_cast<T>(x);
   }
 """
@@ -699,6 +756,7 @@ def qwen4_fused_gdn_decode(
     norm_eps: float,
     *,
     threadgroup_y: int,
+    architecture: str = "qwen4",
 ):
     """Build the fused graph.  Callers must run structural admission first."""
     if threadgroup_y not in _THREADGROUP_Y_CANDIDATES:
@@ -706,6 +764,8 @@ def qwen4_fused_gdn_decode(
             f"unsupported threadgroup_y {threadgroup_y}; "
             f"expected one of {_THREADGROUP_Y_CANDIDATES}"
         )
+    if architecture not in ("qwen4", "agnes"):
+        raise ValueError(f"unsupported fused GDN architecture {architecture!r}")
     outputs = _kernel()(
         inputs=[
             qkv,
@@ -729,6 +789,7 @@ def qwen4_fused_gdn_decode(
             ("K", CONV_KERNEL),
             ("TY", threadgroup_y),
             ("RATIO", NUM_VALUE_HEADS // NUM_KEY_HEADS),
+            ("AGNES_NUMERICS", int(architecture == "agnes")),
         ],
         grid=(32, threadgroup_y, NUM_VALUE_HEADS),
         threadgroup=(32, threadgroup_y, 1),
@@ -884,11 +945,76 @@ def probe_qwen4_fused_gdn_decode(dtype) -> Optional[int]:
         return _PROBED_THREADGROUP_Y
 
 
+_AGNES_PROBED_THREADGROUP_Y: Optional[int] = None
+_AGNES_PROBE_COMPLETE = False
+_AGNES_PROBE_LOCK = Lock()
+
+
+def probe_agnes_fused_gdn_decode(dtype) -> Optional[int]:
+    """Compile the Agnes swish/numerical specialization once, failure-atomically."""
+    global _AGNES_PROBE_COMPLETE, _AGNES_PROBED_THREADGROUP_Y
+    if _AGNES_PROBE_COMPLETE:
+        return _AGNES_PROBED_THREADGROUP_Y
+    with _AGNES_PROBE_LOCK:
+        if _AGNES_PROBE_COMPLETE:
+            return _AGNES_PROBED_THREADGROUP_Y
+        if not fused_gdn_runtime_supported():
+            _AGNES_PROBE_COMPLETE = True
+            return None
+
+        qkv = mx.zeros((1, 1, CONV_DIM), dtype=dtype)
+        z = mx.zeros((1, 1, VALUE_DIM), dtype=dtype)
+        gates = mx.zeros((1, 1, NUM_VALUE_HEADS), dtype=dtype)
+        conv_state = mx.zeros((1, CONV_KERNEL - 1, CONV_DIM), dtype=dtype)
+        conv_weight = mx.zeros((CONV_DIM, CONV_KERNEL, 1), dtype=dtype)
+        recurrent_state = mx.zeros(
+            (1, NUM_VALUE_HEADS, VALUE_HEAD_DIM, KEY_HEAD_DIM), dtype=mx.float32
+        )
+        vector = mx.zeros((NUM_VALUE_HEADS,), dtype=dtype)
+        A_log = mx.zeros((NUM_VALUE_HEADS,), dtype=mx.float32)
+        norm_weight = mx.ones((VALUE_HEAD_DIM,), dtype=dtype)
+        for threadgroup_y in _THREADGROUP_Y_CANDIDATES:
+            try:
+                outputs = qwen4_fused_gdn_decode(
+                    qkv,
+                    z,
+                    gates,
+                    gates,
+                    conv_state,
+                    conv_weight,
+                    A_log,
+                    vector,
+                    recurrent_state,
+                    norm_weight,
+                    1.0e-6,
+                    threadgroup_y=threadgroup_y,
+                    architecture="agnes",
+                )
+                mx.eval(*outputs)
+                _AGNES_PROBED_THREADGROUP_Y = threadgroup_y
+                break
+            except ValueError as exc:
+                if "threads per threadgroup" in str(exc):
+                    continue
+                logger.info("Agnes fused GDN probe failed: %s", exc)
+                break
+            except RuntimeError as exc:
+                logger.info(
+                    "Agnes fused GDN threadgroup_y=%d is unavailable: %s",
+                    threadgroup_y,
+                    exc,
+                )
+                continue
+        _AGNES_PROBE_COMPLETE = True
+        return _AGNES_PROBED_THREADGROUP_Y
+
+
 __all__ = [
     "FusedGdnAdmission",
     "admit_qwen4_fused_gdn_decode",
     "admit_rollback_span",
     "fused_gdn_runtime_supported",
+    "probe_agnes_fused_gdn_decode",
     "probe_qwen4_fused_gdn_decode",
     "qwen4_fused_gdn_decode",
     "qwen4_fused_gdn_decode_outproj",

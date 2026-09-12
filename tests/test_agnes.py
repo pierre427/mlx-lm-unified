@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,13 +12,38 @@ mx.set_default_device(mx.cpu)
 from mlx_lm.apc import APCKey, AutomaticPrefixCache, AutomaticPrefixCacheV2
 from mlx_lm.cache_planes import CachePlaneKind
 from mlx_lm.generate import generate_step, prompt_lookup_generate_step
-from mlx_lm.models import agnes
+from mlx_lm.models import agnes, qwen4_fused_gdn
 from mlx_lm.models.cache import KVCache, record_state_checkpoints
 from mlx_lm.models.qwen3_5 import fuse_gated_delta_net_projections
 from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
 from mlx_lm.prompt_lookup import HybridStats
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.server import ResponseGenerator
+
+
+class FakeArray:
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+
+class FakeGdnCache:
+    def __init__(self, conv_state, recurrent_state, *, speculating=False):
+        self.cache = [conv_state, recurrent_state]
+        self.speculating = speculating
+        self.advanced = 0
+
+    def __getitem__(self, index):
+        return self.cache[index]
+
+    def __setitem__(self, index, value):
+        self.cache[index] = value
+
+    def rollback_spans(self, width, mask):
+        return ()
+
+    def advance(self, amount):
+        self.advanced += amount
 
 
 class TestAgnes(unittest.TestCase):
@@ -202,6 +228,165 @@ class TestAgnes(unittest.TestCase):
         self.assertFalse(hasattr(model.layers[0].delta_attn, "in_proj_fused"))
         self.assertEqual(fuse_gated_delta_net_projections(model, enabled=True), 1)
         self.assertTrue(hasattr(model.layers[0].delta_attn, "in_proj_fused"))
+
+    def test_fused_gdn_admission_keeps_architecture_gate_contracts_separate(self):
+        dtype = mx.bfloat16
+        values = {
+            "qkv": FakeArray((1, 1, 10240), dtype),
+            "z": FakeArray((1, 1, 6144), dtype),
+            "b": FakeArray((1, 1, 48), dtype),
+            "a": FakeArray((1, 1, 48), dtype),
+            "conv_state": FakeArray((1, 3, 10240), dtype),
+            "recurrent_state": FakeArray((1, 48, 128, 128), mx.float32),
+            "conv_weight": FakeArray((10240, 4, 1), dtype),
+            "A_log": FakeArray((48,), mx.float32),
+            "dt_bias": FakeArray((48,), dtype),
+            "norm_weight": FakeArray((128,), dtype),
+            "mask": None,
+            "spans": (),
+            "speculating": False,
+            "training": False,
+            "sharded": False,
+            "num_key_heads": 16,
+            "num_value_heads": 48,
+            "key_head_dim": 128,
+            "value_head_dim": 128,
+            "conv_kernel": 4,
+        }
+        agnes_gate = qwen4_fused_gdn.admit_qwen4_fused_gdn_decode(
+            **values, gate_activation="swish", architecture="agnes"
+        )
+        self.assertTrue(agnes_gate.accepted, agnes_gate.reason)
+        self.assertFalse(
+            qwen4_fused_gdn.admit_qwen4_fused_gdn_decode(
+                **values, gate_activation="swish"
+            ).accepted
+        )
+        self.assertFalse(
+            qwen4_fused_gdn.admit_qwen4_fused_gdn_decode(
+                **values, gate_activation="sigmoid", architecture="agnes"
+            ).accepted
+        )
+
+    def test_fused_gdn_kernel_selects_agnes_numerical_contract_without_dispatch(self):
+        calls = []
+
+        def fake_kernel(**kwargs):
+            calls.append(kwargs)
+            return [
+                FakeArray(shape, dtype)
+                for shape, dtype in zip(
+                    kwargs["output_shapes"], kwargs["output_dtypes"]
+                )
+            ]
+
+        dtype = mx.bfloat16
+        values = [
+            FakeArray((1, 1, 10240), dtype),
+            FakeArray((1, 1, 6144), dtype),
+            FakeArray((1, 1, 48), dtype),
+            FakeArray((1, 1, 48), dtype),
+            FakeArray((1, 3, 10240), dtype),
+            FakeArray((10240, 4, 1), dtype),
+            FakeArray((48,), mx.float32),
+            FakeArray((48,), dtype),
+            FakeArray((1, 48, 128, 128), mx.float32),
+            FakeArray((128,), dtype),
+            1.0e-6,
+        ]
+        with patch.object(qwen4_fused_gdn, "_kernel", return_value=fake_kernel):
+            qwen4_fused_gdn.qwen4_fused_gdn_decode(
+                *values, threadgroup_y=8, architecture="agnes"
+            )
+            qwen4_fused_gdn.qwen4_fused_gdn_decode(*values, threadgroup_y=8)
+
+        self.assertIn(("AGNES_NUMERICS", 1), calls[0]["template"])
+        self.assertIn(("AGNES_NUMERICS", 0), calls[1]["template"])
+        self.assertIn("mlx_sigmoid_fast<float>(zv)", qwen4_fused_gdn._SOURCE)
+        self.assertIn("1.0e-6f / float(DK)", qwen4_fused_gdn._SOURCE)
+
+    def test_fused_gdn_integration_is_opt_in_and_updates_cache_after_success(self):
+        layer = agnes.Model(self.make_args()).layers[0].delta_attn
+        layer.eval()
+        self.assertFalse(layer.fused_gdn_decode)
+        self.assertTrue(layer.set_fused_gdn_decode(True))
+
+        qkv = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+        z = mx.zeros((1, 1, 8), dtype=mx.bfloat16)
+        gates = mx.zeros((1, 1, 2), dtype=mx.bfloat16)
+        original_conv = object()
+        original_state = object()
+        cache = FakeGdnCache(original_conv, original_state)
+        next_conv = object()
+        next_state = object()
+        fused_out = mx.zeros((1, 1, 8), dtype=mx.bfloat16)
+        accepted = qwen4_fused_gdn.FusedGdnAdmission(True, "eligible")
+
+        with (
+            patch.object(agnes, "admit_qwen4_fused_gdn_decode", return_value=accepted),
+            patch.object(agnes, "fused_gdn_runtime_supported", return_value=True),
+            patch.object(agnes, "probe_agnes_fused_gdn_decode", return_value=8),
+            patch.object(
+                agnes,
+                "qwen4_fused_gdn_decode",
+                return_value=(fused_out, next_conv, next_state),
+            ) as execute,
+        ):
+            output = layer._try_fused_decode(qkv, z, gates, gates, None, cache)
+
+        mx.eval(output)
+        self.assertEqual(output.shape, (1, 1, 16))
+        self.assertIs(cache[0], next_conv)
+        self.assertIs(cache[1], next_state)
+        self.assertEqual(cache.advanced, 1)
+        self.assertEqual(layer.fused_gdn_decode_calls, 1)
+        self.assertEqual(execute.call_args.kwargs["architecture"], "agnes")
+
+    def test_fused_gdn_declines_before_runtime_and_bounds_reason_counters(self):
+        layer = agnes.Model(self.make_args()).layers[0].delta_attn
+        layer.eval()
+        layer.set_fused_gdn_decode(True)
+        qkv = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+        z = mx.zeros((1, 1, 8), dtype=mx.bfloat16)
+        gates = mx.zeros((1, 1, 2), dtype=mx.bfloat16)
+        cache = FakeGdnCache(None, None)
+        with patch.object(agnes, "fused_gdn_runtime_supported") as runtime:
+            self.assertIsNone(
+                layer._try_fused_decode(qkv, z, gates, gates, None, cache)
+            )
+        runtime.assert_not_called()
+        self.assertEqual(layer.fused_gdn_decode_last_fallback, "uninitialized cache")
+
+        for index in range(32):
+            layer._fused_gdn_fallback(f"reason {index}")
+        self.assertLessEqual(
+            len(layer.fused_gdn_decode_fallback_reasons),
+            agnes._FUSED_GDN_FALLBACK_REASON_LIMIT + 1,
+        )
+
+    def test_fused_gdn_cpu_runtime_decline_is_output_exact(self):
+        model = agnes.Model(self.make_args())
+        model.eval()
+        prefix = mx.array([[1, 2, 3]], dtype=mx.int32)
+        token = mx.array([[4]], dtype=mx.int32)
+        stock_cache = model.make_cache()
+        fused_cache = model.make_cache()
+        model(prefix, cache=stock_cache)
+        model(prefix, cache=fused_cache)
+
+        stock = model(token, cache=stock_cache)
+        self.assertEqual(agnes.set_agnes_fused_gdn_decode(model, True), 1)
+        accepted = qwen4_fused_gdn.FusedGdnAdmission(True, "eligible")
+        with patch.object(agnes, "admit_qwen4_fused_gdn_decode", return_value=accepted):
+            candidate = model(token, cache=fused_cache)
+        mx.eval(stock, candidate)
+
+        self.assertTrue(mx.array_equal(stock, candidate))
+        stats = agnes.agnes_fused_gdn_stats(model)
+        self.assertEqual(stats["enabled_layers"], 1)
+        self.assertEqual(stats["fused_calls"], 0)
+        self.assertEqual(stats["fallbacks"], 1)
+        self.assertEqual(stats["reasons"], {"Metal runtime unavailable": 1})
 
     def test_apcv2_checkpoint_trim_and_atomic_invalidation(self):
         model = agnes.Model(self.make_args())

@@ -7,12 +7,21 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask
 from .cache import ArraysCache, KVCache
 from .pipeline import PipelineMixin
-from .qwen3_5 import GatedDeltaNet
-from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
+from .qwen3_5 import GatedDeltaNet as Qwen35GatedDeltaNet
+from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP, _env_flag
+from .qwen4_fused_gdn import (
+    admit_qwen4_fused_gdn_decode,
+    fused_gdn_runtime_supported,
+    probe_agnes_fused_gdn_decode,
+    qwen4_fused_gdn_decode,
+)
 
 LAYER_GLOBAL = "agnes_global_attention"
 LAYER_DELTA = "agnes_delta_attention"
 LAYER_TYPES = (LAYER_GLOBAL, LAYER_DELTA)
+
+_FUSED_GDN_DECODE = _env_flag("MLX_AGNES_FUSED_GDN_DECODE")
+_FUSED_GDN_FALLBACK_REASON_LIMIT = 16
 
 
 @dataclass
@@ -121,6 +130,132 @@ class AgnesMLP(Qwen3NextMLP):
         if self.parallel_ffn is not None:
             y = y + self.parallel_ffn(x)
         return y
+
+
+class GatedDeltaNet(Qwen35GatedDeltaNet):
+    """Agnes GDN with an opt-in, swish-correct single-token fused path."""
+
+    _gdn_projection_fusion_compatible = True
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__(args)
+        self.fused_gdn_decode = _FUSED_GDN_DECODE
+        self.fused_gdn_decode_calls = 0
+        self.fused_gdn_decode_fallbacks = 0
+        self.fused_gdn_decode_last_fallback = None
+        object.__setattr__(self, "fused_gdn_decode_fallback_reasons", {})
+
+    def set_fused_gdn_decode(self, enabled: bool) -> bool:
+        self.fused_gdn_decode = bool(enabled)
+        return self.fused_gdn_decode
+
+    def _fused_gdn_fallback(self, reason: str):
+        self.fused_gdn_decode_fallbacks += 1
+        self.fused_gdn_decode_last_fallback = reason
+        reasons = self.fused_gdn_decode_fallback_reasons
+        if reason not in reasons and len(reasons) >= _FUSED_GDN_FALLBACK_REASON_LIMIT:
+            reason = "other"
+        reasons[reason] = reasons.get(reason, 0) + 1
+        return None
+
+    def _try_fused_decode(self, qkv, z, b, a, mask, cache):
+        if not self.fused_gdn_decode:
+            return None
+        if cache is None or cache[0] is None or cache[1] is None:
+            return self._fused_gdn_fallback("uninitialized cache")
+
+        describe = getattr(cache, "rollback_spans", None)
+        spans = describe(int(qkv.shape[1]), mask) if callable(describe) else ()
+        admission = admit_qwen4_fused_gdn_decode(
+            qkv=qkv,
+            z=z,
+            b=b,
+            a=a,
+            conv_state=cache[0],
+            recurrent_state=cache[1],
+            conv_weight=self.conv1d.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            norm_weight=self.norm.weight,
+            mask=mask,
+            spans=spans,
+            speculating=bool(getattr(cache, "speculating", False)),
+            training=bool(self.training),
+            sharded=self.sharding_group is not None,
+            num_key_heads=self.num_k_heads,
+            num_value_heads=self.num_v_heads,
+            key_head_dim=self.head_k_dim,
+            value_head_dim=self.head_v_dim,
+            conv_kernel=self.conv_kernel_size,
+            gate_activation="swish",
+            architecture="agnes",
+        )
+        if not admission.accepted:
+            return self._fused_gdn_fallback(admission.reason)
+        if not fused_gdn_runtime_supported():
+            return self._fused_gdn_fallback("Metal runtime unavailable")
+
+        try:
+            threadgroup_y = probe_agnes_fused_gdn_decode(qkv.dtype)
+            if threadgroup_y is None:
+                return self._fused_gdn_fallback("Metal kernel probe declined")
+            out, conv_state, recurrent_state = qwen4_fused_gdn_decode(
+                qkv,
+                z,
+                b,
+                a,
+                cache[0],
+                self.conv1d.weight,
+                self.A_log,
+                self.dt_bias,
+                cache[1],
+                self.norm.weight,
+                self.norm.eps,
+                threadgroup_y=threadgroup_y,
+                architecture="agnes",
+            )
+        except Exception as exc:  # noqa: BLE001 - optional path fails closed
+            return self._fused_gdn_fallback(
+                f"Metal kernel dispatch failed: {type(exc).__name__}"
+            )
+
+        cache[0] = conv_state
+        cache[1] = recurrent_state
+        cache.advance(1)
+        self.fused_gdn_decode_calls += 1
+        self.fused_gdn_decode_last_fallback = None
+        return self.out_proj(out)
+
+
+def set_agnes_fused_gdn_decode(model: nn.Module, enabled: bool) -> int:
+    """Switch all resident Agnes GDN layers without rebuilding their weights."""
+    layers = [
+        module
+        for _, module in model.named_modules()
+        if isinstance(module, GatedDeltaNet)
+    ]
+    for layer in layers:
+        layer.set_fused_gdn_decode(enabled)
+    return len(layers)
+
+
+def agnes_fused_gdn_stats(model: nn.Module, *, reset: bool = False) -> Dict[str, Any]:
+    """Return bounded, synchronization-free fused decode engagement counters."""
+    stats = {"enabled_layers": 0, "fused_calls": 0, "fallbacks": 0, "reasons": {}}
+    for _, module in model.named_modules():
+        if not isinstance(module, GatedDeltaNet):
+            continue
+        stats["enabled_layers"] += int(module.fused_gdn_decode)
+        stats["fused_calls"] += module.fused_gdn_decode_calls
+        stats["fallbacks"] += module.fused_gdn_decode_fallbacks
+        for reason, count in module.fused_gdn_decode_fallback_reasons.items():
+            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + count
+        if reset:
+            module.fused_gdn_decode_calls = 0
+            module.fused_gdn_decode_fallbacks = 0
+            module.fused_gdn_decode_last_fallback = None
+            module.fused_gdn_decode_fallback_reasons.clear()
+    return stats
 
 
 class DecoderLayer(nn.Module):

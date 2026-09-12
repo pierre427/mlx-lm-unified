@@ -37,6 +37,14 @@ _GDN_FUSED_MAX_ROWS = 8
 _GDN_PROBE_DTYPES = ("bfloat16", "float16")
 
 
+def _is_gdn_projection_fusion_target(module) -> bool:
+    if _GDN_FUSION_SUBCLASS:
+        return isinstance(module, GatedDeltaNet)
+    return type(module) is GatedDeltaNet or bool(
+        getattr(module, "_gdn_projection_fusion_compatible", False)
+    )
+
+
 def _gdn_projection_modules(layer):
     return [
         layer.in_proj_qkv,
@@ -194,11 +202,7 @@ def fuse_gated_delta_net_projections(model, *, enabled: bool = False) -> int:
         targets = [
             module
             for _, module in model.named_modules()
-            if (
-                isinstance(module, GatedDeltaNet)
-                if _GDN_FUSION_SUBCLASS
-                else type(module) is GatedDeltaNet
-            )
+            if _is_gdn_projection_fusion_target(module)
             and _can_fuse_gdn_projections(module)
         ]
     except Exception:
