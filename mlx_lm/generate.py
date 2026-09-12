@@ -3162,7 +3162,7 @@ def _segmented_async_qsa_min_remaining_tokens(
         if config is not None
         and "segment_aware_async_qsa_min_remaining_tokens" in config
         else os.environ.get(
-            "MLX_LM_SEGMENTED_ASYNC_QSA_MIN_REMAINING_TOKENS", "0"
+            "MLX_LM_SEGMENTED_ASYNC_QSA_MIN_REMAINING_TOKENS", "16"
         )
     )
     try:

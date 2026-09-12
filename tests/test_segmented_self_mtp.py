@@ -296,6 +296,10 @@ def test_async_qsa_promotion_is_nested_and_default_off(monkeypatch):
             "segment_aware_async_qsa_promotion": False,
         }
     )
+    monkeypatch.delenv(
+        "MLX_LM_SEGMENTED_ASYNC_QSA_MIN_REMAINING_TOKENS", raising=False
+    )
+    assert _segmented_async_qsa_min_remaining_tokens({}) == 16
     policy = {
         "segment_aware_live_tip": True,
         "segment_aware_async_qsa_promotion": True,
