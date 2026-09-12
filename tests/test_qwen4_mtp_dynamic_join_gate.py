@@ -106,6 +106,51 @@ def test_summary_requires_exact_and_post_join_qsa_engagement():
     assert summary["dynamic_qsa_engaged"] == 1
 
 
+def test_summary_excludes_thermally_discarded_pair_from_medians():
+    rows = [
+        {
+            "arm": "fixed_cohort",
+            "repetition": 1,
+            "transaction_wall_s": 1.0,
+            "aggregate_decode_tps": 100.0,
+            "drift_accepted": True,
+            "qsa_share": {"post_join_share_requested": 0, "post_join_reuse_observed": 0},
+        },
+        {
+            "arm": "dynamic_join",
+            "repetition": 1,
+            "transaction_wall_s": 1.1,
+            "aggregate_decode_tps": 90.0,
+            "drift_accepted": True,
+            "exact_fixed_match": True,
+            "qsa_share": {"post_join_share_requested": 1, "post_join_reuse_observed": 1},
+        },
+        {
+            "arm": "fixed_cohort",
+            "repetition": 2,
+            "transaction_wall_s": 9.0,
+            "aggregate_decode_tps": 10.0,
+            "drift_accepted": False,
+            "qsa_share": {"post_join_share_requested": 0, "post_join_reuse_observed": 0},
+        },
+        {
+            "arm": "dynamic_join",
+            "repetition": 2,
+            "transaction_wall_s": 9.0,
+            "aggregate_decode_tps": 10.0,
+            "drift_accepted": False,
+            "exact_fixed_match": True,
+            "qsa_share": {"post_join_share_requested": 1, "post_join_reuse_observed": 1},
+        },
+    ]
+    summary = MODULE.summarize(rows)
+    assert summary["accepted_repetitions"] == 1
+    assert summary["fixed_cohort"]["accepted_samples"] == 1
+    assert summary["fixed_cohort"]["discarded_samples"] == 1
+    assert summary["fixed_cohort"]["median_aggregate_decode_tps"] == 100.0
+    assert summary["dynamic_join"]["median_aggregate_decode_tps"] == 90.0
+
+
 def test_first_divergence_handles_content_and_length():
     assert MODULE.first_divergence([1, 2, 3], [1, 9, 3]) == 1
     assert MODULE.first_divergence([1, 2], [1, 2, 3]) == 2

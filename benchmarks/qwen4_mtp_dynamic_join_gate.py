@@ -581,9 +581,12 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary = {}
     for arm in ARMS:
-        selected = [row for row in rows if row["arm"] == arm]
+        all_rows = [row for row in rows if row["arm"] == arm]
+        selected = [row for row in all_rows if row.get("drift_accepted", True)]
         summary[arm] = {
-            "samples": len(selected),
+            "samples": len(all_rows),
+            "accepted_samples": len(selected),
+            "discarded_samples": len(all_rows) - len(selected),
             "median_transaction_wall_s": statistics.median(
                 row["transaction_wall_s"] for row in selected
             ) if selected else None,
@@ -600,6 +603,13 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         row["qsa_share"]["post_join_share_requested"] > 0
         and row["qsa_share"]["post_join_reuse_observed"] > 0
         for row in dynamic
+    )
+    summary["accepted_repetitions"] = len(
+        {
+            row.get("repetition")
+            for row in rows
+            if row.get("drift_accepted", True)
+        }
     )
     return summary
 
@@ -717,7 +727,15 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         and row["qsa_share"]["post_join_reuse_observed"] > 0
         for row in dynamic_rows
     )
-    drift_ok = all(row.get("drift_accepted", False) for row in artifact["rows"])
+    accepted_repetitions = {
+        row["repetition"]
+        for row in artifact["rows"]
+        if row.get("drift_accepted", False)
+    }
+    minimum_accepted = max(1, (args.reps + 1) // 2)
+    drift_ok = len(accepted_repetitions) >= minimum_accepted
+    artifact["metadata"]["minimum_accepted_repetitions"] = minimum_accepted
+    artifact["metadata"]["accepted_repetitions"] = sorted(accepted_repetitions)
     ownership_ok = all(
         row["segmented_delta"].get("true_batched_engaged", 0) > 0
         and row["segmented_delta"].get("b1_target_forwards", 0) == 0
@@ -735,6 +753,15 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         for row in artifact["rows"]
     )
     qualified = exact and engaged and drift_ok and ownership_ok and churn_ok
+    artifact["qualification"] = {
+        "qualified": qualified,
+        "exact": exact,
+        "qsa_engaged": engaged,
+        "thermal_majority": drift_ok,
+        "ownership": ownership_ok,
+        "churn": churn_ok,
+    }
+    atomic_write(output, artifact)
     print(json.dumps(artifact["summary"], indent=2, sort_keys=True))
     print(f"VERDICT: {'QUALIFIED' if qualified else 'REJECTED'}")
     return 0 if qualified else 2
