@@ -1049,6 +1049,10 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def apply_composition_environment(args: argparse.Namespace) -> None:
+    if hasattr(args, "shared_qsa_suffix"):
+        os.environ["MLX_LM_SHARED_QSA_SUFFIX"] = str(
+            bool(args.shared_qsa_suffix)
+        ).lower()
     if args.qsa_private_delta != "default":
         os.environ["MLX_LM_QSA_PRIVATE_DELTA"] = str(
             args.qsa_private_delta == "on"

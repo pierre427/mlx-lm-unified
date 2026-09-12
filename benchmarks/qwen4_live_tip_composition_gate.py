@@ -50,6 +50,7 @@ PROFILES = (
     "exact_async_qsa_physical",
     "segmented_race_physical",
     "private_delta",
+    "shared_suffix",
     "exact_set",
 )
 
@@ -167,6 +168,16 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "promote_after_first": False,
             "async_promote_after_first": False,
         }
+    if profile == "shared_suffix":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "on",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+            "async_promote_after_first": False,
+            "shared_qsa_suffix": True,
+        }
     if profile == "exact_set":
         return {
             "branch_mode": "segmented",
@@ -248,6 +259,7 @@ def _configured_args(
     args: argparse.Namespace, profile: str, apc_mode: str = "none"
 ) -> argparse.Namespace:
     configured = copy.copy(args)
+    configured.shared_qsa_suffix = False
     for key, value in profile_settings(profile).items():
         setattr(configured, key, value)
     configured.idle_seconds = 0.0
@@ -326,6 +338,7 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
     }
     private = profile in {
         "private_delta",
+        "shared_suffix",
         "exact_set",
         "private_then_physical",
         "exact_then_physical",
@@ -345,6 +358,27 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
                 if int(receipt.get(key, 0)) != value
             }
         )
+    if profile == "shared_suffix":
+        shared_expected = {
+            "shared_qsa_rows": 28,
+            "shared_qsa_materializations": 28,
+        }
+        mismatches.update(
+            {
+                key: {"expected": value, "actual": int(receipt.get(key, 0))}
+                for key, value in shared_expected.items()
+                if int(receipt.get(key, 0)) != value
+            }
+        )
+        for key in (
+            "shared_qsa_base_bytes",
+            "shared_qsa_materialized_bytes",
+        ):
+            if int(receipt.get(key, 0)) <= 0:
+                mismatches[key] = {
+                    "expected": ">0",
+                    "actual": int(receipt.get(key, 0)),
+                }
     exact = profile in {
         "exact_set",
         "exact_then_physical",
