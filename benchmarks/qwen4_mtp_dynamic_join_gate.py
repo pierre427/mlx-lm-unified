@@ -367,6 +367,18 @@ def first_divergence(left: list[int], right: list[int]) -> int | None:
     return None if len(left) == len(right) else min(len(left), len(right))
 
 
+def build_warmup_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Compile membership shapes without asserting measured churn semantics."""
+    warm_args = argparse.Namespace(**vars(args))
+    warm_args.context = 256
+    warm_args.max_tokens = max(32, 2 * args.join_after_cycles + 5)
+    # A measured cancellation can sit at or beyond the deliberately short
+    # warmup budget.  Warmup owns shape compilation only; the receipted arms
+    # below own joins, exits, cancellation, and cohort reconstruction.
+    warm_args.cancel_uid = None
+    return warm_args
+
+
 def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: str):
     import mlx.core as mx
     from mlx_lm.hybrid_speculative import (
@@ -614,9 +626,7 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
     ]
 
     # Compile/warm both membership shapes without including them in receipts.
-    warm_args = argparse.Namespace(**vars(args))
-    warm_args.context = 256
-    warm_args.max_tokens = max(32, 2 * args.join_after_cycles + 5)
+    warm_args = build_warmup_args(args)
     warm_prompts = [
         mx.array(exact_prompt(tokenizer, 256, f"join-warm-{uid}"), mx.uint32)
         for uid in range(args.lanes)

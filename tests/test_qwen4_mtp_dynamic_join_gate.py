@@ -112,6 +112,20 @@ def test_first_divergence_handles_content_and_length():
     assert MODULE.first_divergence([1, 2], [1, 2]) is None
 
 
+def test_warmup_compiles_shapes_without_requiring_measured_cancellation():
+    measured = args(
+        context=16384,
+        max_tokens=64,
+        cancel_uid=0,
+        cancel_after_tokens=32,
+    )
+    warm = MODULE.build_warmup_args(measured)
+    assert warm.context == 256
+    assert warm.max_tokens == 32
+    assert warm.cancel_uid is None
+    assert measured.cancel_uid == 0
+
+
 def test_token_id_padding_preserves_stable_suffix():
     class FakeTokenizer:
         @staticmethod
