@@ -405,13 +405,16 @@ class SharedSuffixQSAKVCache:
 
     @property
     def state(self):
-        suffix_k, suffix_v = self.suffix_keys_and_values()
+        # Expose stable storage descriptors, not freshly sliced live views.
+        # The segmented transaction separately records the logical position;
+        # including the private offset here also catches same-position trims.
         return (
             self.base.keys,
             self.base.values,
             self.base.index_keys,
-            suffix_k,
-            suffix_v,
+            self._kv.keys,
+            self._kv.values,
+            int(self._kv.offset),
             self.index_keys,
             self.base.pooled_keys,
             self._suffix_pooled_keys,

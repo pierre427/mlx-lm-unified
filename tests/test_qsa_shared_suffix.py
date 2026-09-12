@@ -60,6 +60,20 @@ def test_pooled_base_records_coverage_without_optional_apc_identity():
     assert base.summary_identity == {"complete_blocks": 2}
 
 
+def test_state_identity_uses_stable_suffix_storage_descriptors():
+    base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
+    row = SharedSuffixQSAKVCache(base)
+    row.append_index_keys(mx.ones((1, 1, 5)))
+    row.append_kv(mx.ones((1, 2, 1, 3)), mx.ones((1, 2, 1, 3)))
+
+    first = row.state
+    second = row.state
+
+    assert first[3] is second[3] is row._kv.keys
+    assert first[4] is second[4] is row._kv.values
+    assert first[5] == second[5] == 1
+
+
 def test_normal_append_allocates_only_private_suffix_and_never_joins_prefix():
     base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
     row = SharedSuffixQSAKVCache(base)
