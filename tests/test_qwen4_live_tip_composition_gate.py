@@ -57,6 +57,9 @@ def test_profiles_are_mechanically_distinct():
     assert profile_settings("segmented_async_qsa_physical")[
         "async_qsa_promote_after_first"
     ]
+    assert profile_settings("segmented_prequeued_async_qsa_physical")[
+        "async_qsa_prequeue"
+    ]
     assert profile_settings("private_async_qsa_physical")[
         "async_qsa_promote_after_first"
     ]

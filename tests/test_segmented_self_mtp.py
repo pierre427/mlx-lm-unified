@@ -294,6 +294,25 @@ def test_async_qsa_promotion_is_nested_and_default_off(monkeypatch):
     )
 
 
+def test_async_qsa_prequeue_is_nested_and_default_off(monkeypatch):
+    from mlx_lm.generate import _segmented_async_qsa_prequeue_enabled
+
+    monkeypatch.delenv("MLX_LM_SEGMENTED_ASYNC_QSA_PREQUEUE", raising=False)
+    base = {
+        "segment_aware_live_tip": True,
+        "segment_aware_async_qsa_promotion": True,
+    }
+    assert not _segmented_async_qsa_prequeue_enabled(base)
+    monkeypatch.setenv("MLX_LM_SEGMENTED_ASYNC_QSA_PREQUEUE", "1")
+    assert _segmented_async_qsa_prequeue_enabled(base)
+    assert not _segmented_async_qsa_prequeue_enabled(
+        {**base, "segment_aware_async_qsa_promotion": False}
+    )
+    assert not _segmented_async_qsa_prequeue_enabled(
+        {**base, "segment_aware_async_qsa_prequeue": False}
+    )
+
+
 def test_independent_b1_cycle_engages_without_physical_b2_and_promotes():
     segmented_self_mtp_stats(reset=True)
     detached = [_detached(0), _detached(1)]
@@ -486,6 +505,39 @@ def test_empty_physical_batch_preserves_policy_and_resets_segmented_admission():
 
     assert batch.segmented_live_tip is True
     assert batch._async_qsa_pending is True
+
+
+def test_generation_batch_binds_prequeued_candidate_without_rearming():
+    from mlx_lm.generate import MTPGenerationBatch, StopSequenceMatcher
+
+    ticket = object()
+
+    class Prequeue:
+        def __init__(self):
+            self.bound = 0
+
+        def bind(self, state, *, note):
+            self.bound += 1
+            assert len(state.lanes) == 2
+            return ticket
+
+        def cancel_and_drain(self):
+            raise AssertionError("valid prequeue must not be cancelled")
+
+    prequeue = Prequeue()
+    batch = MTPGenerationBatch(
+        object(),
+        [_detached(0), _detached(1)],
+        [None, None],
+        [StopSequenceMatcher(), StopSequenceMatcher()],
+        segmented_live_tip=True,
+        async_qsa_promotion=True,
+        async_qsa_prequeue=prequeue,
+    )
+    assert prequeue.bound == 1
+    assert batch._async_qsa_ticket is ticket
+    assert segmented_self_mtp_stats()["async_qsa_prequeue_bound"] >= 1
+    batch.close()
 
 
 def test_async_candidate_and_joined_recurrent_state_count_toward_peak_memory():

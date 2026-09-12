@@ -3152,6 +3152,20 @@ def _segmented_async_qsa_promotion_enabled(
     ).lower() in {"1", "true", "yes", "on"}
 
 
+def _segmented_async_qsa_prequeue_enabled(
+    config: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return the shared-prefix N=2 prequeue policy, nested under promotion."""
+
+    if not _segmented_async_qsa_promotion_enabled(config):
+        return False
+    if config is not None and "segment_aware_async_qsa_prequeue" in config:
+        return bool(config["segment_aware_async_qsa_prequeue"])
+    return os.environ.get(
+        "MLX_LM_SEGMENTED_ASYNC_QSA_PREQUEUE", "0"
+    ).lower() in {"1", "true", "yes", "on"}
+
+
 def _prefetch_known_mtp_tail(model, history, prompt, config) -> int:
     """Asynchronously stage file-backed PLE rows for a known MTP tail.
 
@@ -3221,6 +3235,7 @@ class MTPGenerationBatch:
         segmented_live_tip: bool = False,
         async_qsa_promotion: bool = False,
         arm_async_qsa_promotion: bool = True,
+        async_qsa_prequeue: Optional[Any] = None,
         mtp_admission: Optional[
             Callable[
                 [Sequence[Tuple[int, int, int, bool, float]]],
@@ -3281,7 +3296,29 @@ class MTPGenerationBatch:
         self._async_qsa_pending = (
             self.async_qsa_promotion and self.segmented_live_tip
         )
-        if arm_async_qsa_promotion:
+        if async_qsa_prequeue is not None:
+            from .segmented_physical_promotion import (
+                SegmentedPhysicalPromotionDeclined,
+            )
+            from .segmented_self_mtp import note_segmented_self_mtp
+
+            if not self._async_qsa_pending:
+                async_qsa_prequeue.cancel_and_drain()
+                raise ValueError(
+                    "async QSA prequeue requires segmented async promotion"
+                )
+            try:
+                self._async_qsa_ticket = async_qsa_prequeue.bind(
+                    self.state, note=note_segmented_self_mtp
+                )
+            except SegmentedPhysicalPromotionDeclined as error:
+                async_qsa_prequeue.cancel_and_drain()
+                note_segmented_self_mtp("async_qsa_prequeue_declined")
+                logging.info("Async QSA prequeue declined at bind: %s", error)
+                self._arm_async_qsa_promotion()
+            else:
+                note_segmented_self_mtp("async_qsa_prequeue_bound")
+        elif arm_async_qsa_promotion:
             self._arm_async_qsa_promotion()
 
     def _arm_async_qsa_promotion(self) -> None:
@@ -5337,6 +5374,29 @@ class ParallelSampleGenerator:
                 canonical.shared_qsa_prefix_id = hashlib.sha256(
                     prefix_bytes
                 ).hexdigest()
+            async_qsa_prequeue = None
+            if _segmented_async_qsa_prequeue_enabled(config):
+                from .segmented_physical_promotion import (
+                    SegmentedPhysicalPromotionDeclined,
+                    begin_shared_prefix_physical_promotion,
+                )
+                from .segmented_self_mtp import note_segmented_self_mtp
+
+                note_segmented_self_mtp("async_qsa_prequeue_requests")
+                try:
+                    async_qsa_prequeue = begin_shared_prefix_physical_promotion(
+                        canonical,
+                        rows=n,
+                        reserve_tail=int(config.get("num_draft", 1)) + 1,
+                        stream=mx.new_stream(mx.gpu),
+                    )
+                except SegmentedPhysicalPromotionDeclined as error:
+                    note_segmented_self_mtp("async_qsa_prequeue_declined")
+                    logging.info("Async QSA shared-prefix prequeue declined: %s", error)
+                else:
+                    note_segmented_self_mtp("async_qsa_prequeue_queued")
+                    note_segmented_self_mtp("async_qsa_promotion_requests")
+                    note_segmented_self_mtp("async_qsa_promotion_queued")
             prepared_caches = None
             if fanout_candidate:
                 owner = None
@@ -5434,10 +5494,13 @@ class ParallelSampleGenerator:
                     async_qsa_promotion=_segmented_async_qsa_promotion_enabled(
                         config
                     ),
+                    async_qsa_prequeue=async_qsa_prequeue,
                 )
                 if prepared_caches is not None:
                     _note_serving_event("engaged")
             except Exception as error:
+                if async_qsa_prequeue is not None:
+                    async_qsa_prequeue.cancel_and_drain()
                 if segmented_requested:
                     from .segmented_self_mtp import note_segmented_self_mtp
 

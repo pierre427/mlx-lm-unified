@@ -567,6 +567,57 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         # can safely attest the new initial cohort at the branch boundary.
         canonical.shared_qsa_prefix_id = _token_digest(warmup_rows)
 
+    async_promote = bool(getattr(args, "async_promote_after_first", False))
+    async_qsa_promote = bool(
+        getattr(args, "async_qsa_promote_after_first", False)
+    )
+    async_qsa_prequeue = bool(getattr(args, "async_qsa_prequeue", False))
+    if async_qsa_prequeue and not async_qsa_promote:
+        raise ValueError("QSA prequeue requires asynchronous QSA promotion")
+    if async_qsa_prequeue and args.branch_mode != "segmented":
+        raise ValueError("QSA prequeue requires a segmented branch")
+    staged_qsa = None
+    prequeue_started_ns = None
+    async_qsa_queue_ms = 0.0
+    async_qsa_prequeue_lead_ms = 0.0
+    async_qsa_prequeue_breakdown = None
+    if async_qsa_prequeue:
+        from mlx_lm.segmented_physical_promotion import (
+            begin_shared_prefix_physical_promotion,
+        )
+
+        prequeue_started_ns = time.perf_counter_ns()
+        staged_qsa = begin_shared_prefix_physical_promotion(
+            canonical,
+            rows=args.branches,
+            reserve_tail=args.num_draft + 1,
+            stream=mx.new_stream(mx.gpu),
+            diagnostic_timing=True,
+        )
+        async_qsa_queue_ms = (
+            time.perf_counter_ns() - prequeue_started_ns
+        ) / 1e6
+        lead = float(getattr(args, "async_qsa_prequeue_lead_ms", 0.0))
+        if lead > 0:
+            time.sleep(lead / 1e3)
+        async_qsa_prequeue_lead_ms = (
+            time.perf_counter_ns() - prequeue_started_ns
+        ) / 1e6
+        async_qsa_prequeue_breakdown = {
+            "validation_ms": staged_qsa.validation_ns / 1e6,
+            "allocation_graph_ms": staged_qsa.allocation_graph_ns / 1e6,
+            "copy_graph_ms": staged_qsa.copy_graph_ns / 1e6,
+            "metadata_graph_ms": staged_qsa.metadata_graph_ns / 1e6,
+            "reserve_total_ms": staged_qsa.reserve_total_ns / 1e6,
+            "submit_ms": staged_qsa.submit_ns / 1e6,
+            "other_ms": max(
+                0.0,
+                async_qsa_queue_ms
+                - staged_qsa.reserve_total_ns / 1e6
+                - staged_qsa.submit_ns / 1e6,
+            ),
+        }
+
     idle_wait_ns = 0
     if arm == "idle_live_tip" and args.idle_seconds:
         idle_started = time.perf_counter_ns()
@@ -587,10 +638,6 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
     )
     sibling.lane.uid = 1
     sibling.lane.rng = LaneRNG(args.seed + 1)
-    async_promote = bool(getattr(args, "async_promote_after_first", False))
-    async_qsa_promote = bool(
-        getattr(args, "async_qsa_promote_after_first", False)
-    )
     if async_promote and async_qsa_promote:
         raise ValueError("select only one asynchronous promotion strategy")
     if async_promote and args.branch_mode != "segmented":
@@ -656,21 +703,36 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         )
         branch_batch = attach(model, None, [canonical, sibling])
     async_qsa_ticket = None
-    async_qsa_queue_ms = 0.0
+    async_qsa_bind_ms = 0.0
     async_cache_receipt = None
     if async_qsa_promote:
         from mlx_lm.segmented_physical_promotion import (
             begin_segmented_physical_promotion,
         )
 
-        async_started_ns = time.perf_counter_ns()
-        async_qsa_ticket = begin_segmented_physical_promotion(
-            branch_batch,
-            reserve_tail=args.num_draft + 1,
-            stream=mx.new_stream(mx.gpu),
-            note=note_segmented_self_mtp,
+        async_started_ns = (
+            prequeue_started_ns
+            if staged_qsa is not None
+            else time.perf_counter_ns()
         )
-        async_qsa_queue_ms = (time.perf_counter_ns() - async_started_ns) / 1e6
+        if staged_qsa is None:
+            async_qsa_ticket = begin_segmented_physical_promotion(
+                branch_batch,
+                reserve_tail=args.num_draft + 1,
+                stream=mx.new_stream(mx.gpu),
+                note=note_segmented_self_mtp,
+            )
+            async_qsa_queue_ms = (
+                time.perf_counter_ns() - async_started_ns
+            ) / 1e6
+        else:
+            bind_started_ns = time.perf_counter_ns()
+            async_qsa_ticket = staged_qsa.bind(
+                branch_batch, note=note_segmented_self_mtp
+            )
+            async_qsa_bind_ms = (
+                time.perf_counter_ns() - bind_started_ns
+            ) / 1e6
     # attach() consumes these detached owners.  Retaining the local wrappers
     # through all follow-up cycles pins the original B1 arrays beside the B2
     # cache and does not model serving, where the preparation list goes out of
@@ -861,11 +923,19 @@ def _run_arm(model: Any, prompt: Any, args: argparse.Namespace, arm: str) -> dic
         "async_physical_total_ms": async_physical_total_ms,
         "async_wait_after_first_ms": async_wait_after_first_ms,
         "async_qsa_queue_ms": async_qsa_queue_ms,
+        "async_qsa_bind_ms": async_qsa_bind_ms,
+        "async_qsa_prequeue_lead_ms": async_qsa_prequeue_lead_ms,
+        "async_qsa_prequeued": async_qsa_prequeue,
+        "async_qsa_prequeue_breakdown": async_qsa_prequeue_breakdown,
         "async_cache_receipt": async_cache_receipt,
         "steady_cache_geometry": steady_cache_geometry,
         "ple_delta": ple_delta,
         "branch_to_first_commit_if_prequeued_ms": (
-            (first_commit_ns - branch_started) / 1e6 - async_qsa_queue_ms
+            (
+                (first_commit_ns - branch_started) / 1e6
+                if async_qsa_prequeue
+                else (first_commit_ns - branch_started) / 1e6 - async_qsa_queue_ms
+            )
             if async_qsa_promote
             else None
         ),
@@ -1057,6 +1127,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--promote-after-first", action="store_true")
     parser.add_argument("--async-promote-after-first", action="store_true")
     parser.add_argument("--async-qsa-promote-after-first", action="store_true")
+    parser.add_argument("--async-qsa-prequeue", action="store_true")
+    parser.add_argument("--async-qsa-prequeue-lead-ms", type=float, default=0.0)
     parser.add_argument(
         "--share-qsa-indices",
         action=argparse.BooleanOptionalAction,

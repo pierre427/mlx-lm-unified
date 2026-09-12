@@ -27,6 +27,7 @@ import mlx.core as mx
 
 from .hybrid_speculative import (
     BatchedSelfMTPState,
+    DetachedSelfMTPLane,
     SegmentedSelfMTPState,
     SelfMTPCachePair,
 )
@@ -138,8 +139,15 @@ def ensure_segmented_compute_view(
     return state._segmented_caches
 
 
-def _reserve_qsa(cache: SegmentedBatchQSAKVCache, tail: int):
-    rows = cache.rows
+def _reserve_qsa_rows(
+    rows,
+    tail: int,
+    *,
+    shared_prefix: bool = False,
+    timing: dict[str, int] | None = None,
+):
+    started = time.perf_counter_ns() if timing is not None else 0
+    rows = tuple(rows)
     starts = [_offset(row) for row in rows]
     if len(set(starts)) != 1:
         raise SegmentedPhysicalPromotionDeclined(
@@ -160,6 +168,7 @@ def _reserve_qsa(cache: SegmentedBatchQSAKVCache, tail: int):
             raise SegmentedPhysicalPromotionDeclined(
                 "a QSA raw-key ledger is shorter than its base offset"
             )
+    validated = time.perf_counter_ns() if timing is not None else 0
     # Match BatchKVCache's normal geometric contract.  Allocating only the
     # suffix needed by the first commit makes the first post-promotion decode
     # grow and copy the entire long-context KV buffer again.  The raw-key
@@ -173,27 +182,213 @@ def _reserve_qsa(cache: SegmentedBatchQSAKVCache, tail: int):
     # sequence width: compiled/view kernels can specialize on those strides.
     slabs = max(1, (tail + step - 1) // step)
     kv_width = start + slabs * step
-    batch = BatchQSAKVCache([0] * len(rows))
-    batch.keys = mx.zeros(
-        (len(rows), populated.keys.shape[1], kv_width, populated.keys.shape[3]),
-        dtype=populated.keys.dtype,
-    )
-    batch.values = mx.zeros(
-        (len(rows), populated.values.shape[1], kv_width, populated.values.shape[3]),
-        dtype=populated.values.dtype,
-    )
     index = rows[0].index_keys
-    batch.index_keys = mx.zeros(
-        (len(rows), live_width, index.shape[2]), dtype=index.dtype
-    )
-    for i, row in enumerate(rows):
-        batch.keys[i : i + 1, :, :start, :] = row.keys[..., :start, :]
-        batch.values[i : i + 1, :, :start, :] = row.values[..., :start, :]
-        batch.index_keys[i : i + 1, :start] = row.index_keys[:, :start]
+    batch = BatchQSAKVCache([0] * len(rows))
+    if shared_prefix:
+        if any(row is not rows[0] for row in rows[1:]):
+            raise SegmentedPhysicalPromotionDeclined(
+                "shared-prefix reservation requires one canonical source row"
+            )
+        batch.keys = mx.concatenate(
+            [
+                mx.broadcast_to(
+                    populated.keys[..., :start, :],
+                    (
+                        len(rows),
+                        populated.keys.shape[1],
+                        start,
+                        populated.keys.shape[3],
+                    ),
+                ),
+                mx.zeros(
+                    (
+                        len(rows),
+                        populated.keys.shape[1],
+                        kv_width - start,
+                        populated.keys.shape[3],
+                    ),
+                    dtype=populated.keys.dtype,
+                ),
+            ],
+            axis=2,
+        )
+        batch.values = mx.concatenate(
+            [
+                mx.broadcast_to(
+                    populated.values[..., :start, :],
+                    (
+                        len(rows),
+                        populated.values.shape[1],
+                        start,
+                        populated.values.shape[3],
+                    ),
+                ),
+                mx.zeros(
+                    (
+                        len(rows),
+                        populated.values.shape[1],
+                        kv_width - start,
+                        populated.values.shape[3],
+                    ),
+                    dtype=populated.values.dtype,
+                ),
+            ],
+            axis=2,
+        )
+        batch.index_keys = mx.concatenate(
+            [
+                mx.broadcast_to(index[:, :start], (len(rows), start, index.shape[2])),
+                mx.zeros(
+                    (len(rows), live_width - start, index.shape[2]),
+                    dtype=index.dtype,
+                ),
+            ],
+            axis=1,
+        )
+    else:
+        batch.keys = mx.zeros(
+            (len(rows), populated.keys.shape[1], kv_width, populated.keys.shape[3]),
+            dtype=populated.keys.dtype,
+        )
+        batch.values = mx.zeros(
+            (
+                len(rows),
+                populated.values.shape[1],
+                kv_width,
+                populated.values.shape[3],
+            ),
+            dtype=populated.values.dtype,
+        )
+        batch.index_keys = mx.zeros(
+            (len(rows), live_width, index.shape[2]), dtype=index.dtype
+        )
+    allocated = time.perf_counter_ns() if timing is not None else 0
+    if not shared_prefix:
+        for i, row in enumerate(rows):
+            batch.keys[i : i + 1, :, :start, :] = row.keys[..., :start, :]
+            batch.values[i : i + 1, :, :start, :] = row.values[..., :start, :]
+            batch.index_keys[i : i + 1, :start] = row.index_keys[:, :start]
+    copied = time.perf_counter_ns() if timing is not None else 0
     batch.offset = mx.array(starts)
     batch.left_padding = mx.zeros((len(rows),), dtype=mx.int32)
     batch._idx = start
+    if timing is not None:
+        finished = time.perf_counter_ns()
+        timing["validation_ns"] += validated - started
+        timing["allocation_graph_ns"] += allocated - validated
+        timing["copy_graph_ns"] += copied - allocated
+        timing["metadata_graph_ns"] += finished - copied
+        timing["reserve_total_ns"] += finished - started
     return batch, start
+
+
+def _reserve_qsa(cache: SegmentedBatchQSAKVCache, tail: int):
+    return _reserve_qsa_rows(cache.rows, tail)
+
+
+@dataclass
+class SharedPrefixPhysicalPromotionPrequeue:
+    """Unpublished B2 QSA base staged before a two-row fan-out exists.
+
+    This narrow object is valid only when the eventual segmented cohort carries
+    the same non-empty host attestation on every row.  Binding installs the
+    ordinary membership/ownership signature; until then cancellation owns no
+    live B1 state and can only retire the unpublished destination arrays.
+    """
+
+    prefix_id: str
+    rows: int
+    stream: Any
+    reserve_tail: int
+    physical: SelfMTPCachePair
+    target_bases: tuple[int | None, ...]
+    draft_bases: tuple[int | None, ...]
+    creator_thread: int
+    queued_ns: int
+    reserved_bytes: int
+    reserve_total_ns: int = 0
+    validation_ns: int = 0
+    allocation_graph_ns: int = 0
+    copy_graph_ns: int = 0
+    metadata_graph_ns: int = 0
+    submit_ns: int = 0
+    _finished: bool = False
+
+    def cancel_and_drain(self) -> None:
+        if self._finished:
+            return
+        if threading.get_ident() != self.creator_thread:
+            raise SegmentedPhysicalPromotionDeclined(
+                "promotion prequeue must drain on its creator thread"
+            )
+        if self.stream is not None:
+            mx.synchronize(self.stream)
+        self._finished = True
+        self.physical = None
+
+    def bind(
+        self,
+        state: SegmentedSelfMTPState,
+        *,
+        note: Callable[[str, int], None] | None = None,
+    ) -> "SegmentedPhysicalPromotionTicket":
+        """Bind a staged shared-prefix candidate to the admitted cohort."""
+
+        if self._finished:
+            raise RuntimeError("physical promotion prequeue was already consumed")
+        if threading.get_ident() != self.creator_thread:
+            raise SegmentedPhysicalPromotionDeclined(
+                "promotion prequeue must bind on its creator thread"
+            )
+        if not self.prefix_id or state.shared_qsa_prefix_id != self.prefix_id:
+            raise SegmentedPhysicalPromotionDeclined(
+                "admitted cohort lacks the staged shared-prefix attestation"
+            )
+        if len(state.lanes) != self.rows:
+            raise SegmentedPhysicalPromotionDeclined(
+                "admitted cohort width differs from the staged candidate"
+            )
+        view = ensure_segmented_compute_view(state, note=note)
+        if len(view.target) != len(self.physical.target) or len(view.draft) != len(
+            self.physical.draft
+        ):
+            raise SegmentedPhysicalPromotionDeclined(
+                "admitted cache layer width differs from the staged candidate"
+            )
+        for sources, candidates, bases in (
+            (view.target, self.physical.target, self.target_bases),
+            (view.draft, self.physical.draft, self.draft_bases),
+        ):
+            for source, candidate, base in zip(sources, candidates, bases):
+                if isinstance(source, SegmentedBatchQSAKVCache):
+                    if candidate is None or base is None:
+                        raise SegmentedPhysicalPromotionDeclined(
+                            "staged QSA layer map differs from admitted state"
+                        )
+                    if any(_offset(row) != base for row in source.rows):
+                        raise SegmentedPhysicalPromotionDeclined(
+                            "admitted QSA offset differs from staged base"
+                        )
+                elif candidate is not None or base is not None:
+                    raise SegmentedPhysicalPromotionDeclined(
+                        "staged recurrent layer map differs from admitted state"
+                    )
+        ticket = SegmentedPhysicalPromotionTicket(
+            state=state,
+            view=view,
+            stream=self.stream,
+            reserve_tail=self.reserve_tail,
+            signature=_state_signature(state),
+            physical=self.physical,
+            target_bases=self.target_bases,
+            draft_bases=self.draft_bases,
+            creator_thread=self.creator_thread,
+            queued_ns=self.queued_ns,
+            reserved_bytes=self.reserved_bytes,
+        )
+        self._finished = True
+        self.physical = None
+        return ticket
 
 
 def _unwrap_recurrent(cache: SegmentedBatchArraysCache):
@@ -503,7 +698,16 @@ def begin_segmented_physical_promotion(
     with mx.stream(stream):
         for cache in view.target:
             if isinstance(cache, SegmentedBatchQSAKVCache):
-                physical, base = _reserve_qsa(cache, reserve_tail)
+                if state.shared_qsa_prefix_id is not None:
+                    physical, base = _reserve_qsa_rows(
+                        [cache.rows[0]] * len(cache.rows),
+                        reserve_tail,
+                        shared_prefix=True,
+                    )
+                    if note is not None:
+                        note("async_qsa_shared_prefix_fused_layers", 1)
+                else:
+                    physical, base = _reserve_qsa(cache, reserve_tail)
                 target.append(physical)
                 target_bases.append(base)
                 reserved_bytes += int(physical.keys.nbytes + physical.values.nbytes)
@@ -513,7 +717,16 @@ def begin_segmented_physical_promotion(
                 target_bases.append(None)
         for cache in view.draft:
             if isinstance(cache, SegmentedBatchQSAKVCache):
-                physical, base = _reserve_qsa(cache, 0)
+                if state.shared_qsa_prefix_id is not None:
+                    physical, base = _reserve_qsa_rows(
+                        [cache.rows[0]] * len(cache.rows),
+                        0,
+                        shared_prefix=True,
+                    )
+                    if note is not None:
+                        note("async_qsa_shared_prefix_fused_layers", 1)
+                else:
+                    physical, base = _reserve_qsa(cache, 0)
                 draft.append(physical)
                 draft_bases.append(base)
                 reserved_bytes += int(physical.keys.nbytes + physical.values.nbytes)
@@ -545,10 +758,116 @@ def begin_segmented_physical_promotion(
     )
 
 
+def begin_shared_prefix_physical_promotion(
+    lane: DetachedSelfMTPLane,
+    *,
+    rows: int,
+    reserve_tail: int,
+    stream: Any,
+    diagnostic_timing: bool = False,
+) -> SharedPrefixPhysicalPromotionPrequeue:
+    """Stage an immutable replicated QSA base before N=2 fan-out admission.
+
+    The source lane remains authoritative and is only read.  Recurrent state is
+    deliberately omitted: it is adopted from the real segmented rows after the
+    first commit, exactly as in the ordinary promotion path.
+    """
+
+    rows = int(rows)
+    reserve_tail = int(reserve_tail)
+    if rows != 2:
+        raise SegmentedPhysicalPromotionDeclined(
+            "shared-prefix prequeue is qualified only for two rows"
+        )
+    if reserve_tail <= 0:
+        raise ValueError("reserve_tail must be positive")
+    prefix_id = lane.shared_qsa_prefix_id
+    if not prefix_id:
+        raise SegmentedPhysicalPromotionDeclined(
+            "shared-prefix prequeue requires a host prefix attestation"
+        )
+    started = time.perf_counter_ns()
+    target, draft = [], []
+    target_bases, draft_bases = [], []
+    reserved_bytes = 0
+    timing = (
+        {
+            "reserve_total_ns": 0,
+            "validation_ns": 0,
+            "allocation_graph_ns": 0,
+            "copy_graph_ns": 0,
+            "metadata_graph_ns": 0,
+        }
+        if diagnostic_timing
+        else None
+    )
+    with mx.stream(stream):
+        for cache in lane.caches.target:
+            if isinstance(cache, QSAKVCache):
+                physical, base = _reserve_qsa_rows(
+                    [cache] * rows,
+                    reserve_tail,
+                    shared_prefix=True,
+                    timing=timing,
+                )
+                target.append(physical)
+                target_bases.append(base)
+                reserved_bytes += int(physical.keys.nbytes + physical.values.nbytes)
+                reserved_bytes += int(physical.index_keys.nbytes)
+            else:
+                target.append(None)
+                target_bases.append(None)
+        for cache in lane.caches.draft:
+            if isinstance(cache, QSAKVCache):
+                physical, base = _reserve_qsa_rows(
+                    [cache] * rows, 0, shared_prefix=True, timing=timing
+                )
+                draft.append(physical)
+                draft_bases.append(base)
+                reserved_bytes += int(physical.keys.nbytes + physical.values.nbytes)
+                reserved_bytes += int(physical.index_keys.nbytes)
+            else:
+                draft.append(None)
+                draft_bases.append(None)
+        submit_started = time.perf_counter_ns() if diagnostic_timing else 0
+        mx.async_eval(
+            *[
+                value
+                for group in (target, draft)
+                for cache in group
+                if cache is not None
+                for value in (cache.keys, cache.values, cache.index_keys)
+            ]
+        )
+        submit_ns = (
+            time.perf_counter_ns() - submit_started if diagnostic_timing else 0
+        )
+    return SharedPrefixPhysicalPromotionPrequeue(
+        prefix_id=str(prefix_id),
+        rows=rows,
+        stream=stream,
+        reserve_tail=reserve_tail,
+        physical=SelfMTPCachePair(target, draft),
+        target_bases=tuple(target_bases),
+        draft_bases=tuple(draft_bases),
+        creator_thread=threading.get_ident(),
+        queued_ns=time.perf_counter_ns() - started,
+        reserved_bytes=reserved_bytes,
+        reserve_total_ns=(timing or {}).get("reserve_total_ns", 0),
+        validation_ns=(timing or {}).get("validation_ns", 0),
+        allocation_graph_ns=(timing or {}).get("allocation_graph_ns", 0),
+        copy_graph_ns=(timing or {}).get("copy_graph_ns", 0),
+        metadata_graph_ns=(timing or {}).get("metadata_graph_ns", 0),
+        submit_ns=submit_ns,
+    )
+
+
 __all__ = [
     "SegmentedPhysicalPromotionDeclined",
     "SegmentedPhysicalPromotionReceipt",
     "SegmentedPhysicalPromotionTicket",
+    "SharedPrefixPhysicalPromotionPrequeue",
     "begin_segmented_physical_promotion",
+    "begin_shared_prefix_physical_promotion",
     "ensure_segmented_compute_view",
 ]

@@ -45,6 +45,7 @@ PROFILES = (
     "private_then_physical",
     "exact_then_physical",
     "segmented_async_qsa_physical",
+    "segmented_prequeued_async_qsa_physical",
     "private_async_qsa_physical",
     "exact_async_qsa_physical",
     "segmented_race_physical",
@@ -106,6 +107,18 @@ def profile_settings(profile: str) -> dict[str, Any]:
             "promote_after_first": False,
             "async_promote_after_first": False,
             "async_qsa_promote_after_first": True,
+            "async_qsa_prequeue": False,
+        }
+    if profile == "segmented_prequeued_async_qsa_physical":
+        return {
+            "branch_mode": "segmented",
+            "qsa_private_delta": "off",
+            "qsa_exact_set_fold": "off",
+            "qsa_private_delta_min_context": 0,
+            "promote_after_first": False,
+            "async_promote_after_first": False,
+            "async_qsa_promote_after_first": True,
+            "async_qsa_prequeue": True,
         }
     if profile == "private_async_qsa_physical":
         return {
@@ -280,6 +293,7 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
         "private_then_physical",
         "exact_then_physical",
         "segmented_async_qsa_physical",
+        "segmented_prequeued_async_qsa_physical",
         "private_async_qsa_physical",
         "exact_async_qsa_physical",
         "segmented_race_physical",
@@ -297,6 +311,7 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
         "transaction_canonicalizations": (
             0 if profile in {
                 "segmented_async_qsa_physical",
+                "segmented_prequeued_async_qsa_physical",
                 "private_async_qsa_physical",
                 "exact_async_qsa_physical",
             } else 2

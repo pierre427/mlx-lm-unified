@@ -1,14 +1,20 @@
+import copy
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 
-from mlx_lm.hybrid_speculative import SegmentedSelfMTPState, SelfMTPCachePair
+from mlx_lm.hybrid_speculative import (
+    DetachedSelfMTPLane,
+    SegmentedSelfMTPState,
+    SelfMTPCachePair,
+)
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.qwen4_exp import QSAKVCache, Qwen4ArraysCache
 from mlx_lm.segmented_physical_promotion import (
     SegmentedPhysicalPromotionDeclined,
     begin_segmented_physical_promotion,
+    begin_shared_prefix_physical_promotion,
 )
 
 
@@ -97,6 +103,73 @@ def _commit(state, advances):
     # The true segmented consumer owns the authoritative batched recurrent
     # arrays. Simulate its post-commit state and row split.
     view.target[1][0] = mx.array([[111, 112], [121, 122]], dtype=mx.float32)
+
+
+def test_shared_prefix_prequeue_binds_and_finishes_exactly():
+    pair = SelfMTPCachePair(
+        target=[_qsa(3, 7), _arrays(7, speculate=True)],
+        draft=[_qsa(2, 37), _arrays(37)],
+    )
+    canonical = DetachedSelfMTPLane(
+        lane=SimpleNamespace(uid=101),
+        caches=pair,
+        shared_qsa_prefix_id="same-prefix",
+    )
+    staged = begin_shared_prefix_physical_promotion(
+        canonical,
+        rows=2,
+        reserve_tail=3,
+        stream=mx.new_stream(mx.cpu),
+    )
+    sibling_pair = copy.deepcopy(pair)
+    state = SegmentedSelfMTPState(
+        lanes=[SimpleNamespace(uid=101), SimpleNamespace(uid=202)],
+        row_caches=[pair, sibling_pair],
+        transactions=[_Transaction(3), _Transaction(3)],
+        membership_epoch=7,
+        shared_qsa_prefix_id="same-prefix",
+    )
+    ticket = staged.bind(state)
+    _commit(state, [1, 1])
+    physical, receipt = ticket.finish()
+    mx.eval(physical.caches.target[0].keys)
+
+    assert receipt.rows == 2
+    assert receipt.advance == 1
+    assert physical.caches.target[0].offset.tolist() == [4, 4]
+    assert physical.caches.target[0].keys[:, :, :3].tolist() == [
+        pair.target[0].keys[:, :, :3].tolist()[0],
+        sibling_pair.target[0].keys[:, :, :3].tolist()[0],
+    ]
+
+
+def test_shared_prefix_prequeue_rejects_changed_attestation_and_drains():
+    pair = SelfMTPCachePair(
+        target=[_qsa(3, 7), _arrays(7, speculate=True)],
+        draft=[_qsa(2, 37), _arrays(37)],
+    )
+    canonical = DetachedSelfMTPLane(
+        lane=SimpleNamespace(uid=101),
+        caches=pair,
+        shared_qsa_prefix_id="prefix-a",
+    )
+    staged = begin_shared_prefix_physical_promotion(
+        canonical,
+        rows=2,
+        reserve_tail=3,
+        stream=mx.new_stream(mx.cpu),
+    )
+    state = SegmentedSelfMTPState(
+        lanes=[SimpleNamespace(uid=101), SimpleNamespace(uid=202)],
+        row_caches=[pair, copy.deepcopy(pair)],
+        transactions=[_Transaction(3), _Transaction(3)],
+        membership_epoch=7,
+        shared_qsa_prefix_id="prefix-b",
+    )
+    with pytest.raises(SegmentedPhysicalPromotionDeclined, match="attestation"):
+        staged.bind(state)
+    staged.cancel_and_drain()
+    assert staged.physical is None
 
 
 @pytest.fixture(autouse=True)
