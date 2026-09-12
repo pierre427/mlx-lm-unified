@@ -1,0 +1,203 @@
+import mlx.core as mx
+import pytest
+
+from mlx_lm.models.qwen4_exp import QSAIndexer, QSAKVCache
+from mlx_lm.qsa_shared_suffix import (
+    QSAImmutableBase,
+    SharedSuffixQSAError,
+    SharedSuffixQSAKVCache,
+)
+
+
+def _identity(complete_blocks):
+    return {
+        "format_version": 1,
+        "model_config_hash": "model",
+        "block_size": 4,
+        "compress_ratio": 4,
+        "producer_version": "test",
+        "layer_id": "1",
+        "complete_blocks": complete_blocks,
+    }
+
+
+def _source_cache(length=8):
+    cache = QSAKVCache(_identity(0))
+    cache.keys = mx.arange(length * 6, dtype=mx.float32).reshape(1, 2, length, 3)
+    cache.values = cache.keys + 1000
+    cache.index_keys = mx.arange(length * 5, dtype=mx.float32).reshape(1, length, 5)
+    cache.offset = length
+    cache._qsa_pooled_keys = mx.arange(
+        (length // 4) * 5, dtype=mx.float32
+    ).reshape(1, length // 4, 5)
+    cache._qsa_pooled_ratio = 4
+    cache._qsa_summary_identity = _identity(length // 4)
+    return cache
+
+
+def test_rows_share_one_aligned_immutable_base_by_identity():
+    source = _source_cache()
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-f32-d3")
+    left = SharedSuffixQSAKVCache(base)
+    right = SharedSuffixQSAKVCache(base)
+
+    assert left.base is right.base is base
+    assert left.base.keys is base.keys
+    assert left.base.values is base.values
+    assert left.private_nbytes == right.private_nbytes == 0
+    assert base.summary_identity["complete_blocks"] == 2
+    with pytest.raises(ValueError, match="4-aligned"):
+        QSAImmutableBase.from_cache(source, layout_id="qsa-f32-d3", length=7)
+
+
+def test_normal_append_allocates_only_private_suffix_and_never_joins_prefix():
+    base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
+    row = SharedSuffixQSAKVCache(base)
+    raw = mx.full((1, 2, 5), 7.0)
+    keys = mx.full((1, 2, 2, 3), 8.0)
+    values = mx.full((1, 2, 2, 3), 9.0)
+
+    returned_raw = row.append_index_keys(raw)
+    suffix_k, suffix_v = row.append_kv(keys, values)
+    mx.eval(returned_raw, suffix_k, suffix_v)
+
+    assert returned_raw.shape == (1, 2, 5)
+    assert suffix_k.shape == (1, 2, 2, 3)
+    assert suffix_v.shape == (1, 2, 2, 3)
+    assert row.offset == 10
+    assert row.base is base
+    # The private cache has ordinary physical growth slabs, but its storage
+    # starts at suffix position zero rather than allocating base+suffix width.
+    assert row._kv.keys.shape[2] == row._kv.step
+    assert row._kv.keys.shape[2] < base.length + row._kv.step
+    assert mx.array_equal(base.keys, _source_cache().keys).item()
+
+
+def test_trim_is_exact_inside_suffix_and_refuses_to_cross_base():
+    base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
+    row = SharedSuffixQSAKVCache(base)
+    row.append_index_keys(mx.ones((1, 3, 5)))
+    row.append_kv(mx.ones((1, 2, 3, 3)), mx.ones((1, 2, 3, 3)))
+
+    assert row.trim(2) == 2
+    assert row.offset == 9
+    assert row.index_keys.shape[1] == 1
+    with pytest.raises(SharedSuffixQSAError, match="cross the shared base"):
+        row.trim(2)
+    assert row.offset == 9
+
+
+def test_materialization_is_explicit_receipted_and_preserves_qsa_summary():
+    events = {}
+
+    def note(key, amount):
+        events[key] = events.get(key, 0) + amount
+
+    source = _source_cache()
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-f32-d3")
+    row = SharedSuffixQSAKVCache(base, note=note)
+    row.append_index_keys(mx.full((1, 4, 5), 11.0))
+    row.append_kv(mx.full((1, 2, 4, 3), 12.0), mx.full((1, 2, 4, 3), 13.0))
+    row.set_suffix_pooled_keys(mx.full((1, 1, 5), 14.0))
+
+    materialized, receipt = row.materialize_to_qsa()
+    mx.eval(materialized.state)
+
+    assert type(materialized) is QSAKVCache
+    assert receipt.explicit is True
+    assert receipt.base_length == 8
+    assert receipt.suffix_length == 4
+    assert materialized.offset == 12
+    assert materialized.keys.shape[2] == 12
+    assert materialized.index_keys.shape[1] == 12
+    assert materialized._qsa_pooled_keys.shape == (1, 3, 5)
+    assert materialized._qsa_pooled_ratio == 4
+    assert materialized._qsa_summary_identity["complete_blocks"] == 3
+    assert events == {
+        "shared_qsa_materializations": 1,
+        "shared_qsa_materialized_bytes": receipt.materialized_bytes,
+    }
+    assert row.base is base
+
+
+def test_raw_index_and_kv_append_must_advance_together():
+    base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
+    row = SharedSuffixQSAKVCache(base)
+    row.append_index_keys(mx.ones((1, 2, 5)))
+    with pytest.raises(SharedSuffixQSAError, match="append disagree"):
+        row.append_kv(mx.ones((1, 2, 1, 3)), mx.ones((1, 2, 1, 3)))
+
+
+def test_explicit_unledgered_draft_append_must_be_rewound_before_materialize():
+    base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
+    row = SharedSuffixQSAKVCache(base)
+    row.append_kv(
+        mx.ones((1, 2, 1, 3)),
+        mx.ones((1, 2, 1, 3)),
+        allow_unledgered=True,
+    )
+    with pytest.raises(SharedSuffixQSAError, match="ledger and K/V width disagree"):
+        row.materialize_to_qsa()
+    row.trim(1)
+    materialized, _ = row.materialize_to_qsa()
+    assert materialized.offset == base.length
+    assert materialized.index_keys.shape[1] == base.length
+
+
+def test_split_aware_indexer_matches_stock_selection_without_joining_raw_prefix():
+    from test_qwen4_exp import tiny_args
+
+    mx.random.seed(7)
+    args = tiny_args(indexer_budget=8)
+    indexer = QSAIndexer(args)
+    prefix_hidden = mx.random.normal((1, 8, args.hidden_size))
+    source = QSAKVCache(indexer.summary_identity)
+    indexer(
+        prefix_hidden,
+        source.make_mask(8, return_array=True, window_size=None),
+        source,
+    )
+    source.keys = mx.zeros((1, 1, 8, args.head_dim))
+    source.values = mx.zeros((1, 1, 8, args.head_dim))
+    source.offset = 8
+    starts = mx.arange(2) * indexer.compress_ratio
+    source._qsa_pooled_keys = indexer._pool_blocks(source.index_keys, starts)
+    source._qsa_pooled_ratio = indexer.compress_ratio
+    source._qsa_summary_identity = dict(indexer.summary_identity)
+    source._qsa_summary_identity["complete_blocks"] = 2
+
+    stock = QSAKVCache(indexer.summary_identity)
+    stock.keys = source.keys
+    stock.values = source.values
+    stock.index_keys = source.index_keys
+    stock.offset = source.offset
+    stock._qsa_pooled_keys = source._qsa_pooled_keys
+    stock._qsa_pooled_ratio = source._qsa_pooled_ratio
+    stock._qsa_summary_identity = source._qsa_summary_identity
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-selector-test")
+    split = SharedSuffixQSAKVCache(base)
+
+    hidden = mx.random.normal((1, 8, args.hidden_size))
+    mask = stock.make_mask(8, return_array=True, window_size=None)
+    projected = indexer.index_qk_proj(hidden)
+    stock_selection = indexer(
+        hidden, mask, stock, projected_qk=projected
+    )
+    split_selection = indexer.select_shared_suffix(
+        hidden, mask, split, projected_qk=projected
+    )
+    mx.eval(
+        stock_selection.raw_block_ids,
+        split_selection.raw_block_ids,
+        stock_selection.dense_mask(),
+        split_selection.dense_mask(),
+    )
+
+    assert mx.array_equal(
+        stock_selection.raw_block_ids, split_selection.raw_block_ids
+    ).item()
+    assert mx.array_equal(
+        stock_selection.dense_mask(), split_selection.dense_mask()
+    ).item()
+    assert split.index_keys.shape[1] == 8
+    assert split.base.index_keys.shape[1] == 8

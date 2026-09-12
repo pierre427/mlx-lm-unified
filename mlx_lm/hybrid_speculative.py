@@ -2299,6 +2299,95 @@ def attach_segmented_self_mtp_lanes(
     for detached in joining:
         _validate_detached_self_mtp(detached)
 
+    prefix_ids = [item.shared_qsa_prefix_id for item in joining]
+    initial_shared_qsa_prefix_id = (
+        prefix_ids[0]
+        if batch is None
+        and len(prefix_ids) >= 2
+        and prefix_ids[0] is not None
+        and all(value == prefix_ids[0] for value in prefix_ids[1:])
+        else None
+    )
+    if initial_shared_qsa_prefix_id is not None:
+        from .models.qwen4_exp import QSAKVCache
+        from .qsa_shared_suffix import split_attested_qsa_rows
+        from .models.qwen4_qsa_indexed import qwen4_qsa_private_delta_min_context
+        from .segmented_self_mtp import (
+            qsa_private_delta_enabled,
+            shared_qsa_suffix_enabled,
+        )
+
+        query_length = int(joining[0].lane.num_draft) + 1
+        minimum_context = qwen4_qsa_private_delta_min_context(query_length)
+        if shared_qsa_suffix_enabled() and qsa_private_delta_enabled():
+            updates = []
+            target_groups = [item.caches.target for item in joining]
+            for layer_index, layer_rows in enumerate(zip(*target_groups)):
+                if (
+                    all(type(row) is QSAKVCache for row in layer_rows)
+                    and int(layer_rows[0].offset) >= minimum_context
+                ):
+                    updates.append(
+                        (
+                            layer_index,
+                            split_attested_qsa_rows(
+                                layer_rows,
+                                layout_id=f"qwen4-shared-qsa-v1:{layer_index}",
+                                note=note_segmented_self_mtp,
+                            ),
+                        )
+                    )
+            for layer_index, rows in updates:
+                for item, row in zip(joining, rows):
+                    item.caches.target[layer_index] = row
+
+    # A later join invalidates the initial-cohort attestation. Convert retained
+    # rows back to stock, request-owned storage before mixing them with arrivals.
+    if batch is not None and any(
+        getattr(cache, "supports_shared_qsa_suffix", False)
+        for pair in batch.row_caches
+        for cache in pair.target
+    ):
+        replacements = []
+        try:
+            for pair, lane, transaction in zip(
+                batch.row_caches, batch.lanes, batch.transactions
+            ):
+                position = transaction.position
+                transaction.validate(pair, lane, position)
+                target = list(pair.target)
+                changed = False
+                for layer_index, cache in enumerate(target):
+                    if getattr(cache, "supports_shared_qsa_suffix", False):
+                        target[layer_index], _ = cache.materialize_to_qsa()
+                        changed = True
+                if changed:
+                    _stop_all_speculation(pair.target)
+                    pair.target = target
+                    _start_speculation_or_cleanup(
+                        pair.target,
+                        pair.target,
+                        "materialized shared-QSA rows must remain trimmable",
+                    )
+                    successor = SegmentedLaneTransaction(pair, lane, position)
+                    successor.predecessor_lineage_id = (
+                        transaction.lineage.lineage_id
+                    )
+                    replacements.append((transaction, successor))
+                else:
+                    replacements.append((transaction, transaction))
+        except BaseException as error:
+            _poison_self_mtp_batch(
+                batch, f"shared-QSA membership materialization failed: {error}"
+            )
+            note_segmented_self_mtp("failures")
+            raise
+        batch.transactions = [successor for _, successor in replacements]
+        for previous, successor in replacements:
+            if previous is not successor:
+                previous.close()
+                note_segmented_self_mtp("transaction_canonicalizations")
+
     existing_lanes = [] if batch is None else batch.lanes
     uids = [lane.uid for lane in existing_lanes]
     uids.extend(item.lane.uid for item in joining)
@@ -2370,20 +2459,12 @@ def attach_segmented_self_mtp_lanes(
         raise
 
     if batch is None:
-        prefix_ids = [item.shared_qsa_prefix_id for item in joining]
-        shared_qsa_prefix_id = (
-            prefix_ids[0]
-            if prefix_ids
-            and prefix_ids[0] is not None
-            and all(value == prefix_ids[0] for value in prefix_ids[1:])
-            else None
-        )
         result = SegmentedSelfMTPState(
             lanes=[item.lane for item in joining],
             row_caches=[item.caches for item in joining],
             transactions=transactions,
             membership_epoch=1,
-            shared_qsa_prefix_id=shared_qsa_prefix_id,
+            shared_qsa_prefix_id=initial_shared_qsa_prefix_id,
         )
         note_segmented_self_mtp("requests")
         note_segmented_self_mtp("engaged")
@@ -3280,6 +3361,11 @@ def detach_self_mtp_lanes(
         return batch, []
 
     if isinstance(batch, SegmentedSelfMTPState):
+        from .segmented_self_mtp import (
+            SegmentedLaneTransaction,
+            note_segmented_self_mtp,
+        )
+
         batch._segmented_caches = None
         # Detach/rebuild is a membership boundary.  Preserve correctness by
         # requiring a fresh host-side provenance proof before sharing again.
@@ -3304,9 +3390,25 @@ def detach_self_mtp_lanes(
                     )
                 lane.pending_hs = None
                 lane.pending_ts = []
-                transaction = transaction.canonicalize_live_tip(
-                    pair, lane, position
-                )
+                shared_materialized = False
+                target = list(pair.target)
+                for layer_index, cache in enumerate(target):
+                    if getattr(cache, "supports_shared_qsa_suffix", False):
+                        target[layer_index], _ = cache.materialize_to_qsa()
+                        shared_materialized = True
+                if shared_materialized:
+                    pair.target = target
+                    successor = SegmentedLaneTransaction(pair, lane, position)
+                    successor.predecessor_lineage_id = (
+                        transaction.lineage.lineage_id
+                    )
+                    transaction.close()
+                    note_segmented_self_mtp("transaction_canonicalizations")
+                    transaction = successor
+                else:
+                    transaction = transaction.canonicalize_live_tip(
+                        pair, lane, position
+                    )
                 successor_transactions.append(transaction)
                 item = DetachedSelfMTPLane(
                     lane=lane,

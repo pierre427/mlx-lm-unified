@@ -74,23 +74,37 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         *,
         shared_qsa_prefix=False,
     ):
-        if not rows or not all(type(row) is QSAKVCache for row in rows):
+        from .qsa_shared_suffix import SharedSuffixQSAKVCache
+
+        plain = bool(rows) and all(type(row) is QSAKVCache for row in rows)
+        shared = bool(rows) and all(
+            isinstance(row, SharedSuffixQSAKVCache) for row in rows
+        )
+        if not (plain or shared):
             names = ", ".join(type(row).__name__ for row in rows)
             raise SegmentedBatchUnsupported(
-                "true batched QSA initially requires plain QSAKVCache rows; "
+                "true batched QSA requires uniformly plain or shared-suffix rows; "
                 f"got {names or 'none'}"
             )
         self.rows = list(rows)
         self._note = note
         offsets = [_host_offset(row) for row in rows]
         aligned = min(offsets, default=0) // 4 * 4
-        self._private_delta_base_tokens = (
-            aligned
-            if shared_qsa_prefix
-            and aligned > 0
-            and len(set(offsets)) == 1
-            else None
-        )
+        if shared:
+            bases = [row.base for row in rows]
+            if any(base is not bases[0] for base in bases[1:]):
+                raise SegmentedBatchUnsupported(
+                    "shared-suffix QSA rows do not reference one immutable base"
+                )
+            self._private_delta_base_tokens = int(bases[0].length)
+        else:
+            self._private_delta_base_tokens = (
+                aligned
+                if shared_qsa_prefix
+                and aligned > 0
+                and len(set(offsets)) == 1
+                else None
+            )
         self._step_lengths = None
         self._right_padding = None
         self._mtp_share_topk = False
@@ -198,7 +212,14 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
                     training=bool(attention.training),
                 )
             if admitted:
-                exact_set_fold = qsa_private_delta_exact_set_fold_enabled()
+                # Exact-set was slower at 64K. The shared-suffix ABI keeps the
+                # already-qualified two-source private-delta kernel instead.
+                exact_set_fold = (
+                    qsa_private_delta_exact_set_fold_enabled()
+                    and not getattr(
+                        self.rows[0], "supports_shared_qsa_suffix", False
+                    )
+                )
                 if exact_set_fold:
                     note_qsa_exact_set_fold_event("request")
                     exact_admitted, exact_reason = (
@@ -283,12 +304,20 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             row_mask = row.make_mask(length, return_array=True, window_size=None)
             if row_mask is not None and row_mask.ndim == 2:
                 row_mask = row_mask[None, None]
-            selection = attention.indexer(
-                hidden[index : index + 1],
-                row_mask,
-                row,
-                projected_qk=projected_qk[index : index + 1],
-            )
+            if getattr(row, "supports_shared_qsa_suffix", False):
+                selection = attention.indexer.select_shared_suffix(
+                    hidden[index : index + 1],
+                    row_mask,
+                    row,
+                    projected_qk=projected_qk[index : index + 1],
+                )
+            else:
+                selection = attention.indexer(
+                    hidden[index : index + 1],
+                    row_mask,
+                    row,
+                    projected_qk=projected_qk[index : index + 1],
+                )
             compact = selection.compact_blocks()
             if selection.kind != "explicit" or compact is None:
                 raise RuntimeError(
@@ -326,12 +355,27 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
 
         row_keys = []
         row_values = []
+        row_delta_keys = []
+        row_delta_values = []
         delta_lengths = []
         for index, row in enumerate(self.rows):
-            keys, values = row.update_and_fetch(
-                k[index : index + 1], v[index : index + 1]
-            )
-            delta_length = int(keys.shape[2]) - base_tokens
+            if getattr(row, "supports_shared_qsa_suffix", False):
+                suffix_k, suffix_v = row.append_kv(
+                    k[index : index + 1], v[index : index + 1]
+                )
+                keys = values = None
+                delta_length = int(row.suffix_length)
+                row_delta_keys.append(suffix_k)
+                row_delta_values.append(suffix_v)
+            else:
+                keys, values = row.update_and_fetch(
+                    k[index : index + 1], v[index : index + 1]
+                )
+                delta_length = int(keys.shape[2]) - base_tokens
+                row_delta_keys.append(keys[:, :, base_tokens : base_tokens + delta_length])
+                row_delta_values.append(
+                    values[:, :, base_tokens : base_tokens + delta_length]
+                )
             if delta_length < 0:
                 raise RuntimeError("QSA private delta has a negative suffix")
             row_keys.append(keys)
@@ -342,18 +386,24 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         def suffix_batch(values):
             pieces = []
             for value, delta_length in zip(values, delta_lengths):
-                suffix = value[:, :, base_tokens : base_tokens + delta_length]
                 pieces.append(
                     _pad_sequence(
-                        suffix, 0, delta_width - delta_length, axis=2
+                        value[:, :, :delta_length],
+                        0,
+                        delta_width - delta_length,
+                        axis=2,
                     )
                 )
             return mx.concatenate(pieces, axis=0)
 
-        base_k = row_keys[0][:, :, :base_tokens]
-        base_v = row_values[0][:, :, :base_tokens]
-        delta_k = suffix_batch(row_keys)
-        delta_v = suffix_batch(row_values)
+        if getattr(self.rows[0], "supports_shared_qsa_suffix", False):
+            base_k = self.rows[0].base.keys
+            base_v = self.rows[0].base.values
+        else:
+            base_k = row_keys[0][:, :, :base_tokens]
+            base_v = row_values[0][:, :, :base_tokens]
+        delta_k = suffix_batch(row_delta_keys)
+        delta_v = suffix_batch(row_delta_values)
         total = base_tokens + delta_width
 
         masks = [compact.causal_mask for compact in row_compacts]
@@ -453,20 +503,24 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             # The index ledger and K/V cache were already appended.  Consume
             # those exact selections and fetched row tensors once; never
             # re-enter Attention, which would append them a second time.
-            output = mx.concatenate(
-                [
+            dense_rows = []
+            for index in range(batch):
+                keys, values = row_keys[index], row_values[index]
+                dense_cache = self.rows[index]
+                if keys is None:
+                    dense_cache, _receipt = dense_cache.materialize_to_qsa()
+                    keys, values = dense_cache.keys_and_values()
+                dense_rows.append(
                     qsa_dense_attention_from_selection(
                         q[index : index + 1],
-                        row_keys[index],
-                        row_values[index],
+                        keys,
+                        values,
                         row_selections[index],
-                        self.rows[index],
+                        dense_cache,
                         scale=attention.scale,
                     )
-                    for index in range(batch)
-                ],
-                axis=0,
-            )
+                )
+            output = mx.concatenate(dense_rows, axis=0)
             from .segmented_self_mtp import note_qsa_private_delta_event
 
             note_qsa_private_delta_event(

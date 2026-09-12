@@ -5087,6 +5087,143 @@ class QSAIndexer(nn.Module):
             )
         return pooled
 
+    def select_shared_suffix(
+        self,
+        hidden: mx.array,
+        causal_mask: mx.array,
+        cache,
+        projected_qk: Optional[mx.array] = None,
+    ):
+        """Select blocks from one immutable base plus a row-private ledger.
+
+        Decode never concatenates the long raw-key base with its suffix.  The
+        base must carry complete pooled summaries; newly closed suffix blocks
+        are pooled in their own coordinate space, and only the much smaller
+        score vectors are joined before the unchanged top-k selection.
+        """
+
+        if not getattr(cache, "supports_shared_qsa_suffix", False):
+            raise TypeError("shared-suffix selection requires its storage ABI")
+        batch, length, _ = hidden.shape
+        if batch != 1:
+            raise ValueError("one shared-suffix row is selected at a time")
+        base = cache.base
+        ratio = self.compress_ratio
+        if int(base.length) % ratio:
+            raise RuntimeError("shared QSA base is not block aligned")
+        if base.pooled_keys is None or int(base.pooled_ratio or 0) != ratio:
+            raise RuntimeError("shared QSA base lacks compatible pooled summaries")
+        base_blocks = int(base.length) // ratio
+        if int(base.pooled_keys.shape[1]) != base_blocks:
+            raise RuntimeError("shared QSA base pooled coverage is incomplete")
+
+        shared_topk = getattr(cache, "_mtp_shared_topk", None)
+        offset = int(cache.offset)
+        if shared_topk is None:
+            qk = projected_qk if projected_qk is not None else self.index_qk_proj(hidden)
+            q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
+            raw = raw.reshape(batch, length, self.head_dim)
+            suffix_raw = cache.append_index_keys(raw)
+        total = offset + length
+        n_blocks = total // ratio
+        if n_blocks == 0 or (
+            _QSA_DENSE_SHORTCIRCUIT
+            and self._dense_by_construction(n_blocks, shared_topk)
+        ):
+            if shared_topk is None and getattr(cache, "_mtp_share_topk", False):
+                cache._mtp_shared_topk = mx.arange(
+                    n_blocks, dtype=mx.uint32
+                )[None]
+            return QSASelection(
+                kind="implicit_all",
+                batch=1,
+                length=length,
+                block_size=ratio,
+                causal_mask=causal_mask,
+                offset=offset,
+                physical_width=total,
+                n_blocks=n_blocks,
+            )
+
+        q_pos = mx.arange(offset, offset + length)[None, :]
+        starts = mx.arange(n_blocks) * ratio
+        valid_blocks = (
+            (starts + ratio - 1)[None, None, :] <= q_pos[..., None]
+        )
+        if shared_topk is None:
+            q = self.q_layernorm(
+                q.reshape(batch, length, self.n_heads, self.head_dim)
+            )
+            q = _apply_rope_positions(
+                q, q_pos[..., None], self.rotary_dim, self.rope_theta
+            )
+            suffix_blocks = n_blocks - base_blocks
+            if suffix_blocks < 0:
+                raise RuntimeError("shared QSA selection precedes its base")
+            cached_suffix = cache._suffix_pooled_keys
+            cached_blocks = 0 if cached_suffix is None else int(cached_suffix.shape[1])
+            if cached_blocks > suffix_blocks:
+                cached_suffix = mx.contiguous(cached_suffix[:, :suffix_blocks])
+                cached_blocks = suffix_blocks
+            if cached_blocks < suffix_blocks:
+                first = cached_blocks * ratio
+                last = suffix_blocks * ratio
+                new_starts = base.length + mx.arange(cached_blocks, suffix_blocks) * ratio
+                new = self._pool_blocks(suffix_raw[:, first:last], new_starts)
+                cached_suffix = (
+                    new
+                    if cached_suffix is None
+                    else mx.concatenate([cached_suffix, new], axis=1)
+                )
+            cache.set_suffix_pooled_keys(cached_suffix)
+
+            def score(keys):
+                values = mx.einsum(
+                    "blhd,bnd->blnh",
+                    q.astype(mx.float32),
+                    keys.astype(mx.float32),
+                )
+                return mx.sum(mx.maximum(values, 0), axis=-1) / math.sqrt(
+                    self.head_dim
+                )
+
+            score_parts = [score(base.pooled_keys)]
+            if cached_suffix is not None and cached_suffix.shape[1]:
+                score_parts.append(score(cached_suffix))
+            scores = (
+                score_parts[0]
+                if len(score_parts) == 1
+                else mx.concatenate(score_parts, axis=-1)
+            )
+            scores = mx.where(valid_blocks, scores, -mx.inf)
+            k = min(self.block_topk, n_blocks)
+            selected = mx.argpartition(
+                scores, kth=n_blocks - k, axis=-1
+            )[..., -k:]
+            if getattr(cache, "_mtp_share_topk", False):
+                cache._mtp_shared_topk = mx.contiguous(selected[:, -1])
+        else:
+            selected = mx.broadcast_to(
+                shared_topk[:, None, :], (1, length, shared_topk.shape[-1])
+            )
+        token_logical = mx.arange(total)[None, :]
+        return QSASelection(
+            kind="explicit",
+            batch=1,
+            length=length,
+            block_size=ratio,
+            raw_block_ids=selected,
+            valid_blocks=valid_blocks,
+            q_positions=q_pos,
+            token_positions=token_logical,
+            causal_mask=causal_mask,
+            left_padding=None,
+            offset=offset,
+            physical_width=total,
+            n_blocks=n_blocks,
+            scatter_chosen=_QSA_SCATTER_CHOSEN,
+        )
+
     def __call__(
         self,
         hidden: mx.array,

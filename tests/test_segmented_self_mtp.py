@@ -25,6 +25,8 @@ from mlx_lm.segmented_self_mtp import (
     segmented_self_mtp_enabled,
     segmented_self_mtp_stats,
 )
+from mlx_lm.models.qwen4_exp import QSAKVCache
+from mlx_lm.qsa_shared_suffix import SharedSuffixQSAKVCache
 
 
 def _tree_arrays(value):
@@ -165,6 +167,35 @@ def _detached(uid, position=6):
     )
 
 
+def _real_qsa_detached(uid, position=8):
+    item = _detached(uid, position=position)
+    identity = {
+        "format_version": 1,
+        "model_config_hash": "tiny",
+        "block_size": 4,
+        "compress_ratio": 4,
+        "producer_version": "test",
+        "layer_id": "1",
+        "complete_blocks": position // 4,
+    }
+    cache = QSAKVCache(identity)
+    cache.keys = mx.arange(position * 6, dtype=mx.float32).reshape(
+        1, 2, position, 3
+    )
+    cache.values = cache.keys + 100
+    cache.index_keys = mx.arange(position * 5, dtype=mx.float32).reshape(
+        1, position, 5
+    )
+    cache.offset = position
+    cache._qsa_pooled_keys = mx.arange(
+        (position // 4) * 5, dtype=mx.float32
+    ).reshape(1, position // 4, 5)
+    cache._qsa_pooled_ratio = 4
+    cache._qsa_summary_identity = identity
+    item.caches.target[1] = cache
+    return item
+
+
 def test_shared_qsa_prefix_attestation_is_host_only_and_initial_cohort_scoped():
     first = _detached(0, position=8)
     second = _detached(1, position=8)
@@ -177,6 +208,38 @@ def test_shared_qsa_prefix_attestation_is_host_only_and_initial_cohort_scoped():
     state, detached = detach_self_mtp_lanes(_FakeModel(), state, [1])
     assert state.shared_qsa_prefix_id is None
     assert detached[0].shared_qsa_prefix_id is None
+    close_segmented_self_mtp_state(state)
+    detached[0].segment_transaction.close()
+
+
+def test_shared_qsa_suffix_materializes_on_detach_and_later_join(monkeypatch):
+    monkeypatch.setenv("MLX_LM_SHARED_QSA_SUFFIX", "1")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+    first = _real_qsa_detached(0)
+    second = _real_qsa_detached(1)
+    for item in (first, second):
+        item.shared_qsa_prefix_id = "same-live-tip"
+
+    state = attach_segmented_self_mtp_lanes(
+        _FakeModel(), None, [first, second]
+    )
+    left = state.row_caches[0].target[1]
+    right = state.row_caches[1].target[1]
+    assert isinstance(left, SharedSuffixQSAKVCache)
+    assert isinstance(right, SharedSuffixQSAKVCache)
+    assert left.base is right.base
+
+    state, detached = detach_self_mtp_lanes(_FakeModel(), state, [1])
+    assert type(detached[0].caches.target[1]) is QSAKVCache
+    assert isinstance(state.row_caches[0].target[1], SharedSuffixQSAKVCache)
+
+    third = _real_qsa_detached(2)
+    state = attach_segmented_self_mtp_lanes(_FakeModel(), state, [third])
+    assert all(
+        type(pair.target[1]) is QSAKVCache for pair in state.row_caches
+    )
+    assert state.shared_qsa_prefix_id is None
     close_segmented_self_mtp_state(state)
     detached[0].segment_transaction.close()
 

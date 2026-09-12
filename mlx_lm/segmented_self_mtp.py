@@ -59,6 +59,11 @@ _ZERO = {
     "private_delta_base_tokens_min": 0,
     "private_delta_base_tokens_max": 0,
     "private_delta_duplicate_base_storage_bytes_not_formed_cumulative": 0,
+    "shared_qsa_rows": 0,
+    "shared_qsa_base_bytes": 0,
+    "shared_qsa_private_bytes": 0,
+    "shared_qsa_materializations": 0,
+    "shared_qsa_materialized_bytes": 0,
     "exact_set_fold_requests": 0,
     "exact_set_fold_declines": 0,
     "exact_set_fold_preflight_declines": 0,
@@ -173,6 +178,17 @@ def qsa_private_delta_exact_set_fold_enabled() -> bool:
     ).lower() in {"1", "true", "yes", "on"}
 
 
+def shared_qsa_suffix_enabled() -> bool:
+    """Use one immutable QSA base plus row-private physical suffixes."""
+
+    return os.environ.get("MLX_LM_SHARED_QSA_SUFFIX", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def note_segmented_self_mtp(key: str, amount: int = 1) -> None:
     if key not in _STATS:
         raise KeyError(f"unknown segmented self-MTP counter: {key}")
@@ -282,6 +298,7 @@ def segmented_self_mtp_stats(*, reset: bool = False) -> dict[str, Any]:
     result["qsa_exact_set_fold_environment_enabled"] = (
         qsa_private_delta_exact_set_fold_enabled()
     )
+    result["shared_qsa_suffix_environment_enabled"] = shared_qsa_suffix_enabled()
     result["async_qsa_promotion_environment_enabled"] = os.environ.get(
         "MLX_LM_SEGMENTED_ASYNC_QSA_PROMOTION", "0"
     ).lower() in {"1", "true", "yes", "on"}
@@ -481,6 +498,11 @@ _FORMAT_FIELDS = (
 
 def _component_fields(kind: CachePlaneKind, cache: Any) -> tuple[str, ...]:
     is_qsa = "qsa" in type(cache).__name__.lower() or hasattr(cache, "index_keys")
+    if getattr(cache, "supports_shared_qsa_suffix", False):
+        # The split adapter exposes one immutable base plus mutable suffix
+        # arrays through its explicit state tuple.  Recording only stock
+        # ``keys``/``values`` names would miss every private write.
+        return ("state",)
     if kind == CachePlaneKind.MTP_DRAFT and is_qsa:
         return _QSA_ATTENTION_FIELDS + _QSA_SUMMARY_FIELDS
     if is_qsa and kind == CachePlaneKind.ATTENTION_KV:
@@ -817,6 +839,7 @@ __all__ = [
     "note_segmented_self_mtp",
     "qsa_private_delta_enabled",
     "qsa_private_delta_exact_set_fold_enabled",
+    "shared_qsa_suffix_enabled",
     "note_qsa_private_delta_event",
     "note_qsa_exact_set_fold_event",
     "require_qsa_private_delta_engagement",
