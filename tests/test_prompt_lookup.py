@@ -180,6 +180,57 @@ class TestCacheHelpers(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "stale epoch"):
             c.rewind_to_rollback_marker(start)
 
+    def test_arrays_cache_positions_adopt_batch_after_empty_first_record(self):
+        c = ArraysCache(size=1)
+        c.start_speculation(rollback_window=4)
+
+        # Recurrent layers stage the first rollback before publishing their
+        # newly initialized state, so batch_size is still the empty-cache
+        # default (one) here even though the forward has four rows.
+        c.record_rollback(
+            2,
+            lambda m: [mx.full((4, 1), m)],
+            [None],
+        )
+        c.cache = [mx.full((4, 1), 2)]
+
+        # The next record sees the materialized batch and carries the first
+        # uniform advance into every row instead of treating B=4 as a change.
+        before = list(c.cache)
+        c.record_rollback(
+            1,
+            lambda m: [mx.full((4, 1), 2 + m)],
+            before,
+        )
+        c.cache = [mx.full((4, 1), 3)]
+        self.assertEqual(c._rollback_positions, [3, 3, 3, 3])
+
+        c.trim_ragged([1, 0, 1, 0])
+        self.assertEqual(c._rollback_positions, [2, 3, 2, 3])
+        self.assertEqual(c.cache[0].reshape(-1).tolist(), [2, 3, 2, 3])
+
+    def test_arrays_cache_positions_reject_real_unannounced_batch_change(self):
+        c = ArraysCache(size=1)
+        c.cache = [mx.zeros((2, 1))]
+        c.start_speculation(rollback_window=4)
+        c.record_rollback(1, lambda m: [mx.full((2, 1), m)], list(c.cache))
+        self.assertEqual(c._rollback_positions, [1, 1])
+
+        # Once a live batch has recorded history, changing its membership
+        # without filter()/extend() must not silently reinterpret old records.
+        c.cache = [mx.zeros((3, 1))]
+        with self.assertRaisesRegex(RuntimeError, "do not match the live batch"):
+            c.record_rollback(1, lambda m: [mx.full((3, 1), m)], list(c.cache))
+
+    def test_arrays_cache_membership_api_invalidates_empty_history_marker(self):
+        c = ArraysCache(size=1)
+        c.cache = [mx.zeros((1, 1))]
+        c.start_speculation(rollback_window=4)
+        marker = c.rollback_marker()
+        c.filter([0])
+        with self.assertRaisesRegex(RuntimeError, "stale epoch"):
+            c.rewind_to_rollback_marker(marker)
+
     def test_cachelist_snapshot_uses_arrays_epoch_marker(self):
         arrays = ArraysCache(size=1)
         arrays.cache = [mx.array([0])]

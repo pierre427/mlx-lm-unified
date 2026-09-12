@@ -2436,7 +2436,12 @@ class ArraysCache(_BaseCache):
         # backwards after a new verify forward. Track live row positions
         # separately, paired with an epoch so stale snapshots fail closed.
         instance._rollback_epoch = 0
-        instance._rollback_positions = []
+        # Keep uniform progress scalar until row-specific depths appear.  An
+        # empty cache reports batch_size == 1 even when its first forward will
+        # materialize a larger batch, so eagerly allocating one position here
+        # would mistake initialization for a membership change.
+        instance._rollback_position = 0
+        instance._rollback_positions = None
         # Set when the records were dropped because they no longer describe
         # the live rows (a batch membership change); reported by trim().
         instance._rollback_invalid_reason = None
@@ -2479,23 +2484,33 @@ class ArraysCache(_BaseCache):
         )
         self._rollbacks.clear()
         self._rollback_epoch += 1
-        self._rollback_positions = [0] * self.batch_size
+        self._rollback_position = 0
+        self._rollback_positions = None
 
     def stop_speculation(self):
         self.speculating = False
         self._rollbacks.clear()
         self._rollback_epoch += 1
-        self._rollback_positions = []
+        self._rollback_position = 0
+        self._rollback_positions = None
 
     def rollback_marker(self):
         """Return an epoch-bound position for single-row PLD rollback."""
         if not self.speculating:
             raise RuntimeError("ArraysCache rollback recording is not active")
-        if self.batch_size != 1 or len(self._rollback_positions) != 1:
+        if self.batch_size != 1 or (
+            self._rollback_positions is not None
+            and len(self._rollback_positions) != 1
+        ):
             raise RuntimeError(
                 "ArraysCache PLD rollback markers require exactly one live row"
             )
-        return self._rollback_epoch, self._rollback_positions[0]
+        position = (
+            self._rollback_position
+            if self._rollback_positions is None
+            else self._rollback_positions[0]
+        )
+        return self._rollback_epoch, position
 
     def rewind_to_rollback_marker(self, marker):
         """Rewind to a marker without relying on retained deque totals."""
@@ -2514,11 +2529,18 @@ class ArraysCache(_BaseCache):
             raise RuntimeError(
                 "ArraysCache rollback marker belongs to an inactive or stale epoch"
             )
-        if self.batch_size != 1 or len(self._rollback_positions) != 1:
+        if self.batch_size != 1 or (
+            self._rollback_positions is not None
+            and len(self._rollback_positions) != 1
+        ):
             raise RuntimeError(
                 "ArraysCache PLD rollback markers require exactly one live row"
             )
-        current = self._rollback_positions[0]
+        current = (
+            self._rollback_position
+            if self._rollback_positions is None
+            else self._rollback_positions[0]
+        )
         if position > current:
             raise RuntimeError(
                 f"ArraysCache rollback marker is ahead of live state: "
@@ -2610,16 +2632,24 @@ class ArraysCache(_BaseCache):
         """
         depths = self._record_depths(num_tokens, depths)
         batch = self.batch_size
-        if len(self._rollback_positions) != batch:
+        if (
+            self._rollback_positions is not None
+            and len(self._rollback_positions) != batch
+        ):
             raise RuntimeError(
                 "ArraysCache rollback positions do not match the live batch; "
                 "restart speculation after changing membership"
             )
-        advances = [num_tokens] * batch if depths is None else depths
-        self._rollback_positions = [
-            position + advance
-            for position, advance in zip(self._rollback_positions, advances)
-        ]
+        if self._rollback_positions is None and depths is None and self.empty():
+            self._rollback_position += num_tokens
+        else:
+            if self._rollback_positions is None:
+                self._rollback_positions = [self._rollback_position] * batch
+            advances = [num_tokens] * batch if depths is None else depths
+            self._rollback_positions = [
+                position + advance
+                for position, advance in zip(self._rollback_positions, advances)
+            ]
         self._rollback_invalid_reason = None
         self._rollbacks.append(
             _RollbackRecord(num_tokens, fn, snapshot, per_row_fn, depths)
@@ -2711,11 +2741,17 @@ class ArraysCache(_BaseCache):
         later trim into a loud failure instead of a wrong-shaped restore.
         """
         self._clear_staged_rollback()
-        if self._rollbacks or self._rollback_positions:
+        if (
+            self.speculating
+            or self._rollbacks
+            or self._rollback_position
+            or self._rollback_positions is not None
+        ):
             self._rollbacks.clear()
             self._rollback_invalid_reason = reason
             self._rollback_epoch += 1
-            self._rollback_positions = []
+            self._rollback_position = 0
+            self._rollback_positions = None
 
     def _clear_staged_rollback(self):
         """Drop a rollback staged by an interrupted forward.
@@ -2733,7 +2769,9 @@ class ArraysCache(_BaseCache):
         if min(capacity, default=0) < n:
             raise self._rollback_budget_error(n, min(capacity, default=0))
         self._rewind_rows([n] * batch, batch, prefer_per_row=False)
-        if len(self._rollback_positions) == batch:
+        if self._rollback_positions is None:
+            self._rollback_position -= n
+        elif len(self._rollback_positions) == batch:
             self._rollback_positions = [
                 position - n for position in self._rollback_positions
             ]
@@ -2844,7 +2882,11 @@ class ArraysCache(_BaseCache):
         if max(drops, default=0) == 0:
             return drops
         self._rewind_rows(list(drops), self.batch_size, prefer_per_row=True)
-        if len(self._rollback_positions) == self.batch_size:
+        if self._rollback_positions is None and len(set(drops)) <= 1:
+            self._rollback_position -= drops[0]
+        else:
+            if self._rollback_positions is None:
+                self._rollback_positions = [self._rollback_position] * self.batch_size
             self._rollback_positions = [
                 position - drop
                 for position, drop in zip(self._rollback_positions, drops)
@@ -2911,7 +2953,8 @@ class ArraysCache(_BaseCache):
         # Any speculative rollbacks describe the discarded suffix.
         self._rollbacks.clear()
         self._rollback_epoch += 1
-        self._rollback_positions = []
+        self._rollback_position = 0
+        self._rollback_positions = None
         return num_tokens
 
     @property
