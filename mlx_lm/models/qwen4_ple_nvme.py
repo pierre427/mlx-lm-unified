@@ -1000,7 +1000,9 @@ def _iter_ple_embeddings(model):
             yield prefix, ple.ple_embedding
 
 
-def install_file_backed_ple(model, weights: dict, sidecar_path: str, model_path):
+def install_file_backed_ple(
+    model, weights: dict, sidecar_path: str, model_path, *, _owned_tables=None
+):
     """Replace the matching resident ``ShardedEmbedding`` with the sidecar.
 
     Called from ``load_model`` after ``sanitize`` and before quantization.
@@ -1063,34 +1065,43 @@ def install_file_backed_ple(model, weights: dict, sidecar_path: str, model_path)
                 None if verify_shards is None else tuple(verify_shards)
             ),
         )
-        if (
-            os.getenv("MLX_QWEN4_PLE_VERIFY_DEVICE") == "1"
-            and mx.metal.is_available()
-            and mx.default_device() == mx.gpu
-        ):
-            table.prepare_verify_device()
-        ngram_embedding.ngram_embedding = table
-        # Optional static preheat of the LRU hot tier from a hot-rows
-        # manifest (built by scripts/build_qwen4_ple_hot_rows.py). The
-        # count lands on the embedding for bench/config observability.
-        if preheat := os.environ.get("MLX_QWEN4_PLE_NVME_PREHEAT"):
-            ngram_embedding.ngram_embedding.preheated_rows = (
-                ngram_embedding.ngram_embedding.preheat_from_file(preheat)
-            )
-        # NVMe mode hashes and gathers on CPU by construction. The Metal
-        # hash backends would put the row ids on the GPU only for the
-        # lookup to sync them straight back; refuse the combination.
-        if ngram_embedding.hash_backend in ("metal", "metal_prefill"):
-            warnings.warn(
-                "MLX_QWEN4_PLE_NVME forces CPU n-gram hashing; overriding "
-                f"MLX_QWEN4_PLE_HASH_BACKEND={ngram_embedding.hash_backend} "
-                "to routed_cpu"
-            )
-        ngram_embedding.hash_backend = "routed_cpu"
-        shard_prefix = f"{prefix}.shard_"
-        for key in [k for k in weights if k.startswith(shard_prefix)]:
-            del weights[key]
-        installed = True
+        try:
+            if _owned_tables is not None:
+                _owned_tables.append(table)
+            if (
+                os.getenv("MLX_QWEN4_PLE_VERIFY_DEVICE") == "1"
+                and mx.metal.is_available()
+                and mx.default_device() == mx.gpu
+            ):
+                table.prepare_verify_device()
+            ngram_embedding.ngram_embedding = table
+            # Optional static preheat of the LRU hot tier from a hot-rows
+            # manifest (built by scripts/build_qwen4_ple_hot_rows.py). The
+            # count lands on the embedding for bench/config observability.
+            if preheat := os.environ.get("MLX_QWEN4_PLE_NVME_PREHEAT"):
+                ngram_embedding.ngram_embedding.preheated_rows = (
+                    ngram_embedding.ngram_embedding.preheat_from_file(preheat)
+                )
+            # NVMe mode hashes and gathers on CPU by construction. The Metal
+            # hash backends would put the row ids on the GPU only for the
+            # lookup to sync them straight back; refuse the combination.
+            if ngram_embedding.hash_backend in ("metal", "metal_prefill"):
+                warnings.warn(
+                    "MLX_QWEN4_PLE_NVME forces CPU n-gram hashing; overriding "
+                    f"MLX_QWEN4_PLE_HASH_BACKEND={ngram_embedding.hash_backend} "
+                    "to routed_cpu"
+                )
+            ngram_embedding.hash_backend = "routed_cpu"
+            shard_prefix = f"{prefix}.shard_"
+            for key in [k for k in weights if k.startswith(shard_prefix)]:
+                del weights[key]
+            installed = True
+        except BaseException:
+            try:
+                table.close()
+            except BaseException:
+                pass  # Preserve the original installation error.
+            raise
 
     if not installed:
         raise ValueError(

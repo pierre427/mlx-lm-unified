@@ -528,138 +528,150 @@ def load_model(
         weights = model.sanitize(weights)
         _carry_fused_gate_up_overrides(config, weights)
 
-    # Opt-in NVMe-backed PLE tables for Qwen4-Exp: verify the sidecar was
-    # built from this artifact, then swap the resident ShardedEmbedding for
-    # a file-backed one and drop the shard tensors before materialisation.
-    # Removing the shard modules here also removes them from the tree that
-    # nn.quantize walks, so the per-path quantization predicates below never
-    # visit them. Unset env keeps the resident parameter tree and numerical
-    # path unchanged (the generation loops additionally resolve a
-    # prefill-prefetch hook, which is None for resident models). The sidecar
-    # is deliberately not part of weight_files (see the UBC eviction note
-    # below and assert_sidecar_not_in_weight_files).
-    if (ple_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME")) and config[
-        "model_type"
-    ] == "qwen4_exp":
-        from .models.qwen4_ple_nvme import install_file_backed_ple
+    ple_tables = []
+    try:
+        # Opt-in NVMe-backed PLE tables for Qwen4-Exp: verify the sidecar was
+        # built from this artifact, then swap the resident ShardedEmbedding for
+        # a file-backed one and drop the shard tensors before materialisation.
+        # Removing the shard modules here also removes them from the tree that
+        # nn.quantize walks, so the per-path quantization predicates below never
+        # visit them. Unset env keeps the resident parameter tree and numerical
+        # path unchanged (the generation loops additionally resolve a
+        # prefill-prefetch hook, which is None for resident models). The sidecar
+        # is deliberately not part of weight_files (see the UBC eviction note
+        # below and assert_sidecar_not_in_weight_files).
+        if (ple_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME")) and config[
+            "model_type"
+        ] == "qwen4_exp":
+            from .models.qwen4_ple_nvme import install_file_backed_ple
 
-        weights = install_file_backed_ple(model, weights, ple_sidecar, model_path)
+            weights = install_file_backed_ple(
+                model, weights, ple_sidecar, model_path, _owned_tables=ple_tables
+            )
 
-    def _quantize(quantization):
-        def class_predicate(p, m):
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            return f"{p}.scales" in weights
+        def _quantize(quantization):
+            def class_predicate(p, m):
+                # Handle custom per layer quantizations
+                if p in config["quantization"]:
+                    return config["quantization"][p]
+                if not hasattr(m, "to_quantized"):
+                    return False
+                return f"{p}.scales" in weights
 
-        nn.quantize(
-            model,
-            group_size=quantization["group_size"],
-            bits=quantization["bits"],
-            mode=quantization.get("mode", "affine"),
-            class_predicate=class_predicate,
-        )
+            nn.quantize(
+                model,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization.get("mode", "affine"),
+                class_predicate=class_predicate,
+            )
 
-    if (quantization := config.get("quantization", None)) is not None:
-        _quantize(quantization)
-
-    elif quantization_config := config.get("quantization_config", False):
-        # Handle legacy quantization config
-        quant_method = quantization_config["quant_method"]
-        if quant_method == "bitnet":
-            from .models.bitlinear_layers import bitnet_quantize
-
-            model = bitnet_quantize(model, quantization_config)
-        elif quant_method == "mxfp4":
-            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            config["quantization"] = quantization
-            config["quantization_config"] = quantization
-            _quantize(quantization)
-        elif quant_method == "compressed-tensors":
-            if quantization_config.get("format") == "nvfp4-pack-quantized":
-                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-            else:
-                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
-            config["quantization"] = quantization
-            config["quantization_config"] = quantization
-            _quantize(quantization)
-        elif quant_method in ("awq", "gptq"):
-            # Transform AutoAWQ/GPTQ packed weights to MLX format
-            weights, quantization = _transform_awq_weights(weights, quantization_config)
-            config["quantization"] = quantization
-            config["quantization_config"] = quantization
+        if (quantization := config.get("quantization", None)) is not None:
             _quantize(quantization)
 
-    if config.get("quantize_activations", False):
+        elif quantization_config := config.get("quantization_config", False):
+            # Handle legacy quantization config
+            quant_method = quantization_config["quant_method"]
+            if quant_method == "bitnet":
+                from .models.bitlinear_layers import bitnet_quantize
 
-        def _maybe_qq(m):
-            if isinstance(m, nn.QuantizedLinear):
-                if m.mode not in ("nvfp4", "mxfp8"):
-                    raise ValueError(
-                        "Mode ({m.mode}) does not support activation quantization"
+                model = bitnet_quantize(model, quantization_config)
+            elif quant_method == "mxfp4":
+                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+                _quantize(quantization)
+            elif quant_method == "compressed-tensors":
+                if quantization_config.get("format") == "nvfp4-pack-quantized":
+                    quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+                else:
+                    quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+                _quantize(quantization)
+            elif quant_method in ("awq", "gptq"):
+                # Transform AutoAWQ/GPTQ packed weights to MLX format
+                weights, quantization = _transform_awq_weights(weights, quantization_config)
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+                _quantize(quantization)
+
+        if config.get("quantize_activations", False):
+
+            def _maybe_qq(m):
+                if isinstance(m, nn.QuantizedLinear):
+                    if m.mode not in ("nvfp4", "mxfp8"):
+                        raise ValueError(
+                            "Mode ({m.mode}) does not support activation quantization"
+                        )
+                    if m.get("bias", False):
+                        raise ValueError(
+                            "Linear layer with bias does not support activation quantization"
+                        )
+                    out_dims, in_dims = m.weight.shape
+                    in_dims *= 32 // m.bits
+                    return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
+                else:
+                    return m
+
+            leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
+
+            model.update_modules(leaves)
+
+        model.eval()
+        model.load_weights(list(weights.items()), strict=strict)
+        _maybe_fuse_agnes_gdn_projections(model, config)
+
+        if not lazy:
+            mx.eval(model.parameters())
+            # Opt-in macOS UBC eviction: after weights are materialised into MLX's
+            # own Metal buffers, the safetensors mmap is a redundant Unified Buffer
+            # Cache shadow. Evicting it eagerly reclaims that footprint (measured
+            # ~41 GB on Llama-3.3-70B-8bit) for KV cache / long context on near-OOM
+            # large-model loads. Bit-exact + decode-neutral (see
+            # wiki/docs/experiments/ubc-evict-pflash-eval-2026-07-13.md). Default
+            # off; the file staying on disk means eviction can never corrupt values.
+            if os.environ.get("MLX_LM_UBC_EVICT") == "1":
+                try:
+                    from .ubc_evict import ubc_evict_paths
+
+                    # Invariant: the NVMe PLE sidecar backs live lookups and
+                    # must never be UBC-evicted. Its name cannot match the
+                    # model*.safetensors glob, so it can never be in
+                    # weight_files; assert that stays true.
+                    if nvme_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME"):
+                        assert os.path.realpath(nvme_sidecar) not in {
+                            os.path.realpath(wf) for wf in weight_files
+                        }, "PLE sidecar must not be in the UBC eviction list"
+                    ubc_evict_paths(weight_files)
+                except Exception:  # never let eviction block a load
+                    pass
+
+        if strict:
+            from .compiled_qualification import (
+                SERVING_QUALIFICATIONS, bind_serving_qualification, runtime_identity,
+            )
+
+            if SERVING_QUALIFICATIONS or os.environ.get("MLX_LM_COMPILED_DECODE_QUALIFICATION"):
+                try:
+                    bind_serving_qualification(
+                        model, config, weight_files, runtime=runtime_identity(mx),
+                        parameters=tree_flatten(model.parameters()),
                     )
-                if m.get("bias", False):
-                    raise ValueError(
-                        "Linear layer with bias does not support activation quantization"
-                    )
-                out_dims, in_dims = m.weight.shape
-                in_dims *= 32 // m.bits
-                return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
-            else:
-                return m
+                except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+                    # Bad qualification refuses replay, not ordinary eager loading.
+                    model._compiled_decode_serving_binding = None
+                    model._compiled_decode_qualification_error = str(error)
 
-        leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
-
-        model.update_modules(leaves)
-
-    model.eval()
-    model.load_weights(list(weights.items()), strict=strict)
-    _maybe_fuse_agnes_gdn_projections(model, config)
-
-    if not lazy:
-        mx.eval(model.parameters())
-        # Opt-in macOS UBC eviction: after weights are materialised into MLX's
-        # own Metal buffers, the safetensors mmap is a redundant Unified Buffer
-        # Cache shadow. Evicting it eagerly reclaims that footprint (measured
-        # ~41 GB on Llama-3.3-70B-8bit) for KV cache / long context on near-OOM
-        # large-model loads. Bit-exact + decode-neutral (see
-        # wiki/docs/experiments/ubc-evict-pflash-eval-2026-07-13.md). Default
-        # off; the file staying on disk means eviction can never corrupt values.
-        if os.environ.get("MLX_LM_UBC_EVICT") == "1":
+        return model, config
+    except BaseException:
+        # Tracebacks can retain a failed model; release only this load's readers.
+        for table in reversed(ple_tables):
             try:
-                from .ubc_evict import ubc_evict_paths
-
-                # Invariant: the NVMe PLE sidecar backs live lookups and
-                # must never be UBC-evicted. Its name cannot match the
-                # model*.safetensors glob, so it can never be in
-                # weight_files; assert that stays true.
-                if nvme_sidecar := os.environ.get("MLX_QWEN4_PLE_NVME"):
-                    assert os.path.realpath(nvme_sidecar) not in {
-                        os.path.realpath(wf) for wf in weight_files
-                    }, "PLE sidecar must not be in the UBC eviction list"
-                ubc_evict_paths(weight_files)
-            except Exception:  # never let eviction block a load
-                pass
-
-    if strict:
-        from .compiled_qualification import (
-            SERVING_QUALIFICATIONS, bind_serving_qualification, runtime_identity,
-        )
-
-        if SERVING_QUALIFICATIONS or os.environ.get("MLX_LM_COMPILED_DECODE_QUALIFICATION"):
-            try:
-                bind_serving_qualification(
-                    model, config, weight_files, runtime=runtime_identity(mx),
-                    parameters=tree_flatten(model.parameters()),
-                )
-            except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
-                # Bad qualification refuses replay, not ordinary eager loading.
-                model._compiled_decode_serving_binding = None
-                model._compiled_decode_qualification_error = str(error)
-
-    return model, config
+                table.close()
+            except BaseException:
+                pass  # Preserve the original load error.
+        raise
 
 
 def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:

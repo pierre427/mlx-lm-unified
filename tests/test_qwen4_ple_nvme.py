@@ -2,6 +2,7 @@ import importlib.util
 import json
 import shutil
 import unittest
+import weakref
 from contextlib import contextmanager
 from os import environ
 from pathlib import Path
@@ -1046,6 +1047,111 @@ class TestQwen4PleNvme(unittest.TestCase):
             table.lookup_numpy(ids)
         table.prefetch_rows(ids)  # optional path: silent no-op when closed
         table.submit_prefetch(lambda: None)
+
+    def test_strict_load_failure_closes_ple_despite_retained_traceback(self):
+        readers = []
+        original_init = FileBackedShardedEmbedding.__init__
+
+        def track(table, *args, **kwargs):
+            original_init(table, *args, **kwargs)
+            reference = weakref.ref(table)
+            readers.append(reference)
+            self.addCleanup(lambda: reference() is not None and reference().close())
+
+        with TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "broken"
+            shutil.copytree(self.model_dir, broken)
+            removed = []
+            for path in broken.glob("model*.safetensors"):
+                weights = mx.load(str(path))
+                for key in list(weights):
+                    if key.endswith("embed_tokens.weight"):
+                        removed.append(key)
+                        del weights[key]
+                rewritten = path.with_name("rewritten.safetensors")
+                mx.save_safetensors(str(rewritten), weights)
+                rewritten.replace(path)
+            self.assertTrue(removed)
+            with (
+                env_var("MLX_QWEN4_PLE_NVME", str(broken / "ple_rows.bin")),
+                patch.object(FileBackedShardedEmbedding, "__init__", track),
+            ):
+                try:
+                    utils.load_model(broken)
+                except ValueError as error:
+                    retained_error = error
+                else:
+                    self.fail("malformed checkpoint unexpectedly loaded")
+            self.assertIn("embed_tokens.weight", str(retained_error))
+            self.assertIsNotNone(retained_error.__traceback__)
+            self.assertEqual(len(readers), 1)
+            table = readers[0]()
+            self.assertIsNotNone(table)
+            self.assertTrue(table._closed)
+            self.assertIsNone(table._fd)
+
+    def test_quantization_failure_closes_new_ple_and_preserves_original_error(self):
+        readers = []
+        original_init = FileBackedShardedEmbedding.__init__
+        original_close = FileBackedShardedEmbedding.close
+        expected = ValueError("injected quantization failure")
+
+        def track(table, *args, **kwargs):
+            original_init(table, *args, **kwargs)
+            readers.append(table)
+            self.addCleanup(original_close, table)
+
+        def noisy_close(table):
+            original_close(table)
+            raise RuntimeError("secondary cleanup failure")
+
+        with (
+            env_var("MLX_QWEN4_PLE_NVME", str(self.sidecar)),
+            patch.object(FileBackedShardedEmbedding, "__init__", track),
+            patch.object(FileBackedShardedEmbedding, "close", noisy_close),
+            patch.object(nn, "quantize", side_effect=expected),
+        ):
+            try:
+                utils.load_model(self.model_dir)
+            except ValueError as error:
+                self.assertIs(error, expected)
+            else:
+                self.fail("quantization failure was lost")
+        self.assertEqual(len(readers), 1)
+        self.assertTrue(readers[0]._closed)
+        self.assertIsNone(readers[0]._fd)
+
+    def test_failed_install_closes_only_new_table(self):
+        successful = self.load_nvme()
+        retained = self.ngram_embedding(successful).ngram_embedding
+        self.addCleanup(retained.close)
+        readers = []
+        original_init = FileBackedShardedEmbedding.__init__
+        expected = ValueError("injected preheat failure")
+
+        def track(table, *args, **kwargs):
+            original_init(table, *args, **kwargs)
+            readers.append(table)
+            self.addCleanup(table.close)
+
+        with (
+            env_var("MLX_QWEN4_PLE_NVME", str(self.sidecar)),
+            env_var("MLX_QWEN4_PLE_NVME_PREHEAT", "injected.json"),
+            patch.object(FileBackedShardedEmbedding, "__init__", track),
+            patch.object(FileBackedShardedEmbedding, "preheat_from_file", side_effect=expected),
+        ):
+            try:
+                utils.load_model(self.model_dir)
+            except ValueError as error:
+                self.assertIs(error, expected)
+            else:
+                self.fail("installation failure was lost")
+        self.assertEqual(len(readers), 1)
+        self.assertTrue(readers[0]._closed)
+        self.assertIsNone(readers[0]._fd)
+        self.assertFalse(retained._closed)
+        self.assertIsNotNone(retained._fd)
+        self.assertEqual(retained.lookup_numpy(np.array([0], dtype=np.int64)).shape[0], 1)
 
     def test_prefetch_prompt_chunk_does_not_disturb_cache_or_results(self):
         nvme = self.load_nvme()
