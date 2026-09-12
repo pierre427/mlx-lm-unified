@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import mlx.core as mx
 import pytest
 
@@ -37,6 +39,50 @@ def _source_cache(length=8):
     cache._qsa_pooled_ratio = 4
     cache._qsa_summary_identity = _identity(length // 4)
     return cache
+
+
+def _attention_source_and_stock_rows(count):
+    from test_qwen4_exp import tiny_args
+
+    from mlx_lm.models.qwen4_exp import Attention
+
+    args = tiny_args(indexer_budget=4)
+    attention = Attention(args)
+    mx.eval(attention.parameters())
+    prefix = mx.random.normal((1, 8, args.hidden_size))
+    source = QSAKVCache(attention.indexer.summary_identity)
+    output = attention(
+        prefix,
+        source.make_mask(8, return_array=True, window_size=None),
+        source,
+    )
+    mx.eval(output, source.state)
+    ratio = attention.indexer.compress_ratio
+    starts = mx.arange(source.offset // ratio) * ratio
+    source._qsa_pooled_keys = attention.indexer._pool_blocks(
+        source.index_keys, starts
+    )
+    source._qsa_pooled_ratio = ratio
+    source._qsa_summary_identity = dict(attention.indexer.summary_identity)
+    source._qsa_summary_identity["complete_blocks"] = source.offset // ratio
+    mx.eval(source._qsa_pooled_keys)
+    stocks = []
+    for _ in range(count):
+        stock = QSAKVCache(attention.indexer.summary_identity)
+        stock.state = source.state
+        stock.meta_state = source.meta_state
+        stocks.append(stock)
+    return args, attention, source, stocks
+
+
+def _stock_segmented_output(attention, rows, hidden, lengths):
+    segmented = SegmentedBatchQSAKVCache(rows, shared_qsa_prefix=False)
+    width = max(lengths)
+    segmented.prepare(
+        lengths=lengths,
+        right_padding=[width - length for length in lengths],
+    )
+    return segmented.segmented_attention(attention, hidden, None)
 
 
 def test_rows_share_one_aligned_immutable_base_by_identity():
@@ -87,6 +133,84 @@ def test_segmented_builder_accepts_uniform_shared_suffix_rows():
     assert len(group) == 1
     assert isinstance(group[0], SegmentedBatchQSAKVCache)
     assert group[0].rows == rows
+
+
+def test_ragged_shared_suffix_fallback_matches_stock_rows(monkeypatch):
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    mx.random.seed(101)
+    args, attention, source, stocks = _attention_source_and_stock_rows(2)
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-ragged-fallback")
+    rows = [SharedSuffixQSAKVCache(base) for _ in range(2)]
+    lengths = [3, 1]
+    hidden = mx.random.normal((2, 3, args.hidden_size))
+
+    expected = _stock_segmented_output(attention, stocks, hidden, lengths)
+    segmented = SegmentedBatchQSAKVCache(rows)
+    segmented.prepare(lengths=lengths, right_padding=[0, 2])
+    actual = segmented.segmented_attention(attention, hidden, None)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
+    assert [row.offset for row in rows] == [11, 9]
+    assert [row.index_keys.shape[1] for row in rows] == [3, 1]
+
+
+def test_preflight_declined_shared_suffix_fallback_matches_stock_rows(monkeypatch):
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    mx.random.seed(102)
+    args, attention, source, stocks = _attention_source_and_stock_rows(2)
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-declined-fallback")
+    rows = [SharedSuffixQSAKVCache(base) for _ in range(2)]
+    hidden = mx.random.normal((2, 3, args.hidden_size))
+
+    expected = _stock_segmented_output(attention, stocks, hidden, [3, 3])
+    segmented = SegmentedBatchQSAKVCache(rows)
+    segmented.prepare(lengths=[3, 3], right_padding=[0, 0])
+    with patch(
+        "mlx_lm.segmented_batch_cache.qwen4_qsa_indexed_private_delta_preflight",
+        return_value=(False, "synthetic_decline"),
+    ):
+        actual = segmented.segmented_attention(attention, hidden, None)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
+    assert [row.offset for row in rows] == [11, 11]
+
+
+def test_one_surviving_shared_suffix_row_uses_single_row_selector(monkeypatch):
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    mx.random.seed(103)
+    args, attention, source, stocks = _attention_source_and_stock_rows(1)
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-b1-survivor")
+    row = SharedSuffixQSAKVCache(base)
+    hidden = mx.random.normal((1, 3, args.hidden_size))
+
+    expected = _stock_segmented_output(attention, stocks, hidden, [3])
+    segmented = SegmentedBatchQSAKVCache([row])
+    segmented.prepare(lengths=[3], right_padding=[0])
+    with (
+        patch(
+            "mlx_lm.segmented_batch_cache."
+            "qwen4_qsa_indexed_private_delta_preflight",
+            return_value=(True, "engaged"),
+        ),
+        patch.object(
+            attention.indexer,
+            "select_shared_suffix_batch",
+            side_effect=AssertionError("B1 must not use the batched selector"),
+        ),
+        patch(
+            "mlx_lm.segmented_batch_cache."
+            "qwen4_qsa_indexed_private_delta_attention",
+            side_effect=RuntimeError("synthetic CPU decline"),
+        ),
+    ):
+        actual = segmented.segmented_attention(attention, hidden, None)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
+    assert row.offset == 11
+    assert row.index_keys.shape[1] == 3
 
 
 def test_normal_append_allocates_only_private_suffix_and_never_joins_prefix():

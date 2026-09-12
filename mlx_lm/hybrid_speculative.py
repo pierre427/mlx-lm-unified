@@ -2311,14 +2311,11 @@ def attach_segmented_self_mtp_lanes(
     if initial_shared_qsa_prefix_id is not None:
         from .models.qwen4_exp import QSAKVCache
         from .qsa_shared_suffix import split_attested_qsa_rows
-        from .models.qwen4_qsa_indexed import qwen4_qsa_private_delta_min_context
         from .segmented_self_mtp import (
             qsa_private_delta_enabled,
             shared_qsa_suffix_admission,
         )
 
-        query_length = int(joining[0].lane.num_draft) + 1
-        minimum_context = qwen4_qsa_private_delta_min_context(query_length)
         target_groups = [item.caches.target for item in joining]
         qsa_contexts = [
             int(layer_rows[0].offset)
@@ -2349,10 +2346,7 @@ def attach_segmented_self_mtp_lanes(
         if admitted and qsa_private_delta_enabled():
             updates = []
             for layer_index, layer_rows in enumerate(zip(*target_groups)):
-                if (
-                    all(type(row) is QSAKVCache for row in layer_rows)
-                    and int(layer_rows[0].offset) >= minimum_context
-                ):
+                if all(type(row) is QSAKVCache for row in layer_rows):
                     updates.append(
                         (
                             layer_index,

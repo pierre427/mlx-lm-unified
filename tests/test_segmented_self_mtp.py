@@ -238,6 +238,30 @@ def test_shared_qsa_auto_policy_tracks_context_budget_crossover(monkeypatch):
     )[0] is True
 
 
+def test_shared_qsa_auto_policy_is_storage_reachable_at_16k(monkeypatch):
+    monkeypatch.delenv("MLX_LM_SHARED_QSA_SUFFIX", raising=False)
+    monkeypatch.delenv("MLX_LM_SHARED_QSA_SUFFIX_MIN_CONTEXT", raising=False)
+    monkeypatch.delenv("MLX_LM_SHARED_QSA_SUFFIX_MAX_REMAINING", raising=False)
+    monkeypatch.delenv("MLX_LM_QSA_PRIVATE_DELTA", raising=False)
+    monkeypatch.delenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", raising=False)
+    monkeypatch.delenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT_MN", raising=False)
+    rows = [
+        _real_qsa_detached(uid, position=16 * 1024 - 4)
+        for uid in range(2)
+    ]
+    for item in rows:
+        item.shared_qsa_prefix_id = "auto-admitted-16k-live-tip"
+
+    state = attach_segmented_self_mtp_lanes(_FakeModel(), None, rows)
+
+    assert state.shared_qsa_prefix_id == "auto-admitted-16k-live-tip"
+    assert all(
+        isinstance(pair.target[1], SharedSuffixQSAKVCache)
+        for pair in state.row_caches
+    )
+    close_segmented_self_mtp_state(state)
+
+
 def test_shared_qsa_suffix_materializes_on_detach_and_later_join(monkeypatch):
     monkeypatch.setenv("MLX_LM_SHARED_QSA_SUFFIX", "1")
     monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
@@ -268,6 +292,89 @@ def test_shared_qsa_suffix_materializes_on_detach_and_later_join(monkeypatch):
     assert state.shared_qsa_prefix_id is None
     close_segmented_self_mtp_state(state)
     detached[0].segment_transaction.close()
+
+
+def test_shared_qsa_b2_to_b1_survivor_next_forward_matches_physical(monkeypatch):
+    from test_batched_self_mtp_qwen4 import _prepare_lane, _tiny_qwen4_model
+
+    model = _tiny_qwen4_model()
+    # The production shared-suffix ABI is four-token aligned; the generic
+    # tiny-model fixture otherwise uses two-token QSA blocks.
+    indexer = model.language_model.model.layers[1].self_attn.indexer
+    indexer.compress_ratio = 4
+    indexer.summary_identity["block_size"] = 4
+    indexer.summary_identity["compress_ratio"] = 4
+    prompts = ([1, 2, 3, 4], [1, 2, 3, 4])
+    monkeypatch.setenv("MLX_LM_TRUE_BATCHED_SEGMENTED_MTP", "1")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA", "1")
+    monkeypatch.setenv("MLX_LM_QSA_PRIVATE_DELTA_MIN_CONTEXT", "0")
+
+    def run(shared):
+        monkeypatch.setenv("MLX_LM_SHARED_QSA_SUFFIX", "1" if shared else "0")
+        rows = [
+            _prepare_lane(model, uid, prompt)
+            for uid, prompt in enumerate(prompts)
+        ]
+        for item in rows:
+            cache = item.caches.target[1]
+            blocks = cache.offset // indexer.compress_ratio
+            starts = mx.arange(blocks) * indexer.compress_ratio
+            cache._qsa_pooled_keys = indexer._pool_blocks(
+                cache.index_keys, starts
+            )
+            cache._qsa_pooled_ratio = indexer.compress_ratio
+            cache._qsa_summary_identity = dict(indexer.summary_identity)
+            cache._qsa_summary_identity["complete_blocks"] = blocks
+            mx.eval(cache._qsa_pooled_keys)
+        if shared:
+            for item in rows:
+                item.shared_qsa_prefix_id = "same-four-token-live-tip"
+        state = attach_segmented_self_mtp_lanes(model, None, rows)
+        state, leaving = detach_self_mtp_lanes(model, state, [1])
+        survivor = state.row_caches[0].target[1]
+        assert isinstance(survivor, SharedSuffixQSAKVCache) is shared
+
+        def force(logprobs, *_args, **_kwargs):
+            return 0, int(mx.argmax(logprobs[0]).item())
+
+        with (
+            patch(
+                "mlx_lm.segmented_batch_cache."
+                "qwen4_qsa_indexed_private_delta_preflight",
+                return_value=(True, "engaged"),
+            ),
+            patch(
+                "mlx_lm.segmented_batch_cache."
+                "qwen4_qsa_indexed_private_delta_attention",
+                side_effect=RuntimeError("synthetic CPU decline"),
+            ),
+            patch(
+                "mlx_lm.models.qwen4_exp.QSAIndexer."
+                "select_shared_suffix_batch",
+                side_effect=AssertionError("B1 survivor used the batch selector"),
+            ),
+            patch(
+                "mlx_lm.hybrid_speculative._batched_residual_verify",
+                side_effect=force,
+            ),
+        ):
+            proposal = propose_batched_self_mtp(model, state)
+        outputs = tuple(token.token for token in proposal.outputs[0])
+        logprobs = tuple(mx.array(token.logprobs) for token in proposal.outputs[0])
+        abort_batched_self_mtp(state, proposal)
+        close_segmented_self_mtp_state(state)
+        leaving[0].segment_transaction.close()
+        return outputs, logprobs
+
+    expected_outputs, expected_logprobs = run(False)
+    actual_outputs, actual_logprobs = run(True)
+
+    assert actual_outputs == expected_outputs
+    assert len(actual_logprobs) == len(expected_logprobs)
+    assert all(
+        mx.array_equal(actual, expected).item()
+        for actual, expected in zip(actual_logprobs, expected_logprobs)
+    )
 
 
 def test_shared_qsa_prefix_attestation_rejects_mixed_host_identities():

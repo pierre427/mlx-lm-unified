@@ -182,6 +182,9 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
 
         length = int(hidden.shape[1])
         self._arm_row_qsa_share()
+        shared_rows = bool(self.rows) and getattr(
+            self.rows[0], "supports_shared_qsa_suffix", False
+        )
         private_candidate = (
             qsa_private_delta_enabled()
             and self._private_delta_base_tokens is not None
@@ -197,7 +200,8 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
 
             note_qsa_private_delta_event("request", width=length)
             if (
-                int(self._private_delta_base_tokens)
+                not shared_rows
+                and int(self._private_delta_base_tokens)
                 < qwen4_qsa_private_delta_min_context(length)
             ):
                 admitted, reason = False, "context_out_of_range"
@@ -217,9 +221,7 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
                 # already-qualified two-source private-delta kernel instead.
                 exact_set_fold = (
                     qsa_private_delta_exact_set_fold_enabled()
-                    and not getattr(
-                        self.rows[0], "supports_shared_qsa_suffix", False
-                    )
+                    and not shared_rows
                 )
                 if exact_set_fold:
                     note_qsa_exact_set_fold_event("request")
@@ -277,13 +279,18 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             row_projected = tuple(
                 value[index : index + 1, :valid] for value in projected
             )
-            output, gate = attention(
-                row_hidden,
-                row_mask,
-                row,
-                _projected=row_projected,
-                _return_pre_o=True,
-            )
+            if getattr(row, "supports_shared_qsa_suffix", False):
+                output, gate = self._shared_suffix_row_attention(
+                    attention, row_hidden, row_mask, row, row_projected
+                )
+            else:
+                output, gate = attention(
+                    row_hidden,
+                    row_mask,
+                    row,
+                    _projected=row_projected,
+                    _return_pre_o=True,
+                )
             outputs.append(_pad_sequence(output, 0, width - valid, 1))
             gates.append(_pad_sequence(gate, 0, width - valid, 1))
         self._bump("segmented_attention_calls")
@@ -326,6 +333,70 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             else None
         )
 
+    @staticmethod
+    def _shared_suffix_row_attention(
+        attention,
+        hidden: mx.array,
+        row_mask,
+        row,
+        projected,
+    ):
+        """Fail closed through the split-aware B1 selector.
+
+        Ragged rows and a private-delta path that declines before mutation
+        cannot re-enter ``Attention``: its stock indexer and cache append APIs
+        intentionally reject shared-suffix storage. Append the row-private
+        ledgers once, materialize only the temporary dense consumer view, and
+        leave the authoritative row as immutable-base plus suffix.
+        """
+
+        qg, k_flat, v_flat, projected_qk = projected
+        batch, length, _ = hidden.shape
+        if batch != 1:
+            raise RuntimeError("shared-suffix fallback requires one request row")
+        offset = _host_offset(row)
+        # A reused MTP selection normally omits the transient raw key. Dense
+        # fallback needs a complete temporary materialization, so record that
+        # key here; rollback trims it with the matching K/V append.
+        if getattr(row, "_mtp_shared_topk", None) is not None:
+            qk_width = int(attention.indexer.n_heads) * int(
+                attention.indexer.head_dim
+            )
+            _q, raw = mx.split(projected_qk, [qk_width], axis=-1)
+            row.append_index_keys(raw.reshape(batch, length, -1))
+        selection = attention.indexer.select_shared_suffix(
+            hidden,
+            row_mask,
+            row,
+            projected_qk=projected_qk,
+        )
+        q, gate = mx.split(
+            qg.reshape(batch, length, attention.num_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(batch, length, -1)
+        k = k_flat.reshape(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        )
+        v = v_flat.reshape(
+            batch, length, attention.num_kv_heads, attention.head_dim
+        )
+        q = attention.q_norm(q).transpose(0, 2, 1, 3)
+        k = attention.k_norm(k).transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        q, k = attention.rope(q, offset=offset), attention.rope(k, offset=offset)
+        row.append_kv(k, v)
+        dense_cache, _receipt = row.materialize_to_qsa()
+        keys, values = dense_cache.keys_and_values()
+        output = qsa_dense_attention_from_selection(
+            q,
+            keys,
+            values,
+            selection,
+            dense_cache,
+            scale=attention.scale,
+        )
+        return output.transpose(0, 2, 1, 3).reshape(batch, length, -1), gate
+
     def _private_delta_attention(
         self, attention, hidden: mx.array, *, exact_set_fold: bool = False
     ):
@@ -353,7 +424,7 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         shared_rows = getattr(
             self.rows[0], "supports_shared_qsa_suffix", False
         )
-        if shared_rows and len(set(offsets)) == 1:
+        if shared_rows and batch >= 2 and len(set(offsets)) == 1:
             selections = attention.indexer.select_shared_suffix_batch(
                 hidden,
                 row_masks,

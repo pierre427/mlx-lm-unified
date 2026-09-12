@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 from mlx_lm.apc import (
     APCKey,
@@ -64,6 +65,42 @@ def test_apcv2_records_layers_token_segments_and_mtp_plane():
     assert stats["layout_name"] == "test-hybrid-v1"
     assert stats["layer_segments"]["fallback_entries"] == 0
     assert stats["layer_segments"]["segments"] == 6
+
+
+@pytest.mark.parametrize("prompt_length", [2047, 2048, 2049])
+def test_apcv2_hybrid_mtp_boundary_hits_around_prefill_page(prompt_length):
+    """P-1 target/P-2 draft coverage must not collapse at a 2048 boundary."""
+
+    covered = prompt_length - 1
+    prompt = list(range(prompt_length))
+    target = [_recurrent(covered), _state(KVCache(), covered)]
+    draft = [_state(KVCache(), covered - 1, seed=prompt_length)]
+    sidecar = MTPAPCSidecar(
+        (draft, mx.ones((1, 1, 4), dtype=mx.float32)),
+        covered_tokens=covered,
+    )
+    apc = AutomaticPrefixCacheV2(
+        max_size=2, layout_name="qwen4-exp-layer-segments-v1"
+    )
+    apc.store(
+        APCKey("qwen4"),
+        prompt[:covered],
+        target,
+        sidecar=sidecar,
+    )
+
+    hit = apc.lookup(APCKey("qwen4"), prompt)
+
+    assert hit.hit
+    assert hit.hit_kind == "mtp_sidecar"
+    assert hit.cached_tokens == covered
+    assert hit.remaining_tokens == [prompt[-1]]
+    assert hit.sidecar.covered_tokens == covered
+    assert hit.sidecar.state[0][0].offset == covered - 1
+    assert hit.cache[0].lengths.item() == covered
+    assert hit.cache[1].offset == covered
+    assert hit.segment_manifest["by_plane"]["gdn_recurrent"]["segments"] == 1
+    assert hit.segment_manifest["by_plane"]["mtp_draft"]["segments"] == 2
 
 
 def test_legacy_apc_cow_does_not_implicitly_adopt_v2_segments():
