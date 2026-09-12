@@ -8,6 +8,7 @@ from benchmarks.qwen4_live_tip_composition_gate import (
     build_plan,
     profile_settings,
     summarize,
+    token_traces_prefix_compatible,
     validate_mechanism_receipt,
 )
 
@@ -42,6 +43,13 @@ def test_plan_places_cooldown_outside_live_boundary():
 def test_counterbalanced_order(profile):
     assert block_order(profile, 1) == ["physical", profile, profile, "physical"]
     assert block_order(profile, 2) == [profile, "physical", "physical", profile]
+
+
+def test_cycle_limited_token_traces_allow_only_prefix_extensions():
+    assert token_traces_prefix_compatible([[1, 2], [3]], [[1, 2, 4], [3, 5]])
+    assert token_traces_prefix_compatible([[1, 2, 4]], [[1, 2]])
+    assert not token_traces_prefix_compatible([[1, 9]], [[1, 2, 4]])
+    assert not token_traces_prefix_compatible([[1], [2]], [[1]])
 
 
 def test_profiles_are_mechanically_distinct():

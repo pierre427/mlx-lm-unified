@@ -55,6 +55,19 @@ PROFILES = (
 )
 
 
+def token_traces_prefix_compatible(
+    left: list[list[int]], right: list[list[int]]
+) -> bool:
+    """Compare cycle-limited traces without requiring equal acceptance counts."""
+    if len(left) != len(right):
+        return False
+    for left_row, right_row in zip(left, right):
+        common = min(len(left_row), len(right_row))
+        if left_row[:common] != right_row[:common]:
+            return False
+    return True
+
+
 def profile_settings(profile: str) -> dict[str, Any]:
     if profile == "physical":
         return {
@@ -563,7 +576,9 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
                     if row["profile"] == candidate
                 ]
                 if any(
-                    tokens != control_tokens[0]
+                    not token_traces_prefix_compatible(
+                        tokens, control_tokens[0]
+                    )
                     for tokens in [*control_tokens[1:], *candidate_tokens]
                 ):
                     raise AssertionError(
