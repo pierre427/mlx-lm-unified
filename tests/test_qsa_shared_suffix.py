@@ -7,6 +7,10 @@ from mlx_lm.qsa_shared_suffix import (
     SharedSuffixQSAError,
     SharedSuffixQSAKVCache,
 )
+from mlx_lm.segmented_batch_cache import (
+    SegmentedBatchQSAKVCache,
+    build_segmented_batch_cache_group,
+)
 
 
 def _identity(complete_blocks):
@@ -72,6 +76,17 @@ def test_state_identity_uses_stable_suffix_storage_descriptors():
     assert first[3] is second[3] is row._kv.keys
     assert first[4] is second[4] is row._kv.values
     assert first[5] == second[5] == 1
+
+
+def test_segmented_builder_accepts_uniform_shared_suffix_rows():
+    base = QSAImmutableBase.from_cache(_source_cache(), layout_id="qsa-f32-d3")
+    rows = [SharedSuffixQSAKVCache(base), SharedSuffixQSAKVCache(base)]
+
+    group = build_segmented_batch_cache_group([[rows[0]], [rows[1]]])
+
+    assert len(group) == 1
+    assert isinstance(group[0], SegmentedBatchQSAKVCache)
+    assert group[0].rows == rows
 
 
 def test_normal_append_allocates_only_private_suffix_and_never_joins_prefix():

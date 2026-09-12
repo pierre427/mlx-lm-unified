@@ -828,7 +828,9 @@ def build_segmented_batch_cache_group(
         first = layer_rows[0]
         if isinstance(first, ArraysCache):
             result.append(SegmentedBatchArraysCache(layer_rows, note=note))
-        elif isinstance(first, QSAKVCache):
+        elif isinstance(first, QSAKVCache) or getattr(
+            first, "supports_shared_qsa_suffix", False
+        ):
             result.append(
                 SegmentedBatchQSAKVCache(
                     layer_rows,
