@@ -4,12 +4,19 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+# Generation owns a module-level execution stream, so select CPU before
+# importing it or any model code used by these tiny correctness tests.
+mx.set_default_device(mx.cpu)
+
 from mlx_lm.apc import APCKey, AutomaticPrefixCache, AutomaticPrefixCacheV2
 from mlx_lm.cache_planes import CachePlaneKind
+from mlx_lm.generate import generate_step, prompt_lookup_generate_step
 from mlx_lm.models import agnes
 from mlx_lm.models.cache import record_state_checkpoints
 from mlx_lm.models.qwen3_5 import fuse_gated_delta_net_projections
 from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
+from mlx_lm.prompt_lookup import HybridStats
+from mlx_lm.sample_utils import make_sampler
 from mlx_lm.server import ResponseGenerator
 
 
@@ -251,6 +258,99 @@ class TestAgnes(unittest.TestCase):
         invalidated = apc.lookup(key, [1, 2, 3, 10])
         self.assertFalse(invalidated.hit)
         self.assertEqual(invalidated.miss_reason, "stale_cow_generation")
+
+    def test_apcv2_reused_prefix_composes_with_prompt_lookup(self):
+        model = agnes.Model(self.make_args(max_position_embeddings=256))
+        model.eval()
+        mx.eval(model.parameters())
+        history = list(range(16)) * 4
+        sampler = make_sampler(temp=0.0)
+
+        plain_cache = model.make_cache()
+        plain = list(
+            generate_step(
+                mx.array(history),
+                model,
+                max_tokens=8,
+                sampler=sampler,
+                prompt_cache=plain_cache,
+                prefill_step_size=2048,
+            )
+        )
+        plain_tokens = [int(item[0]) for item in plain]
+
+        class ReplayProposer:
+            def observe(self, token):
+                pass
+
+            def propose(self, sequence, max_span, prompt_length):
+                generated = len(sequence) - prompt_length
+                return plain_tokens[generated : generated + max_span]
+
+        cached_prefix = history[:48]
+        source = model.make_cache()
+        prefix_logits = model(mx.array(cached_prefix)[None], cache=source)
+        mx.eval(prefix_logits, *[cache.state for cache in source])
+        apc = AutomaticPrefixCacheV2(max_size=2, layout_name=model.apc_v2_layout)
+        key = APCKey("agnes-pld-composition")
+        apc.store(key, cached_prefix, source)
+        hit = apc.lookup(key, history)
+        self.assertTrue(hit.hit)
+        self.assertEqual(hit.cached_tokens, 48)
+
+        pld_stats = HybridStats()
+        pld = list(
+            prompt_lookup_generate_step(
+                mx.array(hit.remaining_tokens),
+                model,
+                max_tokens=8,
+                sampler=sampler,
+                prompt_cache=hit.cache,
+                history_prompt=mx.array(history),
+                backend=ReplayProposer(),
+                num_draft=4,
+                ngram_max=3,
+                ngram_min=1,
+                adaptive=False,
+                warmup=48,
+                gate=0.12,
+                rate_gate=False,
+                stats=pld_stats,
+            )
+        )
+        self.assertEqual([int(item[0]) for item in pld], plain_tokens)
+        self.assertGreater(pld_stats.retrieval_cycles, 0)
+        self.assertGreater(pld_stats.retrieval_accepted, 0)
+
+        # Batched PLD verification can differ from sequential decode by small
+        # floating-point ties, so state fidelity uses the same tolerance as
+        # the model reference harness while token equivalence stays exact.
+        for reused_cache, cold_cache in zip(hit.cache, plain_cache):
+            if hasattr(reused_cache, "keys"):
+                self.assertEqual(reused_cache.offset, cold_cache.offset)
+                reused_state = reused_cache.keys_and_values()
+                cold_state = cold_cache.keys_and_values()
+            else:
+                reused_state = reused_cache.cache
+                cold_state = cold_cache.cache
+            for reused_array, cold_array in zip(reused_state, cold_state):
+                mx.eval(reused_array, cold_array)
+                self.assertTrue(
+                    mx.allclose(reused_array, cold_array, rtol=2e-4, atol=2e-4)
+                )
+
+        counters = apc.apc_stats
+        self.assertEqual(counters["hits"], 1)
+        self.assertEqual(counters["cached_tokens"], 48)
+        self.assertEqual(
+            counters["cow"]["planes"]["gdn_recurrent"]["materializations"],
+            1,
+        )
+        self.assertEqual(
+            counters["cow"]["planes"]["attention_kv"]["materializations"],
+            1,
+        )
+        hit.cache.close()
 
     def test_sanitize_raw_then_native_does_not_shift_norm_twice(self):
         raw_model = agnes.Model(self.make_args(mtp_num_hidden_layers=1))
