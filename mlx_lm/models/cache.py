@@ -2775,7 +2775,18 @@ class ArraysCache(_BaseCache):
             self._rollback_positions = [
                 position - n for position in self._rollback_positions
             ]
+        self._collapse_empty_rollback_positions()
         return n
+
+    def _collapse_empty_rollback_positions(self):
+        """Return a fully rewound, uninitialized batch to its lazy form."""
+        if (
+            self._rollback_positions is not None
+            and self.empty()
+            and all(position == 0 for position in self._rollback_positions)
+        ):
+            self._rollback_position = 0
+            self._rollback_positions = None
 
     def supports_ragged_trim(self):
         return True
@@ -2891,6 +2902,7 @@ class ArraysCache(_BaseCache):
                 position - drop
                 for position, drop in zip(self._rollback_positions, drops)
             ]
+        self._collapse_empty_rollback_positions()
         return drops
 
     def state_checkpoint(self, positions: List[int], force: bool = False):

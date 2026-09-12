@@ -222,6 +222,34 @@ class TestCacheHelpers(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "do not match the live batch"):
             c.record_rollback(1, lambda m: [mx.full((3, 1), m)], list(c.cache))
 
+    def test_arrays_cache_full_rewind_allows_batched_reinitialization(self):
+        c = ArraysCache(size=1)
+        c.start_speculation(rollback_window=4)
+        c.record_rollback(1, lambda m: [mx.full((2, 1), m)], [None])
+        c.cache = [mx.ones((2, 1))]
+        c.record_rollback(
+            1,
+            lambda m: [mx.full((2, 1), 1 + m)],
+            list(c.cache),
+        )
+        c.cache = [mx.full((2, 1), 2)]
+        self.assertEqual(c._rollback_positions, [2, 2])
+
+        c.trim(2)
+        self.assertIsNone(c.cache[0])
+        self.assertIsNone(c._rollback_positions)
+        self.assertEqual(c._rollback_position, 0)
+
+        # The same logical batch may now initialize again from empty state.
+        c.record_rollback(1, lambda m: [mx.full((2, 1), m)], [None])
+        c.cache = [mx.ones((2, 1))]
+        c.record_rollback(
+            1,
+            lambda m: [mx.full((2, 1), 1 + m)],
+            list(c.cache),
+        )
+        self.assertEqual(c._rollback_positions, [2, 2])
+
     def test_arrays_cache_membership_api_invalidates_empty_history_marker(self):
         c = ArraysCache(size=1)
         c.cache = [mx.zeros((1, 1))]
