@@ -3152,12 +3152,77 @@ def _segmented_async_qsa_promotion_enabled(
     ).lower() in {"1", "true", "yes", "on"}
 
 
+def _segmented_async_qsa_min_remaining_tokens(
+    config: Optional[Mapping[str, Any]],
+) -> int:
+    """Return the known-output budget that stays segmented."""
+
+    value = (
+        config.get("segment_aware_async_qsa_min_remaining_tokens")
+        if config is not None
+        and "segment_aware_async_qsa_min_remaining_tokens" in config
+        else os.environ.get(
+            "MLX_LM_SEGMENTED_ASYNC_QSA_MIN_REMAINING_TOKENS", "0"
+        )
+    )
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "segment_aware_async_qsa_min_remaining_tokens must be an integer"
+        ) from error
+    if value < 0:
+        raise ValueError(
+            "segment_aware_async_qsa_min_remaining_tokens must be non-negative"
+        )
+    return value
+
+
+def _segmented_async_qsa_promotion_for_budget(
+    config: Optional[Mapping[str, Any]],
+    remaining_tokens: int,
+    *,
+    record: bool = False,
+) -> bool:
+    """Admit physical promotion only when its destination can be reused."""
+
+    if not _segmented_async_qsa_promotion_enabled(config):
+        return False
+    remaining_tokens = max(0, int(remaining_tokens))
+    cutoff = _segmented_async_qsa_min_remaining_tokens(config)
+    admitted = remaining_tokens > cutoff
+    if record:
+        from .segmented_self_mtp import note_segmented_self_mtp
+
+        note_segmented_self_mtp("async_qsa_budget_checks")
+        note_segmented_self_mtp(
+            "async_qsa_budget_remaining_tokens_cumulative", remaining_tokens
+        )
+        note_segmented_self_mtp(
+            "async_qsa_budget_cutoff_tokens_cumulative", cutoff
+        )
+        note_segmented_self_mtp(
+            "async_qsa_budget_promotions"
+            if admitted
+            else "async_qsa_budget_retained_segmented"
+        )
+    return admitted
+
+
 def _segmented_async_qsa_prequeue_enabled(
     config: Optional[Mapping[str, Any]],
+    remaining_tokens: Optional[int] = None,
 ) -> bool:
     """Return the shared-prefix N=2 prequeue policy, nested under promotion."""
 
-    if not _segmented_async_qsa_promotion_enabled(config):
+    enabled = (
+        _segmented_async_qsa_promotion_enabled(config)
+        if remaining_tokens is None
+        else _segmented_async_qsa_promotion_for_budget(
+            config, remaining_tokens
+        )
+    )
+    if not enabled:
         return False
     if config is not None and "segment_aware_async_qsa_prequeue" in config:
         return bool(config["segment_aware_async_qsa_prequeue"])
@@ -3672,7 +3737,27 @@ class MTPGenerationBatch:
         if self.segmented_live_tip != batch.segmented_live_tip:
             raise ValueError("cannot mix segmented and physical self-MTP batches")
         if self.async_qsa_promotion != batch.async_qsa_promotion:
-            raise ValueError("cannot mix async-promotion and control self-MTP batches")
+            if not self.segmented_live_tip:
+                raise ValueError(
+                    "cannot mix async-promotion and control self-MTP batches"
+                )
+            if self._async_qsa_ticket is not None:
+                self._decline_async_qsa_promotion(
+                    "short-output cohort joined before promotion"
+                )
+            if batch._async_qsa_ticket is not None:
+                batch._decline_async_qsa_promotion(
+                    "short-output cohort already owns admission"
+                )
+            # The shortest known output budget owns the cohort decision. A
+            # later join can safely suppress an unpublished destination, but
+            # it cannot make a short row pay for a cache it will not reuse.
+            self.async_qsa_promotion = (
+                self.async_qsa_promotion and batch.async_qsa_promotion
+            )
+            self._async_qsa_pending = (
+                self.async_qsa_promotion and self.segmented_live_tip
+            )
         packages = batch._detach_packages(range(len(batch)))
         packages.extend(batch._paused.values())
         batch._paused.clear()
@@ -4520,7 +4605,14 @@ class BatchGenerator:
                 mtp_admission=self.mtp_admission,
                 segmented_live_tip=segmented_join,
                 async_qsa_promotion=(
-                    _segmented_async_qsa_promotion_enabled(self.self_mtp)
+                    _segmented_async_qsa_promotion_for_budget(
+                        self.self_mtp,
+                        min(
+                            max(0, item.lane.max_tokens - item.lane.ntoks)
+                            for item in detached
+                        ),
+                        record=True,
+                    )
                 ),
                 arm_async_qsa_promotion=False,
             ),
@@ -5375,7 +5467,12 @@ class ParallelSampleGenerator:
                     prefix_bytes
                 ).hexdigest()
             async_qsa_prequeue = None
-            if _segmented_async_qsa_prequeue_enabled(config):
+            remaining_budget = max(
+                0, canonical.lane.max_tokens - canonical.lane.ntoks
+            )
+            if _segmented_async_qsa_prequeue_enabled(
+                config, remaining_budget
+            ):
                 from .segmented_physical_promotion import (
                     SegmentedPhysicalPromotionDeclined,
                     begin_shared_prefix_physical_promotion,
@@ -5491,8 +5588,15 @@ class ParallelSampleGenerator:
                     prepared_caches=prepared_caches,
                     mtp_admission=mtp_admission,
                     segmented_live_tip=segmented_requested,
-                    async_qsa_promotion=_segmented_async_qsa_promotion_enabled(
-                        config
+                    async_qsa_promotion=(
+                        _segmented_async_qsa_promotion_for_budget(
+                            config,
+                            min(
+                                max(0, item.lane.max_tokens - item.lane.ntoks)
+                                for item in lanes
+                            ),
+                            record=True,
+                        )
                     ),
                     async_qsa_prequeue=async_qsa_prequeue,
                 )

@@ -273,7 +273,11 @@ def test_serving_knob_honors_env_and_explicit_override(monkeypatch):
 
 
 def test_async_qsa_promotion_is_nested_and_default_off(monkeypatch):
-    from mlx_lm.generate import _segmented_async_qsa_promotion_enabled
+    from mlx_lm.generate import (
+        _segmented_async_qsa_min_remaining_tokens,
+        _segmented_async_qsa_promotion_enabled,
+        _segmented_async_qsa_promotion_for_budget,
+    )
 
     monkeypatch.delenv("MLX_LM_SEGMENTED_ASYNC_QSA_PROMOTION", raising=False)
     assert not _segmented_async_qsa_promotion_enabled(
@@ -292,6 +296,31 @@ def test_async_qsa_promotion_is_nested_and_default_off(monkeypatch):
             "segment_aware_async_qsa_promotion": False,
         }
     )
+    policy = {
+        "segment_aware_live_tip": True,
+        "segment_aware_async_qsa_promotion": True,
+        "segment_aware_async_qsa_min_remaining_tokens": 8,
+    }
+    assert _segmented_async_qsa_min_remaining_tokens(policy) == 8
+    assert not _segmented_async_qsa_promotion_for_budget(policy, 8)
+    assert _segmented_async_qsa_promotion_for_budget(policy, 9)
+    segmented_self_mtp_stats(reset=True)
+    assert not _segmented_async_qsa_promotion_for_budget(
+        policy, 7, record=True
+    )
+    assert _segmented_async_qsa_promotion_for_budget(
+        policy, 10, record=True
+    )
+    budget = segmented_self_mtp_stats()
+    assert budget["async_qsa_budget_checks"] == 2
+    assert budget["async_qsa_budget_retained_segmented"] == 1
+    assert budget["async_qsa_budget_promotions"] == 1
+    assert budget["async_qsa_budget_remaining_tokens_cumulative"] == 17
+    assert budget["async_qsa_budget_cutoff_tokens_cumulative"] == 16
+    with pytest.raises(ValueError, match="must be non-negative"):
+        _segmented_async_qsa_min_remaining_tokens(
+            {"segment_aware_async_qsa_min_remaining_tokens": -1}
+        )
 
 
 def test_async_qsa_prequeue_is_nested_and_default_off(monkeypatch):
@@ -305,6 +334,20 @@ def test_async_qsa_prequeue_is_nested_and_default_off(monkeypatch):
     assert not _segmented_async_qsa_prequeue_enabled(base)
     monkeypatch.setenv("MLX_LM_SEGMENTED_ASYNC_QSA_PREQUEUE", "1")
     assert _segmented_async_qsa_prequeue_enabled(base)
+    assert not _segmented_async_qsa_prequeue_enabled(
+        {
+            **base,
+            "segment_aware_async_qsa_min_remaining_tokens": 6,
+        },
+        6,
+    )
+    assert _segmented_async_qsa_prequeue_enabled(
+        {
+            **base,
+            "segment_aware_async_qsa_min_remaining_tokens": 6,
+        },
+        7,
+    )
     assert not _segmented_async_qsa_prequeue_enabled(
         {**base, "segment_aware_async_qsa_promotion": False}
     )
@@ -505,6 +548,29 @@ def test_empty_physical_batch_preserves_policy_and_resets_segmented_admission():
 
     assert batch.segmented_live_tip is True
     assert batch._async_qsa_pending is True
+
+
+def test_short_output_join_suppresses_unpublished_async_destination():
+    from mlx_lm.generate import MTPGenerationBatch, StopSequenceMatcher
+
+    destination = MTPGenerationBatch.empty(
+        object(), segmented_live_tip=True, async_qsa_promotion=True
+    )
+    short = MTPGenerationBatch(
+        object(),
+        [_detached(0)],
+        [None],
+        [StopSequenceMatcher()],
+        segmented_live_tip=True,
+        async_qsa_promotion=False,
+    )
+
+    destination.extend(short)
+
+    assert destination.async_qsa_promotion is False
+    assert destination._async_qsa_pending is False
+    assert destination.uids == [0]
+    destination.close()
 
 
 def test_generation_batch_binds_prequeued_candidate_without_rearming():
