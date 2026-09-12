@@ -296,7 +296,8 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
         row_compacts = []
         row_selections = []
         offsets = []
-        for index, row in enumerate(self.rows):
+        row_masks = []
+        for row in self.rows:
             offset = _host_offset(row)
             if offset < base_tokens:
                 raise RuntimeError("QSA private delta trimmed through its base")
@@ -304,20 +305,37 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             row_mask = row.make_mask(length, return_array=True, window_size=None)
             if row_mask is not None and row_mask.ndim == 2:
                 row_mask = row_mask[None, None]
-            if getattr(row, "supports_shared_qsa_suffix", False):
-                selection = attention.indexer.select_shared_suffix(
-                    hidden[index : index + 1],
-                    row_mask,
-                    row,
-                    projected_qk=projected_qk[index : index + 1],
-                )
-            else:
-                selection = attention.indexer(
-                    hidden[index : index + 1],
-                    row_mask,
-                    row,
-                    projected_qk=projected_qk[index : index + 1],
-                )
+            row_masks.append(row_mask)
+        shared_rows = getattr(
+            self.rows[0], "supports_shared_qsa_suffix", False
+        )
+        if shared_rows and len(set(offsets)) == 1:
+            selections = attention.indexer.select_shared_suffix_batch(
+                hidden,
+                row_masks,
+                self.rows,
+                projected_qk=projected_qk,
+            )
+            self._bump("shared_qsa_batched_selections")
+        else:
+            selections = []
+            for index, (row, row_mask) in enumerate(zip(self.rows, row_masks)):
+                if getattr(row, "supports_shared_qsa_suffix", False):
+                    selection = attention.indexer.select_shared_suffix(
+                        hidden[index : index + 1],
+                        row_mask,
+                        row,
+                        projected_qk=projected_qk[index : index + 1],
+                    )
+                else:
+                    selection = attention.indexer(
+                        hidden[index : index + 1],
+                        row_mask,
+                        row,
+                        projected_qk=projected_qk[index : index + 1],
+                    )
+                selections.append(selection)
+        for selection in selections:
             compact = selection.compact_blocks()
             if selection.kind != "explicit" or compact is None:
                 raise RuntimeError(

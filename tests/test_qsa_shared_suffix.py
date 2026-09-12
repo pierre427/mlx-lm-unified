@@ -240,3 +240,52 @@ def test_split_aware_indexer_matches_stock_selection_without_joining_raw_prefix(
     ).item()
     assert split.index_keys.shape[1] == 8
     assert split.base.index_keys.shape[1] == 8
+
+
+def test_batched_shared_base_scoring_matches_two_row_selection():
+    from test_qwen4_exp import tiny_args
+
+    mx.random.seed(11)
+    args = tiny_args(indexer_budget=8)
+    indexer = QSAIndexer(args)
+    source = _source_cache()
+    source.index_keys = mx.random.normal((1, 8, args.indexer_head_dim))
+    starts = mx.arange(2) * indexer.compress_ratio
+    source._qsa_pooled_keys = indexer._pool_blocks(source.index_keys, starts)
+    source._qsa_pooled_ratio = indexer.compress_ratio
+    source._qsa_summary_identity = dict(indexer.summary_identity)
+    source._qsa_summary_identity["complete_blocks"] = 2
+    source.keys = mx.zeros((1, 2, 8, 3))
+    source.values = mx.zeros((1, 2, 8, 3))
+    base = QSAImmutableBase.from_cache(source, layout_id="qsa-batch-test")
+    batched_rows = [SharedSuffixQSAKVCache(base) for _ in range(2)]
+    serial_rows = [SharedSuffixQSAKVCache(base) for _ in range(2)]
+    hidden = mx.random.normal((2, 8, args.hidden_size))
+    projected = indexer.index_qk_proj(hidden)
+    masks = [
+        row.make_mask(8, return_array=True, window_size=None)
+        for row in batched_rows
+    ]
+
+    batched = indexer.select_shared_suffix_batch(
+        hidden, masks, batched_rows, projected_qk=projected
+    )
+    serial = [
+        indexer.select_shared_suffix(
+            hidden[index : index + 1],
+            masks[index],
+            row,
+            projected_qk=projected[index : index + 1],
+        )
+        for index, row in enumerate(serial_rows)
+    ]
+    mx.eval(
+        *[selection.raw_block_ids for selection in batched],
+        *[selection.raw_block_ids for selection in serial],
+    )
+
+    for actual, expected in zip(batched, serial):
+        assert mx.array_equal(
+            actual.raw_block_ids, expected.raw_block_ids
+        ).item()
+        assert mx.array_equal(actual.dense_mask(), expected.dense_mask()).item()

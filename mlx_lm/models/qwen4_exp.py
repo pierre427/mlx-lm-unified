@@ -5224,6 +5224,155 @@ class QSAIndexer(nn.Module):
             scatter_chosen=_QSA_SCATTER_CHOSEN,
         )
 
+    def select_shared_suffix_batch(
+        self,
+        hidden: mx.array,
+        causal_masks,
+        caches,
+        projected_qk: Optional[mx.array] = None,
+    ):
+        """Coalesce equal-width shared-base selection across request rows.
+
+        Persistent suffix ledgers remain row-owned. Only their short raw-key
+        slabs and pooled summaries form a transient batch, while the immutable
+        base summaries are broadcast by descriptor and scored in one einsum.
+        """
+
+        caches = list(caches)
+        causal_masks = list(causal_masks)
+        batch, length, _ = hidden.shape
+        if batch < 2 or len(caches) != batch or len(causal_masks) != batch:
+            raise ValueError("shared QSA batch selection requires every row")
+        if not all(
+            getattr(cache, "supports_shared_qsa_suffix", False)
+            for cache in caches
+        ):
+            raise TypeError("shared QSA batch selection requires split rows")
+        base = caches[0].base
+        if any(cache.base is not base for cache in caches[1:]):
+            raise ValueError("shared QSA batch rows do not share one base")
+        offsets = [int(cache.offset) for cache in caches]
+        if len(set(offsets)) != 1:
+            raise ValueError("shared QSA batch fast path requires equal offsets")
+        if any(getattr(cache, "_mtp_shared_topk", None) is not None for cache in caches):
+            raise ValueError("target shared-suffix rows cannot reuse draft top-k")
+        ratio = self.compress_ratio
+        if int(base.length) % ratio:
+            raise RuntimeError("shared QSA base is not block aligned")
+        if base.pooled_keys is None or int(base.pooled_ratio or 0) != ratio:
+            raise RuntimeError("shared QSA base lacks compatible pooled summaries")
+        base_blocks = int(base.length) // ratio
+        if int(base.pooled_keys.shape[1]) != base_blocks:
+            raise RuntimeError("shared QSA base pooled coverage is incomplete")
+
+        qk = projected_qk if projected_qk is not None else self.index_qk_proj(hidden)
+        q, raw = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
+        raw = raw.reshape(batch, length, self.head_dim)
+        suffix_raw_rows = [
+            cache.append_index_keys(raw[index : index + 1])
+            for index, cache in enumerate(caches)
+        ]
+        suffix_widths = {int(value.shape[1]) for value in suffix_raw_rows}
+        if len(suffix_widths) != 1:
+            raise ValueError("shared QSA batch fast path requires equal suffix widths")
+        suffix_raw = mx.concatenate(suffix_raw_rows, axis=0)
+        offset = offsets[0]
+        total = offset + length
+        n_blocks = total // ratio
+        if n_blocks <= self.block_topk and _QSA_DENSE_SHORTCIRCUIT:
+            raise RuntimeError("shared QSA batch fast path requires sparse selection")
+
+        q_pos = mx.broadcast_to(
+            mx.arange(offset, offset + length)[None, :], (batch, length)
+        )
+        starts = mx.arange(n_blocks) * ratio
+        valid_blocks = (
+            (starts + ratio - 1)[None, None, :] <= q_pos[..., None]
+        )
+        q = self.q_layernorm(
+            q.reshape(batch, length, self.n_heads, self.head_dim)
+        )
+        q = _apply_rope_positions(
+            q, q_pos[..., None], self.rotary_dim, self.rope_theta
+        )
+        suffix_blocks = n_blocks - base_blocks
+        cached_rows = [cache._suffix_pooled_keys for cache in caches]
+        cached_counts = {
+            0 if value is None else int(value.shape[1]) for value in cached_rows
+        }
+        if len(cached_counts) != 1:
+            raise ValueError("shared QSA batch rows have unequal pooled coverage")
+        cached_blocks = cached_counts.pop()
+        if cached_blocks > suffix_blocks:
+            cached_blocks = suffix_blocks
+            cached_rows = [
+                None if value is None else mx.contiguous(value[:, :suffix_blocks])
+                for value in cached_rows
+            ]
+        cached = (
+            None
+            if cached_blocks == 0
+            else mx.concatenate(cached_rows, axis=0)
+        )
+        if cached_blocks < suffix_blocks:
+            first = cached_blocks * ratio
+            last = suffix_blocks * ratio
+            new_starts = (
+                base.length + mx.arange(cached_blocks, suffix_blocks) * ratio
+            )
+            new = self._pool_blocks(suffix_raw[:, first:last], new_starts)
+            cached = new if cached is None else mx.concatenate([cached, new], axis=1)
+        for index, cache in enumerate(caches):
+            cache.set_suffix_pooled_keys(
+                None if cached is None else cached[index : index + 1]
+            )
+
+        def score(keys):
+            values = mx.einsum(
+                "blhd,bnd->blnh",
+                q.astype(mx.float32),
+                keys.astype(mx.float32),
+            )
+            return mx.sum(mx.maximum(values, 0), axis=-1) / math.sqrt(
+                self.head_dim
+            )
+
+        base_keys = mx.broadcast_to(
+            base.pooled_keys,
+            (batch, int(base.pooled_keys.shape[1]), int(base.pooled_keys.shape[2])),
+        )
+        score_parts = [score(base_keys)]
+        if cached is not None and int(cached.shape[1]):
+            score_parts.append(score(cached))
+        scores = (
+            score_parts[0]
+            if len(score_parts) == 1
+            else mx.concatenate(score_parts, axis=-1)
+        )
+        scores = mx.where(valid_blocks, scores, -mx.inf)
+        k = min(self.block_topk, n_blocks)
+        selected = mx.argpartition(scores, kth=n_blocks - k, axis=-1)[..., -k:]
+        token_logical = mx.arange(total)[None, :]
+        return [
+            QSASelection(
+                kind="explicit",
+                batch=1,
+                length=length,
+                block_size=ratio,
+                raw_block_ids=selected[index : index + 1],
+                valid_blocks=valid_blocks[index : index + 1],
+                q_positions=q_pos[index : index + 1],
+                token_positions=token_logical,
+                causal_mask=causal_masks[index],
+                left_padding=None,
+                offset=offset,
+                physical_width=total,
+                n_blocks=n_blocks,
+                scatter_chosen=_QSA_SCATTER_CHOSEN,
+            )
+            for index in range(batch)
+        ]
+
     def __call__(
         self,
         hidden: mx.array,

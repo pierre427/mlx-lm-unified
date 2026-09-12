@@ -64,6 +64,7 @@ _ZERO = {
     "shared_qsa_private_bytes": 0,
     "shared_qsa_materializations": 0,
     "shared_qsa_materialized_bytes": 0,
+    "shared_qsa_batched_selections": 0,
     "exact_set_fold_requests": 0,
     "exact_set_fold_declines": 0,
     "exact_set_fold_preflight_declines": 0,

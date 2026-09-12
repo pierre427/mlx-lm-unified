@@ -364,6 +364,7 @@ def validate_mechanism_receipt(row: dict[str, Any], profile: str) -> None:
             # target layers, each split/materialized for two sibling rows.
             "shared_qsa_rows": 24,
             "shared_qsa_materializations": 24,
+            "shared_qsa_batched_selections": 12 * cycles,
         }
         mismatches.update(
             {
