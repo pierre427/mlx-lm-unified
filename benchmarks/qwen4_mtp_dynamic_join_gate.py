@@ -334,7 +334,15 @@ class QSAShareCounter:
             reused = False
             if self._share_cycle and self._draft_call > 0:
                 qsa = [item for item in cache if hasattr(item, "_mtp_shared_topk")]
-                reused = bool(qsa) and all(item._mtp_shared_topk is not None for item in qsa)
+                def has_selection(item):
+                    if item._mtp_shared_topk is not None:
+                        return True
+                    rows = getattr(item, "rows", ())
+                    return bool(rows) and all(
+                        row._mtp_shared_topk is not None for row in rows
+                    )
+
+                reused = bool(qsa) and all(has_selection(item) for item in qsa)
             if reused:
                 self.reuse_observed += 1
                 self.post_join_reuse_observed += int(self.joined)

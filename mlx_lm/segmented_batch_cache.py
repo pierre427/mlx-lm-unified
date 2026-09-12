@@ -304,20 +304,25 @@ class SegmentedBatchQSAKVCache(BatchQSAKVCache):
             raise RuntimeError("segmented QSA shared top-k batch size changed")
         for index, row in enumerate(self.rows):
             row._mtp_share_topk = True
-            row._mtp_shared_topk = (
-                None
-                if shared is None
-                else mx.contiguous(shared[index : index + 1])
-            )
+            # ``None`` on the wrapper can mean the row-local sets are ragged,
+            # not absent.  Cycle start already clears every row, so preserve
+            # a row's first-step set for the second MTP step in that case.
+            if shared is not None:
+                row._mtp_shared_topk = mx.contiguous(shared[index : index + 1])
 
     def _capture_row_qsa_share(self):
         """Expose per-lineage selections on the batched cycle receipt/state."""
         if not self._mtp_share_topk:
             return
         selected = [row._mtp_shared_topk for row in self.rows]
+        shapes = {tuple(value.shape[1:]) for value in selected if value is not None}
         self._mtp_shared_topk = (
             mx.concatenate(selected, axis=0)
-            if selected and all(value is not None for value in selected)
+            if (
+                selected
+                and all(value is not None for value in selected)
+                and len(shapes) == 1
+            )
             else None
         )
 

@@ -1147,6 +1147,33 @@ def test_segmented_qsa_zero_length_row_uses_pre_o_width():
     assert mx.array_equal(actual[1], mx.zeros((3, 48))).item()
 
 
+def test_segmented_qsa_preserves_ragged_row_local_shared_topk():
+    from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
+    from mlx_lm.models.qwen4_exp import QSAKVCache
+    from mlx_lm.segmented_batch_cache import SegmentedBatchQSAKVCache
+
+    model = _tiny_qwen4_model()
+    attention = model.language_model.model.layers[1].self_attn
+    rows = [
+        QSAKVCache(attention.indexer.summary_identity),
+        QSAKVCache(attention.indexer.summary_identity),
+    ]
+    segmented = SegmentedBatchQSAKVCache(rows, shared_qsa_prefix=False)
+    segmented._mtp_share_topk = True
+    rows[0]._mtp_shared_topk = mx.array([[1, 2]], dtype=mx.uint32)
+    rows[1]._mtp_shared_topk = mx.array([[3, 4, 5]], dtype=mx.uint32)
+
+    segmented._capture_row_qsa_share()
+    assert segmented._mtp_shared_topk is None
+    segmented._arm_row_qsa_share()
+    assert rows[0]._mtp_shared_topk.shape == (1, 2)
+    assert rows[1]._mtp_shared_topk.shape == (1, 3)
+
+    segmented.release_qsa_cycle("test")
+    assert all(row._mtp_shared_topk is None for row in rows)
+    assert all(not row._mtp_share_topk for row in rows)
+
+
 def test_exact_set_preflight_decline_uses_proven_private_path(monkeypatch):
     from test_batched_self_mtp_qwen4 import _tiny_qwen4_model
     from mlx_lm.models.qwen4_exp import QSAKVCache
