@@ -145,6 +145,30 @@ def test_fixed_pipeline_drain_is_amortized_over_remaining_work():
     assert sustained.predicted_net_savings_ms > 0.2
 
 
+def test_same_cycle_overlap_has_no_final_pipeline_drain():
+    config = ANEVerifierConfig(
+        mode="active",
+        allow_approximate_commit=True,
+        qualified_service_p95_ms=10.0,
+        min_net_savings_ms=0.2,
+    )
+    decision = ane_verifier_eligibility(
+        config,
+        greedy=True,
+        has_logits_processors=False,
+        needs_full_logprobs=False,
+        package_resident=True,
+        memory_headroom_gib=4.0,
+        package_gib=1.2,
+        predicted_gpu_marginal_delay_ms=0.84,
+        predicted_ane_interference_ms=0.2,
+        available_overlap_ms=12.0,
+        expected_remaining_verifications=1,
+        predicted_final_drain_ms=0.0,
+    )
+    assert decision.eligible
+
+
 def test_ticket_resolves_only_for_same_generation_and_sufficient_margin():
     runner = FakeRunner()
     controller = ANEVerifierController(

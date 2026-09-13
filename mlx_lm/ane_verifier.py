@@ -87,6 +87,7 @@ def ane_verifier_eligibility(
     available_overlap_ms: float,
     predicted_ane_interference_ms: float = 0.0,
     expected_remaining_verifications: int = 1,
+    predicted_final_drain_ms: Optional[float] = None,
 ) -> ANEVerifierEligibility:
     """Gate on measured scheduler state rather than batch width.
 
@@ -112,7 +113,12 @@ def ane_verifier_eligibility(
     if expected_remaining_verifications < 1:
         return ANEVerifierEligibility(False, "no_remaining_verification")
     residual_wait = max(0.0, config.qualified_service_p95_ms - available_overlap_ms)
-    amortized_drain = config.qualified_service_p95_ms / expected_remaining_verifications
+    final_drain = (
+        config.qualified_service_p95_ms
+        if predicted_final_drain_ms is None
+        else max(0.0, predicted_final_drain_ms)
+    )
+    amortized_drain = final_drain / expected_remaining_verifications
     predicted_net = (
         predicted_gpu_marginal_delay_ms
         - max(0.0, predicted_ane_interference_ms)
