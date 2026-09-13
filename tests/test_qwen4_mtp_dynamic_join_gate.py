@@ -19,6 +19,7 @@ def args(**overrides):
         context=16384,
         lanes=2,
         initial_lanes=1,
+        static_cohort=False,
         join_after_cycles=4,
         max_tokens=128,
         num_draft=2,
@@ -49,6 +50,17 @@ def test_plan_is_paired_rotated_and_model_free():
     ]
     assert plan["joining_lanes"] == 1
     assert not plan["execution_authorized"]
+
+
+def test_static_plan_requires_and_describes_full_initial_cohort():
+    plan = MODULE.build_plan(
+        args(lanes=4, initial_lanes=4, static_cohort=True, max_tokens=8)
+    )
+    assert plan["static_cohort"] is True
+    assert plan["joining_lanes"] == 0
+    assert "static B4" in plan["correctness_gate"]
+    with pytest.raises(ValueError, match="initial-lanes == lanes"):
+        MODULE.build_plan(args(lanes=4, initial_lanes=2, static_cohort=True))
 
 
 @pytest.mark.parametrize(

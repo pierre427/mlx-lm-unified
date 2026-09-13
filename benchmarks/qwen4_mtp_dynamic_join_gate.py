@@ -197,7 +197,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("context must be positive")
     if args.lanes < 2:
         raise ValueError("lanes must be at least 2")
-    if not 1 <= args.initial_lanes < args.lanes:
+    if args.static_cohort:
+        if args.initial_lanes != args.lanes:
+            raise ValueError("static-cohort requires initial-lanes == lanes")
+    elif not 1 <= args.initial_lanes < args.lanes:
         raise ValueError("initial-lanes must be in [1, lanes)")
     if args.join_after_cycles < 1:
         raise ValueError("join-after-cycles must be positive")
@@ -206,7 +209,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if args.num_draft < 1:
         raise ValueError("num-draft must be positive")
     minimum_live_join = 1 + (args.num_draft + 1) * args.join_after_cycles
-    if args.max_tokens <= minimum_live_join:
+    if not args.static_cohort and args.max_tokens <= minimum_live_join:
         raise ValueError("max-tokens is too small to guarantee a live join")
     if args.cancel_uid is not None and not 0 <= args.cancel_uid < args.lanes:
         raise ValueError("cancel-uid must name a configured lane")
@@ -232,6 +235,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "lanes": args.lanes,
         "initial_lanes": args.initial_lanes,
         "joining_lanes": args.lanes - args.initial_lanes,
+        "static_cohort": bool(args.static_cohort),
         "join_after_cycles": args.join_after_cycles,
         "max_tokens_per_lane": args.max_tokens,
         "cancel_uid": args.cancel_uid,
@@ -245,10 +249,17 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "max_drift": args.max_drift,
         "arms": list(ARMS),
         "orders": [arm_order(rep) for rep in range(1, args.reps + 1)],
-        "correctness_gate": "exact per-UID token IDs, fixed cohort versus dynamic join",
+        "correctness_gate": (
+            "exact per-UID token IDs, fixed cohort versus static B4 replay"
+            if args.static_cohort
+            else "exact per-UID token IDs, fixed cohort versus dynamic join"
+        ),
         "engagement_gate": (
-            "dynamic membership epoch advances at join; shared QSA start requests and "
-            "second-step reuse are observed after the join"
+            "shared QSA start requests and second-step reuse are observed in the "
+            "static cohort"
+            if args.static_cohort
+            else "dynamic membership epoch advances at join; shared QSA start requests "
+            "and second-step reuse are observed after the join"
         ),
         "performance_metrics": (
             "prepare_wall_s, transaction_wall_s, total_wall_s, aggregate decode and "
@@ -256,6 +267,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "timing_boundary": (
             "all lanes are prefetched sequentially before transaction timing in both "
+            "arms; static cohorts attach all lanes before the first transaction cycle"
+            if args.static_cohort
+            else "all lanes are prefetched sequentially before transaction timing in both "
             "arms; dynamic lanes are detached until the configured cycle boundary"
         ),
     }
@@ -494,7 +508,7 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
             envelopes[uid] = [envelope(first.logprobs, int(first.token))]
     prepared_at = time.perf_counter()
 
-    if arm == "fixed_cohort":
+    if arm == "fixed_cohort" or args.static_cohort:
         batch = attach_segmented_self_mtp_lanes(model, None, prepared)
         pending = []
     else:
@@ -645,7 +659,13 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
             "cancellations": cancellation_receipts,
             "reconstruction_epochs": reconstruction_epochs,
             "empty_cohort": not batch.lanes,
-            "joined": join_receipt is not None if arm == "dynamic_join" else False,
+            "joined": (
+                bool(args.static_cohort)
+                if arm == "dynamic_join"
+                else False
+            ) if args.static_cohort else (
+                join_receipt is not None if arm == "dynamic_join" else False
+            ),
         },
     }
     if args.capture_logprob_envelopes:
@@ -808,13 +828,20 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
     atomic_write(output, artifact)
     dynamic_rows = [row for row in artifact["rows"] if row["arm"] == "dynamic_join"]
     exact = bool(dynamic_rows) and all(row["exact_fixed_match"] for row in dynamic_rows)
-    engaged = bool(dynamic_rows) and all(
-        row["join"] is not None
-        and row["join"]["epoch_after"] == row["join"]["epoch_before"] + 1
-        and row["qsa_share"]["post_join_share_requested"] > 0
-        and row["qsa_share"]["post_join_reuse_observed"] > 0
-        for row in dynamic_rows
-    )
+    if args.static_cohort:
+        engaged = bool(dynamic_rows) and all(
+            row["qsa_share"]["share_requested"] > 0
+            and row["qsa_share"]["reuse_observed"] > 0
+            for row in dynamic_rows
+        )
+    else:
+        engaged = bool(dynamic_rows) and all(
+            row["join"] is not None
+            and row["join"]["epoch_after"] == row["join"]["epoch_before"] + 1
+            and row["qsa_share"]["post_join_share_requested"] > 0
+            and row["qsa_share"]["post_join_reuse_observed"] > 0
+            for row in dynamic_rows
+        )
     accepted_repetitions = {
         row["repetition"]
         for row in artifact["rows"]
@@ -862,6 +889,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context", type=int, default=16384)
     parser.add_argument("--lanes", type=int, default=2)
     parser.add_argument("--initial-lanes", type=int, default=1)
+    parser.add_argument(
+        "--static-cohort",
+        action="store_true",
+        help="qualify an all-at-once cohort without a live width transition",
+    )
     parser.add_argument("--join-after-cycles", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--num-draft", type=int, default=2)
