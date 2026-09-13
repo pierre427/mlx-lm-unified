@@ -3512,6 +3512,60 @@ def _discard_hedge(model, mtp_cache, hedge) -> None:
     _lv.bump("hedge_discarded")
 
 
+def _reconcile_unfinished_mtp_delivery(lever_state, tracker) -> None:
+    """Rewind a verified MTP round to the consumer's delivered boundary.
+
+    Verification necessarily advances the target over the whole accepted span
+    before individual tokens can be yielded.  If the consumer closes while an
+    accepted span is suspended, the final delivered token must remain the
+    uncached continuation seed, just as it does after ordinary decoding.  The
+    target cache and any persistent MTP sidecar therefore need to be rewound
+    together to ``prompt + delivered - 1`` rather than merely agreeing with
+    each other at a speculative future boundary.
+    """
+    delivery = lever_state.get("delivery_round")
+    if delivery is None or delivery["bonus_delivered"]:
+        return
+
+    n_accept = delivery["n_accept"]
+    delivered = delivery["delivered_accepts"]
+    # The target currently contains cur plus every accepted draft.  Keep cur
+    # and the accepted tokens *before* the last delivered token.
+    rewind = n_accept - delivered + 1
+    trim_prompt_cache(delivery["cache"], rewind)
+
+    pending_hs = None
+    pending_ts = []
+    if delivery["persistent"]:
+        if delivery["mtp_precommitted"]:
+            # A full-accept hedge has already teacher-forced the entire round.
+            # The queued next-round chain was discarded by the wrapper first;
+            # rewind the committed suffix by the same delivered-boundary delta.
+            trim_prompt_cache(delivery["mtp_cache"], rewind)
+        elif delivered:
+            # The head cache is still at the cycle-start boundary.  Carry only
+            # the pairs needed to reach the delivered prefix; finalization
+            # flushes these once using trunk hiddens.
+            hidden_parts = [delivery["seed_before"]]
+            if delivered > 1:
+                hidden_parts.append(delivery["vhidden"][:, : delivered - 1, :])
+            pending_hs = mx.concatenate(hidden_parts, axis=1)
+            pending_ts = [delivery["cur"]] + delivery["drafts"][: delivered - 1]
+
+    seed_h = (
+        delivery["seed_before"]
+        if delivered == 0
+        else delivery["vhidden"][:, delivered - 1 : delivered, :]
+    )
+    if tracker is not None:
+        tracker.update(
+            pending_hs=pending_hs,
+            pending_ts=pending_ts,
+            seed_h=seed_h,
+        )
+    lever_state["delivery_round"] = None
+
+
 def _mtp_draft_verify_loop_impl(
     model,
     cache,
@@ -4026,6 +4080,7 @@ def _mtp_draft_verify_loop_impl(
             pending_ts = [cur] + drafts[:n_accept]
         if lever_ple:
             recent_tokens.extend([cur] + drafts[:n_accept])
+        seed_before = seed_h
         seed_h = vhidden[:, n_accept : n_accept + 1, :]  # hidden that predicted bonus
         if mtp_state_tracker is not None:
             mtp_state_tracker.update(
@@ -4042,18 +4097,42 @@ def _mtp_draft_verify_loop_impl(
             speculation_router.observe(k, n_accept)
             stats.router_accept_prob = speculation_router.accept_prob
 
+        # The verified cache is ahead of the consumer until the bonus token is
+        # delivered.  Keep an exact transaction receipt so generator.close()
+        # can rewind undelivered accepted tokens and leave the final delivered
+        # token as the uncached continuation seed.
+        lever_state["delivery_round"] = {
+            "cache": cache,
+            "mtp_cache": mtp_cache,
+            "persistent": persistent,
+            "mtp_precommitted": bool(
+                persistent and hedge is not None and n_accept == k
+            ),
+            "n_accept": n_accept,
+            "delivered_accepts": 0,
+            "bonus_delivered": False,
+            "seed_before": seed_before,
+            "vhidden": vhidden,
+            "cur": cur,
+            "drafts": drafts,
+        }
+
         # Delivered-token telemetry updates exactly at each yield boundary so
         # an early close (e.g. EOS) never overstates accepted/bonus counts.
         for i in range(n_accept):
             ntoks += 1
             stats.draft_accepted += 1
+            lever_state["delivery_round"]["delivered_accepts"] = i + 1
             yield drafts[i], logprobs[i], True
             if ntoks == max_tokens:
                 break
         if ntoks < max_tokens:
             ntoks += 1
             stats.bonus_tokens += 1
+            lever_state["delivery_round"]["bonus_delivered"] = True
             yield bonus, logprobs[n_accept], False
+        if lever_state["delivery_round"]["bonus_delivered"]:
+            lever_state["delivery_round"] = None
         token_prefix = mx.concatenate(
             [token_prefix, mx.array([cur] + drafts[:n_accept], mx.uint32)]
         )
@@ -4093,6 +4172,7 @@ def _mtp_draft_verify_loop(*args, mtp_state_out=None, **kwargs):
                 prebuilt,
             )
             lever_state["prebuilt"] = None
+        _reconcile_unfinished_mtp_delivery(lever_state, tracker)
         if tracker is not None and tracker.get("mtp_cache") is not None:
             mtp_cache = tracker["mtp_cache"]
             pending_hs = tracker.get("pending_hs")

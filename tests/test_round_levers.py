@@ -16,9 +16,11 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_lm import round_levers as lv
+from mlx_lm.generate import prompt_lookup_generate_step
 from mlx_lm.hybrid_speculative import HybridStats, self_mtp_generate_step
 from mlx_lm.models import qwen4_exp
 from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.qwen4_exp import QSAKVCache, Qwen4ArraysCache
 from mlx_lm.models.qwen4_ple_nvme import (
     FileBackedShardedEmbedding,
     dequant_rows_numpy,
@@ -157,9 +159,76 @@ class TestHedgeDraft(_Base):
         self.assertGreater(c["hedge_hit"], 0)
         self.assertGreaterEqual(c["hedge_discarded"], 1)
         self.assertTrue(out["reusable"])
+        # The sidecar must describe the delivered prefix, not merely agree
+        # with a target cache that is also ahead of the consumer.  Six output
+        # tokens leave the sixth token as the uncached continuation seed.
+        self.assertEqual(out["covered_tokens"], int(self.prompt.size) + 6 - 1)
         mtp_cache, _seed = out["state"]
         self.assertEqual(
             max(c_.offset for c_ in mtp_cache), out["covered_tokens"] - 1
+        )
+
+    def test_early_close_sidecar_resumes_from_delivered_prefix(self):
+        with _biased_logits(self.model, 5, "always"):
+            for hedge in (False, True):
+                lv.set_lever("hedge_draft", hedge)
+                full, _ = self._run(
+                    seed=7, num_draft=2, persistent_mtp=True, max_tokens=12
+                )
+                for stop_after in (2, 6):
+                    with self.subTest(hedge=hedge, stop_after=stop_after):
+                        lv.set_lever("hedge_draft", hedge)
+                        cache = make_prompt_cache(self.model)
+                        state_out = {}
+                        gen = self_mtp_generate_step(
+                            self.prompt,
+                            self.model,
+                            num_draft=2,
+                            persistent_mtp=True,
+                            max_tokens=12,
+                            prompt_cache=cache,
+                            mtp_state_out=state_out,
+                        )
+                        prefix = []
+                        for _ in range(stop_after):
+                            token, _lp, _fd = next(gen)
+                            prefix.append(int(token))
+                        gen.close()
+
+                        self.assertEqual(
+                            state_out["covered_tokens"],
+                            int(self.prompt.size) + stop_after - 1,
+                        )
+                        resumed = [
+                            int(token)
+                            for token, _lp, _fd in self_mtp_generate_step(
+                                mx.array([prefix[-1]], mx.uint32),
+                                self.model,
+                                num_draft=2,
+                                persistent_mtp=True,
+                                max_tokens=12 - stop_after,
+                                prompt_cache=cache,
+                                mtp_state=state_out["state"],
+                            )
+                        ]
+                        self.assertEqual(prefix + resumed, full)
+
+    def test_budget_clamped_final_round_does_not_build_a_hedge(self):
+        lv.set_lever("hedge_draft", True)
+        lv.reset_counters()
+        state_out = {}
+        self._run(
+            num_draft=2,
+            persistent_mtp=True,
+            max_tokens=3,
+            mtp_state_out=state_out,
+        )
+        counters = lv.counters()
+        self.assertEqual(counters["hedge_built"], 0)
+        self.assertGreaterEqual(counters["hedge_skipped"], 1)
+        self.assertTrue(state_out["reusable"])
+        self.assertEqual(
+            state_out["covered_tokens"], int(self.prompt.size) + 3 - 1
         )
 
     def test_hedge_is_silent_when_off_or_non_persistent(self):
@@ -235,6 +304,29 @@ class TestEagerDispatchToggle(_Base):
         self.assertEqual(qwen4_exp.set_qwen4_eager_dispatch_stride(4), 1)
         self.assertEqual(qwen4_exp.set_qwen4_eager_dispatch_stride(1), 4)
 
+
+class TestPeerRegressionGuards(_Base):
+    def test_qwen4_text_path_builds_native_hybrid_cache(self):
+        caches = make_prompt_cache(self.model)
+        self.assertTrue(any(isinstance(c, Qwen4ArraysCache) for c in caches))
+        self.assertTrue(any(isinstance(c, QSAKVCache) for c in caches))
+
+    def test_qwen4_prompt_lookup_enters_speculation(self):
+        stats = HybridStats()
+        prompt = mx.array([1, 2, 3, 4, 1, 2, 3], mx.uint32)
+        result = list(
+            prompt_lookup_generate_step(
+                prompt,
+                self.model,
+                max_tokens=8,
+                num_draft=4,
+                ngram_max=3,
+                stats=stats,
+            )
+        )
+        self.assertEqual(len(result), 8)
+        self.assertGreater(stats.retrieval_proposed, 0)
+        self.assertGreater(stats.retrieval_cycles, 0)
 
 class TestPleVerifyPrefetch(_Base):
     def test_resident_table_is_a_noop_and_stream_identical(self):
