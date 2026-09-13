@@ -1249,6 +1249,14 @@ def _self_mtp_config(
         "accept_rule": "residual",
         "state_out": {},
     }
+    if getattr(cli_args, "self_mtp_segment_aware_live_tip", False):
+        # Experimental serving admission mode: form a fixed segmented cohort
+        # before its first true-batched cycle, then defer arrivals until the
+        # cohort is empty.  Kept default-off until the serving gates qualify.
+        config["segment_aware_live_tip"] = True
+        config["segment_aware_cohort_size"] = int(
+            getattr(cli_args, "self_mtp_segment_aware_cohort_size", 2)
+        )
     if quantized_kv:
         # Tag so the BatchGenerator constructor admits the quantized cache; the
         # cache is already built quantized by _make_new_cache.
@@ -5416,6 +5424,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     "max_prompt_tokens": getattr(
                         cli, "self_mtp_max_prompt_tokens", None
                     ),
+                    "segment_aware_live_tip": bool(
+                        getattr(cli, "self_mtp_segment_aware_live_tip", False)
+                    ),
+                    "segment_aware_cohort_size": int(
+                        getattr(cli, "self_mtp_segment_aware_cohort_size", 2)
+                    ),
                 },
                 "prompt_cache": {
                     "entries": len(self.response_generator.prompt_cache),
@@ -5825,6 +5839,26 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--self-mtp-segment-aware-live-tip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental: keep each segmented self-MTP cohort at a fixed "
+            "width while it is live; later arrivals wait for an empty seam "
+            "(default: off)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-segment-aware-cohort-size",
+        type=int,
+        default=2,
+        metavar="N",
+        help=(
+            "Initial fixed width for --self-mtp-segment-aware-live-tip. "
+            "A live cohort is never widened (default: 2)."
+        ),
+    )
+    parser.add_argument(
         "--self-mtp-share-qsa-indices-min-prompt-tokens",
         type=int,
         default=0,
@@ -6189,6 +6223,8 @@ def main():
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
     if args.prompt_host_cache_size < 1:
         parser.error("--prompt-host-cache-size must be >= 1")
+    if args.self_mtp_segment_aware_cohort_size < 1:
+        parser.error("--self-mtp-segment-aware-cohort-size must be >= 1")
     if args.self_mtp_window_size and not args.self_mtp_persistent:
         parser.error("--self-mtp-window-size requires --self-mtp-persistent")
     try:

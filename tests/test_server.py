@@ -198,6 +198,16 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertFalse(disabled["gdn_prefix_fanout"])
         self.assertTrue(enabled["gdn_prefix_fanout"])
 
+    def test_segmented_static_cohort_serving_is_explicit_opt_in(self):
+        disabled = _self_mtp_config(self.args(), self.cli, self.model)
+        self.cli.self_mtp_segment_aware_live_tip = True
+        self.cli.self_mtp_segment_aware_cohort_size = 4
+        enabled = _self_mtp_config(self.args(), self.cli, self.model)
+
+        self.assertNotIn("segment_aware_live_tip", disabled)
+        self.assertTrue(enabled["segment_aware_live_tip"])
+        self.assertEqual(enabled["segment_aware_cohort_size"], 4)
+
     def test_temperature_only_sampling_is_exact_and_admitted(self):
         config = _self_mtp_config(
             self.args(temperature=0.7), self.cli, self.model
