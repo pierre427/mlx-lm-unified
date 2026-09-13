@@ -61,6 +61,21 @@ class TestSelfMTPLaneAdmissionController(unittest.TestCase):
         controller = SelfMTPLaneAdmissionController(saturation_lane_cap=8)
         self.assertEqual(len(controller.decide([256] * 64, 95.0).mtp_indices), 8)
 
+    def test_verification_row_cap_tracks_primary_and_branch_width(self):
+        controller = SelfMTPLaneAdmissionController(
+            saturation_lane_cap=None, verification_row_cap=8
+        )
+        decision = controller.decide([256] * 4, 95.0, max_draft=2)
+        self.assertEqual(decision.primary_rows, 4)
+        self.assertEqual(decision.speculative_rows, 4)
+        self.assertEqual(len(decision.mtp_indices), 2)
+        self.assertEqual(decision.stage, "fewer_lanes")
+
+        pressured = controller.decide([256] * 8, 95.0, max_draft=2)
+        self.assertEqual(pressured.mtp_indices, ())
+        self.assertEqual(pressured.stage, "plain")
+        self.assertEqual(pressured.primary_rows, 8)
+
     def test_dense_transient_admits_fewer_lanes(self):
         # The MoE-calibrated 1.76 GiB/lane under-models a dense 27B (~3.1 GiB).
         # A dense-calibrated controller admits fewer lanes for the same budget.

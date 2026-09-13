@@ -74,6 +74,12 @@ from .cache_capsule import (
     cache_capsules_enabled,
     prepare_prompt_cache_capsules,
 )
+from .batch_runtime import (
+    BatchFaultSpec,
+    BatchOverloaded,
+    BatchRuntimeMetrics,
+    InjectedBatchFault,
+)
 from .cache_planes import (
     CachePlaneFingerprint,
     CachePlaneKind,
@@ -251,6 +257,9 @@ class GenerationArguments:
     prompt_lookup_gate: float = 0.12
     prompt_lookup_rate_gate_probe: int = 32
     prompt_lookup_rate_gate_margin: float = 0.0
+    request_id: str = ""
+    tenant_id: str = "default"
+    batch_fault: Optional[BatchFaultSpec] = None
 
 
 @dataclass
@@ -1299,6 +1308,8 @@ class SelfMTPLaneAdmission:
     stage: Literal["full", "fewer_lanes", "lower_k", "plain", "queue"]
     estimated_gib: float
     usable_gib: float
+    primary_rows: int = 0
+    speculative_rows: int = 0
 
     @property
     def mtp_indices(self) -> Tuple[int, ...]:
@@ -1376,6 +1387,7 @@ class SelfMTPLaneAdmissionController:
         driver_allowance_gib: float = DRIVER_ALLOWANCE_GIB,
         transient_gib_per_lane: float = K2_TRANSIENT_GIB_PER_LANE,
         saturation_lane_cap: Optional[int] = SATURATION_LANE_CAP,
+        verification_row_cap: Optional[int] = None,
     ):
         if service_reserve_gib < self.SERVICE_RESERVE_GIB:
             raise ValueError("self-MTP service reserve must be at least 16 GiB")
@@ -1389,10 +1401,17 @@ class SelfMTPLaneAdmissionController:
             or saturation_lane_cap < 1
         ):
             raise ValueError("self-MTP saturation lane cap must be a positive int or None")
+        if verification_row_cap is not None and (
+            isinstance(verification_row_cap, bool)
+            or not isinstance(verification_row_cap, int)
+            or verification_row_cap < 1
+        ):
+            raise ValueError("verification row cap must be a positive int or None")
         self.service_reserve_gib = float(service_reserve_gib)
         self.driver_allowance_gib = float(driver_allowance_gib)
         self.transient_gib_per_lane = float(transient_gib_per_lane)
         self.saturation_lane_cap = saturation_lane_cap
+        self.verification_row_cap = verification_row_cap
 
     @property
     def hard_reserve_gib(self) -> float:
@@ -1536,7 +1555,7 @@ class SelfMTPLaneAdmissionController:
         mtp_candidates = [i for i, ok in enumerate(eligible) if ok]
         if not mtp_candidates:
             return SelfMTPLaneAdmission(
-                tuple(modes), tuple(depths), "plain", 0.0, 0.0
+                tuple(modes), tuple(depths), "plain", 0.0, 0.0, len(contexts), 0
             )
 
         try:
@@ -1558,7 +1577,7 @@ class SelfMTPLaneAdmissionController:
         usable = max(free - self.hard_reserve_gib, 0.0) if valid else 0.0
         if not valid:
             return SelfMTPLaneAdmission(
-                tuple(modes), tuple(depths), "queue", 0.0, usable
+                tuple(modes), tuple(depths), "queue", 0.0, usable, len(contexts), 0
             )
 
         # The frozen degradation order, generalized over depth: try the largest
@@ -1567,6 +1586,16 @@ class SelfMTPLaneAdmissionController:
         # admitting fewer full-depth lanes, which is the invariant the two-rung
         # form encoded and the loop preserves.
         for depth in range(max_draft, 0, -1):
+            lane_cap = self.saturation_lane_cap
+            if self.verification_row_cap is not None:
+                # Every request needs one target row. Each draft depth uses
+                # one additional verification row per speculative lane.
+                branch_cap = max(
+                    0, (self.verification_row_cap - len(contexts)) // depth
+                )
+                lane_cap = (
+                    branch_cap if lane_cap is None else min(lane_cap, branch_cap)
+                )
             chosen, used = self._fit(
                 mtp_candidates,
                 contexts,
@@ -1574,7 +1603,7 @@ class SelfMTPLaneAdmissionController:
                 resident_cache,
                 depth,
                 usable,
-                self.saturation_lane_cap,
+                lane_cap,
             )
             if not chosen:
                 continue
@@ -1588,7 +1617,8 @@ class SelfMTPLaneAdmissionController:
             else:
                 stage = "fewer_lanes"
             return SelfMTPLaneAdmission(
-                tuple(modes), tuple(depths), stage, used, usable
+                tuple(modes), tuple(depths), stage, used, usable,
+                len(contexts), len(chosen) * depth,
             )
 
         chosen, used = self._fit(
@@ -1609,11 +1639,11 @@ class SelfMTPLaneAdmissionController:
                 resident_cache=resident_cache[i],
             )
             return SelfMTPLaneAdmission(
-                tuple(modes), tuple(depths), "plain", used, usable
+                tuple(modes), tuple(depths), "plain", used, usable, len(contexts), 0
             )
 
         return SelfMTPLaneAdmission(
-            tuple(modes), tuple(depths), "queue", 0.0, usable
+            tuple(modes), tuple(depths), "queue", 0.0, usable, len(contexts), 0
         )
 
 
@@ -1665,11 +1695,32 @@ def _current_self_mtp_free_memory_gib() -> Optional[float]:
     return available / float(1 << 30)
 
 
+def _batch_memory_snapshot(prompt_cache) -> Dict[str, Optional[int]]:
+    """Read allocator and host counters without synchronizing device work."""
+    snapshot = {
+        "prompt_cache_entries": len(prompt_cache),
+        "prompt_cache_bytes": int(getattr(prompt_cache, "nbytes", 0)),
+        "system_available_bytes": _system_available_memory_bytes(),
+    }
+    for key, getter_name in (
+        ("metal_active_bytes", "get_active_memory"),
+        ("metal_peak_bytes", "get_peak_memory"),
+        ("metal_cache_bytes", "get_cache_memory"),
+    ):
+        getter = getattr(mx, getter_name, None)
+        try:
+            snapshot[key] = int(getter()) if callable(getter) else None
+        except (RuntimeError, ValueError):
+            snapshot[key] = None
+    return snapshot
+
+
 def _make_self_mtp_admission_callback(
     controller: Optional[SelfMTPLaneAdmissionController] = None,
     free_memory: Callable[[], Optional[float]] = _current_self_mtp_free_memory_gib,
     *,
     max_draft: Union[int, Callable[[], int]] = 2,
+    observer: Optional[Callable[[SelfMTPLaneAdmission], None]] = None,
 ) -> Callable[
     [Sequence[Tuple[int, int, int, bool, float]]],
     Mapping[int, Union[int, str]],
@@ -1699,6 +1750,8 @@ def _make_self_mtp_admission_callback(
             resident_cache=[bool(row[3]) for row in rows],
             max_draft=max_draft() if callable(max_draft) else max_draft,
         )
+        if observer is not None:
+            observer(decision)
         actions: Dict[int, Union[int, str]] = {}
         for row, mode, depth in zip(rows, decision.modes, decision.draft_depths):
             uid = int(row[0])
@@ -2262,6 +2315,11 @@ class ResponseGenerator:
             else None
         )
         self.requests = Queue()
+        self.batch_metrics = BatchRuntimeMetrics(
+            history_size=int(
+                getattr(model_provider.cli_args, "batch_metrics_history", 512)
+            )
+        )
         self._state_machine_cache = {}
         self._prompt_host_cache = PromptHostPlaneCache(
             int(getattr(model_provider.cli_args, "prompt_host_cache_size", 64))
@@ -2283,6 +2341,9 @@ class ResponseGenerator:
                 float(_transient) if _transient
                 else SelfMTPLaneAdmissionController.K2_TRANSIENT_GIB_PER_LANE
             ),
+            verification_row_cap=getattr(
+                _cli, "self_mtp_verification_row_cap", None
+            ),
         )
         # Read the depth at admission time, not at construction: it is a
         # soft-reloadable key, and capturing it here made a reload silently
@@ -2294,6 +2355,13 @@ class ResponseGenerator:
             self._self_mtp_admission_controller,
             max_draft=lambda: int(
                 getattr(self.model_provider.cli_args, "self_mtp_num_draft", 2)
+            ),
+            observer=lambda decision: self.batch_metrics.branch_decision(
+                stage=decision.stage,
+                primary_rows=decision.primary_rows,
+                speculative_rows=decision.speculative_rows,
+                estimated_gib=decision.estimated_gib,
+                usable_gib=decision.usable_gib,
             ),
         )
 
@@ -2927,6 +2995,21 @@ class ResponseGenerator:
             # We got a request
             if request is not None:
                 rqueue, request, args = request
+                self.batch_metrics.dequeued(
+                    getattr(args, "request_id", ""), self.requests.qsize()
+                )
+                fault = getattr(args, "batch_fault", None)
+                if fault is not None and fault.kind in {
+                    "cache_evict",
+                    "cache_reallocate",
+                }:
+                    self.batch_metrics.fault(
+                        getattr(args, "request_id", ""), fault.kind
+                    )
+                    self.clear_prompt_cache()
+                    if fault.kind == "cache_reallocate":
+                        gc.collect()
+                        mx.clear_cache()
                 tokenized = None
                 if (
                     batch_generator is not None
@@ -3060,7 +3143,13 @@ class ResponseGenerator:
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                         "mtp": self_mtp is not None,
+                        "request_id": getattr(args, "request_id", ""),
                     }
+                    self.batch_metrics.lane_attached(
+                        getattr(args, "request_id", ""),
+                        len(batch_results),
+                        "self_mtp" if self_mtp is not None else "plain",
+                    )
                     # just making sure we don't leave a reference around
                     del cache
 
@@ -3260,6 +3349,7 @@ class ResponseGenerator:
                 uids_to_remove = []
                 batch_idle = True
                 for _ in self._time_budget:
+                    self.batch_metrics.batch_cycle(len(batch_results))
                     prompt_responses, gen_responses = batch_generator.next()
                     if not prompt_responses and not gen_responses:
                         break
@@ -4266,28 +4356,59 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
-        self._admit_request()
+        request_id = generation_args.request_id or f"request-{uuid.uuid4()}"
+        generation_args.request_id = request_id
+        self._admit_request(request_id, generation_args.tenant_id)
         released = False
+        terminal_status = "cancelled"
 
         def _release():
             nonlocal released
             if not released:
                 released = True
+                self.batch_metrics.terminal(request_id, terminal_status)
                 self._retire_request()
 
         def _inner():
+            nonlocal terminal_status
+            delivered = 0
             try:
                 while True:
+                    fault = generation_args.batch_fault
+                    if (
+                        fault is not None
+                        and fault.kind == "lane_abort"
+                        and delivered >= fault.after_tokens
+                    ):
+                        self.batch_metrics.fault(request_id, fault.kind)
+                        terminal_status = "faulted"
+                        raise InjectedBatchFault(
+                            f"injected lane abort after {fault.after_tokens} tokens"
+                        )
                     response = response_queue.get()
                     if response is None:
+                        terminal_status = "completed"
                         break
                     if isinstance(response, Exception):
+                        terminal_status = "error"
                         raise response
                     if isinstance(response, tuple):
                         if progress_callback is not None:
                             progress_callback(*response)
                         continue
                     yield response
+                    # Generator resumption is the delivery acknowledgement.
+                    # A close injected at the yield leaves this token out of
+                    # delivery metrics and triggers the lane rollback path.
+                    self.batch_metrics.token(request_id, response.mtp_receipt)
+                    delivered += 1
+            except GeneratorExit:
+                terminal_status = "cancelled"
+                raise
+            except BaseException:
+                if terminal_status != "faulted":
+                    terminal_status = "error"
+                raise
             finally:
                 _release()
 
@@ -4298,6 +4419,7 @@ class ResponseGenerator:
             if isinstance(ctx, Exception):
                 raise ctx
         except BaseException:
+            terminal_status = "error"
             _release()
             raise
 
@@ -4308,7 +4430,12 @@ class ResponseGenerator:
         weakref.finalize(stream, _release)
         return ctx, stream
 
-    def _admit_request(self, timeout: Optional[float] = None):
+    def _admit_request(
+        self,
+        request_id: str,
+        tenant_id: str,
+        timeout: Optional[float] = None,
+    ):
         """Take an in-flight slot, waiting while a soft reload holds the gate."""
         timeout = self.admission_timeout if timeout is None else timeout
         deadline = time.monotonic() + max(0.0, timeout)
@@ -4320,7 +4447,18 @@ class ResponseGenerator:
                         "server is applying a configuration change; retry shortly"
                     )
                 self._admission.wait(remaining)
+            limit = int(getattr(self.cli_args, "max_inflight_requests", 0) or 0)
+            if limit and self._inflight >= limit:
+                self.batch_metrics.rejected(
+                    request_id, "max_inflight", self.requests.qsize()
+                )
+                raise BatchOverloaded(
+                    f"server has {self._inflight} in-flight requests; limit is {limit}"
+                )
             self._inflight += 1
+            self.batch_metrics.admitted(
+                request_id, tenant_id or "default", self.requests.qsize()
+            )
 
     def _retire_request(self):
         with self._admission:
@@ -4568,6 +4706,27 @@ class APIHandler(BaseHTTPRequestHandler):
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
+        metadata = self.body.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            self._bad_request("metadata must be an object")
+            return
+        self.tenant_id = str(
+            self.headers.get("X-Tenant-ID") or metadata.get("tenant_id") or "default"
+        )[:128]
+        try:
+            self.batch_fault = BatchFaultSpec.parse(
+                self.body.get("mlx_fault"),
+                enabled=bool(
+                    getattr(
+                        self.response_generator.cli_args,
+                        "batch_fault_injection",
+                        False,
+                    )
+                ),
+            )
+        except ValueError as exc:
+            self._bad_request(str(exc))
+            return
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
@@ -5135,6 +5294,9 @@ class APIHandler(BaseHTTPRequestHandler):
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
             n=max(1, int(getattr(self, "n", 1))),
+            request_id=self.request_id,
+            tenant_id=getattr(self, "tenant_id", "default"),
+            batch_fault=getattr(self, "batch_fault", None),
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -5156,13 +5318,17 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             # An unsupported request composition is a 400; a closed admission
             # gate is a 503; 404 stays for an unknown model.
-            if isinstance(e, SoftReloadBusy):
+            if isinstance(e, BatchOverloaded):
+                status = 429
+            elif isinstance(e, SoftReloadBusy):
                 status = 503
             elif isinstance(e, RequestCompositionError):
                 status = 400
             else:
                 status = 404
             self._set_completion_headers(status)
+            if status == 429:
+                self.send_header("Retry-After", "1")
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
@@ -5271,6 +5437,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         finally:
             ctx.stop()
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                close_response()
 
     def completion_usage_response(
         self,
@@ -5435,6 +5604,37 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             self.end_headers()
             self.wfile.write(encoded)
+        elif self.path == "/v1/status/batching":
+            prompt_cache = self.response_generator.prompt_cache
+            payload = self.response_generator.batch_metrics.snapshot(
+                queue_depth=self.response_generator.requests.qsize(),
+                memory=_batch_memory_snapshot(prompt_cache),
+            )
+            payload["configured"] = {
+                "decode_concurrency": int(
+                    getattr(self.response_generator.cli_args, "decode_concurrency", 1)
+                ),
+                "prompt_concurrency": int(
+                    getattr(self.response_generator.cli_args, "prompt_concurrency", 1)
+                ),
+                "max_inflight_requests": int(
+                    getattr(self.response_generator.cli_args, "max_inflight_requests", 0)
+                    or 0
+                ),
+                "verification_row_cap": getattr(
+                    self.response_generator.cli_args,
+                    "self_mtp_verification_row_cap",
+                    None,
+                ),
+                "fault_injection": bool(
+                    getattr(
+                        self.response_generator.cli_args,
+                        "batch_fault_injection",
+                        False,
+                    )
+                ),
+            }
+            self._json_ok(payload)
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -5746,6 +5946,17 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--self-mtp-verification-row-cap",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Cap target plus speculative rows in each MTP verify forward. "
+            "At every cycle the branch budget is floor((N-primary_rows)/k); "
+            "memory admission can reduce it further. Default: unset."
+        ),
+    )
+    parser.add_argument(
         "--self-mtp-max-prompt-tokens",
         type=int,
         default=None,
@@ -6009,6 +6220,31 @@ def setup_arg_parser():
         help="When a request is batchable then decode that many requests in parallel",
     )
     parser.add_argument(
+        "--max-inflight-requests",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Reject new work with HTTP 429 once N requests are queued or active. "
+            "0 keeps the compatibility default with no count ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--batch-metrics-history",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Bounded request and event history exposed by /v1/status/batching.",
+    )
+    parser.add_argument(
+        "--batch-fault-injection",
+        action="store_true",
+        help=(
+            "Allow qualification-only mlx_fault request controls. Disabled by "
+            "default; do not enable on an untrusted endpoint."
+        ),
+    )
+    parser.add_argument(
         "--prompt-concurrency",
         type=int,
         default=8,
@@ -6189,6 +6425,15 @@ def main():
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
     if args.prompt_host_cache_size < 1:
         parser.error("--prompt-host-cache-size must be >= 1")
+    if args.max_inflight_requests < 0:
+        parser.error("--max-inflight-requests must be >= 0")
+    if args.batch_metrics_history < 1:
+        parser.error("--batch-metrics-history must be >= 1")
+    if (
+        args.self_mtp_verification_row_cap is not None
+        and args.self_mtp_verification_row_cap < 1
+    ):
+        parser.error("--self-mtp-verification-row-cap must be >= 1")
     if args.self_mtp_window_size and not args.self_mtp_persistent:
         parser.error("--self-mtp-window-size requires --self-mtp-persistent")
     try:
