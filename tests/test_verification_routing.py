@@ -53,3 +53,47 @@ def test_timely_gpu_keeps_work_on_gpu_without_memory_pressure():
 def test_invalid_probability_is_rejected():
     with pytest.raises(ValueError, match="acceptance_probability"):
         pending("bad", 1.1, 0)
+
+
+def test_memory_pressure_does_not_replace_a_measured_crossover():
+    decision = select_ane_verification(
+        [pending("batch", 0.9, 20)],
+        enabled=True,
+        memory_pressure=True,
+        gpu_verify_delay_ms=1,
+        min_gpu_delay_ms=2,
+    )
+    assert decision.reason == "gpu_service_is_timely"
+    assert decision.selected_batch_id is None
+
+
+def test_residency_headroom_and_overlap_are_hard_gates():
+    common = dict(
+        pending=[pending("batch", 0.9, 20)],
+        enabled=True,
+        memory_pressure=True,
+        gpu_verify_delay_ms=3,
+        min_gpu_delay_ms=2,
+        ane_package_gib=1.2,
+        ane_service_p95_ms=11,
+    )
+    assert (
+        select_ane_verification(**common, ane_package_resident=False).reason
+        == "ane_package_not_resident"
+    )
+    assert (
+        select_ane_verification(**common, ane_memory_headroom_gib=1.0).reason
+        == "ane_package_exceeds_headroom"
+    )
+    assert (
+        select_ane_verification(
+            **common, ane_memory_headroom_gib=2.0, available_overlap_ms=8
+        ).reason
+        == "ane_service_not_hidden"
+    )
+    assert (
+        select_ane_verification(
+            **common, ane_memory_headroom_gib=2.0, available_overlap_ms=20
+        ).selected_batch_id
+        == "batch"
+    )

@@ -1,9 +1,9 @@
-"""Host policy for a future exact delayed-verification backend."""
+"""Host policy for delayed GPU or guarded ANE verification."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Iterable
 
 
@@ -43,12 +43,19 @@ def select_ane_verification(
     gpu_verify_delay_ms: float,
     min_gpu_delay_ms: float = 10.0,
     starvation_ms: float = 250.0,
+    ane_package_resident: bool = True,
+    ane_memory_headroom_gib: float = math.inf,
+    ane_package_gib: float = 0.0,
+    available_overlap_ms: float = math.inf,
+    ane_service_p95_ms: float = 0.0,
 ) -> ANEVerificationDecision:
-    """Select one exact-eligible batch without claiming an ANE implementation.
+    """Select one exact-eligible batch from measured scheduler state.
 
     Starved work wins first. Otherwise the highest expected acceptance wins,
-    with age as a bounded tie-breaker. The caller must supply an independently
-    qualified exact ANE backend before acting on the selection.
+    with age as a bounded tie-breaker. ``gpu_verify_delay_ms`` is an observed or
+    predicted *marginal critical-path delay*, not a batch-width proxy.  The ANE
+    lane is useful only when another GPU unit can cover its service time; memory
+    pressure alone cannot waive that dependency or the package residency cost.
     """
     candidates = tuple(item for item in pending if item.exact_ane_eligible)
     ranked = tuple(
@@ -70,6 +77,12 @@ def select_ane_verification(
         return ANEVerificationDecision(None, "disabled", ids)
     if not ranked:
         return ANEVerificationDecision(None, "no_exact_eligible_batch", ids)
-    if not memory_pressure and gpu_verify_delay_ms < min_gpu_delay_ms:
+    if not ane_package_resident:
+        return ANEVerificationDecision(None, "ane_package_not_resident", ids)
+    if ane_memory_headroom_gib < ane_package_gib:
+        return ANEVerificationDecision(None, "ane_package_exceeds_headroom", ids)
+    if gpu_verify_delay_ms < min_gpu_delay_ms:
         return ANEVerificationDecision(None, "gpu_service_is_timely", ids)
+    if available_overlap_ms < ane_service_p95_ms:
+        return ANEVerificationDecision(None, "ane_service_not_hidden", ids)
     return ANEVerificationDecision(ranked[0].batch_id, "eligible", ids)
