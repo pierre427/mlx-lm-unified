@@ -664,6 +664,43 @@ def test_generation_batch_seam_keeps_two_concrete_b1_rows():
     batch.close()
 
 
+def test_live_true_batched_width_lock_defers_join_until_empty_cohort():
+    """A live B2 consumer must not silently become B3 mid-generation."""
+    from mlx_lm.generate import MTPGenerationBatch, StopSequenceMatcher
+
+    segmented_self_mtp_stats(reset=True)
+    active = MTPGenerationBatch(
+        object(),
+        [_detached(0), _detached(1)],
+        [None, None],
+        [StopSequenceMatcher(), StopSequenceMatcher()],
+        segmented_live_tip=True,
+    )
+    arriving = MTPGenerationBatch(
+        object(),
+        [_detached(2)],
+        [None],
+        [StopSequenceMatcher()],
+        segmented_live_tip=True,
+    )
+    active._segmented_compute_width_locked = True
+
+    active.extend(arriving)
+
+    assert active.uids == [0, 1]
+    assert list(active._paused) == [2]
+    assert segmented_self_mtp_stats()["live_width_change_deferrals"] == 1
+
+    # The preserved detached row enters a new, ownership-free cohort.
+    active.state.lanes.clear()
+    active.state.row_caches.clear()
+    active.state.transactions.clear()
+    active._attach_packages(list(active._paused.values()))
+    active._paused.clear()
+    assert active.uids == [2]
+    active.close()
+
+
 def test_generation_batch_promotes_after_one_uniform_segmented_cycle():
     from types import SimpleNamespace
 

@@ -43,6 +43,7 @@ _ZERO = {
     "true_batched_requests": 0,
     "true_batched_engaged": 0,
     "true_batched_declined": 0,
+    "live_width_change_deferrals": 0,
     "layer_local_materializations": 0,
     "recurrent_state_materializations": 0,
     "recurrent_state_materialized_bytes": 0,
