@@ -62,6 +62,52 @@ def token_digest(tokens: list[int]) -> str:
     ).hexdigest()
 
 
+def classify_first_envelope_flip(
+    reference_tokens: list[int],
+    candidate_tokens: list[int],
+    reference_envelopes: list[dict[str, Any]],
+    candidate_envelopes: list[dict[str, Any]],
+    *,
+    shape_noise_band: float = 3e-3,
+) -> dict[str, Any] | None:
+    """Classify only the first mismatch using opt-in top-two receipts.
+
+    ``near_tie_candidate`` is deliberately conservative: both disagreeing
+    tokens must be in each arm's top two and both margins must fit the known
+    cross-shape noise band. It is diagnostic only; exact qualification is
+    unchanged.
+    """
+    if shape_noise_band < 0:
+        raise ValueError("shape_noise_band must be non-negative")
+    position = first_divergence(reference_tokens, candidate_tokens)
+    if position is None:
+        return None
+    if position >= len(reference_envelopes) or position >= len(candidate_envelopes):
+        raise ValueError("missing envelope at first token divergence")
+    reference = reference_envelopes[position]
+    candidate = candidate_envelopes[position]
+    reference_limit = shape_noise_band * max(1.0, float(reference["scale"]))
+    candidate_limit = shape_noise_band * max(1.0, float(candidate["scale"]))
+    reference_token = int(reference_tokens[position])
+    candidate_token = int(candidate_tokens[position])
+    reference_top_two = {int(reference["top1_token"]), int(reference["top2_token"])}
+    candidate_top_two = {int(candidate["top1_token"]), int(candidate["top2_token"])}
+    return {
+        "position": position,
+        "reference_token": reference_token,
+        "candidate_token": candidate_token,
+        "reference": reference,
+        "candidate": candidate,
+        "shape_noise_band": shape_noise_band,
+        "near_tie_candidate": (
+            {reference_token, candidate_token}.issubset(reference_top_two)
+            and {reference_token, candidate_token}.issubset(candidate_top_two)
+            and float(reference["top2_margin"]) <= reference_limit
+            and float(candidate["top2_margin"]) <= candidate_limit
+        ),
+    }
+
+
 def distribution_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -399,11 +445,30 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
     from mlx_lm.sample_utils import LaneRNG
     from mlx_lm.segmented_self_mtp import segmented_self_mtp_stats
 
+    def envelope(logprobs: Any, token: int) -> dict[str, Any]:
+        """Read a bounded top-two receipt after the benchmark's normal eval."""
+        values = mx.reshape(logprobs, (-1,))
+        if int(values.size) < 2:
+            raise ValueError("logprob envelope requires a vocabulary of at least two")
+        top = mx.argsort(values)[-2:]
+        mx.eval(top, values[top], mx.max(mx.abs(values)))
+        runner_up, winner = (int(value) for value in top.tolist())
+        runner_up_value, winner_value = (float(value) for value in values[top].tolist())
+        return {
+            "top1_token": winner,
+            "top1_logprob": winner_value,
+            "top2_token": runner_up,
+            "top2_logprob": runner_up_value,
+            "top2_margin": winner_value - runner_up_value,
+            "scale": float(mx.max(mx.abs(values)).item()),
+        }
+
     mx.reset_peak_memory()
     segmented_before = segmented_self_mtp_stats(reset=False)
     started = time.perf_counter()
     prepared = []
     traces: dict[int, list[int]] = {}
+    envelopes: dict[int, list[dict[str, Any]]] = {}
     for uid, prompt in enumerate(prompts):
         lane, first = prepare_self_mtp_lane(
             prompt,
@@ -425,6 +490,8 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
         )
         prepared.append(lane)
         traces[uid] = [int(first.token)]
+        if args.capture_logprob_envelopes:
+            envelopes[uid] = [envelope(first.logprobs, int(first.token))]
     prepared_at = time.perf_counter()
 
     if arm == "fixed_cohort":
@@ -468,6 +535,11 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
                 remaining = args.max_tokens - len(traces[lane.uid])
                 delivered = outputs[:remaining]
                 traces[lane.uid].extend(int(output.token) for output in delivered)
+                if args.capture_logprob_envelopes:
+                    envelopes[lane.uid].extend(
+                        envelope(output.logprobs, int(output.token))
+                        for output in delivered
+                    )
                 emitted_counts.append(len(delivered))
                 terminal.append(len(traces[lane.uid]) >= args.max_tokens)
             commit_batched_self_mtp(
@@ -552,7 +624,7 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
         for key, value in segmented_after.items()
         if isinstance(value, int) and isinstance(segmented_before.get(key, 0), int)
     }
-    return {
+    result = {
         "arm": arm,
         "prepare_wall_s": prepared_at - started,
         "transaction_wall_s": transaction_wall,
@@ -576,6 +648,11 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
             "joined": join_receipt is not None if arm == "dynamic_join" else False,
         },
     }
+    if args.capture_logprob_envelopes:
+        result["logprob_envelopes_by_uid"] = {
+            str(uid): values for uid, values in envelopes.items()
+        }
+    return result
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -703,6 +780,17 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
             }
         dynamic["exact_by_uid"] = per_uid
         dynamic["exact_fixed_match"] = all(row["exact"] for row in per_uid.values())
+        if args.capture_logprob_envelopes:
+            dynamic["first_divergence_envelopes"] = {
+                uid: classify_first_envelope_flip(
+                    fixed["token_ids_by_uid"][uid],
+                    dynamic["token_ids_by_uid"][uid],
+                    fixed["logprob_envelopes_by_uid"][uid],
+                    dynamic["logprob_envelopes_by_uid"][uid],
+                )
+                for uid, row in per_uid.items()
+                if not row["exact"]
+            }
         dynamic["transaction_tps_ratio_vs_fixed"] = (
             dynamic["aggregate_decode_tps"] / fixed["aggregate_decode_tps"]
         )
@@ -790,6 +878,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--share-qsa-indices",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--capture-logprob-envelopes",
+        action="store_true",
+        help="diagnostic-only host receipts for first cross-shape token flips",
     )
     parser.add_argument(
         "--out", default="results/qwen4-mtp-dynamic-join-gate-20260910.json"

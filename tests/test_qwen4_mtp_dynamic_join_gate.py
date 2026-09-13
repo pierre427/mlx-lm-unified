@@ -32,6 +32,7 @@ def args(**overrides):
         cancel_after_tokens=32,
         seed=20260910,
         share_qsa_indices=True,
+        capture_logprob_envelopes=False,
         out="unused.json",
     )
     values.update(overrides)
@@ -155,6 +156,16 @@ def test_first_divergence_handles_content_and_length():
     assert MODULE.first_divergence([1, 2, 3], [1, 9, 3]) == 1
     assert MODULE.first_divergence([1, 2], [1, 2, 3]) == 2
     assert MODULE.first_divergence([1, 2], [1, 2]) is None
+
+
+def test_first_envelope_flip_requires_top_two_membership_and_bounded_margin():
+    reference = [{"top1_token": 4, "top2_token": 9, "top2_margin": 0.02, "scale": 10.0}]
+    candidate = [{"top1_token": 9, "top2_token": 4, "top2_margin": 0.01, "scale": 10.0}]
+    receipt = MODULE.classify_first_envelope_flip([4], [9], reference, candidate)
+    assert receipt["position"] == 0
+    assert receipt["near_tie_candidate"]
+    candidate[0]["top2_margin"] = 0.04
+    assert not MODULE.classify_first_envelope_flip([4], [9], reference, candidate)["near_tie_candidate"]
 
 
 def test_warmup_compiles_shapes_without_requiring_measured_cancellation():
