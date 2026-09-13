@@ -3574,7 +3574,12 @@ class MTPGenerationBatch:
                 uid,
                 len(self._prefix_tokens(paused.detached.lane)) + 1,
                 paused.detached.lane.num_draft,
-                False,
+                # Pausing detaches the row from the device batch but does not
+                # release its target or draft cache. Those bytes are already
+                # reflected in the live free-memory reading; charging them as
+                # a fresh joining allocation can make the lane queue itself
+                # forever under pressure.
+                True,
                 sum(
                     cache.nbytes
                     for cache in (

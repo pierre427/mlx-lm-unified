@@ -253,6 +253,24 @@ class TestMTPGenerationBatch(unittest.TestCase):
         self.assertEqual([(r.uid, r.token) for r in responses], [(2, 1)])
         propose.assert_not_called()
 
+    def test_paused_lane_reports_its_retained_cache_as_resident(self):
+        decisions = {1: "queue"}
+        batch = self._batch(
+            [_Lane(1, depth=3)],
+            admission=lambda rows: {row[0]: decisions[row[0]] for row in rows},
+        )
+
+        with patch(
+            "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+            side_effect=_detach,
+        ):
+            batch._apply_admission()
+
+        self.assertEqual(batch.uids, [])
+        (row,) = batch.mtp_cycle_state()
+        self.assertEqual(row[0], 1)
+        self.assertTrue(row[3])
+
     def test_async_segmented_cohort_cancels_empties_and_reconstructs(self):
         """A membership churn boundary must retire and re-arm async work."""
 
