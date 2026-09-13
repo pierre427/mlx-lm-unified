@@ -32,6 +32,14 @@ def xml(value="hi", name="f"):
     return f"<function={name}><parameter=x>{value}</parameter></function>"
 
 
+def qwen_xml_call(name, parameter, value, closed=True):
+    text = (
+        f"<tool_call>\n<function={name}>\n<parameter={parameter}>\n"
+        f"{value}\n</parameter>\n</function>"
+    )
+    return text + ("\n</tool_call>" if closed else "")
+
+
 def context():
     return SimpleNamespace(
         tool_parser=parse_tool_call,
@@ -62,6 +70,22 @@ def assembled(parts, stream=False, finish="stop"):
     return content, reasoning, calls, choices[-1]["finish_reason"]
 
 
+def assembled_tool_calls(parts, stream=False, finish="stop"):
+    events = [_r(part, i) for i, part in enumerate(parts)] + [_r("", 999, finish)]
+    result = _AssemblyHarness(context(), events, stream=stream).run()
+    choices = (
+        [chunk["choices"][0] for chunk in result]
+        if stream
+        else result["choices"]
+    )
+    calls, content = [], ""
+    for choice in choices:
+        message = choice["delta" if stream else "message"]
+        content += message.get("content") or ""
+        calls.extend(message.get("tool_calls", []))
+    return content, calls, choices[-1]["finish_reason"]
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_all_two_piece_splits_multiple_calls_and_reasoning(stream):
     text = (
@@ -79,6 +103,57 @@ def test_all_two_piece_splits_multiple_calls_and_reasoning(stream):
     for cut in range(len(text) + 1):
         assert assembled([text[:cut], text[cut:]], stream) == expected, cut
     assert assembled(list(text), stream) == expected
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("separator", ["", "\n", "\n\n"])
+@pytest.mark.parametrize("prefix", ["", "Before tools. "])
+def test_separate_qwen_tool_blocks_at_every_split(stream, separator, prefix):
+    text = (
+        prefix
+        + qwen_xml_call("weather", "city", "Toronto")
+        + separator
+        + qwen_xml_call("clock", "timezone", "America/Toronto")
+    )
+    expected = [
+        {"name": "weather", "arguments": '{"city": "Toronto"}'},
+        {"name": "clock", "arguments": '{"timezone": "America/Toronto"}'},
+    ]
+
+    def check(parts):
+        content, calls, reason = assembled_tool_calls(parts, stream)
+        assert content == prefix + separator
+        assert [call["function"] for call in calls] == expected
+        assert reason == "tool_calls"
+        if stream:
+            assert [call["index"] for call in calls] == [0, 1]
+
+    for cut in range(len(text) + 1):
+        check([text[:cut], text[cut:]])
+    check(list(text))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_second_separate_qwen_block_can_finish_unclosed(stream, finish):
+    text = (
+        qwen_xml_call("weather", "city", "Toronto")
+        + "\n"
+        + qwen_xml_call("clock", "timezone", "America/Toronto", closed=False)
+    )
+    expected = [
+        {"name": "weather", "arguments": '{"city": "Toronto"}'},
+        {"name": "clock", "arguments": '{"timezone": "America/Toronto"}'},
+    ]
+    for cut in range(len(text) + 1):
+        content, calls, reason = assembled_tool_calls(
+            [text[:cut], text[cut:]], stream, finish
+        )
+        assert content == "\n", cut
+        assert [call["function"] for call in calls] == expected, cut
+        assert reason == ("tool_calls" if finish == "stop" else "length"), cut
+        if stream:
+            assert [call["index"] for call in calls] == [0, 1], cut
 
 
 @pytest.mark.parametrize("stream", [False, True])
