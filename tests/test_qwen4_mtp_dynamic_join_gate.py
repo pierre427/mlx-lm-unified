@@ -19,6 +19,7 @@ def args(**overrides):
         context=16384,
         lanes=2,
         initial_lanes=1,
+        static_cohort=False,
         join_after_cycles=4,
         max_tokens=128,
         num_draft=2,
@@ -32,6 +33,7 @@ def args(**overrides):
         cancel_after_tokens=32,
         seed=20260910,
         share_qsa_indices=True,
+        capture_logprob_envelopes=False,
         out="unused.json",
     )
     values.update(overrides)
@@ -48,6 +50,17 @@ def test_plan_is_paired_rotated_and_model_free():
     ]
     assert plan["joining_lanes"] == 1
     assert not plan["execution_authorized"]
+
+
+def test_static_plan_requires_and_describes_full_initial_cohort():
+    plan = MODULE.build_plan(
+        args(lanes=4, initial_lanes=4, static_cohort=True, max_tokens=8)
+    )
+    assert plan["static_cohort"] is True
+    assert plan["joining_lanes"] == 0
+    assert "static B4" in plan["correctness_gate"]
+    with pytest.raises(ValueError, match="initial-lanes == lanes"):
+        MODULE.build_plan(args(lanes=4, initial_lanes=2, static_cohort=True))
 
 
 @pytest.mark.parametrize(
@@ -106,6 +119,25 @@ def test_summary_requires_exact_and_post_join_qsa_engagement():
     assert summary["dynamic_qsa_engaged"] == 1
 
 
+def test_summary_uses_in_cohort_qsa_receipt_for_static_b4():
+    rows = [
+        {
+            "arm": "dynamic_join",
+            "cohort_mode": "static",
+            "transaction_wall_s": 2.0,
+            "aggregate_decode_tps": 100.0,
+            "exact_fixed_match": True,
+            "qsa_share": {
+                "share_requested": 3,
+                "reuse_observed": 3,
+                "post_join_share_requested": 0,
+                "post_join_reuse_observed": 0,
+            },
+        }
+    ]
+    assert MODULE.summarize(rows)["dynamic_qsa_engaged"] == 1
+
+
 def test_summary_excludes_thermally_discarded_pair_from_medians():
     rows = [
         {
@@ -155,6 +187,16 @@ def test_first_divergence_handles_content_and_length():
     assert MODULE.first_divergence([1, 2, 3], [1, 9, 3]) == 1
     assert MODULE.first_divergence([1, 2], [1, 2, 3]) == 2
     assert MODULE.first_divergence([1, 2], [1, 2]) is None
+
+
+def test_first_envelope_flip_requires_top_two_membership_and_bounded_margin():
+    reference = [{"top1_token": 4, "top2_token": 9, "top2_margin": 0.02, "scale": 10.0}]
+    candidate = [{"top1_token": 9, "top2_token": 4, "top2_margin": 0.01, "scale": 10.0}]
+    receipt = MODULE.classify_first_envelope_flip([4], [9], reference, candidate)
+    assert receipt["position"] == 0
+    assert receipt["near_tie_candidate"]
+    candidate[0]["top2_margin"] = 0.04
+    assert not MODULE.classify_first_envelope_flip([4], [9], reference, candidate)["near_tie_candidate"]
 
 
 def test_warmup_compiles_shapes_without_requiring_measured_cancellation():

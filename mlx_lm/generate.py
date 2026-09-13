@@ -3132,6 +3132,28 @@ def _segment_aware_live_tip_enabled(config: Optional[Mapping[str, Any]]) -> bool
     return segmented_self_mtp_enabled(explicit)
 
 
+def _segment_aware_cohort_size(config: Optional[Mapping[str, Any]]) -> int:
+    """Return the max width admitted before a segmented cohort starts.
+
+    This is an admission-window target, not permission to widen a live
+    true-batched cohort.  The latter remains rejected by MTPGenerationBatch's
+    width lock.  Leaving this unspecified preserves the qualified N=2 policy.
+    """
+
+    value = (
+        config.get("segment_aware_cohort_size", 2)
+        if config is not None
+        else 2
+    )
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("segment_aware_cohort_size must be an integer") from error
+    if value < 1:
+        raise ValueError("segment_aware_cohort_size must be positive")
+    return value
+
+
 def _segmented_async_qsa_promotion_enabled(
     config: Optional[Mapping[str, Any]],
 ) -> bool:
@@ -3352,6 +3374,10 @@ class MTPGenerationBatch:
         self._async_qsa_ticket = None
         self._async_qsa_receipt = None
         self._async_qsa_receipts_by_uid = {}
+        # Once a segmented cohort has executed as one device batch, preserve
+        # that width until the cohort drains. Changing it live can select a
+        # different Apple GPU numerical path for already-running requests.
+        self._segmented_compute_width_locked = False
         self._async_qsa_pending = (
             self.async_qsa_promotion and self.segmented_live_tip
         )
@@ -3633,6 +3659,20 @@ class MTPGenerationBatch:
             depth = depths.pop()
             for package in packages:
                 package.detached.lane.num_draft = depth
+        if (
+            self.segmented_live_tip
+            and self._segmented_compute_width_locked
+            and self.state.lanes
+        ):
+            from .segmented_self_mtp import note_segmented_self_mtp
+
+            for package in packages:
+                uid = package.detached.lane.uid
+                if uid in self._paused:
+                    raise ValueError(f"duplicate deferred self-MTP lane uid {uid}")
+                self._paused[uid] = package
+            note_segmented_self_mtp("live_width_change_deferrals", len(packages))
+            return
         attach = (
             attach_segmented_self_mtp_lanes
             if self.segmented_live_tip
@@ -3646,6 +3686,12 @@ class MTPGenerationBatch:
         self._num_tokens.extend(package.num_tokens for package in packages)
         self._initial_outputs.extend(package.initial_output for package in packages)
         self._arm_async_qsa_promotion()
+
+    @property
+    def has_deferred_lanes(self) -> bool:
+        """Whether fixed-width segmented admission is holding arrivals."""
+
+        return bool(self._paused)
 
     def _apply_admission(self):
         if self.mtp_admission is None:
@@ -3693,6 +3739,7 @@ class MTPGenerationBatch:
         epoch = int(getattr(self.state, "membership_epoch", 0))
         self.state = SegmentedSelfMTPState([], [], [], epoch)
         self.segmented_live_tip = True
+        self._segmented_compute_width_locked = False
         self._async_qsa_pending = True
         self._async_qsa_receipt = None
         self._async_qsa_receipts_by_uid.clear()
@@ -3898,6 +3945,12 @@ class MTPGenerationBatch:
 
         self._apply_admission()
         if not self.state.lanes:
+            self._segmented_compute_width_locked = False
+        if not self.state.lanes and self._paused and self.mtp_admission is None:
+            deferred = list(self._paused.values())
+            self._paused.clear()
+            self._attach_packages(deferred)
+        if not self.state.lanes:
             return []
 
         from .hybrid_speculative import (
@@ -3907,6 +3960,10 @@ class MTPGenerationBatch:
         )
 
         proposal = propose_batched_self_mtp(self.model, self.state)
+        true_batched_segmented = bool(
+            getattr(self, "segmented_live_tip", False)
+            and getattr(self.state, "_batched_state", None) is not None
+        )
         try:
             emitted_counts = []
             terminal = []
@@ -3948,6 +4005,8 @@ class MTPGenerationBatch:
                 emitted_counts=emitted_counts,
                 terminal=terminal,
             )
+            if true_batched_segmented:
+                self._segmented_compute_width_locked = True
             ticket = self._async_qsa_ticket
             if ticket is not None:
                 if any(terminal):
@@ -5090,7 +5149,10 @@ class BatchGenerator:
         generation_responses = []
         prompt_responses = []
 
-        if self._generation_batch.mtp_cycle_state():
+        if (
+            self._generation_batch.mtp_cycle_state()
+            or self._generation_batch.has_deferred_lanes
+        ):
             generation_responses.extend(self._generation_batch.next())
         generation_responses.extend(self._migrate_plain_fallbacks())
         if len(self._plain_fallback_batch) > 0:
@@ -5111,9 +5173,12 @@ class BatchGenerator:
             len(self._unprocessed_sequences),
         )
         if _segment_aware_live_tip_enabled(self.self_mtp):
-            # This first production gate is deliberately N=2. Keep dynamic
-            # admission from silently growing a wider independent-B1 cohort.
-            n = min(n, max(0, 2 - occupied))
+            # Admit an explicit static cohort before its first batched cycle.
+            # Once that consumer has run, MTPGenerationBatch holds later
+            # arrivals for the next ownership-free cohort instead of widening
+            # the device shape under active requests.
+            cohort_size = _segment_aware_cohort_size(self.self_mtp)
+            n = min(n, max(0, cohort_size - occupied))
         n = self._budget_admissible(n)
         n = self._admit_mtp_joining(n)
         if n > 0:

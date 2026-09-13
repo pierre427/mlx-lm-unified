@@ -284,11 +284,23 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+    request_started_ns: int = 0
+    request_admitted_ns: int = 0
+    generation_admitted_ns: int = 0
 
     _should_stop: bool = False
 
     def stop(self):
         self._should_stop = True
+
+
+def _generation_context_timing(args) -> Dict[str, int]:
+    """Copy monotonic request boundaries into a terminally visible context."""
+    return {
+        "request_started_ns": int(getattr(args, "_server_request_started_ns", 0)),
+        "request_admitted_ns": int(getattr(args, "_server_request_admitted_ns", 0)),
+        "generation_admitted_ns": time.perf_counter_ns(),
+    }
 
 
 @dataclass
@@ -309,13 +321,25 @@ def _completed_self_mtp_receipt(response, ctx):
     receipt = getattr(response, "mtp_receipt", None)
     if response.finish_reason is None or receipt is None:
         return None
-    return {
+    receipt = {
         **receipt,
         "ts": time.time(),
         "prompt_tokens": len(ctx.prompt),
         "cached_prompt_tokens": int(ctx.prompt_cache_count),
         "completed": True,
     }
+    completed_ns = time.perf_counter_ns()
+    started_ns = int(getattr(ctx, "request_started_ns", 0))
+    admitted_ns = int(getattr(ctx, "request_admitted_ns", 0))
+    generation_ns = int(getattr(ctx, "generation_admitted_ns", 0))
+    if 0 < started_ns <= admitted_ns <= generation_ns <= completed_ns:
+        receipt["server_timing_ms"] = {
+            "request_admission": (admitted_ns - started_ns) / 1e6,
+            "generation_admission": (generation_ns - admitted_ns) / 1e6,
+            "generation_service": (completed_ns - generation_ns) / 1e6,
+            "total": (completed_ns - started_ns) / 1e6,
+        }
+    return receipt
 
 
 class TimeBudget:
@@ -1258,6 +1282,14 @@ def _self_mtp_config(
         "accept_rule": "residual",
         "state_out": {},
     }
+    if getattr(cli_args, "self_mtp_segment_aware_live_tip", False):
+        # Experimental serving admission mode: form a fixed segmented cohort
+        # before its first true-batched cycle, then defer arrivals until the
+        # cohort is empty.  Kept default-off until the serving gates qualify.
+        config["segment_aware_live_tip"] = True
+        config["segment_aware_cohort_size"] = int(
+            getattr(cli_args, "self_mtp_segment_aware_cohort_size", 2)
+        )
     if quantized_kv:
         # Tag so the BatchGenerator constructor admits the quantized cache; the
         # cache is already built quantized by _make_new_cache.
@@ -2375,6 +2407,16 @@ class ResponseGenerator:
         self.admission_timeout = DEFAULT_SOFT_RELOAD_ADMISSION_TIMEOUT
 
         self._time_budget = TimeBudget()
+        # Always-on, synchronization-free evidence that the continuous-batch
+        # decode path actually ran at the configured width. Keep this to
+        # Python integer bookkeeping: benchmark gates need an engagement
+        # receipt, but telemetry must not synchronize the device it measures.
+        self._batch_decode_stats = {
+            "next_calls": 0,
+            "decode_calls": 0,
+            "max_generation_width": 0,
+            "generation_width_histogram": {},
+        }
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
@@ -2399,14 +2441,20 @@ class ResponseGenerator:
             old_capsule_pool.close()
         max_size = int(self.prompt_cache.max_size)
         max_bytes = int(self.prompt_cache.max_bytes)
+        max_tokens = getattr(self.prompt_cache, "max_tokens", None)
         self.prompt_cache = (
             AutomaticPrefixCacheV2(
                 max_size=max_size,
                 max_bytes=max_bytes,
+                max_tokens=max_tokens,
                 layout_name=str(layout_name),
             )
             if desired_v2
-            else AutomaticPrefixCache(max_size=max_size, max_bytes=max_bytes)
+            else AutomaticPrefixCache(
+                max_size=max_size,
+                max_bytes=max_bytes,
+                max_tokens=max_tokens,
+            )
         )
         self._cache_capsule_pool = CacheCapsulePool(
             self.prompt_cache.capsule_generation
@@ -2499,6 +2547,24 @@ class ResponseGenerator:
             except QueueEmpty:
                 pass
         return self._share_request(request)
+
+    def _record_batch_decode_width(self, batch_generator) -> None:
+        """Record the live generation width before one batch scheduler step."""
+
+        stats = self._batch_decode_stats
+        stats["next_calls"] += 1
+        generation = getattr(batch_generator, "_generation_batch", ())
+        fallback = getattr(batch_generator, "_plain_fallback_batch", ())
+        width = len(generation) + len(fallback)
+        if width <= 0:
+            return
+        stats["decode_calls"] += 1
+        stats["max_generation_width"] = max(
+            int(stats["max_generation_width"]), width
+        )
+        histogram = stats["generation_width_histogram"]
+        key = str(width)
+        histogram[key] = int(histogram.get(key, 0)) + 1
 
     def _share_object(self, obj):
         if not self._is_distributed:
@@ -2673,6 +2739,19 @@ class ResponseGenerator:
 
     def _tokenize(self, tokenizer, request, args):
         """Reuse an exact host prompt plane when the opt-in serving gate is on."""
+        def checked(result):
+            prompt = result[0]
+            ceiling = getattr(self.model_provider.cli_args, "max_context_length", None)
+            if ceiling is not None:
+                requested = len(prompt) + max(int(args.max_tokens), 0)
+                if requested > ceiling:
+                    raise ValueError(
+                        "request exceeds --max-context-length: "
+                        f"{len(prompt)} prompt + {args.max_tokens} output = "
+                        f"{requested} tokens, limit {ceiling}"
+                    )
+            return result
+
         if request.request_type == "chat" and tokenizer.has_chat_template:
             process_message_content(request.messages)
             if request.tools and not tokenizer.has_tool_calling:
@@ -2686,19 +2765,19 @@ class ResponseGenerator:
         if not getattr(self.model_provider.cli_args, "prompt_host_cache", False):
             if prompt_host_cache is not None:
                 prompt_host_cache.record_bypass("disabled")
-            return self._tokenize_uncached(tokenizer, request, args)
+            return checked(self._tokenize_uncached(tokenizer, request, args))
         if prompt_host_cache is None:
             # ResponseGenerator normally creates this owner in __init__.  A
             # few embedders construct a minimal generator around the uncached
             # tokenizer path; preserve that supported path instead of making
             # an opt-in cache an unconditional attribute dependency.
-            return self._tokenize_uncached(tokenizer, request, args)
+            return checked(self._tokenize_uncached(tokenizer, request, args))
 
         try:
             metadata = self._prompt_host_metadata(tokenizer, request, args)
         except (TypeError, ValueError, OverflowError):
             prompt_host_cache.record_bypass("uncacheable_input")
-            return self._tokenize_uncached(tokenizer, request, args)
+            return checked(self._tokenize_uncached(tokenizer, request, args))
 
         adopted = prompt_host_cache.lookup(
             metadata["input_fingerprint"], self._prompt_host_fingerprint(metadata)
@@ -2712,12 +2791,12 @@ class ResponseGenerator:
                     for span in plane.prefix_spans
                 ]
                 segment_types = [span.name for span in plane.prefix_spans]
-                return (
+                return checked((
                     prompt,
                     segments,
                     segment_types,
                     plane.initial_state,
-                )
+                ))
             finally:
                 adopted.close()
 
@@ -2751,7 +2830,7 @@ class ResponseGenerator:
             )
         except (TypeError, ValueError, OverflowError):
             prompt_host_cache.record_bypass("uncacheable_result")
-        return result
+        return checked(result)
 
     def _tokenize_uncached(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
@@ -3115,6 +3194,7 @@ class ResponseGenerator:
                         initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
+                        **_generation_context_timing(args),
                     )
                     rqueue.put(ctx)
 
@@ -3350,6 +3430,7 @@ class ResponseGenerator:
                 batch_idle = True
                 for _ in self._time_budget:
                     self.batch_metrics.batch_cycle(len(batch_results))
+                    self._record_batch_decode_width(batch_generator)
                     prompt_responses, gen_responses = batch_generator.next()
                     if not prompt_responses and not gen_responses:
                         break
@@ -3601,6 +3682,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                **_generation_context_timing(args),
             )
             context_published = False
 
@@ -4048,6 +4130,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                **_generation_context_timing(args),
             )
             rqueue.put(ctx)
 
@@ -4356,9 +4439,12 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
+        request_started_ns = time.perf_counter_ns()
         request_id = generation_args.request_id or f"request-{uuid.uuid4()}"
         generation_args.request_id = request_id
         self._admit_request(request_id, generation_args.tenant_id)
+        generation_args._server_request_started_ns = request_started_ns
+        generation_args._server_request_admitted_ns = time.perf_counter_ns()
         released = False
         terminal_status = "cancelled"
 
@@ -4942,12 +5028,28 @@ class APIHandler(BaseHTTPRequestHandler):
                 "effective_config": read_effective_config(cli_args),
                 "restart_required": dict(SOFT_RELOAD_RESTART_KEYS),
                 "prompt_cache": {
+                    "implementation": type(
+                        self.response_generator.prompt_cache
+                    ).__name__,
                     "entries": len(self.response_generator.prompt_cache),
                     "bytes": int(
                         getattr(self.response_generator.prompt_cache, "nbytes", 0)
                     ),
                     "apc_stats": getattr(
                         self.response_generator.prompt_cache, "apc_stats", {}
+                    ),
+                    "max_tokens": getattr(
+                        self.response_generator.prompt_cache, "max_tokens", None
+                    ),
+                    "max_entry_tokens": getattr(
+                        self.response_generator.prompt_cache,
+                        "max_entry_tokens",
+                        0,
+                    ),
+                    "overlength_rejections": getattr(
+                        self.response_generator.prompt_cache,
+                        "overlength_rejections",
+                        0,
                     ),
                 },
                 "inflight": self.response_generator.inflight,
@@ -5585,6 +5687,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     "max_prompt_tokens": getattr(
                         cli, "self_mtp_max_prompt_tokens", None
                     ),
+                    "segment_aware_live_tip": bool(
+                        getattr(cli, "self_mtp_segment_aware_live_tip", False)
+                    ),
+                    "segment_aware_cohort_size": int(
+                        getattr(cli, "self_mtp_segment_aware_cohort_size", 2)
+                    ),
                 },
                 "prompt_cache": {
                     "entries": len(self.response_generator.prompt_cache),
@@ -5597,6 +5705,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
                 "receipts": receipts,
                 "engaged_requests": len(receipts),
+                "batch_decode": self.response_generator._batch_decode_stats,
                 "apc_boundaries": dict(SELF_MTP_APC_COUNTERS),
                 "segmented": segmented_self_mtp_stats(),
             }
@@ -5834,6 +5943,7 @@ def run(
             if model_provider.cli_args.prompt_cache_bytes is not None
             else 1 << 63
         ),
+        max_tokens=model_provider.cli_args.max_context_length,
     )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
@@ -6033,6 +6143,26 @@ def setup_arg_parser():
         help=(
             "Reuse QSA top-k blocks after the first step of each chained MTP "
             "draft cycle (default: off; target verification is unchanged)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-segment-aware-live-tip",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental: keep each segmented self-MTP cohort at a fixed "
+            "width while it is live; later arrivals wait for an empty seam "
+            "(default: off)."
+        ),
+    )
+    parser.add_argument(
+        "--self-mtp-segment-aware-cohort-size",
+        type=int,
+        default=2,
+        metavar="N",
+        help=(
+            "Initial fixed width for --self-mtp-segment-aware-live-tip. "
+            "A live cohort is never widened (default: 2)."
         ),
     )
     parser.add_argument(
@@ -6315,6 +6445,26 @@ def setup_arg_parser():
         help="Maximum number of distinct KV caches to hold in the prompt cache",
     )
     parser.add_argument(
+        "--max-context-length",
+        type=int,
+        default=None,
+        help=(
+            "Hard prompt-plus-output token ceiling. Requests exceeding it are "
+            "rejected before cache lookup/prefill, and APC refuses to retain "
+            "entries beyond the same ceiling. Default: model limit only."
+        ),
+    )
+    parser.add_argument(
+        "--process-wired-limit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply MLX's recommended process wired-memory clamp for ordinary "
+            "serving (default: on). Disable explicitly only when an external "
+            "memory/swap guard owns the safety boundary."
+        ),
+    )
+    parser.add_argument(
         "--prompt-host-cache",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6404,7 +6554,11 @@ def _configure_process_wired_limit(args):
     model reproducibly causes a Metal watchdog timeout on its first PLE
     command; MLX's existing default limit completes the same stream.
     """
-    if not mx.metal.is_available() or getattr(args, "self_mtp", False):
+    if (
+        not mx.metal.is_available()
+        or getattr(args, "self_mtp", False)
+        or not getattr(args, "process_wired_limit", True)
+    ):
         return None
     wired_limit = mx.device_info()["max_recommended_working_set_size"]
     mx.set_wired_limit(wired_limit)
@@ -6434,6 +6588,10 @@ def main():
         and args.self_mtp_verification_row_cap < 1
     ):
         parser.error("--self-mtp-verification-row-cap must be >= 1")
+    if args.max_context_length is not None and args.max_context_length < 1:
+        parser.error("--max-context-length must be >= 1")
+    if args.self_mtp_segment_aware_cohort_size < 1:
+        parser.error("--self-mtp-segment-aware-cohort-size must be >= 1")
     if args.self_mtp_window_size and not args.self_mtp_persistent:
         parser.error("--self-mtp-window-size requires --self-mtp-persistent")
     try:

@@ -26,6 +26,7 @@ from mlx_lm.server import (
     _make_sampler,
     _measure_kv_cost,
     _configure_process_wired_limit,
+    _completed_self_mtp_receipt,
     _request_output_ceiling,
     _request_sampling_profile,
     _self_mtp_config,
@@ -122,6 +123,86 @@ class TestModelProvider(unittest.TestCase):
         self.assertTrue(provider.is_batchable)
 
 
+class TestBatchDecodeTelemetry(unittest.TestCase):
+    def make_generator(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._batch_decode_stats = {
+            "next_calls": 0,
+            "decode_calls": 0,
+            "max_generation_width": 0,
+            "generation_width_histogram": {},
+        }
+        return generator
+
+    def test_records_live_width_without_touching_device_state(self):
+        generator = self.make_generator()
+        batch = types.SimpleNamespace(
+            _generation_batch=[object(), object(), object(), object()],
+            _plain_fallback_batch=[],
+        )
+
+        generator._record_batch_decode_width(batch)
+        generator._record_batch_decode_width(batch)
+
+        self.assertEqual(
+            generator._batch_decode_stats,
+            {
+                "next_calls": 2,
+                "decode_calls": 2,
+                "max_generation_width": 4,
+                "generation_width_histogram": {"4": 2},
+            },
+        )
+
+    def test_empty_generation_only_counts_scheduler_call(self):
+        generator = self.make_generator()
+        batch = types.SimpleNamespace(
+            _generation_batch=[], _plain_fallback_batch=[]
+        )
+
+        generator._record_batch_decode_width(batch)
+
+        self.assertEqual(generator._batch_decode_stats["next_calls"], 1)
+        self.assertEqual(generator._batch_decode_stats["decode_calls"], 0)
+
+
+class TestServerContextCeiling(unittest.TestCase):
+    def make_generator(self, ceiling):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                max_context_length=ceiling,
+                prompt_host_cache=False,
+            )
+        )
+        generator._prompt_host_cache = None
+        return generator
+
+    def test_prompt_plus_output_at_ceiling_is_admitted(self):
+        generator = self.make_generator(16)
+        args = types.SimpleNamespace(max_tokens=4)
+        request = types.SimpleNamespace(request_type="text", prompt="ignored")
+        with patch.object(
+            generator,
+            "_tokenize_uncached",
+            return_value=(list(range(12)), [list(range(12))], ["assistant"], "normal"),
+        ):
+            result = generator._tokenize(object(), request, args)
+        self.assertEqual(len(result[0]), 12)
+
+    def test_prompt_plus_output_over_ceiling_is_rejected(self):
+        generator = self.make_generator(16)
+        args = types.SimpleNamespace(max_tokens=5)
+        request = types.SimpleNamespace(request_type="text", prompt="ignored")
+        with patch.object(
+            generator,
+            "_tokenize_uncached",
+            return_value=(list(range(12)), [list(range(12))], ["assistant"], "normal"),
+        ):
+            with self.assertRaisesRegex(ValueError, "limit 16"):
+                generator._tokenize(object(), request, args)
+
+
 class TestSelfMTPAdmission(unittest.TestCase):
     def setUp(self):
         self.cli = types.SimpleNamespace(
@@ -198,6 +279,42 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertFalse(disabled["gdn_prefix_fanout"])
         self.assertTrue(enabled["gdn_prefix_fanout"])
 
+    def test_segmented_static_cohort_serving_is_explicit_opt_in(self):
+        disabled = _self_mtp_config(self.args(), self.cli, self.model)
+        self.cli.self_mtp_segment_aware_live_tip = True
+        self.cli.self_mtp_segment_aware_cohort_size = 4
+        enabled = _self_mtp_config(self.args(), self.cli, self.model)
+
+        self.assertNotIn("segment_aware_live_tip", disabled)
+        self.assertTrue(enabled["segment_aware_live_tip"])
+        self.assertEqual(enabled["segment_aware_cohort_size"], 4)
+
+    def test_terminal_mtp_receipt_exposes_server_queue_boundaries(self):
+        response = types.SimpleNamespace(
+            finish_reason="length", mtp_receipt={"uid": 7}
+        )
+        ctx = types.SimpleNamespace(
+            prompt=[1, 2, 3],
+            prompt_cache_count=2,
+            request_started_ns=1_000_000,
+            request_admitted_ns=1_250_000,
+            generation_admitted_ns=2_000_000,
+        )
+        with patch("mlx_lm.server.time.perf_counter_ns", return_value=5_000_000):
+            receipt = _completed_self_mtp_receipt(response, ctx)
+
+        self.assertEqual(receipt["prompt_tokens"], 3)
+        self.assertEqual(receipt["cached_prompt_tokens"], 2)
+        self.assertEqual(
+            receipt["server_timing_ms"],
+            {
+                "request_admission": 0.25,
+                "generation_admission": 0.75,
+                "generation_service": 3.0,
+                "total": 4.0,
+            },
+        )
+
     def test_temperature_only_sampling_is_exact_and_admitted(self):
         config = _self_mtp_config(
             self.args(temperature=0.7), self.cli, self.model
@@ -272,6 +389,16 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertFalse(generator._is_batchable(request_args))
 
     def test_enabled_self_mtp_preserves_existing_process_wired_limit(self):
+        with (
+            patch("mlx_lm.server.mx.metal.is_available", return_value=True),
+            patch("mlx_lm.server.mx.set_wired_limit") as set_limit,
+        ):
+            self.assertIsNone(_configure_process_wired_limit(self.cli))
+        set_limit.assert_not_called()
+
+    def test_explicit_external_guard_preserves_existing_process_wired_limit(self):
+        self.cli.self_mtp = False
+        self.cli.process_wired_limit = False
         with (
             patch("mlx_lm.server.mx.metal.is_available", return_value=True),
             patch("mlx_lm.server.mx.set_wired_limit") as set_limit,
@@ -1213,6 +1340,20 @@ class TestPromptTrie(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_token_ceiling_refuses_overlength_entry(self):
+        cache = LRUPromptCache(max_tokens=4)
+        self.assertFalse(
+            cache.insert_cache(("model",), [1, 2, 3, 4, 5], [MockCache("abc")])
+        )
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.max_entry_tokens, 0)
+        self.assertEqual(cache.overlength_rejections, 1)
+
+        self.assertTrue(
+            cache.insert_cache(("model",), [1, 2, 3, 4], [MockCache("abcd")])
+        )
+        self.assertEqual(cache.max_entry_tokens, 4)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 

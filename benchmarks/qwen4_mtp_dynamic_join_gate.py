@@ -62,6 +62,52 @@ def token_digest(tokens: list[int]) -> str:
     ).hexdigest()
 
 
+def classify_first_envelope_flip(
+    reference_tokens: list[int],
+    candidate_tokens: list[int],
+    reference_envelopes: list[dict[str, Any]],
+    candidate_envelopes: list[dict[str, Any]],
+    *,
+    shape_noise_band: float = 3e-3,
+) -> dict[str, Any] | None:
+    """Classify only the first mismatch using opt-in top-two receipts.
+
+    ``near_tie_candidate`` is deliberately conservative: both disagreeing
+    tokens must be in each arm's top two and both margins must fit the known
+    cross-shape noise band. It is diagnostic only; exact qualification is
+    unchanged.
+    """
+    if shape_noise_band < 0:
+        raise ValueError("shape_noise_band must be non-negative")
+    position = first_divergence(reference_tokens, candidate_tokens)
+    if position is None:
+        return None
+    if position >= len(reference_envelopes) or position >= len(candidate_envelopes):
+        raise ValueError("missing envelope at first token divergence")
+    reference = reference_envelopes[position]
+    candidate = candidate_envelopes[position]
+    reference_limit = shape_noise_band * max(1.0, float(reference["scale"]))
+    candidate_limit = shape_noise_band * max(1.0, float(candidate["scale"]))
+    reference_token = int(reference_tokens[position])
+    candidate_token = int(candidate_tokens[position])
+    reference_top_two = {int(reference["top1_token"]), int(reference["top2_token"])}
+    candidate_top_two = {int(candidate["top1_token"]), int(candidate["top2_token"])}
+    return {
+        "position": position,
+        "reference_token": reference_token,
+        "candidate_token": candidate_token,
+        "reference": reference,
+        "candidate": candidate,
+        "shape_noise_band": shape_noise_band,
+        "near_tie_candidate": (
+            {reference_token, candidate_token}.issubset(reference_top_two)
+            and {reference_token, candidate_token}.issubset(candidate_top_two)
+            and float(reference["top2_margin"]) <= reference_limit
+            and float(candidate["top2_margin"]) <= candidate_limit
+        ),
+    }
+
+
 def distribution_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -151,7 +197,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("context must be positive")
     if args.lanes < 2:
         raise ValueError("lanes must be at least 2")
-    if not 1 <= args.initial_lanes < args.lanes:
+    if args.static_cohort:
+        if args.initial_lanes != args.lanes:
+            raise ValueError("static-cohort requires initial-lanes == lanes")
+    elif not 1 <= args.initial_lanes < args.lanes:
         raise ValueError("initial-lanes must be in [1, lanes)")
     if args.join_after_cycles < 1:
         raise ValueError("join-after-cycles must be positive")
@@ -160,7 +209,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if args.num_draft < 1:
         raise ValueError("num-draft must be positive")
     minimum_live_join = 1 + (args.num_draft + 1) * args.join_after_cycles
-    if args.max_tokens <= minimum_live_join:
+    if not args.static_cohort and args.max_tokens <= minimum_live_join:
         raise ValueError("max-tokens is too small to guarantee a live join")
     if args.cancel_uid is not None and not 0 <= args.cancel_uid < args.lanes:
         raise ValueError("cancel-uid must name a configured lane")
@@ -186,6 +235,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "lanes": args.lanes,
         "initial_lanes": args.initial_lanes,
         "joining_lanes": args.lanes - args.initial_lanes,
+        "static_cohort": bool(args.static_cohort),
         "join_after_cycles": args.join_after_cycles,
         "max_tokens_per_lane": args.max_tokens,
         "cancel_uid": args.cancel_uid,
@@ -199,10 +249,17 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "max_drift": args.max_drift,
         "arms": list(ARMS),
         "orders": [arm_order(rep) for rep in range(1, args.reps + 1)],
-        "correctness_gate": "exact per-UID token IDs, fixed cohort versus dynamic join",
+        "correctness_gate": (
+            "exact per-UID token IDs, fixed cohort versus static B4 replay"
+            if args.static_cohort
+            else "exact per-UID token IDs, fixed cohort versus dynamic join"
+        ),
         "engagement_gate": (
-            "dynamic membership epoch advances at join; shared QSA start requests and "
-            "second-step reuse are observed after the join"
+            "shared QSA start requests and second-step reuse are observed in the "
+            "static cohort"
+            if args.static_cohort
+            else "dynamic membership epoch advances at join; shared QSA start requests "
+            "and second-step reuse are observed after the join"
         ),
         "performance_metrics": (
             "prepare_wall_s, transaction_wall_s, total_wall_s, aggregate decode and "
@@ -210,6 +267,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "timing_boundary": (
             "all lanes are prefetched sequentially before transaction timing in both "
+            "arms; static cohorts attach all lanes before the first transaction cycle"
+            if args.static_cohort
+            else "all lanes are prefetched sequentially before transaction timing in both "
             "arms; dynamic lanes are detached until the configured cycle boundary"
         ),
     }
@@ -399,11 +459,30 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
     from mlx_lm.sample_utils import LaneRNG
     from mlx_lm.segmented_self_mtp import segmented_self_mtp_stats
 
+    def envelope(logprobs: Any, token: int) -> dict[str, Any]:
+        """Read a bounded top-two receipt after the benchmark's normal eval."""
+        values = mx.reshape(logprobs, (-1,))
+        if int(values.size) < 2:
+            raise ValueError("logprob envelope requires a vocabulary of at least two")
+        top = mx.argsort(values)[-2:]
+        mx.eval(top, values[top], mx.max(mx.abs(values)))
+        runner_up, winner = (int(value) for value in top.tolist())
+        runner_up_value, winner_value = (float(value) for value in values[top].tolist())
+        return {
+            "top1_token": winner,
+            "top1_logprob": winner_value,
+            "top2_token": runner_up,
+            "top2_logprob": runner_up_value,
+            "top2_margin": winner_value - runner_up_value,
+            "scale": float(mx.max(mx.abs(values)).item()),
+        }
+
     mx.reset_peak_memory()
     segmented_before = segmented_self_mtp_stats(reset=False)
     started = time.perf_counter()
     prepared = []
     traces: dict[int, list[int]] = {}
+    envelopes: dict[int, list[dict[str, Any]]] = {}
     for uid, prompt in enumerate(prompts):
         lane, first = prepare_self_mtp_lane(
             prompt,
@@ -425,9 +504,11 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
         )
         prepared.append(lane)
         traces[uid] = [int(first.token)]
+        if args.capture_logprob_envelopes:
+            envelopes[uid] = [envelope(first.logprobs, int(first.token))]
     prepared_at = time.perf_counter()
 
-    if arm == "fixed_cohort":
+    if arm == "fixed_cohort" or args.static_cohort:
         batch = attach_segmented_self_mtp_lanes(model, None, prepared)
         pending = []
     else:
@@ -468,6 +549,11 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
                 remaining = args.max_tokens - len(traces[lane.uid])
                 delivered = outputs[:remaining]
                 traces[lane.uid].extend(int(output.token) for output in delivered)
+                if args.capture_logprob_envelopes:
+                    envelopes[lane.uid].extend(
+                        envelope(output.logprobs, int(output.token))
+                        for output in delivered
+                    )
                 emitted_counts.append(len(delivered))
                 terminal.append(len(traces[lane.uid]) >= args.max_tokens)
             commit_batched_self_mtp(
@@ -552,8 +638,9 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
         for key, value in segmented_after.items()
         if isinstance(value, int) and isinstance(segmented_before.get(key, 0), int)
     }
-    return {
+    result = {
         "arm": arm,
+        "cohort_mode": "static" if args.static_cohort else "dynamic",
         "prepare_wall_s": prepared_at - started,
         "transaction_wall_s": transaction_wall,
         "total_wall_s": total_wall,
@@ -573,9 +660,20 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
             "cancellations": cancellation_receipts,
             "reconstruction_epochs": reconstruction_epochs,
             "empty_cohort": not batch.lanes,
-            "joined": join_receipt is not None if arm == "dynamic_join" else False,
+            "joined": (
+                bool(args.static_cohort)
+                if arm == "dynamic_join"
+                else False
+            ) if args.static_cohort else (
+                join_receipt is not None if arm == "dynamic_join" else False
+            ),
         },
     }
+    if args.capture_logprob_envelopes:
+        result["logprob_envelopes_by_uid"] = {
+            str(uid): values for uid, values in envelopes.items()
+        }
+    return result
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -600,8 +698,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     summary["dynamic_trials"] = len(dynamic)
     summary["dynamic_qsa_engaged"] = sum(
-        row["qsa_share"]["post_join_share_requested"] > 0
-        and row["qsa_share"]["post_join_reuse_observed"] > 0
+        (
+            row["qsa_share"]["share_requested"] > 0
+            and row["qsa_share"]["reuse_observed"] > 0
+        )
+        if row.get("cohort_mode") == "static"
+        else (
+            row["qsa_share"]["post_join_share_requested"] > 0
+            and row["qsa_share"]["post_join_reuse_observed"] > 0
+        )
         for row in dynamic
     )
     summary["accepted_repetitions"] = len(
@@ -703,6 +808,17 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
             }
         dynamic["exact_by_uid"] = per_uid
         dynamic["exact_fixed_match"] = all(row["exact"] for row in per_uid.values())
+        if args.capture_logprob_envelopes:
+            dynamic["first_divergence_envelopes"] = {
+                uid: classify_first_envelope_flip(
+                    fixed["token_ids_by_uid"][uid],
+                    dynamic["token_ids_by_uid"][uid],
+                    fixed["logprob_envelopes_by_uid"][uid],
+                    dynamic["logprob_envelopes_by_uid"][uid],
+                )
+                for uid, row in per_uid.items()
+                if not row["exact"]
+            }
         dynamic["transaction_tps_ratio_vs_fixed"] = (
             dynamic["aggregate_decode_tps"] / fixed["aggregate_decode_tps"]
         )
@@ -720,13 +836,20 @@ def execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
     atomic_write(output, artifact)
     dynamic_rows = [row for row in artifact["rows"] if row["arm"] == "dynamic_join"]
     exact = bool(dynamic_rows) and all(row["exact_fixed_match"] for row in dynamic_rows)
-    engaged = bool(dynamic_rows) and all(
-        row["join"] is not None
-        and row["join"]["epoch_after"] == row["join"]["epoch_before"] + 1
-        and row["qsa_share"]["post_join_share_requested"] > 0
-        and row["qsa_share"]["post_join_reuse_observed"] > 0
-        for row in dynamic_rows
-    )
+    if args.static_cohort:
+        engaged = bool(dynamic_rows) and all(
+            row["qsa_share"]["share_requested"] > 0
+            and row["qsa_share"]["reuse_observed"] > 0
+            for row in dynamic_rows
+        )
+    else:
+        engaged = bool(dynamic_rows) and all(
+            row["join"] is not None
+            and row["join"]["epoch_after"] == row["join"]["epoch_before"] + 1
+            and row["qsa_share"]["post_join_share_requested"] > 0
+            and row["qsa_share"]["post_join_reuse_observed"] > 0
+            for row in dynamic_rows
+        )
     accepted_repetitions = {
         row["repetition"]
         for row in artifact["rows"]
@@ -774,6 +897,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context", type=int, default=16384)
     parser.add_argument("--lanes", type=int, default=2)
     parser.add_argument("--initial-lanes", type=int, default=1)
+    parser.add_argument(
+        "--static-cohort",
+        action="store_true",
+        help="qualify an all-at-once cohort without a live width transition",
+    )
     parser.add_argument("--join-after-cycles", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--num-draft", type=int, default=2)
@@ -790,6 +918,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--share-qsa-indices",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--capture-logprob-envelopes",
+        action="store_true",
+        help="diagnostic-only host receipts for first cross-shape token flips",
     )
     parser.add_argument(
         "--out", default="results/qwen4-mtp-dynamic-join-gate-20260910.json"

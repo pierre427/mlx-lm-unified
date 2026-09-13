@@ -196,10 +196,13 @@ class AutomaticPrefixCache(LRUPromptCache):
         self,
         max_size: int = 10,
         max_bytes: int = 1 << 63,
+        max_tokens: Optional[int] = None,
         *,
         cow_branching: Optional[bool] = None,
     ):
-        super().__init__(max_size=max_size, max_bytes=max_bytes)
+        super().__init__(
+            max_size=max_size, max_bytes=max_bytes, max_tokens=max_tokens
+        )
         self._apc_lock = threading.RLock()
         self._cow_branching = cow_cache_enabled(cow_branching)
         self._cow_telemetry = COWCacheTelemetry()
@@ -429,6 +432,9 @@ class AutomaticPrefixCache(LRUPromptCache):
         capabilities = inspect_apc_capabilities(prompt_cache)
         if not capabilities.exact_prefix:
             return capabilities
+        if self.max_tokens is not None and len(tokens) > self.max_tokens:
+            self.overlength_rejections += 1
+            return capabilities
         if self._cow_branching:
             try:
                 prompt_cache, sidecar = freeze_prompt_cache(
@@ -577,6 +583,9 @@ class AutomaticPrefixCache(LRUPromptCache):
                 stats["lifetime"][key] += self._apc_stats[key]
             stats["cow_enabled"] = self._cow_branching
             stats["cow"] = self._cow_telemetry.snapshot()
+            stats["max_tokens"] = self.max_tokens
+            stats["max_entry_tokens"] = self.max_entry_tokens
+            stats["overlength_rejections"] = self.overlength_rejections
             return stats
 
     def trim_to(
@@ -611,6 +620,7 @@ class AutomaticPrefixCacheV2(AutomaticPrefixCache):
         self,
         max_size: int = 10,
         max_bytes: int = 1 << 63,
+        max_tokens: Optional[int] = None,
         *,
         layout_name: str,
     ) -> None:
@@ -619,6 +629,7 @@ class AutomaticPrefixCacheV2(AutomaticPrefixCache):
         super().__init__(
             max_size=max_size,
             max_bytes=max_bytes,
+            max_tokens=max_tokens,
             cow_branching=True,
         )
         self._layer_segments = True

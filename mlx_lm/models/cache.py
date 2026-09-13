@@ -5733,9 +5733,18 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        max_tokens: Optional[int] = None,
+    ):
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
         self.max_size = max_size
         self.max_bytes = max_bytes
+        self.max_tokens = max_tokens
+        self.overlength_rejections = 0
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
@@ -5747,6 +5756,17 @@ class LRUPromptCache:
     @property
     def nbytes(self):
         return self._n_bytes
+
+    @property
+    def max_entry_tokens(self):
+        return max(
+            (
+                len(tokens)
+                for lru in self._lru._lrus.values()
+                for _, tokens in lru
+            ),
+            default=0,
+        )
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
@@ -5817,6 +5837,9 @@ class LRUPromptCache:
         cache_type: str = "assistant",
         sidecar: Any = None,
     ):
+        if self.max_tokens is not None and len(tokens) > self.max_tokens:
+            self.overlength_rejections += 1
+            return False
         # Make the cache entry
         sidecar_nbytes = int(getattr(sidecar, "nbytes", 0))
         entry = LRUPromptCache.CacheEntry(
@@ -5857,6 +5880,7 @@ class LRUPromptCache:
             entry = self._trie.pop(model, tokens)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        return True
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
