@@ -26,6 +26,7 @@ from mlx_lm.server import (
     _make_sampler,
     _measure_kv_cost,
     _configure_process_wired_limit,
+    _completed_self_mtp_receipt,
     _request_output_ceiling,
     _request_sampling_profile,
     _self_mtp_config,
@@ -207,6 +208,32 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertNotIn("segment_aware_live_tip", disabled)
         self.assertTrue(enabled["segment_aware_live_tip"])
         self.assertEqual(enabled["segment_aware_cohort_size"], 4)
+
+    def test_terminal_mtp_receipt_exposes_server_queue_boundaries(self):
+        response = types.SimpleNamespace(
+            finish_reason="length", mtp_receipt={"uid": 7}
+        )
+        ctx = types.SimpleNamespace(
+            prompt=[1, 2, 3],
+            prompt_cache_count=2,
+            request_started_ns=1_000_000,
+            request_admitted_ns=1_250_000,
+            generation_admitted_ns=2_000_000,
+        )
+        with patch("mlx_lm.server.time.perf_counter_ns", return_value=5_000_000):
+            receipt = _completed_self_mtp_receipt(response, ctx)
+
+        self.assertEqual(receipt["prompt_tokens"], 3)
+        self.assertEqual(receipt["cached_prompt_tokens"], 2)
+        self.assertEqual(
+            receipt["server_timing_ms"],
+            {
+                "request_admission": 0.25,
+                "generation_admission": 0.75,
+                "generation_service": 3.0,
+                "total": 4.0,
+            },
+        )
 
     def test_temperature_only_sampling_is_exact_and_admitted(self):
         config = _self_mtp_config(

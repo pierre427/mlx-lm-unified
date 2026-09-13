@@ -275,11 +275,23 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+    request_started_ns: int = 0
+    request_admitted_ns: int = 0
+    generation_admitted_ns: int = 0
 
     _should_stop: bool = False
 
     def stop(self):
         self._should_stop = True
+
+
+def _generation_context_timing(args) -> Dict[str, int]:
+    """Copy monotonic request boundaries into a terminally visible context."""
+    return {
+        "request_started_ns": int(getattr(args, "_server_request_started_ns", 0)),
+        "request_admitted_ns": int(getattr(args, "_server_request_admitted_ns", 0)),
+        "generation_admitted_ns": time.perf_counter_ns(),
+    }
 
 
 @dataclass
@@ -300,13 +312,25 @@ def _completed_self_mtp_receipt(response, ctx):
     receipt = getattr(response, "mtp_receipt", None)
     if response.finish_reason is None or receipt is None:
         return None
-    return {
+    receipt = {
         **receipt,
         "ts": time.time(),
         "prompt_tokens": len(ctx.prompt),
         "cached_prompt_tokens": int(ctx.prompt_cache_count),
         "completed": True,
     }
+    completed_ns = time.perf_counter_ns()
+    started_ns = int(getattr(ctx, "request_started_ns", 0))
+    admitted_ns = int(getattr(ctx, "request_admitted_ns", 0))
+    generation_ns = int(getattr(ctx, "generation_admitted_ns", 0))
+    if 0 < started_ns <= admitted_ns <= generation_ns <= completed_ns:
+        receipt["server_timing_ms"] = {
+            "request_admission": (admitted_ns - started_ns) / 1e6,
+            "generation_admission": (generation_ns - admitted_ns) / 1e6,
+            "generation_service": (completed_ns - generation_ns) / 1e6,
+            "total": (completed_ns - started_ns) / 1e6,
+        }
+    return receipt
 
 
 class TimeBudget:
@@ -3040,6 +3064,7 @@ class ResponseGenerator:
                         initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
+                        **_generation_context_timing(args),
                     )
                     rqueue.put(ctx)
 
@@ -3519,6 +3544,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                **_generation_context_timing(args),
             )
             context_published = False
 
@@ -3966,6 +3992,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                **_generation_context_timing(args),
             )
             rqueue.put(ctx)
 
@@ -4274,7 +4301,10 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
+        request_started_ns = time.perf_counter_ns()
         self._admit_request()
+        generation_args._server_request_started_ns = request_started_ns
+        generation_args._server_request_admitted_ns = time.perf_counter_ns()
         released = False
 
         def _release():
