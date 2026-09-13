@@ -128,20 +128,24 @@ def _capture_qsa_segment_inputs(
     if int(pooled.shape[1]) < min_blocks:
         return
     limit = max(1, int(os.environ.get("MLX_QWEN4_QSA_SEGMENT_CAPTURE_COUNT", "24")))
+    capture_keys = os.environ.get("MLX_QWEN4_QSA_SEGMENT_CAPTURE_KEYS", "1") != "0"
     global _QSA_SEGMENT_CAPTURE_COUNT
     with _QSA_SEGMENT_CAPTURE_LOCK:
         remaining = limit - _QSA_SEGMENT_CAPTURE_COUNT
         if remaining <= 0:
             return
-        mx.eval(q, pooled, q_pos, valid_blocks, selected)
-        q_np = np.asarray(q.astype(mx.float32))
-        pooled_np = np.asarray(pooled.astype(mx.float32))
+        values = [q_pos, valid_blocks, selected]
+        if capture_keys:
+            values.extend((q, pooled))
+        mx.eval(*values)
         q_pos_np = np.asarray(q_pos)
         valid_np = np.asarray(valid_blocks)
         selected_np = np.asarray(selected)
+        q_np = np.asarray(q.astype(mx.float32)) if capture_keys else None
+        pooled_np = np.asarray(pooled.astype(mx.float32)) if capture_keys else None
         directory = Path(capture_dir)
         directory.mkdir(parents=True, exist_ok=True)
-        rows = min(int(q_np.shape[0]), remaining)
+        rows = min(int(selected_np.shape[0]), remaining)
         for row in range(rows):
             _QSA_SEGMENT_CAPTURE_COUNT += 1
             safe_layer_id = str(layer_id).replace(":", "-")
@@ -152,10 +156,7 @@ def _capture_qsa_segment_inputs(
             target = directory / f"{stem}.npz"
             temporary = directory / f".{stem}.npz.tmp"
             with temporary.open("wb") as stream:
-                np.savez_compressed(
-                    stream,
-                    keys=pooled_np[row],
-                    queries=q_np[row, -1:, :, :],
+                payload = dict(
                     valid_blocks=np.asarray(
                         [int(valid_np[row, -1].sum())], dtype=np.int64
                     ),
@@ -163,6 +164,12 @@ def _capture_qsa_segment_inputs(
                     production_selected=selected_np[row, -1:],
                     layer_id=np.asarray([str(layer_id)]),
                 )
+                if capture_keys:
+                    payload.update(
+                        keys=pooled_np[row],
+                        queries=q_np[row, -1:, :, :],
+                    )
+                np.savez_compressed(stream, **payload)
             temporary.replace(target)
 
 

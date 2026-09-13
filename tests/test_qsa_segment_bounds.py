@@ -182,6 +182,29 @@ class TestQSASegmentBounds(unittest.TestCase):
             evaluate.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_selection_only_capture_omits_large_geometry_arrays(self):
+        q = mx.zeros((1, 1, 1, 2))
+        pooled = mx.zeros((1, 4, 2))
+        q_pos = mx.array([[15]])
+        valid = mx.ones((1, 1, 4), dtype=mx.bool_)
+        selected = mx.array([[[0, 2]]])
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ",
+            {
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_DIR": directory,
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_KEYS": "0",
+            },
+        ):
+            qwen4_exp._QSA_SEGMENT_CAPTURE_COUNT = 0
+            qwen4_exp._capture_qsa_segment_inputs(
+                q, pooled, q_pos, valid, selected, layer_id=3
+            )
+            capture = next(Path(directory).glob("*.npz"))
+            with np.load(capture) as data:
+                self.assertNotIn("keys", data.files)
+                self.assertNotIn("queries", data.files)
+                self.assertEqual(data["production_selected"].tolist(), [[0, 2]])
+
 
 if __name__ == "__main__":
     unittest.main()
