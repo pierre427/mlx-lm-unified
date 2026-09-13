@@ -16,6 +16,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import socket
 import statistics
 import subprocess
@@ -207,6 +208,8 @@ def server_command(args, arm):
         "--decode-concurrency", "4", "--prompt-concurrency", "4",
         "--prompt-batch-window", "20", "--prefill-step-size",
         str(args.prefill_step_size), "--prompt-cache-size", "64",
+        "--max-context-length", str(args.max_context_length),
+        "--no-process-wired-limit",
         "--chat-template-args",
         '{"enable_thinking":false,"preserve_thinking":true}',
     ]
@@ -255,6 +258,16 @@ def process_rss_bytes(pid):
     )
     text = result.stdout.strip()
     return int(text) * 1024 if result.returncode == 0 and text else None
+
+
+def swap_used_mib():
+    result = subprocess.run(
+        ["sysctl", "vm.swapusage"], capture_output=True, text=True, timeout=3
+    )
+    match = re.search(r"used = ([0-9.]+)M", result.stdout)
+    if result.returncode != 0 or match is None:
+        raise RuntimeError(f"cannot read swap usage: {result.stdout}{result.stderr}")
+    return float(match.group(1))
 
 
 def response_row(response, status, submitted, completed):
@@ -342,16 +355,20 @@ def run_arm(args, arm, system_prompt, prefix_tokens):
     command = server_command(args, arm)
     server_log = Path(args.server_log_dir) / f"{arm}.server.log"
     server_log.parent.mkdir(parents=True, exist_ok=True)
+    host_before = host_snapshot()
+    baseline_swap_mib = swap_used_mib()
     result = {
         "arm": arm, "server_command": command,
         "server_environment": MTP_ENV if arm == "mtp" else {},
         "apc_target_prefix_tokens": args.system_tokens,
         "apc_actual_prefix_tokens": prefix_tokens,
-        "host_before": host_snapshot(), "status_samples": [], "turns": [],
+        "host_before": host_before, "status_samples": [], "turns": [],
+        "swap_samples_mib": [baseline_swap_mib],
     }
     process = None
     stop = threading.Event()
     monitor = None
+    swap_guard = None
     started = time.perf_counter()
     try:
         with server_log.open("w") as log:
@@ -360,6 +377,33 @@ def run_arm(args, arm, system_prompt, prefix_tokens):
                 env=server_environment(arm), stdout=log,
                 stderr=subprocess.STDOUT, text=True, start_new_session=True,
             )
+
+            def guard_swap():
+                while not stop.wait(0.25):
+                    try:
+                        used_mib = swap_used_mib()
+                        result["swap_samples_mib"].append(used_mib)
+                        growth_mib = used_mib - baseline_swap_mib
+                        if growth_mib > args.swap_abort_mib:
+                            result["swap_abort"] = {
+                                "baseline_mib": baseline_swap_mib,
+                                "observed_mib": used_mib,
+                                "growth_mib": growth_mib,
+                                "threshold_mib": args.swap_abort_mib,
+                            }
+                            if process.poll() is None:
+                                process.terminate()
+                            return
+                    except Exception as error:
+                        result["swap_guard_error"] = (
+                            f"{type(error).__name__}: {error}"
+                        )
+                        if process.poll() is None:
+                            process.terminate()
+                        return
+
+            swap_guard = threading.Thread(target=guard_swap, daemon=True)
+            swap_guard.start()
             models = wait_ready(base_url, process, args.startup_timeout)
             model_id = models["data"][0]["id"]
             result["model_id"] = model_id
@@ -440,17 +484,46 @@ def run_arm(args, arm, system_prompt, prefix_tokens):
                 "rss_min_bytes": min(rss) if rss else None,
                 "rss_peak_bytes": max(rss) if rss else None,
                 "rss_range_bytes": max(rss) - min(rss) if rss else None,
+                "swap_used_mib_start": baseline_swap_mib,
+                "swap_used_mib_peak": max(result["swap_samples_mib"]),
+                "swap_growth_mib_peak": (
+                    max(result["swap_samples_mib"]) - baseline_swap_mib
+                ),
             }
             configured = after.get("configured", {})
             batch = after.get("batch_decode", {})
             delta = result["segmented_delta"]
+            prompt_cache = after.get("prompt_cache", {})
             result["checks"] = {
                 "all_http_200": all(r["http_status"] == 200 for r in responses),
                 "four_by_three": len(responses) == 12,
                 "apc_explicitly_enabled": "--prompt-cache-size" in command,
-                "apc_20k_primed": after_prime.get("prompt_cache", {}).get("entries", 0) > 0,
-                "measured_first_turn_uses_20k_apc": all(
+                "apcv2_primed": (
+                    after_prime.get("prompt_cache", {}).get("entries", 0) > 0
+                    and after_prime.get("prompt_cache", {}).get("implementation")
+                    == "AutomaticPrefixCacheV2"
+                ),
+                "measured_first_turn_uses_static_apc": all(
                     value >= args.apc_cached_floor for value in cached[:4]
+                ),
+                "context_ceiling_obeyed": all(
+                    int(r["usage"].get("prompt_tokens", 0))
+                    + args.turn_tokens[turn_index]
+                    <= args.max_context_length
+                    for turn_index, turn in enumerate(result["turns"])
+                    for r in turn["responses"]
+                ),
+                "apc_cache_ceiling_obeyed": (
+                    prompt_cache.get("max_tokens") == args.max_context_length
+                    and 0 < prompt_cache.get("max_entry_tokens", 0)
+                    <= args.max_context_length
+                    and prompt_cache.get("overlength_rejections", 0) == 0
+                ),
+                "no_swap_growth": (
+                    "swap_abort" not in result
+                    and "swap_guard_error" not in result
+                    and max(result["swap_samples_mib"]) - baseline_swap_mib
+                    <= args.swap_abort_mib
                 ),
                 "batch_width_four_observed": batch.get("max_generation_width") == 4,
                 "healthy_after": health_status == 200 and health.get("status") == "ok",
@@ -473,6 +546,8 @@ def run_arm(args, arm, system_prompt, prefix_tokens):
         stop.set()
         if monitor is not None:
             monitor.join(timeout=5)
+        if swap_guard is not None:
+            swap_guard.join(timeout=5)
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -553,8 +628,10 @@ def main(argv=None):
     parser.add_argument("--python", default=os.environ.get("PYTHON", "python3"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8298)
-    parser.add_argument("--system-tokens", type=int, default=20_000)
-    parser.add_argument("--apc-cached-floor", type=int, default=19_900)
+    parser.add_argument("--system-tokens", type=int, default=14_000)
+    parser.add_argument("--apc-cached-floor", type=int, default=13_900)
+    parser.add_argument("--max-context-length", type=int, default=16_384)
+    parser.add_argument("--swap-abort-mib", type=float, default=16.0)
     parser.add_argument("--turn-tokens", type=int, nargs=3, default=(96, 64, 64))
     parser.add_argument("--prefill-step-size", type=int, default=512)
     parser.add_argument("--startup-timeout", type=float, default=600)
@@ -570,6 +647,10 @@ def main(argv=None):
         parser.error("--system-tokens must be at least 1024")
     if args.apc_cached_floor > args.system_tokens:
         parser.error("--apc-cached-floor cannot exceed --system-tokens")
+    if args.system_tokens >= args.max_context_length:
+        parser.error("--system-tokens must leave room below --max-context-length")
+    if args.swap_abort_mib < 0:
+        parser.error("--swap-abort-mib must be non-negative")
     if any(value < 1 for value in args.turn_tokens):
         parser.error("all --turn-tokens values must be positive")
     if not args.execute:

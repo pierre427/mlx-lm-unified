@@ -13,7 +13,7 @@ SPEC.loader.exec_module(MODULE)
 def args():
     return SimpleNamespace(
         python="/venv/python", model="/model", host="127.0.0.1", port=8298,
-        prefill_step_size=512,
+        prefill_step_size=512, max_context_length=16384,
     )
 
 
@@ -21,6 +21,8 @@ def test_plain_command_has_apc_and_no_speculative_lane():
     command = MODULE.server_command(args(), "plain")
     assert command[command.index("--prompt-cache-size") + 1] == "64"
     assert command[command.index("--decode-concurrency") + 1] == "4"
+    assert command[command.index("--max-context-length") + 1] == "16384"
+    assert "--no-process-wired-limit" in command
     assert "--self-mtp" not in command
     assert not any("prompt-lookup" in item for item in command)
     assert "--draft-model" not in command
@@ -49,6 +51,19 @@ def test_environment_enables_segmented_only_for_mtp(monkeypatch):
 def test_common_prefix_length_stops_at_first_difference():
     assert MODULE.common_prefix_length([1, 2, 3], [1, 2, 4, 5]) == 2
     assert MODULE.common_prefix_length([1, 2], [1, 2, 3]) == 2
+
+
+def test_swap_parser_reads_used_mebibytes(monkeypatch):
+    monkeypatch.setattr(
+        MODULE.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="vm.swapusage: total = 10240.00M  used = 9458.62M  free = 781.38M",
+            stderr="",
+        ),
+    )
+    assert MODULE.swap_used_mib() == 9458.62
 
 
 def test_compare_arms_requires_all_twelve_exact():

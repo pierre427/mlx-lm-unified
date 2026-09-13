@@ -2373,14 +2373,20 @@ class ResponseGenerator:
             old_capsule_pool.close()
         max_size = int(self.prompt_cache.max_size)
         max_bytes = int(self.prompt_cache.max_bytes)
+        max_tokens = getattr(self.prompt_cache, "max_tokens", None)
         self.prompt_cache = (
             AutomaticPrefixCacheV2(
                 max_size=max_size,
                 max_bytes=max_bytes,
+                max_tokens=max_tokens,
                 layout_name=str(layout_name),
             )
             if desired_v2
-            else AutomaticPrefixCache(max_size=max_size, max_bytes=max_bytes)
+            else AutomaticPrefixCache(
+                max_size=max_size,
+                max_bytes=max_bytes,
+                max_tokens=max_tokens,
+            )
         )
         self._cache_capsule_pool = CacheCapsulePool(
             self.prompt_cache.capsule_generation
@@ -2665,6 +2671,19 @@ class ResponseGenerator:
 
     def _tokenize(self, tokenizer, request, args):
         """Reuse an exact host prompt plane when the opt-in serving gate is on."""
+        def checked(result):
+            prompt = result[0]
+            ceiling = getattr(self.model_provider.cli_args, "max_context_length", None)
+            if ceiling is not None:
+                requested = len(prompt) + max(int(args.max_tokens), 0)
+                if requested > ceiling:
+                    raise ValueError(
+                        "request exceeds --max-context-length: "
+                        f"{len(prompt)} prompt + {args.max_tokens} output = "
+                        f"{requested} tokens, limit {ceiling}"
+                    )
+            return result
+
         if request.request_type == "chat" and tokenizer.has_chat_template:
             process_message_content(request.messages)
             if request.tools and not tokenizer.has_tool_calling:
@@ -2678,19 +2697,19 @@ class ResponseGenerator:
         if not getattr(self.model_provider.cli_args, "prompt_host_cache", False):
             if prompt_host_cache is not None:
                 prompt_host_cache.record_bypass("disabled")
-            return self._tokenize_uncached(tokenizer, request, args)
+            return checked(self._tokenize_uncached(tokenizer, request, args))
         if prompt_host_cache is None:
             # ResponseGenerator normally creates this owner in __init__.  A
             # few embedders construct a minimal generator around the uncached
             # tokenizer path; preserve that supported path instead of making
             # an opt-in cache an unconditional attribute dependency.
-            return self._tokenize_uncached(tokenizer, request, args)
+            return checked(self._tokenize_uncached(tokenizer, request, args))
 
         try:
             metadata = self._prompt_host_metadata(tokenizer, request, args)
         except (TypeError, ValueError, OverflowError):
             prompt_host_cache.record_bypass("uncacheable_input")
-            return self._tokenize_uncached(tokenizer, request, args)
+            return checked(self._tokenize_uncached(tokenizer, request, args))
 
         adopted = prompt_host_cache.lookup(
             metadata["input_fingerprint"], self._prompt_host_fingerprint(metadata)
@@ -2704,12 +2723,12 @@ class ResponseGenerator:
                     for span in plane.prefix_spans
                 ]
                 segment_types = [span.name for span in plane.prefix_spans]
-                return (
+                return checked((
                     prompt,
                     segments,
                     segment_types,
                     plane.initial_state,
-                )
+                ))
             finally:
                 adopted.close()
 
@@ -2743,7 +2762,7 @@ class ResponseGenerator:
             )
         except (TypeError, ValueError, OverflowError):
             prompt_host_cache.record_bypass("uncacheable_result")
-        return result
+        return checked(result)
 
     def _tokenize_uncached(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
@@ -4850,12 +4869,28 @@ class APIHandler(BaseHTTPRequestHandler):
                 "effective_config": read_effective_config(cli_args),
                 "restart_required": dict(SOFT_RELOAD_RESTART_KEYS),
                 "prompt_cache": {
+                    "implementation": type(
+                        self.response_generator.prompt_cache
+                    ).__name__,
                     "entries": len(self.response_generator.prompt_cache),
                     "bytes": int(
                         getattr(self.response_generator.prompt_cache, "nbytes", 0)
                     ),
                     "apc_stats": getattr(
                         self.response_generator.prompt_cache, "apc_stats", {}
+                    ),
+                    "max_tokens": getattr(
+                        self.response_generator.prompt_cache, "max_tokens", None
+                    ),
+                    "max_entry_tokens": getattr(
+                        self.response_generator.prompt_cache,
+                        "max_entry_tokens",
+                        0,
+                    ),
+                    "overlength_rejections": getattr(
+                        self.response_generator.prompt_cache,
+                        "overlength_rejections",
+                        0,
                     ),
                 },
                 "inflight": self.response_generator.inflight,
@@ -5708,6 +5743,7 @@ def run(
             if model_provider.cli_args.prompt_cache_bytes is not None
             else 1 << 63
         ),
+        max_tokens=model_provider.cli_args.max_context_length,
     )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
@@ -6173,6 +6209,26 @@ def setup_arg_parser():
         help="Maximum number of distinct KV caches to hold in the prompt cache",
     )
     parser.add_argument(
+        "--max-context-length",
+        type=int,
+        default=None,
+        help=(
+            "Hard prompt-plus-output token ceiling. Requests exceeding it are "
+            "rejected before cache lookup/prefill, and APC refuses to retain "
+            "entries beyond the same ceiling. Default: model limit only."
+        ),
+    )
+    parser.add_argument(
+        "--process-wired-limit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply MLX's recommended process wired-memory clamp for ordinary "
+            "serving (default: on). Disable explicitly only when an external "
+            "memory/swap guard owns the safety boundary."
+        ),
+    )
+    parser.add_argument(
         "--prompt-host-cache",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6262,7 +6318,11 @@ def _configure_process_wired_limit(args):
     model reproducibly causes a Metal watchdog timeout on its first PLE
     command; MLX's existing default limit completes the same stream.
     """
-    if not mx.metal.is_available() or getattr(args, "self_mtp", False):
+    if (
+        not mx.metal.is_available()
+        or getattr(args, "self_mtp", False)
+        or not getattr(args, "process_wired_limit", True)
+    ):
         return None
     wired_limit = mx.device_info()["max_recommended_working_set_size"]
     mx.set_wired_limit(wired_limit)
@@ -6283,6 +6343,8 @@ def main():
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
     if args.prompt_host_cache_size < 1:
         parser.error("--prompt-host-cache-size must be >= 1")
+    if args.max_context_length is not None and args.max_context_length < 1:
+        parser.error("--max-context-length must be >= 1")
     if args.self_mtp_segment_aware_cohort_size < 1:
         parser.error("--self-mtp-segment-aware-cohort-size must be >= 1")
     if args.self_mtp_window_size and not args.self_mtp_persistent:

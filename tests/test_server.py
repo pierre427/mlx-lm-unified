@@ -166,6 +166,43 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
         self.assertEqual(generator._batch_decode_stats["decode_calls"], 0)
 
 
+class TestServerContextCeiling(unittest.TestCase):
+    def make_generator(self, ceiling):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(
+                max_context_length=ceiling,
+                prompt_host_cache=False,
+            )
+        )
+        generator._prompt_host_cache = None
+        return generator
+
+    def test_prompt_plus_output_at_ceiling_is_admitted(self):
+        generator = self.make_generator(16)
+        args = types.SimpleNamespace(max_tokens=4)
+        request = types.SimpleNamespace(request_type="text", prompt="ignored")
+        with patch.object(
+            generator,
+            "_tokenize_uncached",
+            return_value=(list(range(12)), [list(range(12))], ["assistant"], "normal"),
+        ):
+            result = generator._tokenize(object(), request, args)
+        self.assertEqual(len(result[0]), 12)
+
+    def test_prompt_plus_output_over_ceiling_is_rejected(self):
+        generator = self.make_generator(16)
+        args = types.SimpleNamespace(max_tokens=5)
+        request = types.SimpleNamespace(request_type="text", prompt="ignored")
+        with patch.object(
+            generator,
+            "_tokenize_uncached",
+            return_value=(list(range(12)), [list(range(12))], ["assistant"], "normal"),
+        ):
+            with self.assertRaisesRegex(ValueError, "limit 16"):
+                generator._tokenize(object(), request, args)
+
+
 class TestSelfMTPAdmission(unittest.TestCase):
     def setUp(self):
         self.cli = types.SimpleNamespace(
@@ -352,6 +389,16 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.assertFalse(generator._is_batchable(request_args))
 
     def test_enabled_self_mtp_preserves_existing_process_wired_limit(self):
+        with (
+            patch("mlx_lm.server.mx.metal.is_available", return_value=True),
+            patch("mlx_lm.server.mx.set_wired_limit") as set_limit,
+        ):
+            self.assertIsNone(_configure_process_wired_limit(self.cli))
+        set_limit.assert_not_called()
+
+    def test_explicit_external_guard_preserves_existing_process_wired_limit(self):
+        self.cli.self_mtp = False
+        self.cli.process_wired_limit = False
         with (
             patch("mlx_lm.server.mx.metal.is_available", return_value=True),
             patch("mlx_lm.server.mx.set_wired_limit") as set_limit,
@@ -1293,6 +1340,20 @@ class TestPromptTrie(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_token_ceiling_refuses_overlength_entry(self):
+        cache = LRUPromptCache(max_tokens=4)
+        self.assertFalse(
+            cache.insert_cache(("model",), [1, 2, 3, 4, 5], [MockCache("abc")])
+        )
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.max_entry_tokens, 0)
+        self.assertEqual(cache.overlength_rejections, 1)
+
+        self.assertTrue(
+            cache.insert_cache(("model",), [1, 2, 3, 4], [MockCache("abcd")])
+        )
+        self.assertEqual(cache.max_entry_tokens, 4)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
