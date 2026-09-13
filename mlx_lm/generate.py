@@ -3944,6 +3944,12 @@ class MTPGenerationBatch:
             return self._emit_initial()
 
         self._apply_admission()
+        # Admission can attach a previously queued lane whose first token was
+        # produced during prompt preparation but has not been delivered yet.
+        # Deliver that token before the lane participates in a speculative
+        # cycle; otherwise a k-token draft plus its bonus overtakes it.
+        if any(output is not None for output in self._initial_outputs):
+            return self._emit_initial()
         if not self.state.lanes:
             self._segmented_compute_width_locked = False
         if not self.state.lanes and self._paused and self.mtp_admission is None:

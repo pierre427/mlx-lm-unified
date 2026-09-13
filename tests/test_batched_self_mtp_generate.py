@@ -212,6 +212,47 @@ class TestMTPGenerationBatch(unittest.TestCase):
         self.assertEqual(active.uids, [1, 2])
         self.assertEqual([lane.num_draft for lane in active.state.lanes], [1, 1])
 
+    def test_newly_admitted_lane_delivers_initial_before_speculative_cycle(self):
+        decisions = {1: 3, 2: "queue"}
+
+        def admit(rows):
+            return {row[0]: decisions[row[0]] for row in rows}
+
+        active = self._batch([_Lane(1, depth=3)], admission=admit)
+        first_lp = mx.array([-2.0, -0.1])
+        joining = self._batch(
+            [_Lane(2, depth=3)],
+            initial=[MTPToken(1, first_lp, False)],
+        )
+
+        def attach(_model, batch, packages):
+            if batch is None or not batch.lanes:
+                return _state(packages)
+            batch.lanes.extend(package.lane for package in packages)
+            batch.membership_epoch += 1
+            return batch
+
+        with (
+            patch(
+                "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+                side_effect=_detach,
+            ),
+            patch(
+                "mlx_lm.hybrid_speculative.attach_self_mtp_lanes",
+                side_effect=attach,
+            ),
+        ):
+            active.extend(joining)
+            self.assertIn(2, active._paused)
+            decisions[2] = 3
+            with patch(
+                "mlx_lm.hybrid_speculative.propose_batched_self_mtp"
+            ) as propose:
+                responses = active.next()
+
+        self.assertEqual([(r.uid, r.token) for r in responses], [(2, 1)])
+        propose.assert_not_called()
+
     def test_async_segmented_cohort_cancels_empties_and_reconstructs(self):
         """A membership churn boundary must retire and re-arm async work."""
 
