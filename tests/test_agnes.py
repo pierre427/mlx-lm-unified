@@ -305,10 +305,11 @@ class TestAgnes(unittest.TestCase):
         self.assertIn("mlx_sigmoid_fast<float>(zv)", qwen4_fused_gdn._SOURCE)
         self.assertIn("1.0e-6f / float(DK)", qwen4_fused_gdn._SOURCE)
 
-    def test_fused_gdn_integration_is_opt_in_and_updates_cache_after_success(self):
+    def test_fused_gdn_integration_defaults_on_and_updates_cache_after_success(self):
         layer = agnes.Model(self.make_args()).layers[0].delta_attn
         layer.eval()
-        self.assertFalse(layer.fused_gdn_decode)
+        self.assertTrue(layer.fused_gdn_decode)
+        self.assertFalse(layer.set_fused_gdn_decode(False))
         self.assertTrue(layer.set_fused_gdn_decode(True))
 
         qkv = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
@@ -371,6 +372,7 @@ class TestAgnes(unittest.TestCase):
         token = mx.array([[4]], dtype=mx.int32)
         stock_cache = model.make_cache()
         fused_cache = model.make_cache()
+        self.assertEqual(agnes.set_agnes_fused_gdn_decode(model, False), 1)
         model(prefix, cache=stock_cache)
         model(prefix, cache=fused_cache)
 

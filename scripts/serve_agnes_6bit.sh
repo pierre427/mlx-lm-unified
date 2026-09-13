@@ -10,6 +10,8 @@ reasoning_effort="${AGNES_REASONING_EFFORT:-xhigh}"
 
 # Quantized Agnes loads use verified GDN projection fusion by default.
 # Set MLX_AGNES_GDN_PROJ_FUSION=0 for an explicit stock-projection comparison.
+# Single-token Agnes decode also uses the exact swish fused GDN kernel by
+# default. Set MLX_AGNES_FUSED_GDN_DECODE=0 for a stock-recurrence comparison.
 
 # The Agnes template spells its highest tier xhigh. Accept the common OpenAI
 # spelling as a launcher convenience while passing the native value through.

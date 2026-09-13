@@ -20,7 +20,7 @@ LAYER_GLOBAL = "agnes_global_attention"
 LAYER_DELTA = "agnes_delta_attention"
 LAYER_TYPES = (LAYER_GLOBAL, LAYER_DELTA)
 
-_FUSED_GDN_DECODE = _env_flag("MLX_AGNES_FUSED_GDN_DECODE")
+_FUSED_GDN_DECODE = _env_flag("MLX_AGNES_FUSED_GDN_DECODE", default=True)
 _FUSED_GDN_FALLBACK_REASON_LIMIT = 16
 
 
