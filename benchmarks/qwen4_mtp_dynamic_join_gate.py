@@ -640,6 +640,7 @@ def run_schedule(model: Any, prompts: list[Any], args: argparse.Namespace, arm: 
     }
     result = {
         "arm": arm,
+        "cohort_mode": "static" if args.static_cohort else "dynamic",
         "prepare_wall_s": prepared_at - started,
         "transaction_wall_s": transaction_wall,
         "total_wall_s": total_wall,
@@ -697,8 +698,15 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     summary["dynamic_trials"] = len(dynamic)
     summary["dynamic_qsa_engaged"] = sum(
-        row["qsa_share"]["post_join_share_requested"] > 0
-        and row["qsa_share"]["post_join_reuse_observed"] > 0
+        (
+            row["qsa_share"]["share_requested"] > 0
+            and row["qsa_share"]["reuse_observed"] > 0
+        )
+        if row.get("cohort_mode") == "static"
+        else (
+            row["qsa_share"]["post_join_share_requested"] > 0
+            and row["qsa_share"]["post_join_reuse_observed"] > 0
+        )
         for row in dynamic
     )
     summary["accepted_repetitions"] = len(

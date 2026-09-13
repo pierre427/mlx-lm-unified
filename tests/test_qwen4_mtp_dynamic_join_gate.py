@@ -119,6 +119,25 @@ def test_summary_requires_exact_and_post_join_qsa_engagement():
     assert summary["dynamic_qsa_engaged"] == 1
 
 
+def test_summary_uses_in_cohort_qsa_receipt_for_static_b4():
+    rows = [
+        {
+            "arm": "dynamic_join",
+            "cohort_mode": "static",
+            "transaction_wall_s": 2.0,
+            "aggregate_decode_tps": 100.0,
+            "exact_fixed_match": True,
+            "qsa_share": {
+                "share_requested": 3,
+                "reuse_observed": 3,
+                "post_join_share_requested": 0,
+                "post_join_reuse_observed": 0,
+            },
+        }
+    ]
+    assert MODULE.summarize(rows)["dynamic_qsa_engaged"] == 1
+
+
 def test_summary_excludes_thermally_discarded_pair_from_medians():
     rows = [
         {
