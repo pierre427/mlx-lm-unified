@@ -123,6 +123,49 @@ class TestModelProvider(unittest.TestCase):
         self.assertTrue(provider.is_batchable)
 
 
+class TestBatchDecodeTelemetry(unittest.TestCase):
+    def make_generator(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator._batch_decode_stats = {
+            "next_calls": 0,
+            "decode_calls": 0,
+            "max_generation_width": 0,
+            "generation_width_histogram": {},
+        }
+        return generator
+
+    def test_records_live_width_without_touching_device_state(self):
+        generator = self.make_generator()
+        batch = types.SimpleNamespace(
+            _generation_batch=[object(), object(), object(), object()],
+            _plain_fallback_batch=[],
+        )
+
+        generator._record_batch_decode_width(batch)
+        generator._record_batch_decode_width(batch)
+
+        self.assertEqual(
+            generator._batch_decode_stats,
+            {
+                "next_calls": 2,
+                "decode_calls": 2,
+                "max_generation_width": 4,
+                "generation_width_histogram": {"4": 2},
+            },
+        )
+
+    def test_empty_generation_only_counts_scheduler_call(self):
+        generator = self.make_generator()
+        batch = types.SimpleNamespace(
+            _generation_batch=[], _plain_fallback_batch=[]
+        )
+
+        generator._record_batch_decode_width(batch)
+
+        self.assertEqual(generator._batch_decode_stats["next_calls"], 1)
+        self.assertEqual(generator._batch_decode_stats["decode_calls"], 0)
+
+
 class TestSelfMTPAdmission(unittest.TestCase):
     def setUp(self):
         self.cli = types.SimpleNamespace(

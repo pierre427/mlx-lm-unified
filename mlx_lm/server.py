@@ -2339,6 +2339,16 @@ class ResponseGenerator:
         self.admission_timeout = DEFAULT_SOFT_RELOAD_ADMISSION_TIMEOUT
 
         self._time_budget = TimeBudget()
+        # Always-on, synchronization-free evidence that the continuous-batch
+        # decode path actually ran at the configured width. Keep this to
+        # Python integer bookkeeping: benchmark gates need an engagement
+        # receipt, but telemetry must not synchronize the device it measures.
+        self._batch_decode_stats = {
+            "next_calls": 0,
+            "decode_calls": 0,
+            "max_generation_width": 0,
+            "generation_width_histogram": {},
+        }
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
@@ -2463,6 +2473,24 @@ class ResponseGenerator:
             except QueueEmpty:
                 pass
         return self._share_request(request)
+
+    def _record_batch_decode_width(self, batch_generator) -> None:
+        """Record the live generation width before one batch scheduler step."""
+
+        stats = self._batch_decode_stats
+        stats["next_calls"] += 1
+        generation = getattr(batch_generator, "_generation_batch", ())
+        fallback = getattr(batch_generator, "_plain_fallback_batch", ())
+        width = len(generation) + len(fallback)
+        if width <= 0:
+            return
+        stats["decode_calls"] += 1
+        stats["max_generation_width"] = max(
+            int(stats["max_generation_width"]), width
+        )
+        histogram = stats["generation_width_histogram"]
+        key = str(width)
+        histogram[key] = int(histogram.get(key, 0)) + 1
 
     def _share_object(self, obj):
         if not self._is_distributed:
@@ -3293,6 +3321,7 @@ class ResponseGenerator:
                 uids_to_remove = []
                 batch_idle = True
                 for _ in self._time_budget:
+                    self._record_batch_decode_width(batch_generator)
                     prompt_responses, gen_responses = batch_generator.next()
                     if not prompt_responses and not gen_responses:
                         break
@@ -5472,6 +5501,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
                 "receipts": receipts,
                 "engaged_requests": len(receipts),
+                "batch_decode": self.response_generator._batch_decode_stats,
                 "apc_boundaries": dict(SELF_MTP_APC_COUNTERS),
                 "segmented": segmented_self_mtp_stats(),
             }
