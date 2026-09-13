@@ -3132,6 +3132,28 @@ def _segment_aware_live_tip_enabled(config: Optional[Mapping[str, Any]]) -> bool
     return segmented_self_mtp_enabled(explicit)
 
 
+def _segment_aware_cohort_size(config: Optional[Mapping[str, Any]]) -> int:
+    """Return the max width admitted before a segmented cohort starts.
+
+    This is an admission-window target, not permission to widen a live
+    true-batched cohort.  The latter remains rejected by MTPGenerationBatch's
+    width lock.  Leaving this unspecified preserves the qualified N=2 policy.
+    """
+
+    value = (
+        config.get("segment_aware_cohort_size", 2)
+        if config is not None
+        else 2
+    )
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("segment_aware_cohort_size must be an integer") from error
+    if value < 1:
+        raise ValueError("segment_aware_cohort_size must be positive")
+    return value
+
+
 def _segmented_async_qsa_promotion_enabled(
     config: Optional[Mapping[str, Any]],
 ) -> bool:
@@ -5151,9 +5173,12 @@ class BatchGenerator:
             len(self._unprocessed_sequences),
         )
         if _segment_aware_live_tip_enabled(self.self_mtp):
-            # This first production gate is deliberately N=2. Keep dynamic
-            # admission from silently growing a wider independent-B1 cohort.
-            n = min(n, max(0, 2 - occupied))
+            # Admit an explicit static cohort before its first batched cycle.
+            # Once that consumer has run, MTPGenerationBatch holds later
+            # arrivals for the next ownership-free cohort instead of widening
+            # the device shape under active requests.
+            cohort_size = _segment_aware_cohort_size(self.self_mtp)
+            n = min(n, max(0, cohort_size - occupied))
         n = self._budget_admissible(n)
         n = self._admit_mtp_joining(n)
         if n > 0:

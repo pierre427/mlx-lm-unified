@@ -461,11 +461,20 @@ def test_segmented_self_mtp_gate_defaults_off(monkeypatch):
 
 
 def test_serving_knob_honors_env_and_explicit_override(monkeypatch):
-    from mlx_lm.generate import _segment_aware_live_tip_enabled
+    from mlx_lm.generate import (
+        _segment_aware_cohort_size,
+        _segment_aware_live_tip_enabled,
+    )
 
     monkeypatch.setenv("MLX_LM_SEGMENTED_SELF_MTP", "1")
     assert _segment_aware_live_tip_enabled({}) is True
     assert _segment_aware_live_tip_enabled({"segment_aware_live_tip": False}) is False
+    assert _segment_aware_cohort_size({"segment_aware_live_tip": True}) == 2
+    assert _segment_aware_cohort_size(
+        {"segment_aware_live_tip": True, "segment_aware_cohort_size": 4}
+    ) == 4
+    with pytest.raises(ValueError, match="must be positive"):
+        _segment_aware_cohort_size({"segment_aware_cohort_size": 0})
 
 
 def test_async_qsa_promotion_is_nested_and_default_off(monkeypatch):
