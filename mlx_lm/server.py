@@ -2421,6 +2421,11 @@ class ResponseGenerator:
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_error = None
+        # Every HTTP request waits on one of these queues.  Keep an explicit
+        # registry so a fatal generation-worker exception can wake all waiters
+        # instead of leaving streams blocked behind a still-live HTTP process.
+        self._response_queues_lock = Lock()
+        self._response_queues = set()
         self._generation_thread = Thread(target=self._run_generation)
         self._generation_thread.start()
 
@@ -2442,18 +2447,31 @@ class ResponseGenerator:
         max_size = int(self.prompt_cache.max_size)
         max_bytes = int(self.prompt_cache.max_bytes)
         max_tokens = getattr(self.prompt_cache, "max_tokens", None)
+        idle_disk_seconds = float(
+            getattr(self.prompt_cache, "_idle_disk_seconds", 0.0)
+        )
+        idle_disk_dir = getattr(self.prompt_cache, "_idle_disk_dir", None)
+        idle_disk_max_bytes = int(
+            getattr(self.prompt_cache, "_idle_disk_max_bytes", 1 << 63)
+        )
         self.prompt_cache = (
             AutomaticPrefixCacheV2(
                 max_size=max_size,
                 max_bytes=max_bytes,
                 max_tokens=max_tokens,
                 layout_name=str(layout_name),
+                idle_disk_seconds=idle_disk_seconds,
+                idle_disk_dir=(str(idle_disk_dir) if idle_disk_dir else None),
+                idle_disk_max_bytes=idle_disk_max_bytes,
             )
             if desired_v2
             else AutomaticPrefixCache(
                 max_size=max_size,
                 max_bytes=max_bytes,
                 max_tokens=max_tokens,
+                idle_disk_seconds=idle_disk_seconds,
+                idle_disk_dir=(str(idle_disk_dir) if idle_disk_dir else None),
+                idle_disk_max_bytes=idle_disk_max_bytes,
             )
         )
         self._cache_capsule_pool = CacheCapsulePool(
@@ -2474,6 +2492,38 @@ class ResponseGenerator:
         except BaseException as e:
             self._generation_error = e
             logging.error("Generation thread stopped: %r", e, exc_info=True)
+            self._fail_waiting_requests(e)
+
+    def _register_response_queue(self, response_queue: Queue) -> None:
+        lock = getattr(self, "_response_queues_lock", None)
+        if lock is None:
+            # A few embedders/tests construct the generator with __new__.
+            # Preserve that supported lightweight path.
+            lock = self._response_queues_lock = Lock()
+            self._response_queues = set()
+        with lock:
+            self._response_queues.add(response_queue)
+
+    def _unregister_response_queue(self, response_queue: Queue) -> None:
+        lock = getattr(self, "_response_queues_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._response_queues.discard(response_queue)
+
+    def _fail_waiting_requests(self, error: BaseException) -> None:
+        """Wake every request when the sole generation worker terminates."""
+
+        lock = getattr(self, "_response_queues_lock", None)
+        if lock is None:
+            return
+        with lock:
+            queues = tuple(self._response_queues)
+        reason = f"generation worker stopped: {error!r}"
+        for response_queue in queues:
+            # Give every consumer its own exception object: raising one shared
+            # instance from concurrent HTTP threads mutates its traceback.
+            response_queue.put(RuntimeError(reason))
 
     def stop_and_join(self):
         self._stop = True
@@ -3604,6 +3654,13 @@ class ResponseGenerator:
                     # bounded interval instead.
                     time.sleep(BATCH_IDLE_BACKOFF_SECONDS)
 
+            # Disk serialization can synchronize cache arrays, so run the idle
+            # tier only on the generation thread and only with no live batch.
+            else:
+                spill_idle = getattr(self.prompt_cache, "spill_idle_entries", None)
+                if callable(spill_idle):
+                    spill_idle()
+
     def _check_parallel_sampling_state_budget(
         self, cache, n, prompt_tokens, max_tokens
     ):
@@ -4452,6 +4509,7 @@ class ResponseGenerator:
             nonlocal released
             if not released:
                 released = True
+                self._unregister_response_queue(response_queue)
                 self.batch_metrics.terminal(request_id, terminal_status)
                 self._retire_request()
 
@@ -4500,6 +4558,7 @@ class ResponseGenerator:
 
         try:
             response_queue = Queue()
+            self._register_response_queue(response_queue)
             self.requests.put((response_queue, request, generation_args))
             ctx = response_queue.get()
             if isinstance(ctx, Exception):
@@ -4526,6 +4585,11 @@ class ResponseGenerator:
         timeout = self.admission_timeout if timeout is None else timeout
         deadline = time.monotonic() + max(0.0, timeout)
         with self._admission:
+            generation_error = getattr(self, "_generation_error", None)
+            if generation_error is not None:
+                raise RuntimeError(
+                    f"generation worker stopped: {generation_error!r}"
+                )
             while self._paused:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -5918,11 +5982,31 @@ def _run_http_server(
         "it only implements basic security checks."
     )
     logging.info(f"Starting httpd at {host} on port {port}...")
+
+    def stop_http_if_generation_dies():
+        response_generator._generation_thread.join()
+        if not response_generator._stop:
+            logging.error(
+                "Stopping HTTP server because the generation worker terminated"
+            )
+            httpd.shutdown()
+
+    generation_watch = Thread(
+        target=stop_http_if_generation_dies,
+        name="mlx-lm-generation-watch",
+        daemon=True,
+    )
+    generation_watch.start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        httpd.shutdown()
-        response_generator.stop_and_join()
+        pass
+    finally:
+        httpd.server_close()
+        if response_generator._generation_thread.is_alive():
+            response_generator.stop_and_join()
+        elif getattr(response_generator, "_cache_capsule_pool", None) is not None:
+            response_generator._cache_capsule_pool.close()
         # Process shutdown: restore QuantizedLinear, flush overlay caches and
         # stop the reaper thread without reinstalling the patch.
         _release_int8_prefill_overlay(reapply=False)
@@ -5944,6 +6028,13 @@ def run(
             else 1 << 63
         ),
         max_tokens=model_provider.cli_args.max_context_length,
+        idle_disk_seconds=float(
+            getattr(model_provider.cli_args, "prompt_cache_idle_seconds", 0.0)
+        ),
+        idle_disk_dir=getattr(model_provider.cli_args, "prompt_cache_disk_dir", None),
+        idle_disk_max_bytes=int(
+            getattr(model_provider.cli_args, "prompt_cache_disk_bytes", 64 << 30)
+        ),
     )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
@@ -6484,6 +6575,27 @@ def setup_arg_parser():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-idle-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Move APC entries unused for this many seconds from device memory "
+            "to --prompt-cache-disk-dir. 0 disables the disk tier."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-dir",
+        type=str,
+        default=None,
+        help="Local directory for idle APC snapshots.",
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-bytes",
+        type=_parse_size,
+        default=64 << 30,
+        help="Maximum bytes retained by the idle APC disk tier (default: 64 GiB).",
     )
     parser.add_argument(
         "--kv-bits",

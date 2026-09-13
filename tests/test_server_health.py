@@ -21,7 +21,12 @@ from pathlib import Path
 
 import requests
 
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    ResponseGenerator,
+    _run_http_server,
+)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from test_soft_reload import make_cli_args  # noqa: E402
@@ -45,6 +50,20 @@ class StubModelProvider:
 
     def load(self, model, adapter=None, draft_model=None):
         return None, None
+
+
+class BlockingCrashProvider(StubModelProvider):
+    """Hold startup until an HTTP waiter has registered, then fail."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def load_default(self):
+        self.started.set()
+        self.release.wait(timeout=10)
+        raise RuntimeError("simulated Metal OOM")
 
 
 class HealthServer:
@@ -137,6 +156,64 @@ class TestHealthLiveness(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("no Stream(gpu, 0)", body["reason"])
 
+    def test_crash_wakes_registered_request_and_releases_inflight_slot(self):
+        provider = BlockingCrashProvider()
+        generator = ResponseGenerator(provider, LRUPromptCache())
+        self.generators.append(generator)
+        self.assertTrue(provider.started.wait(timeout=10))
+        result = {}
+
+        def request():
+            try:
+                generator.generate(
+                    types.SimpleNamespace(),
+                    types.SimpleNamespace(request_id="waiting", tenant_id="default"),
+                )
+            except BaseException as error:
+                result["error"] = error
+
+        waiter = threading.Thread(target=request)
+        waiter.start()
+        deadline = time.monotonic() + 10
+        while not generator._response_queues:
+            self.assertLess(time.monotonic(), deadline, "request never registered")
+            time.sleep(0.01)
+
+        provider.release.set()
+        waiter.join(timeout=10)
+
+        self.assertFalse(waiter.is_alive(), "request stayed blocked after worker crash")
+        self.assertIn("simulated Metal OOM", str(result["error"]))
+        self.assertEqual(generator.inflight, 0)
+        self.assertFalse(generator._response_queues)
+
+    def test_new_request_is_rejected_after_generation_worker_crashes(self):
+        generator, _server = self.start(load_error=RuntimeError("dead worker"))
+        deadline = time.monotonic() + 10
+        while generator._generation_thread.is_alive():
+            self.assertLess(time.monotonic(), deadline, "thread never exited")
+            time.sleep(0.02)
+
+        with self.assertRaisesRegex(RuntimeError, "dead worker"):
+            generator._admit_request("late", "default")
+        self.assertEqual(generator.inflight, 0)
+
+    def test_production_http_server_stops_when_generation_worker_is_dead(self):
+        generator = ResponseGenerator(
+            StubModelProvider(load_error=RuntimeError("fatal worker")),
+            LRUPromptCache(),
+        )
+        self.generators.append(generator)
+        generator._generation_thread.join(timeout=10)
+        server = threading.Thread(
+            target=_run_http_server,
+            args=("127.0.0.1", 0, generator),
+        )
+        server.start()
+        server.join(timeout=10)
+
+        self.assertFalse(server.is_alive(), "HTTP shell survived its dead worker")
+
     def test_shutdown_is_not_reported_as_unhealthy(self):
         generator, server = self.start()
         generator.stop_and_join()
@@ -152,7 +229,7 @@ class TestHealthLiveness(unittest.TestCase):
         # Hold one request in flight so the reload parks at the drain wait
         # with the admission gate shut. That is the window a supervisor
         # would see, and it must not read as a fault.
-        generator._admit_request()
+        generator._admit_request("reload-holder", "default")
 
         done = threading.Event()
         errors = []

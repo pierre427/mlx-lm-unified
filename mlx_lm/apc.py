@@ -13,12 +13,22 @@ copy-on-write sharing.
 from __future__ import annotations
 
 import copy
+import os
 import threading
+import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Hashable, Iterable, List, Optional
 
 import mlx.core as mx
 
+from .cache_capsule import CacheCapsuleGeneration
+from .cache_planes import (
+    CompiledScheduleMetadata,
+    PLEResidencyHints,
+    PromptHostPlane,
+)
 from .cow_cache import (
     COWCacheStale,
     COWCacheTelemetry,
@@ -27,22 +37,18 @@ from .cow_cache import (
     cow_cache_enabled,
     freeze_prompt_cache,
 )
-from .cache_planes import (
-    CompiledScheduleMetadata,
-    PLEResidencyHints,
-    PromptHostPlane,
-)
-from .cache_capsule import CacheCapsuleGeneration
 from .models.cache import (
-    _copy_prompt_cache_for_restore,
-    _mark_prompt_cache_restored,
     ArraysCache,
     CacheList,
     KVCache,
     LRUPromptCache,
     PromptTrie,
     RotatingKVCache,
+    _copy_prompt_cache_for_restore,
+    _mark_prompt_cache_restored,
     can_trim_prompt_cache,
+    load_prompt_cache,
+    save_prompt_cache,
 )
 
 try:
@@ -191,6 +197,16 @@ class AutomaticPrefixCache(LRUPromptCache):
     """
 
     _STAT_KEYS = ("lookups", "hits", "misses", "cached_tokens", "stores")
+    _DISK_STAT_KEYS = (
+        "idle_spills",
+        "pressure_spills",
+        "restores",
+        "restore_failures",
+        "spill_failures",
+        "disk_evictions",
+        "bytes_written",
+        "bytes_read",
+    )
 
     def __init__(
         self,
@@ -199,6 +215,10 @@ class AutomaticPrefixCache(LRUPromptCache):
         max_tokens: Optional[int] = None,
         *,
         cow_branching: Optional[bool] = None,
+        idle_disk_seconds: float = 0.0,
+        idle_disk_dir: Optional[str] = None,
+        idle_disk_max_bytes: int = 1 << 63,
+        now_fn=time.monotonic,
     ):
         super().__init__(
             max_size=max_size, max_bytes=max_bytes, max_tokens=max_tokens
@@ -212,6 +232,31 @@ class AutomaticPrefixCache(LRUPromptCache):
         self._apc_lifetime = {key: 0 for key in self._STAT_KEYS}
         self._apc_clears = 0
         self._capsule_generation = CacheCapsuleGeneration()
+        self._idle_disk_seconds = max(0.0, float(idle_disk_seconds))
+        if self._idle_disk_seconds > 0 and not idle_disk_dir:
+            raise ValueError(
+                "idle_disk_dir is required when idle_disk_seconds is enabled"
+            )
+        self._idle_disk_dir = (
+            Path(idle_disk_dir).expanduser().resolve()
+            if idle_disk_dir and self._idle_disk_seconds > 0
+            else None
+        )
+        self._idle_disk_max_bytes = max(0, int(idle_disk_max_bytes))
+        self._now = now_fn
+        self._last_idle_scan = 0.0
+        self._disk_stats = {key: 0 for key in self._DISK_STAT_KEYS}
+        self._disk_bytes = 0
+        if self._idle_disk_dir is not None:
+            self._idle_disk_dir.mkdir(parents=True, exist_ok=True)
+            # This tier preserves idle state only within one process. A stale
+            # file has no live APC identity/compatibility owner, so fail closed
+            # across restarts and remove only our namespaced files.
+            for path in self._idle_disk_dir.glob("apc-idle-*.safetensors"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
 
     @property
     def capsule_generation(self) -> CacheCapsuleGeneration:
@@ -238,6 +283,316 @@ class AutomaticPrefixCache(LRUPromptCache):
             semantic_fingerprint=semantic_fingerprint,
         )
 
+    def _entry_records_locked(self):
+        seen = set()
+        for cache_type in self._lru._ordering:
+            for key, tokens in tuple(self._lru._lrus[cache_type]):
+                entry = self._trie.get(key, tokens)
+                if entry is not None and id(entry) not in seen:
+                    seen.add(id(entry))
+                    yield key, list(tokens), entry
+
+    @staticmethod
+    def _entry_pinned(entry) -> bool:
+        cache = entry.prompt_cache
+        if not isinstance(cache, COWFrozenPromptCache):
+            return False
+        return int(getattr(cache.cow_owner, "pin_count", 0) or 0) > 0
+
+    @staticmethod
+    def _atomic_save_cache(path: Path, cache: List[Any]) -> None:
+        temporary = path.with_name(
+            f".{path.name}.{uuid.uuid4().hex}.tmp.safetensors"
+        )
+        try:
+            save_prompt_cache(str(temporary), list(cache))
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _atomic_save_arrays(path: Path, arrays: dict[str, mx.array]) -> None:
+        temporary = path.with_name(
+            f".{path.name}.{uuid.uuid4().hex}.tmp.safetensors"
+        )
+        try:
+            mx.save_safetensors(str(temporary), arrays)
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _disk_paths(entry) -> tuple[Path, ...]:
+        disk = getattr(entry, "_apc_disk", None) or {}
+        return tuple(
+            Path(path)
+            for path in (
+                disk.get("target"),
+                disk.get("draft"),
+                disk.get("aux"),
+            )
+            if path
+        )
+
+    def _remove_disk_files_locked(self, entry) -> None:
+        for path in self._disk_paths(entry):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            self._disk_bytes = max(0, self._disk_bytes - int(size))
+        entry._apc_disk = None
+
+    def _drop_entry_locked(self, key, tokens, entry) -> None:
+        current = self._trie.pop(key, tokens)
+        if current is None:
+            return
+        self._lru.remove(key, tokens)
+        self._n_bytes = max(0, self._n_bytes - int(current.nbytes))
+        self._n_bytes_by_type[current.cache_type] = max(
+            0,
+            self._n_bytes_by_type[current.cache_type] - int(current.nbytes),
+        )
+        if isinstance(current.prompt_cache, COWFrozenPromptCache):
+            current.prompt_cache.close()
+        self._remove_disk_files_locked(current)
+        current.prompt_cache = []
+        current.sidecar = None
+        current.nbytes = 0
+        self._capsule_generation.advance()
+
+    def _spill_entry_locked(self, key, tokens, entry, *, reason: str) -> bool:
+        if self._idle_disk_dir is None or not entry.prompt_cache:
+            return False
+        if self._entry_pinned(entry):
+            return False
+
+        disk = getattr(entry, "_apc_disk", None)
+        if not disk:
+            stem = f"apc-idle-{uuid.uuid4().hex}"
+            target = self._idle_disk_dir / f"{stem}.target.safetensors"
+            draft = self._idle_disk_dir / f"{stem}.draft.safetensors"
+            aux = self._idle_disk_dir / f"{stem}.aux.safetensors"
+            created = []
+            try:
+                self._atomic_save_cache(target, entry.prompt_cache)
+                created.append(target)
+                sidecar = entry.sidecar
+                sidecar_info = None
+                if sidecar is not None:
+                    draft_cache, tail_hidden = sidecar.state
+                    self._atomic_save_cache(draft, draft_cache)
+                    created.append(draft)
+                    arrays = {}
+                    if tail_hidden is not None:
+                        arrays["tail_hidden"] = tail_hidden
+                    if sidecar.rng_key is not None:
+                        arrays["rng_key"] = sidecar.rng_key
+                    if arrays:
+                        self._atomic_save_arrays(aux, arrays)
+                        created.append(aux)
+                    sidecar_info = {
+                        "covered_tokens": int(sidecar.covered_tokens),
+                        "rng_draws": int(sidecar.rng_draws),
+                    }
+                metadata = getattr(
+                    getattr(entry.prompt_cache, "cow_owner", None),
+                    "metadata",
+                    None,
+                )
+                disk = {
+                    "target": str(target),
+                    "draft": str(draft) if draft in created else None,
+                    "aux": str(aux) if aux in created else None,
+                    "sidecar": sidecar_info,
+                    "cow_metadata": metadata,
+                    "resident_nbytes": int(entry.nbytes),
+                }
+                entry._apc_disk = disk
+                written = sum(path.stat().st_size for path in created)
+                self._disk_bytes += int(written)
+                self._disk_stats["bytes_written"] += int(written)
+            except Exception:
+                self._disk_stats["spill_failures"] += 1
+                for path in created:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                return False
+
+        resident_nbytes = int(entry.nbytes)
+        if isinstance(entry.prompt_cache, COWFrozenPromptCache):
+            entry.prompt_cache.close()
+        entry.prompt_cache = []
+        entry.sidecar = None
+        entry.nbytes = 0
+        self._n_bytes = max(0, self._n_bytes - resident_nbytes)
+        self._n_bytes_by_type[entry.cache_type] = max(
+            0, self._n_bytes_by_type[entry.cache_type] - resident_nbytes
+        )
+        self._disk_stats[
+            "idle_spills" if reason == "idle" else "pressure_spills"
+        ] += 1
+        self._capsule_generation.advance()
+        return True
+
+    def _restore_entry_locked(self, key, tokens, entry) -> bool:
+        disk = getattr(entry, "_apc_disk", None) or {}
+        target = disk.get("target")
+        if not target:
+            return False
+        try:
+            # Make room before materializing file-backed arrays. The requested
+            # entry may temporarily exceed the resident ceiling by itself, but
+            # unrelated idle sources should not crowd its restore.
+            expected = int(disk.get("resident_nbytes", 0) or 0)
+            original_limit = self.max_bytes
+            self.max_bytes = max(0, original_limit - expected)
+            try:
+                self._spill_resident_budget_locked()
+            finally:
+                self.max_bytes = original_limit
+            cache = load_prompt_cache(target)
+            sidecar = None
+            sidecar_info = disk.get("sidecar")
+            if sidecar_info is not None:
+                draft = load_prompt_cache(disk["draft"])
+                arrays = mx.load(disk["aux"]) if disk.get("aux") else {}
+                sidecar = MTPAPCSidecar(
+                    (draft, arrays.get("tail_hidden")),
+                    covered_tokens=int(sidecar_info["covered_tokens"]),
+                    rng_key=arrays.get("rng_key"),
+                    rng_draws=int(sidecar_info.get("rng_draws", 0)),
+                )
+            mx.eval([item.state for item in cache])
+            if sidecar is not None:
+                mx.eval(
+                    [item.state for item in sidecar.state[0]],
+                    *(
+                        [sidecar.state[1]]
+                        if sidecar.state[1] is not None
+                        else []
+                    ),
+                    *([sidecar.rng_key] if sidecar.rng_key is not None else []),
+                )
+            metadata = disk.get("cow_metadata")
+            if self._cow_branching:
+                cache, sidecar = freeze_prompt_cache(
+                    cache,
+                    key=key,
+                    tokens=tokens,
+                    cache_type=entry.cache_type,
+                    sidecar=sidecar,
+                    prompt_host=getattr(metadata, "prompt_host", None),
+                    ple_hints=getattr(metadata, "ple_hints", None),
+                    compiled_schedule=getattr(metadata, "compiled_schedule", None),
+                    telemetry=self._cow_telemetry,
+                    layer_segments=getattr(self, "_layer_segments", False),
+                )
+            entry.prompt_cache = cache
+            entry.sidecar = sidecar
+            entry.nbytes = sum(int(item.nbytes) for item in cache) + int(
+                getattr(sidecar, "nbytes", 0)
+            )
+            self._n_bytes += int(entry.nbytes)
+            self._n_bytes_by_type[entry.cache_type] += int(entry.nbytes)
+            self._disk_stats["restores"] += 1
+            self._disk_stats["bytes_read"] += sum(
+                path.stat().st_size for path in self._disk_paths(entry)
+            )
+            entry._apc_last_access_at = self._now()
+            return True
+        except Exception:
+            self._disk_stats["restore_failures"] += 1
+            return False
+
+    def _enforce_disk_limit_locked(self) -> None:
+        if self._disk_bytes <= self._idle_disk_max_bytes:
+            return
+        records = sorted(
+            (
+                (float(getattr(entry, "_apc_last_access_at", 0.0)), key, tokens, entry)
+                for key, tokens, entry in self._entry_records_locked()
+                if getattr(entry, "_apc_disk", None)
+            ),
+            key=lambda row: row[0],
+        )
+        for _last_access, key, tokens, entry in records:
+            if self._disk_bytes <= self._idle_disk_max_bytes:
+                break
+            if entry.prompt_cache:
+                self._remove_disk_files_locked(entry)
+            else:
+                self._drop_entry_locked(key, tokens, entry)
+            self._disk_stats["disk_evictions"] += 1
+
+    def _spill_resident_budget_locked(self, *, exclude=None) -> int:
+        if self._idle_disk_dir is None or self._n_bytes <= self.max_bytes:
+            return 0
+        spilled = 0
+        while self._n_bytes > self.max_bytes:
+            records = sorted(
+                (
+                    (
+                        float(getattr(entry, "_apc_last_access_at", 0.0)),
+                        key,
+                        tokens,
+                        entry,
+                    )
+                    for key, tokens, entry in self._entry_records_locked()
+                    if entry.prompt_cache
+                    and not self._entry_pinned(entry)
+                    and (entry is not exclude or self._n_bytes == entry.nbytes)
+                ),
+                key=lambda row: row[0],
+            )
+            if not records:
+                break
+            _last_access, key, tokens, entry = records[0]
+            if not self._spill_entry_locked(key, tokens, entry, reason="pressure"):
+                break
+            spilled += 1
+        if spilled:
+            mx.clear_cache()
+            self._enforce_disk_limit_locked()
+        return spilled
+
+    def spill_idle_entries(self, *, now: Optional[float] = None) -> int:
+        """Move unpinned APC entries idle past the configured age to disk."""
+
+        if self._idle_disk_dir is None or self._idle_disk_seconds <= 0:
+            return 0
+        now = self._now() if now is None else float(now)
+        scan_interval = 1.0
+        with self._apc_lock:
+            if now - self._last_idle_scan < scan_interval:
+                return 0
+            self._last_idle_scan = now
+            spilled = 0
+            for key, tokens, entry in tuple(self._entry_records_locked()):
+                last_access = float(getattr(entry, "_apc_last_access_at", now))
+                if (
+                    entry.prompt_cache
+                    and now - last_access >= self._idle_disk_seconds
+                    and self._spill_entry_locked(key, tokens, entry, reason="idle")
+                ):
+                    spilled += 1
+            if spilled:
+                mx.clear_cache()
+                self._enforce_disk_limit_locked()
+            return spilled
+
     def lookup(self, key: Hashable, tokens: Iterable[int]) -> APCLookup:
         # Search, candidate selection, restoration, and hit accounting must
         # observe one trie generation. clear()/trim_to()/store() use the same
@@ -247,7 +602,32 @@ class AutomaticPrefixCache(LRUPromptCache):
 
     def _lookup_locked(self, key: Hashable, tokens: Iterable[int]) -> APCLookup:
         tokens = [int(token) for token in tokens]
-        trie_result = self._trie.search(key, tokens)
+        # A disk-only entry keeps its radix identity but no device arrays.
+        # Hydrate only the exact/nearest candidates before the established APC
+        # selection logic inspects their offsets and trim capabilities.
+        while True:
+            trie_result = self._trie.search(key, tokens)
+            retry = False
+            seen = set()
+            for path in (
+                trie_result.exact,
+                trie_result.longer,
+                trie_result.shorter,
+            ):
+                if path is None or tuple(path) in seen:
+                    continue
+                seen.add(tuple(path))
+                entry = self._trie.get(trie_result.model, path)
+                if entry is None:
+                    continue
+                if getattr(entry, "_apc_disk", None) and not entry.prompt_cache:
+                    if not self._restore_entry_locked(trie_result.model, path, entry):
+                        self._drop_entry_locked(trie_result.model, path, entry)
+                        retry = True
+                        break
+                entry._apc_last_access_at = self._now()
+            if not retry:
+                break
         # A target cache may only compose with an MTP sidecar at the exact
         # boundary jointly captured by the two states. Prefer the deepest such
         # candidate whose stored token path still matches through that
@@ -461,29 +841,41 @@ class AutomaticPrefixCache(LRUPromptCache):
         )
         before = (
             {id(entry): entry for entry in _iter_trie_entries(self._trie)}
-            if self._cow_branching
+            if self._cow_branching or self._idle_disk_dir is not None
             else {}
         )
-        super().insert_cache(
-            key,
-            tokens,
-            prompt_cache,
-            cache_type=cache_type,
-            sidecar=sidecar,
-        )
+        resident_limit = self.max_bytes
+        if self._idle_disk_dir is not None:
+            # Preserve over-budget entries in the disk tier instead of letting
+            # the base LRU delete them before APC can serialize them.
+            self.max_bytes = 1 << 63
+        try:
+            super().insert_cache(
+                key,
+                tokens,
+                prompt_cache,
+                cache_type=cache_type,
+                sidecar=sidecar,
+            )
+        finally:
+            self.max_bytes = resident_limit
         self._capsule_generation.advance()
         if before or cow_source is not None:
             live_entries = list(_iter_trie_entries(self._trie))
             live = {id(entry) for entry in live_entries}
             for ident, entry in before.items():
-                if ident not in live and isinstance(
-                    entry.prompt_cache, COWFrozenPromptCache
-                ):
-                    entry.prompt_cache.close()
+                if ident not in live:
+                    if isinstance(entry.prompt_cache, COWFrozenPromptCache):
+                        entry.prompt_cache.close()
+                    self._remove_disk_files_locked(entry)
             if cow_source is not None and not any(
                 entry.prompt_cache is cow_source for entry in live_entries
             ):
                 cow_source.close()
+        stored_entry = self._trie.get(key, tokens)
+        if stored_entry is not None:
+            stored_entry._apc_last_access_at = self._now()
+            self._spill_resident_budget_locked(exclude=stored_entry)
         self._apc_stats["stores"] += 1
         return capabilities
 
@@ -553,6 +945,7 @@ class AutomaticPrefixCache(LRUPromptCache):
         for entry in entries:
             if isinstance(entry.prompt_cache, COWFrozenPromptCache):
                 entry.prompt_cache.close()
+            self._remove_disk_files_locked(entry)
 
         # Release the arrays the detached entries still hold. Rebind, never
         # mutate in place: a caller may hold the same list.
@@ -586,6 +979,19 @@ class AutomaticPrefixCache(LRUPromptCache):
             stats["max_tokens"] = self.max_tokens
             stats["max_entry_tokens"] = self.max_entry_tokens
             stats["overlength_rejections"] = self.overlength_rejections
+            stats["idle_disk"] = {
+                "enabled": self._idle_disk_dir is not None,
+                "idle_seconds": self._idle_disk_seconds,
+                "resident_bytes": int(self._n_bytes),
+                "disk_bytes": int(self._disk_bytes),
+                "disk_max_bytes": int(self._idle_disk_max_bytes),
+                "disk_entries": sum(
+                    1
+                    for entry in _iter_trie_entries(self._trie)
+                    if getattr(entry, "_apc_disk", None)
+                ),
+                **dict(self._disk_stats),
+            }
             return stats
 
     def trim_to(
@@ -605,10 +1011,10 @@ class AutomaticPrefixCache(LRUPromptCache):
         if live != set(before):
             self._capsule_generation.advance()
         for ident, entry in before.items():
-            if ident not in live and isinstance(
-                entry.prompt_cache, COWFrozenPromptCache
-            ):
-                entry.prompt_cache.close()
+            if ident not in live:
+                if isinstance(entry.prompt_cache, COWFrozenPromptCache):
+                    entry.prompt_cache.close()
+                self._remove_disk_files_locked(entry)
 
 
 class AutomaticPrefixCacheV2(AutomaticPrefixCache):
@@ -623,6 +1029,10 @@ class AutomaticPrefixCacheV2(AutomaticPrefixCache):
         max_tokens: Optional[int] = None,
         *,
         layout_name: str,
+        idle_disk_seconds: float = 0.0,
+        idle_disk_dir: Optional[str] = None,
+        idle_disk_max_bytes: int = 1 << 63,
+        now_fn=time.monotonic,
     ) -> None:
         if not layout_name:
             raise ValueError("APCv2 requires a model cache-layout declaration")
@@ -631,6 +1041,10 @@ class AutomaticPrefixCacheV2(AutomaticPrefixCache):
             max_bytes=max_bytes,
             max_tokens=max_tokens,
             cow_branching=True,
+            idle_disk_seconds=idle_disk_seconds,
+            idle_disk_dir=idle_disk_dir,
+            idle_disk_max_bytes=idle_disk_max_bytes,
+            now_fn=now_fn,
         )
         self._layer_segments = True
         self.layout_name = str(layout_name)

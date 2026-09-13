@@ -1,5 +1,7 @@
 """APCv2 model opt-in, layer segmentation, and atomic restore contracts."""
 
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -112,6 +114,144 @@ def test_legacy_apc_cow_does_not_implicitly_adopt_v2_segments():
     assert hit.hit
     assert hit.segment_manifest["segments"] == 0
     assert "version" not in legacy.apc_stats
+
+
+def test_apcv2_spills_idle_target_and_mtp_sidecar_then_restores_exactly():
+    with tempfile.TemporaryDirectory() as directory:
+        now = [0.0]
+        apc = AutomaticPrefixCacheV2(
+            max_size=4,
+            layout_name="qwen4-exp-layer-segments-v1",
+            idle_disk_seconds=180,
+            idle_disk_dir=directory,
+            idle_disk_max_bytes=1 << 30,
+            now_fn=lambda: now[0],
+        )
+        target = [_recurrent(3), _state(KVCache(), 3)]
+        draft = [_state(KVCache(), 2, seed=100)]
+        sidecar = MTPAPCSidecar(
+            (draft, mx.ones((1, 1, 4), dtype=mx.float32)),
+            covered_tokens=3,
+            rng_key=mx.array([7, 11], dtype=mx.uint32),
+            rng_draws=5,
+        )
+        key = APCKey("qwen4")
+        apc.store(key, [1, 2, 3], target, sidecar=sidecar)
+
+        now[0] = 179
+        assert apc.spill_idle_entries() == 0
+        now[0] = 180
+        assert apc.spill_idle_entries() == 1
+        assert apc.nbytes == 0
+        assert apc.apc_stats["idle_disk"]["disk_entries"] == 1
+        assert len(list(Path(directory).glob("apc-idle-*.safetensors"))) == 3
+
+        hit = apc.lookup(key, [1, 2, 3, 4])
+
+        assert hit.hit_kind == "mtp_sidecar"
+        assert hit.cached_tokens == 3
+        assert hit.remaining_tokens == [4]
+        assert hit.cache[0].lengths.item() == 3
+        assert hit.cache[1].offset == 3
+        assert hit.sidecar.state[0][0].offset == 2
+        assert hit.sidecar.covered_tokens == 3
+        assert hit.sidecar.rng_draws == 5
+        assert mx.array_equal(hit.sidecar.rng_key, mx.array([7, 11], dtype=mx.uint32))
+        assert apc.apc_stats["idle_disk"]["restores"] == 1
+        hit.cache.close()
+
+
+def test_apcv2_resident_byte_pressure_spills_instead_of_dropping_entry():
+    with tempfile.TemporaryDirectory() as directory:
+        apc = AutomaticPrefixCacheV2(
+            max_size=4,
+            max_bytes=1,
+            layout_name="qwen4-exp-layer-segments-v1",
+            idle_disk_seconds=180,
+            idle_disk_dir=directory,
+        )
+        key = APCKey("qwen4")
+        apc.store(key, [1, 2, 3], [_state(KVCache(), 3)])
+
+        assert len(apc) == 1
+        assert apc.nbytes == 0
+        disk = apc.apc_stats["idle_disk"]
+        assert disk["pressure_spills"] == 1
+        assert disk["disk_entries"] == 1
+
+        hit = apc.lookup(key, [1, 2, 3, 4])
+        assert hit.hit
+        assert hit.cached_tokens == 3
+        hit.cache.close()
+
+
+def test_apcv2_idle_spill_waits_for_live_cow_branch_to_close():
+    with tempfile.TemporaryDirectory() as directory:
+        now = [0.0]
+        apc = AutomaticPrefixCacheV2(
+            max_size=4,
+            layout_name="qwen4-exp-layer-segments-v1",
+            idle_disk_seconds=180,
+            idle_disk_dir=directory,
+            now_fn=lambda: now[0],
+        )
+        key = APCKey("qwen4")
+        apc.store(key, [1, 2, 3], [_state(KVCache(), 3)])
+        live = apc.lookup(key, [1, 2, 3, 4]).cache
+
+        now[0] = 180
+        assert apc.spill_idle_entries() == 0
+        assert apc.nbytes > 0
+
+        live.close()
+        now[0] = 181
+        assert apc.spill_idle_entries() == 1
+        assert apc.nbytes == 0
+
+
+def test_apcv2_missing_disk_snapshot_fails_closed_as_cache_miss():
+    with tempfile.TemporaryDirectory() as directory:
+        now = [0.0]
+        apc = AutomaticPrefixCacheV2(
+            max_size=4,
+            layout_name="qwen4-exp-layer-segments-v1",
+            idle_disk_seconds=180,
+            idle_disk_dir=directory,
+            now_fn=lambda: now[0],
+        )
+        key = APCKey("qwen4")
+        tokens = [1, 2, 3]
+        apc.store(key, tokens, [_state(KVCache(), 3)])
+        now[0] = 180
+        assert apc.spill_idle_entries() == 1
+        entry = apc._trie.get(key, tokens)
+        Path(entry._apc_disk["target"]).unlink()
+
+        miss = apc.lookup(key, tokens + [4])
+
+        assert not miss.hit
+        assert len(apc) == 0
+        assert apc.apc_stats["idle_disk"]["restore_failures"] == 1
+
+
+def test_apcv2_disk_budget_evicts_oldest_disk_only_entry():
+    with tempfile.TemporaryDirectory() as directory:
+        apc = AutomaticPrefixCacheV2(
+            max_size=4,
+            max_bytes=1,
+            layout_name="qwen4-exp-layer-segments-v1",
+            idle_disk_seconds=180,
+            idle_disk_dir=directory,
+            idle_disk_max_bytes=1,
+        )
+
+        apc.store(APCKey("qwen4"), [1, 2, 3], [_state(KVCache(), 3)])
+
+        disk = apc.apc_stats["idle_disk"]
+        assert len(apc) == 0
+        assert disk["disk_entries"] == 0
+        assert disk["disk_evictions"] == 1
+        assert not list(Path(directory).glob("apc-idle-*.safetensors"))
 
 
 def test_apcv2_target_segment_invalidation_rejects_atomic_restore():
