@@ -8,12 +8,14 @@ from mlx_lm.cache_segmentation import (
     PerPlaneSegmentationPolicy,
     PlaneSegmentCandidate,
     Qwen4CacheGeometry,
+    SegmentValueCandidate,
     SegmentationPolicyConfig,
     SyntheticServingTrace,
     TraceCalibrator,
     pareto_front,
     qsa_window,
     recompute_cost_proxy_us,
+    select_protected_segment_hotset,
 )
 
 
@@ -231,6 +233,32 @@ def test_recompute_proxy_treats_gdn_as_one_state_plus_serial_replay():
     )
     assert 1_000 < short < 2_000
     assert 7_000 < long < 8_000
+
+
+def test_protected_hotset_uses_saved_work_per_byte_and_rejects_mutable_state():
+    candidates = (
+        SegmentValueCandidate("large", 8, 100, 2, 800),
+        SegmentValueCandidate("dense", 5, 100, 2, 200),
+        SegmentValueCandidate(
+            "mutable", 100, 100, 4, 100, contains_mutable_request_data=True
+        ),
+        SegmentValueCandidate("unstable", 100, 100, 4, 100, stable=False),
+    )
+    hotset = select_protected_segment_hotset(candidates, byte_budget=800)
+    assert hotset.segment_ids == ("dense",)
+    assert hotset.resident_bytes == 200
+    assert hotset.expected_value_us == 1_000
+
+
+def test_protected_hotset_is_deterministic_and_byte_bounded():
+    candidates = (
+        SegmentValueCandidate("b", 1, 10, 1, 10),
+        SegmentValueCandidate("a", 1, 10, 1, 10),
+        SegmentValueCandidate("c", 1, 10, 1, 10),
+    )
+    hotset = select_protected_segment_hotset(candidates, byte_budget=20)
+    assert hotset.segment_ids == ("a", "b")
+    assert hotset.resident_bytes == 20
 
 
 def test_calibration_reports_traffic_memory_and_recomputation_metrics():

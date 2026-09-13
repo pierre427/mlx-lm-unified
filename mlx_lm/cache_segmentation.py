@@ -42,6 +42,82 @@ def recompute_cost_proxy_us(
 
 
 @dataclass(frozen=True)
+class SegmentValueCandidate:
+    """Measured evidence for protecting one immutable cache segment."""
+
+    segment_id: str
+    expected_future_hits: float
+    recompute_cost_us: float
+    branch_fanout: int
+    resident_bytes: int
+    stable: bool = True
+    contains_mutable_request_data: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.segment_id:
+            raise ValueError("segment value candidate needs an id")
+        if not math.isfinite(self.expected_future_hits) or self.expected_future_hits < 0:
+            raise ValueError("expected future hits must be finite and non-negative")
+        if not math.isfinite(self.recompute_cost_us) or self.recompute_cost_us < 0:
+            raise ValueError("recompute cost must be finite and non-negative")
+        if self.branch_fanout < 1 or self.resident_bytes < 1:
+            raise ValueError("fanout and resident bytes must be positive")
+
+    @property
+    def expected_value_us(self) -> float:
+        return self.expected_future_hits * self.recompute_cost_us * self.branch_fanout
+
+    @property
+    def value_per_resident_byte(self) -> float:
+        return self.expected_value_us / self.resident_bytes
+
+    @property
+    def retention_eligible(self) -> bool:
+        return self.stable and not self.contains_mutable_request_data
+
+
+@dataclass(frozen=True)
+class ProtectedSegmentHotset:
+    """Deterministic, byte-bounded protection recommendation."""
+
+    segment_ids: tuple[str, ...]
+    resident_bytes: int
+    expected_value_us: float
+
+
+def select_protected_segment_hotset(
+    candidates: Iterable[SegmentValueCandidate], *, byte_budget: int
+) -> ProtectedSegmentHotset:
+    """Greedily admit stable segments by expected saved work per byte.
+
+    This emits metadata only. Callers retain authority over materialization,
+    eviction, precision, and correctness-bearing cache ownership.
+    """
+    if byte_budget < 0:
+        raise ValueError("byte budget must be non-negative")
+    eligible = sorted(
+        (candidate for candidate in candidates if candidate.retention_eligible),
+        key=lambda candidate: (
+            -candidate.value_per_resident_byte,
+            -candidate.expected_value_us,
+            candidate.segment_id,
+        ),
+    )
+    selected = []
+    resident_bytes = 0
+    expected_value_us = 0.0
+    for candidate in eligible:
+        if resident_bytes + candidate.resident_bytes > byte_budget:
+            continue
+        selected.append(candidate.segment_id)
+        resident_bytes += candidate.resident_bytes
+        expected_value_us += candidate.expected_value_us
+    return ProtectedSegmentHotset(
+        tuple(selected), resident_bytes, expected_value_us
+    )
+
+
+@dataclass(frozen=True)
 class Qwen4CacheGeometry:
     layers: int = 48
     full_attention_stride: int = 4
@@ -727,6 +803,8 @@ __all__ = [
     "PlaneSegmentationPlan",
     "QSAWindow",
     "Qwen4CacheGeometry",
+    "ProtectedSegmentHotset",
+    "SegmentValueCandidate",
     "SegmentSlice",
     "SegmentationPolicyConfig",
     "SyntheticServingTrace",
@@ -735,4 +813,5 @@ __all__ = [
     "pareto_front",
     "qsa_window",
     "recompute_cost_proxy_us",
+    "select_protected_segment_hotset",
 ]

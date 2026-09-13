@@ -100,6 +100,72 @@ from .rope_utils import initialize_rope
 from ..verify_sync import record_verify_sync
 
 
+_QSA_SEGMENT_CAPTURE_LOCK = threading.Lock()
+_QSA_SEGMENT_CAPTURE_COUNT = 0
+
+
+def _capture_qsa_segment_inputs(
+    q,
+    pooled,
+    q_pos,
+    valid_blocks,
+    selected,
+    *,
+    layer_id: Union[int, str],
+) -> None:
+    """Save bounded QSA selection inputs for an explicit offline experiment."""
+    capture_dir = os.environ.get("MLX_QWEN4_QSA_SEGMENT_CAPTURE_DIR")
+    if not capture_dir:
+        return
+    allowed_layers = os.environ.get("MLX_QWEN4_QSA_SEGMENT_CAPTURE_LAYERS")
+    if allowed_layers and str(layer_id) not in {
+        value.strip() for value in allowed_layers.split(",")
+    }:
+        return
+    min_blocks = max(
+        0, int(os.environ.get("MLX_QWEN4_QSA_SEGMENT_CAPTURE_MIN_BLOCKS", "0"))
+    )
+    if int(pooled.shape[1]) < min_blocks:
+        return
+    limit = max(1, int(os.environ.get("MLX_QWEN4_QSA_SEGMENT_CAPTURE_COUNT", "24")))
+    global _QSA_SEGMENT_CAPTURE_COUNT
+    with _QSA_SEGMENT_CAPTURE_LOCK:
+        remaining = limit - _QSA_SEGMENT_CAPTURE_COUNT
+        if remaining <= 0:
+            return
+        mx.eval(q, pooled, q_pos, valid_blocks, selected)
+        q_np = np.asarray(q.astype(mx.float32))
+        pooled_np = np.asarray(pooled.astype(mx.float32))
+        q_pos_np = np.asarray(q_pos)
+        valid_np = np.asarray(valid_blocks)
+        selected_np = np.asarray(selected)
+        directory = Path(capture_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        rows = min(int(q_np.shape[0]), remaining)
+        for row in range(rows):
+            _QSA_SEGMENT_CAPTURE_COUNT += 1
+            safe_layer_id = str(layer_id).replace(":", "-")
+            stem = (
+                f"qsa-selection-{_QSA_SEGMENT_CAPTURE_COUNT:04d}"
+                f"-layer-{safe_layer_id}"
+            )
+            target = directory / f"{stem}.npz"
+            temporary = directory / f".{stem}.npz.tmp"
+            with temporary.open("wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    keys=pooled_np[row],
+                    queries=q_np[row, -1:, :, :],
+                    valid_blocks=np.asarray(
+                        [int(valid_np[row, -1].sum())], dtype=np.int64
+                    ),
+                    q_positions=q_pos_np[row, -1:],
+                    production_selected=selected_np[row, -1:],
+                    layer_id=np.asarray([str(layer_id)]),
+                )
+            temporary.replace(target)
+
+
 # Opt-in micro-levers, each read once at import.  Off keeps the stock path,
 # EXCEPT where a lever has been promoted (``default=True``) -- see below.
 #
@@ -4896,6 +4962,7 @@ class QSAIndexer(nn.Module):
         self.block_topk = args.indexer_budget // args.indexer_compress_ratio
         self.rotary_dim = int(args.head_dim * args.partial_rotary_factor)
         self.rope_theta = args.rope_theta
+        self.layer_id = layer_id
         self.summary_identity = _qsa_summary_identity(args, layer_id)
         self.index_qk_proj = nn.Linear(
             args.hidden_size,
@@ -5560,6 +5627,14 @@ class QSAIndexer(nn.Module):
                     query_width=length,
                     blocks=n_blocks,
                 )
+            _capture_qsa_segment_inputs(
+                q,
+                pooled,
+                q_pos,
+                valid_blocks,
+                selected,
+                layer_id=self.layer_id,
+            )
             if cache is not None and getattr(cache, "_mtp_share_topk", False):
                 shared = (
                     cache.last_valid_query(selected)

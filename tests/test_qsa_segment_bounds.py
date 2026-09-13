@@ -1,5 +1,9 @@
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
+import mlx.core as mx
 import numpy as np
 
 from mlx_lm.qsa_segment_bounds import (
@@ -10,6 +14,7 @@ from mlx_lm.qsa_segment_bounds import (
     qsa_scores,
     qsa_segment_upper_bounds,
 )
+from mlx_lm.models import qwen4_exp
 
 
 class TestQSASegmentBounds(unittest.TestCase):
@@ -123,6 +128,59 @@ class TestQSASegmentBounds(unittest.TestCase):
         np.testing.assert_array_equal(profile.hot_segment_ids, [0])
         self.assertAlmostEqual(profile.hot_membership_coverage, 2 / 3)
         self.assertAlmostEqual(profile.hot_query_touch_coverage, 1 / 2)
+
+    def test_opt_in_capture_is_bounded_and_replayable(self):
+        q = mx.array(np.arange(24, dtype=np.float32).reshape(1, 1, 3, 8))
+        pooled = mx.array(np.arange(80, dtype=np.float32).reshape(1, 10, 8))
+        q_pos = mx.array([[39]], dtype=mx.int32)
+        valid = mx.ones((1, 1, 10), dtype=mx.bool_)
+        selected = mx.array([[[1, 3, 5]]], dtype=mx.uint32)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ",
+            {
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_DIR": directory,
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_COUNT": "1",
+            },
+        ):
+            qwen4_exp._QSA_SEGMENT_CAPTURE_COUNT = 0
+            qwen4_exp._capture_qsa_segment_inputs(
+                q, pooled, q_pos, valid, selected, layer_id=7
+            )
+            qwen4_exp._capture_qsa_segment_inputs(
+                q, pooled, q_pos, valid, selected, layer_id=8
+            )
+            captures = list(Path(directory).glob("*.npz"))
+            self.assertEqual(len(captures), 1)
+            with np.load(captures[0]) as data:
+                self.assertEqual(data["keys"].shape, (10, 8))
+                self.assertEqual(data["queries"].shape, (1, 3, 8))
+                self.assertEqual(data["valid_blocks"].tolist(), [10])
+                self.assertEqual(data["production_selected"].tolist(), [[1, 3, 5]])
+                self.assertEqual(data["layer_id"].tolist(), ["7"])
+
+    def test_capture_layer_and_context_filters_avoid_syncing(self):
+        q = mx.zeros((1, 1, 1, 2))
+        pooled = mx.zeros((1, 4, 2))
+        q_pos = mx.array([[15]])
+        valid = mx.ones((1, 1, 4), dtype=mx.bool_)
+        selected = mx.array([[[0]]])
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ",
+            {
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_DIR": directory,
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_LAYERS": "3,7",
+                "MLX_QWEN4_QSA_SEGMENT_CAPTURE_MIN_BLOCKS": "5",
+            },
+        ), patch.object(qwen4_exp.mx, "eval") as evaluate:
+            qwen4_exp._QSA_SEGMENT_CAPTURE_COUNT = 0
+            qwen4_exp._capture_qsa_segment_inputs(
+                q, pooled, q_pos, valid, selected, layer_id=11
+            )
+            qwen4_exp._capture_qsa_segment_inputs(
+                q, pooled, q_pos, valid, selected, layer_id=3
+            )
+            evaluate.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 if __name__ == "__main__":
