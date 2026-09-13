@@ -115,6 +115,16 @@ class TestHealthLiveness(unittest.TestCase):
         self.servers.append(server)
         return generator, server
 
+    def test_idle_prompt_cache_hook_delegates_to_cache_tier(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        calls = []
+        generator.prompt_cache = types.SimpleNamespace(
+            spill_idle_entries=lambda: calls.append("spill") or 2
+        )
+
+        self.assertEqual(generator._spill_idle_prompt_cache(), 2)
+        self.assertEqual(calls, ["spill"])
+
     def test_running_generation_is_200_ok(self):
         _generator, server = self.start()
         status, body = server.get_health()

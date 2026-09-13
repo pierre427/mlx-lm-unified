@@ -2525,6 +2525,10 @@ class ResponseGenerator:
             # instance from concurrent HTTP threads mutates its traceback.
             response_queue.put(RuntimeError(reason))
 
+    def _spill_idle_prompt_cache(self) -> int:
+        spill_idle = getattr(self.prompt_cache, "spill_idle_entries", None)
+        return int(spill_idle()) if callable(spill_idle) else 0
+
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
@@ -3474,6 +3478,10 @@ class ResponseGenerator:
                         batch_generator.close()
                         batch_generator = None
                         drain_batch = False
+                    # A persistent, empty BatchGenerator is reusable but owns
+                    # no live request state. It is therefore a safe idle point
+                    # for APC serialization too.
+                    self._spill_idle_prompt_cache()
                     continue
 
                 uids_to_remove = []
@@ -3657,9 +3665,7 @@ class ResponseGenerator:
             # Disk serialization can synchronize cache arrays, so run the idle
             # tier only on the generation thread and only with no live batch.
             else:
-                spill_idle = getattr(self.prompt_cache, "spill_idle_entries", None)
-                if callable(spill_idle):
-                    spill_idle()
+                self._spill_idle_prompt_cache()
 
     def _check_parallel_sampling_state_budget(
         self, cache, n, prompt_tokens, max_tokens
