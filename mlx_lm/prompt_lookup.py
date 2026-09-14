@@ -95,6 +95,9 @@ class SuffixAutomaton:
         return min(self._len[v], max_len), self._first_end[v] + 1
 
 
+PLD_CORPUS_MODES = ("target", "uncompacted", "hybrid")
+
+
 class NgramProposer:
     """Tail n-gram lookup. Stateless: proposes the continuation of the rightmost
     earlier occurrence of the tail n-gram (largest n first)."""
@@ -105,7 +108,19 @@ class NgramProposer:
         ngram_min: int = 1,
         prompt_only: bool = False,
         max_lookback: int = 4096,
+        retrieval_corpus: Sequence[int] | None = None,
+        corpus_mode: str = "target",
     ):
+        if corpus_mode not in PLD_CORPUS_MODES:
+            raise ValueError(
+                f"unknown prompt-lookup corpus mode {corpus_mode!r}; "
+                f"expected one of {PLD_CORPUS_MODES}"
+            )
+        if corpus_mode != "target" and retrieval_corpus is None:
+            raise ValueError(
+                f"prompt-lookup corpus mode {corpus_mode!r} requires an "
+                "uncompacted retrieval corpus"
+            )
         self.ngram_max = ngram_max
         self.ngram_min = ngram_min
         self.prompt_only = prompt_only
@@ -114,26 +129,48 @@ class NgramProposer:
         # over a long generation. Proposals are verified anyway, so a bounded
         # window is lossless (worst case: fewer proposals). 0 = unbounded.
         self.max_lookback = max_lookback
+        self.retrieval_corpus = (
+            [int(token) for token in retrieval_corpus]
+            if retrieval_corpus is not None
+            else None
+        )
+        self.corpus_mode = corpus_mode
 
     def observe(self, token: int) -> None:  # stateless
         pass
 
     def propose(self, seq: List[int], max_span: int, prompt_len: int) -> List[int]:
-        search_len = prompt_len if self.prompt_only else None
         n = len(seq)
-        limit = n if search_len is None else min(search_len, n)
+        corpora: List[Tuple[List[int], int | None]] = []
+        if self.corpus_mode in ("uncompacted", "hybrid"):
+            corpora.append((self.retrieval_corpus or [], None))
+        if self.corpus_mode in ("target", "hybrid"):
+            corpora.append((seq, prompt_len if self.prompt_only else None))
         for g in range(self.ngram_max, self.ngram_min - 1, -1):
-            if n < g + 1:
+            # An external corpus can supply the earlier occurrence even when
+            # the compacted target history contains only the live key itself.
+            if n < g:
                 continue
             key = seq[-g:]
-            start = (limit - g) if search_len is not None else (n - g - 1)
-            begin = min(start, n - g - 1)
-            floor = -1 if not self.max_lookback else max(-1, begin - self.max_lookback)
-            for i in range(begin, floor, -1):
-                if seq[i : i + g] == key:
-                    cont = seq[i + g : i + g + max_span]
-                    if cont:
-                        return cont
+            for corpus, search_len in corpora:
+                limit = (
+                    len(corpus)
+                    if search_len is None
+                    else min(search_len, len(corpus))
+                )
+                last = limit - g
+                if corpus is seq:
+                    last = min(last, n - g - 1)
+                floor = (
+                    -1
+                    if not self.max_lookback
+                    else max(-1, last - self.max_lookback)
+                )
+                for i in range(last, floor, -1):
+                    if corpus[i : i + g] == key:
+                        cont = corpus[i + g : i + g + max_span]
+                        if cont:
+                            return cont
         return []
 
 
@@ -237,6 +274,8 @@ class HybridStats:
     rate_gate_delatched: bool = False
     rate_gate_spec_ms_per_tok: float = 0.0
     rate_gate_plain_ms_per_tok: float = 0.0
+    retrieval_corpus_mode: str = "target"
+    retrieval_corpus_tokens: int = 0
 
     @property
     def total_emitted(self) -> int:

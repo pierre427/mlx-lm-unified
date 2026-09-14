@@ -13,7 +13,11 @@ from mlx_lm.apc import (
     AutomaticPrefixCacheV2,
     MTPAPCSidecar,
 )
-from mlx_lm.cache_planes import CachePlaneKind
+from mlx_lm.cache_planes import (
+    CachePlaneKind,
+    TranscriptLedgerPlane,
+    TranscriptLedgerSegment,
+)
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.server import ResponseGenerator
 
@@ -270,6 +274,45 @@ def test_apcv2_target_segment_invalidation_rejects_atomic_restore():
     miss = apc.lookup(key, list(range(301)))
     assert not miss.hit
     assert miss.miss_reason == "stale_cow_generation"
+
+
+def test_apcv2_transcript_segments_are_optional_and_independently_invalidatable():
+    apc = AutomaticPrefixCacheV2(max_size=2, layout_name="test-kv-v1")
+    key = APCKey("model")
+    ledger = TranscriptLedgerPlane(
+        "test-tokenizer",
+        "rev-a",
+        "transcript-a",
+        (
+            TranscriptLedgerSegment("turn:1", 0, 3, (7, 8, 9)),
+            TranscriptLedgerSegment("turn:2", 3, 5, (10, 11)),
+        ),
+    )
+    tokens = [1, 2, 3]
+    apc.store(
+        key,
+        tokens,
+        [_state(KVCache(), len(tokens))],
+        transcript_ledger=ledger,
+    )
+
+    hit = apc.lookup(key, tokens + [4])
+    assert hit.hit
+    assert hit.transcript_ledger is ledger
+    assert hit.segment_manifest["by_plane"]["transcript_ledger"]["segments"] == 2
+
+    entry = apc._trie.get(key, tokens)
+    owner = entry.prompt_cache.cow_owner
+    transcript_segment = next(
+        segment
+        for segment in owner.segment_manifest.segments
+        if segment.key.kind == CachePlaneKind.TRANSCRIPT_LEDGER
+    )
+    assert owner.invalidate_segment(transcript_segment.key, "ledger-stale")
+
+    target_only_hit = apc.lookup(key, tokens + [4])
+    assert target_only_hit.hit
+    assert target_only_hit.transcript_ledger is None
 
 
 def test_server_selects_v2_only_for_declared_model_layout():

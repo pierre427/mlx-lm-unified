@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 class CachePlaneKind(str, Enum):
     PROMPT_HOST = "prompt_host"
+    TRANSCRIPT_LEDGER = "transcript_ledger"
     ATTENTION_KV = "attention_kv"
     ATTENTION_RING = "attention_ring"
     QSA_SUMMARY = "qsa_summary"
@@ -182,6 +183,88 @@ class PromptHostPlane:
             revision=provenance.revision,
             adapter=provenance.adapter,
             semantic=provenance.semantic_fingerprint,
+        )
+
+
+@dataclass(frozen=True)
+class TranscriptLedgerSegment:
+    """One immutable source-history span retained outside target attention."""
+
+    segment_id: str
+    token_start: int
+    token_stop: int
+    token_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.segment_id:
+            raise ValueError("transcript segment needs an identity")
+        if not 0 <= self.token_start < self.token_stop:
+            raise ValueError("invalid transcript segment token span")
+        if self.token_stop - self.token_start != len(self.token_ids):
+            raise ValueError("transcript segment span and token count disagree")
+        if any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.token_ids
+        ):
+            raise ValueError("transcript token IDs must be non-negative integers")
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(repr(self.token_ids).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class TranscriptLedgerPlane:
+    """Segmented uncompacted transcript for proposal/retrieval consumers only."""
+
+    tokenizer_identity: str
+    tokenizer_version: str
+    revision: str
+    segments: tuple[TranscriptLedgerSegment, ...]
+    compaction_strategy: str = "oldest_contiguous"
+
+    def __post_init__(self) -> None:
+        if not self.tokenizer_identity or not self.revision:
+            raise ValueError("transcript ledger identity and revision are required")
+        if self.compaction_strategy not in (
+            "oldest_contiguous",
+            "largest_first",
+            "lowest_importance",
+        ):
+            raise ValueError("unknown transcript compaction strategy")
+        cursor = 0
+        seen = set()
+        for segment in self.segments:
+            if segment.segment_id in seen:
+                raise ValueError("duplicate transcript segment identity")
+            if segment.token_start != cursor:
+                raise ValueError("transcript segments must be contiguous and ordered")
+            seen.add(segment.segment_id)
+            cursor = segment.token_stop
+
+    @property
+    def token_ids(self) -> tuple[int, ...]:
+        return tuple(token for segment in self.segments for token in segment.token_ids)
+
+    @property
+    def fingerprint(self) -> CachePlaneFingerprint:
+        manifest = tuple(
+            (
+                segment.segment_id,
+                segment.token_start,
+                segment.token_stop,
+                segment.digest,
+            )
+            for segment in self.segments
+        )
+        return CachePlaneFingerprint.from_fields(
+            CachePlaneKind.TRANSCRIPT_LEDGER,
+            schema_version=1,
+            tokenizer=self.tokenizer_identity,
+            tokenizer_version=self.tokenizer_version,
+            revision=self.revision,
+            compaction_strategy=self.compaction_strategy,
+            segments=manifest,
         )
 
 

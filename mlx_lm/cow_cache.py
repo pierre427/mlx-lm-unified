@@ -41,6 +41,7 @@ from .cache_planes import (
     LayeredSegmentManifest,
     PLEResidencyHints,
     PromptHostPlane,
+    TranscriptLedgerPlane,
 )
 
 
@@ -90,6 +91,7 @@ class COWPromptMetadata:
     tokens: tuple[int, ...]
     cache_type: str
     prompt_host: PromptHostPlane | None = None
+    transcript_ledger: TranscriptLedgerPlane | None = None
     ple_hints: PLEResidencyHints | None = None
     compiled_schedule: CompiledScheduleMetadata | None = None
 
@@ -408,6 +410,7 @@ def _build_layer_segment_manifest(
     source_sidecar: Any,
     *,
     covered_tokens: int,
+    transcript_ledger: TranscriptLedgerPlane | None = None,
 ) -> LayeredSegmentManifest:
     segments = []
     for layer_index, cache in enumerate(source_cache):
@@ -463,6 +466,33 @@ def _build_layer_segment_manifest(
                     compatibility=compatibility,
                 )
                 segments.append(CacheLayerSegment(key, fingerprint, nbytes))
+    if transcript_ledger is not None:
+        for segment_index, transcript in enumerate(transcript_ledger.segments):
+            key = CacheSegmentKey(
+                CachePlaneKind.TRANSCRIPT_LEDGER,
+                0,
+                segment_index,
+                transcript.token_start,
+                transcript.token_stop,
+                f"transcript:{transcript.segment_id}",
+            )
+            fingerprint = CachePlaneFingerprint.from_fields(
+                CachePlaneKind.TRANSCRIPT_LEDGER,
+                schema_version=1,
+                segment=transcript.segment_id,
+                token_start=transcript.token_start,
+                token_stop=transcript.token_stop,
+                content=transcript.digest,
+                ledger=transcript_ledger.fingerprint.digest,
+            )
+            segments.append(
+                CacheLayerSegment(
+                    key,
+                    fingerprint,
+                    len(transcript.token_ids) * 8,
+                    required=False,
+                )
+            )
     return LayeredSegmentManifest(segments)
 
 
@@ -948,6 +978,14 @@ class COWCacheOwner:
                     fingerprint=metadata.prompt_host.fingerprint,
                 )
             )
+        if metadata.transcript_ledger is not None:
+            owners.append(
+                CachePlaneOwner(
+                    kind=CachePlaneKind.TRANSCRIPT_LEDGER,
+                    payload=metadata.transcript_ledger,
+                    fingerprint=metadata.transcript_ledger.fingerprint,
+                )
+            )
         if metadata.ple_hints is not None:
             owners.append(
                 CachePlaneOwner(
@@ -987,6 +1025,7 @@ class COWCacheOwner:
                         len(metadata.tokens),
                     )
                 ),
+                transcript_ledger=metadata.transcript_ledger,
             )
             if layer_segments
             else LayeredSegmentManifest()
@@ -1060,6 +1099,11 @@ class COWCacheOwner:
                 None
                 if CachePlaneKind.PROMPT_HOST in self._invalid_planes
                 else self.metadata.prompt_host
+            ),
+            transcript_ledger=(
+                None
+                if CachePlaneKind.TRANSCRIPT_LEDGER in self._invalid_planes
+                else self.metadata.transcript_ledger
             ),
             ple_hints=(
                 None
@@ -1455,6 +1499,7 @@ def freeze_prompt_cache(
     cache_type: str,
     sidecar: Any = None,
     prompt_host: PromptHostPlane | None = None,
+    transcript_ledger: TranscriptLedgerPlane | None = None,
     ple_hints: PLEResidencyHints | None = None,
     compiled_schedule: CompiledScheduleMetadata | None = None,
     telemetry: Optional[COWCacheTelemetry] = None,
@@ -1502,6 +1547,7 @@ def freeze_prompt_cache(
         tokens=tuple(int(token) for token in tokens),
         cache_type=str(cache_type),
         prompt_host=prompt_host,
+        transcript_ledger=transcript_ledger,
         ple_hints=ple_hints,
         compiled_schedule=compiled_schedule,
     )

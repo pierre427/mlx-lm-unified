@@ -1521,6 +1521,8 @@ def prompt_lookup_generate_step(
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     stats: Optional[Any] = None,
     history_prompt: Optional[mx.array] = None,
+    retrieval_corpus: Optional[Any] = None,
+    retrieval_corpus_mode: str = "target",
     **_ignored,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Draft-free (prompt-lookup) speculative decoding.
@@ -1548,6 +1550,12 @@ def prompt_lookup_generate_step(
     ``history_prompt`` may be the full prompt when ``prompt`` is only an
     uncached tail backed by a prefilled ``prompt_cache``. Retrieval proposals use
     the full history, while target verification forwards only the uncached tail.
+
+    ``retrieval_corpus`` is a second, proposal-only token ledger. With
+    ``retrieval_corpus_mode="uncompacted"``, n-gram PLD searches that immutable
+    ledger instead of the target-visible prompt; ``"hybrid"`` searches it first
+    and then falls back to the target history. The target never attends to this
+    corpus, and every proposed token still passes ordinary target verification.
     """
     from .prompt_lookup import (
         HybridStats,
@@ -1576,6 +1584,13 @@ def prompt_lookup_generate_step(
         if history_prompt is not None
         else list(seq)
     )
+    retrieval_seq = (
+        retrieval_corpus.tolist()
+        if isinstance(retrieval_corpus, mx.array)
+        else list(retrieval_corpus)
+        if retrieval_corpus is not None
+        else None
+    )
     if not seq:
         raise ValueError("prompt-lookup decoding requires a non-empty prompt tail")
     if len(history_seq) < len(seq) or history_seq[-len(seq):] != seq:
@@ -1584,9 +1599,22 @@ def prompt_lookup_generate_step(
     history_prompt_len = len(history_seq)
 
     if backend == "ngram":
-        proposer = NgramProposer(ngram_max, ngram_min, prompt_only)
+        proposer = NgramProposer(
+            ngram_max,
+            ngram_min,
+            prompt_only,
+            retrieval_corpus=retrieval_seq,
+            corpus_mode=retrieval_corpus_mode,
+        )
     else:
+        if retrieval_corpus_mode != "target" or retrieval_seq is not None:
+            raise ValueError(
+                "an uncompacted prompt-lookup corpus currently requires the "
+                "ngram backend"
+            )
         proposer = make_proposer(backend)  # empty; the observe loop below is the
+    stats.retrieval_corpus_mode = retrieval_corpus_mode
+    stats.retrieval_corpus_tokens = len(retrieval_seq or ())
     for t in history_seq:                  # single seeding authority (avoids a
         proposer.observe(t)                # double-seed that desyncs SAM coords)
 
@@ -2073,6 +2101,10 @@ def stream_generate(
             rate_gate_margin=prompt_lookup.get("rate_gate_margin", 0.0),
             stats=prompt_lookup.get("stats"),
             history_prompt=prompt_lookup.get("history_prompt"),
+            retrieval_corpus=prompt_lookup.get("retrieval_corpus"),
+            retrieval_corpus_mode=prompt_lookup.get(
+                "retrieval_corpus_mode", "target"
+            ),
             **kwargs,
         )
     elif draft_model is None:

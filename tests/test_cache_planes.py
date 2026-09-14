@@ -16,6 +16,8 @@ from mlx_lm.cache_planes import (
     PromptHostPlane,
     PromptHostPlaneCache,
     PromptPrefixSpan,
+    TranscriptLedgerPlane,
+    TranscriptLedgerSegment,
 )
 
 
@@ -42,6 +44,30 @@ def _prompt(input_fingerprint="messages-sha"):
 
 def _fingerprint(kind, value):
     return CachePlaneFingerprint.from_fields(kind, identity=value)
+
+
+def test_transcript_ledger_has_stable_ordered_segments_and_content_identity():
+    segments = (
+        TranscriptLedgerSegment("turn:1", 0, 3, (1, 2, 3)),
+        TranscriptLedgerSegment("turn:2", 3, 5, (4, 5)),
+    )
+    plane = TranscriptLedgerPlane("qwen-tokenizer", "rev-a", "ledger-a", segments)
+
+    assert plane.token_ids == (1, 2, 3, 4, 5)
+    assert plane.fingerprint.kind == CachePlaneKind.TRANSCRIPT_LEDGER
+    assert plane.fingerprint != TranscriptLedgerPlane(
+        "qwen-tokenizer",
+        "rev-a",
+        "ledger-b",
+        segments,
+    ).fingerprint
+    with pytest.raises(ValueError, match="contiguous"):
+        TranscriptLedgerPlane(
+            "qwen-tokenizer",
+            "rev-a",
+            "ledger-a",
+            (TranscriptLedgerSegment("turn:1", 1, 2, (1,)),),
+        )
 
 
 def test_prompt_host_plane_is_immutable_and_excludes_mutable_request_state():

@@ -62,6 +62,34 @@ class TestProposers(unittest.TestCase):
         p = NgramProposer(ngram_max=3, ngram_min=2)
         self.assertEqual(p.propose([1, 2, 3, 4], max_span=4, prompt_len=4), [])
 
+    def test_ngram_can_read_uncompacted_corpus_without_target_visibility(self):
+        # The compacted target prompt no longer contains the earlier copy, but
+        # its live suffix still keys a continuation in the immutable transcript.
+        compacted = [90, 91, 7, 8]
+        uncompacted = [1, 2, 7, 8, 30, 31, 32]
+        p = NgramProposer(
+            ngram_max=2,
+            ngram_min=2,
+            retrieval_corpus=uncompacted,
+            corpus_mode="uncompacted",
+        )
+        self.assertEqual(p.propose(compacted, 3, len(compacted)), [30, 31, 32])
+
+    def test_ngram_corpus_mode_is_selectable_and_fail_closed(self):
+        target = [4, 5, 40, 41, 4, 5]
+        unrelated = [7, 8, 9]
+        hybrid = NgramProposer(
+            ngram_max=2,
+            ngram_min=2,
+            retrieval_corpus=unrelated,
+            corpus_mode="hybrid",
+        )
+        self.assertEqual(hybrid.propose(target, 2, len(target)), [40, 41])
+        with self.assertRaises(ValueError):
+            NgramProposer(corpus_mode="uncompacted")
+        with self.assertRaises(ValueError):
+            NgramProposer(retrieval_corpus=unrelated, corpus_mode="mystery")
+
     def test_suffix_automaton_longest_repeat(self):
         sam = SuffixAutomaton([5, 6, 7, 8, 5, 6])
         mlen, nxt = sam.longest_suffix_match(max_len=16)
@@ -397,6 +425,31 @@ class TestPromptLookupLifecycle(unittest.TestCase):
         self.assertEqual(stats.bonus_tokens, 0)
         self.assertEqual(stats.total_emitted, 1)
         self.assertEqual(cache.offset, 2)  # one prompt + one delivered token
+
+    def test_uncompacted_corpus_is_proposal_only_and_accounted(self):
+        from mlx_lm.prompt_lookup import HybridStats
+
+        cache = _LifecycleCache()
+        stats = HybridStats()
+        out = list(
+            prompt_lookup_generate_step(
+                mx.array([1]),
+                _LifecycleModel(),
+                prompt_cache=[cache],
+                max_tokens=2,
+                num_draft=1,
+                ngram_max=1,
+                ngram_min=1,
+                retrieval_corpus=mx.array([1, 0, 0]),
+                retrieval_corpus_mode="uncompacted",
+                stats=stats,
+            )
+        )
+        self.assertEqual([token for token, _, _ in out], [0, 0])
+        self.assertEqual(cache.offset, 3)
+        self.assertEqual(stats.retrieval_corpus_mode, "uncompacted")
+        self.assertEqual(stats.retrieval_corpus_tokens, 3)
+        self.assertGreater(stats.retrieval_proposed, 0)
 
     def test_cliff_aware_span_is_opt_in_and_tracks_trimming(self):
         class FixedProposer:

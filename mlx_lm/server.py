@@ -88,6 +88,8 @@ from .cache_planes import (
     PromptHostPlane,
     PromptHostPlaneCache,
     PromptPrefixSpan,
+    TranscriptLedgerPlane,
+    TranscriptLedgerSegment,
 )
 from .compiled_decode import (
     compiled_decode_context_policy,
@@ -257,6 +259,9 @@ class GenerationArguments:
     prompt_lookup_gate: float = 0.12
     prompt_lookup_rate_gate_probe: int = 32
     prompt_lookup_rate_gate_margin: float = 0.0
+    prompt_lookup_context: Optional[Any] = None
+    prompt_lookup_context_mode: str = "target"
+    context_compaction_strategy: str = "oldest_contiguous"
     request_id: str = ""
     tenant_id: str = "default"
     batch_fault: Optional[BatchFaultSpec] = None
@@ -292,6 +297,71 @@ class GenerationContext:
 
     def stop(self):
         self._should_stop = True
+
+
+def _prompt_lookup_transcript_plane(tokenizer, args, max_tokens: int):
+    """Materialize a segmented, proposal-only transcript on the generation thread."""
+    raw = getattr(args, "prompt_lookup_context", None)
+    if raw is None:
+        return None
+
+    if isinstance(raw, str) or all(isinstance(item, int) for item in raw):
+        raw_segments = [{"id": "request:0", "content": raw}]
+    else:
+        raw_segments = raw
+
+    segments = []
+    cursor = 0
+    for item in raw_segments:
+        segment_id = str(item["id"])
+        content = item["content"]
+        if isinstance(content, str):
+            tokens = tokenizer.encode(content, add_special_tokens=False)
+        else:
+            tokens = list(content)
+        token_ids = tuple(int(token) for token in tokens)
+        segments.append(
+            TranscriptLedgerSegment(
+                segment_id=segment_id,
+                token_start=cursor,
+                token_stop=cursor + len(token_ids),
+                token_ids=token_ids,
+            )
+        )
+        cursor += len(token_ids)
+
+    if cursor > max_tokens:
+        raise RequestCompositionError(
+            "prompt_lookup_context token count "
+            f"{cursor} exceeds server limit {max_tokens}"
+        )
+    tokenizer_identity = str(
+        getattr(tokenizer, "name_or_path", None)
+        or f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
+    )
+    revision = hashlib.sha256(
+        repr(
+            tuple((segment.segment_id, segment.digest) for segment in segments)
+        ).encode()
+    ).hexdigest()
+    return TranscriptLedgerPlane(
+        tokenizer_identity=tokenizer_identity,
+        tokenizer_version=str(getattr(tokenizer, "revision", "")),
+        revision=revision,
+        segments=tuple(segments),
+        compaction_strategy=args.context_compaction_strategy,
+    )
+
+
+def _transcript_scoped_apc_key(model_key, transcript_ledger):
+    """Keep hidden transcript identity inside the reusable APC namespace."""
+    if transcript_ledger is None:
+        return model_key
+    return (
+        model_key,
+        "transcript-ledger-v1",
+        transcript_ledger.fingerprint.digest,
+    )
 
 
 def _generation_context_timing(args) -> Dict[str, int]:
@@ -2462,6 +2532,7 @@ def _store_single_request_prompt_cache(
     cache,
     *,
     sidecar=None,
+    transcript_ledger=None,
     external_draft: bool,
 ):
     """Store one request's cache when its token key fully describes the state."""
@@ -2472,7 +2543,13 @@ def _store_single_request_prompt_cache(
         )
         return False
     if isinstance(prompt_cache, AutomaticPrefixCache):
-        prompt_cache.insert_cache(model_key, tokens, cache, sidecar=sidecar)
+        prompt_cache.insert_cache(
+            model_key,
+            tokens,
+            cache,
+            sidecar=sidecar,
+            transcript_ledger=transcript_ledger,
+        )
     else:
         prompt_cache.insert_cache(model_key, tokens, cache)
     return True
@@ -4375,9 +4452,27 @@ class ResponseGenerator:
             # Load the KV cache
             self._log_cache_stats()
             external_draft = draft_model is not None
+            transcript_ledger = _prompt_lookup_transcript_plane(
+                tokenizer,
+                args,
+                int(
+                    getattr(
+                        self.cli_args,
+                        "prompt_lookup_context_max_tokens",
+                        262144,
+                    )
+                ),
+            )
+            # A compacted target prompt does not identify its hidden full
+            # history. Bind the ledger fingerprint into the APC namespace so
+            # equal compacted prompts cannot adopt another proposal corpus.
+            prompt_cache_model_key = _transcript_scoped_apc_key(
+                self.model_provider.model_key,
+                transcript_ledger,
+            )
             cache, rest, mtp_sidecar = _fetch_single_request_prompt_cache(
                 self.prompt_cache,
-                self.model_provider.model_key,
+                prompt_cache_model_key,
                 prompt,
                 external_draft=external_draft,
             )
@@ -4466,6 +4561,20 @@ class ResponseGenerator:
                 from .prompt_lookup import HybridStats
 
                 prompt_lookup_stats = HybridStats()
+                retrieval_corpus = (
+                    transcript_ledger.token_ids
+                    if transcript_ledger is not None
+                    else None
+                )
+                if (
+                    args.prompt_lookup_context_mode != "target"
+                    and retrieval_corpus is None
+                ):
+                    raise RequestCompositionError(
+                        f"prompt_lookup_context_mode "
+                        f"{args.prompt_lookup_context_mode!r} requires "
+                        "request-scoped transcript segments"
+                    )
                 prompt_lookup_config = {
                     "ngram_max": args.prompt_lookup_ngram,
                     "num_draft": args.prompt_lookup_tokens,
@@ -4480,6 +4589,11 @@ class ResponseGenerator:
                     # PLD separately needs token IDs so suffix matches can
                     # cross the cached-prefix boundary.
                     "history_prompt": prompt,
+                    # This proposal-only ledger may be the immutable full
+                    # transcript while the target prompt is compacted. It is
+                    # never forwarded through the target model.
+                    "retrieval_corpus": retrieval_corpus,
+                    "retrieval_corpus_mode": args.prompt_lookup_context_mode,
                 }
             token_stream = stream_generate(
                 model=model,
@@ -4552,12 +4666,14 @@ class ResponseGenerator:
                 if prompt_lookup_stats is not None:
                     logging.info(
                         "Prompt lookup: %s | rate_probe=%s delatched=%s "
-                        "spec_ms_tok=%.3f plain_ms_tok=%.3f",
+                        "spec_ms_tok=%.3f plain_ms_tok=%.3f corpus=%s/%d",
                         prompt_lookup_stats.summary(),
                         prompt_lookup_stats.rate_gate_probed,
                         prompt_lookup_stats.rate_gate_delatched,
                         prompt_lookup_stats.rate_gate_spec_ms_per_tok,
                         prompt_lookup_stats.rate_gate_plain_ms_per_tok,
+                        prompt_lookup_stats.retrieval_corpus_mode,
+                        prompt_lookup_stats.retrieval_corpus_tokens,
                     )
                 if self_mtp is not None:
                     adaptive_router = self_mtp.get("speculation_router")
@@ -4620,10 +4736,11 @@ class ResponseGenerator:
                 if publishable is None:
                     _store_single_request_prompt_cache(
                         self.prompt_cache,
-                        self.model_provider.model_key,
+                        prompt_cache_model_key,
                         cache_key,
                         cache,
                         sidecar=sidecar,
+                        transcript_ledger=transcript_ledger,
                         external_draft=external_draft,
                     )
                 else:
@@ -4640,10 +4757,11 @@ class ResponseGenerator:
                 if publishable is None:
                     _store_single_request_prompt_cache(
                         self.prompt_cache,
-                        self.model_provider.model_key,
+                        prompt_cache_model_key,
                         cache_key,
                         _compiled_cache_for_publication(cache),
                         sidecar=sidecar,
+                        transcript_ledger=transcript_ledger,
                         external_draft=external_draft,
                     )
                 else:
@@ -4653,10 +4771,11 @@ class ResponseGenerator:
             else:
                 _store_single_request_prompt_cache(
                     self.prompt_cache,
-                    self.model_provider.model_key,
+                    prompt_cache_model_key,
                     cache_key,
                     cache,
                     sidecar=sidecar,
+                    transcript_ledger=transcript_ledger,
                     external_draft=external_draft,
                 )
 
@@ -5094,6 +5213,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 0.0,
             ),
         )
+        self.prompt_lookup_context = self.body.get("prompt_lookup_context")
+        self.prompt_lookup_context_mode = self.body.get(
+            "prompt_lookup_context_mode", "target"
+        )
+        self.context_compaction_strategy = self.body.get(
+            "context_compaction_strategy", "oldest_contiguous"
+        )
         self.adapter = self.body.get("adapters", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         # Read before validate_model_parameters runs, so its type is checked
@@ -5374,6 +5500,87 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate(
             "prompt_lookup_rate_gate_margin", (float, int), min_val=0, max_val=1
         )
+        prompt_lookup_context_mode = getattr(
+            self, "prompt_lookup_context_mode", "target"
+        )
+        if not isinstance(prompt_lookup_context_mode, str):
+            raise ValueError("prompt_lookup_context_mode must be of type str")
+        if prompt_lookup_context_mode not in (
+            "target",
+            "uncompacted",
+            "hybrid",
+        ):
+            raise ValueError(
+                "prompt_lookup_context_mode must be one of target, "
+                "uncompacted, or hybrid"
+            )
+        context_compaction_strategy = getattr(
+            self, "context_compaction_strategy", "oldest_contiguous"
+        )
+        if not isinstance(context_compaction_strategy, str):
+            raise ValueError("context_compaction_strategy must be of type str")
+        if context_compaction_strategy not in (
+            "oldest_contiguous",
+            "largest_first",
+            "lowest_importance",
+        ):
+            raise ValueError(
+                "context_compaction_strategy must be oldest_contiguous, "
+                "largest_first, or lowest_importance"
+            )
+        context = getattr(self, "prompt_lookup_context", None)
+        if context is not None and not isinstance(context, (str, list)):
+            raise ValueError(
+                "prompt_lookup_context must be a string, token list, or segment list"
+            )
+        if isinstance(context, str) and not context:
+            raise ValueError("prompt_lookup_context must not be empty")
+        if isinstance(context, list):
+            if not context:
+                raise ValueError("prompt_lookup_context must not be empty")
+            token_list = all(
+                not isinstance(token, bool) and isinstance(token, int)
+                for token in context
+            )
+            segment_list = bool(context) and all(
+                isinstance(segment, dict)
+                and isinstance(segment.get("id"), str)
+                and bool(segment.get("id"))
+                and "content" in segment
+                and (
+                    isinstance(segment["content"], str)
+                    or (
+                        isinstance(segment["content"], list)
+                        and all(
+                            not isinstance(token, bool)
+                            and isinstance(token, int)
+                            and token >= 0
+                            for token in segment["content"]
+                        )
+                    )
+                )
+                for segment in context
+            )
+            if not token_list and not segment_list:
+                raise ValueError(
+                    "prompt_lookup_context must be a non-negative token list or "
+                    "a list of {'id': string, 'content': string|token-list} segments"
+                )
+            if token_list and any(token < 0 for token in context):
+                raise ValueError(
+                    "prompt_lookup_context token list must contain "
+                    "non-negative integers"
+                )
+        if prompt_lookup_context_mode != "target":
+            if not self.prompt_lookup_ngram:
+                raise ValueError(
+                    "an uncompacted prompt_lookup_context requires prompt_lookup_ngram"
+                )
+            if context is None:
+                raise ValueError(
+                    f"prompt_lookup_context_mode {prompt_lookup_context_mode!r} "
+                    "requires request-scoped prompt_lookup_context"
+                )
         self._validate("repetition_penalty", (float, int), min_val=0)
         self._validate("repetition_context_size", int, min_val=0)
         self._validate("presence_penalty", (float, int))
@@ -5628,6 +5835,13 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_lookup_gate=self.prompt_lookup_gate,
             prompt_lookup_rate_gate_probe=self.prompt_lookup_rate_gate_probe,
             prompt_lookup_rate_gate_margin=self.prompt_lookup_rate_gate_margin,
+            prompt_lookup_context=getattr(self, "prompt_lookup_context", None),
+            prompt_lookup_context_mode=getattr(
+                self, "prompt_lookup_context_mode", "target"
+            ),
+            context_compaction_strategy=getattr(
+                self, "context_compaction_strategy", "oldest_contiguous"
+            ),
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -6531,6 +6745,16 @@ def setup_arg_parser():
     parser.add_argument("--prompt-lookup-rate-gate-probe", type=int, default=32)
     parser.add_argument(
         "--prompt-lookup-rate-gate-margin", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--prompt-lookup-context-max-tokens",
+        type=int,
+        default=262144,
+        help=(
+            "Maximum proposal-only token corpus accepted through "
+            "prompt_lookup_context. The target never attends to this corpus. "
+            "Default: 262144."
+        ),
     )
     parser.add_argument(
         "--trust-remote-code",

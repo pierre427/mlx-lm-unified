@@ -28,6 +28,7 @@ from .cache_planes import (
     CompiledScheduleMetadata,
     PLEResidencyHints,
     PromptHostPlane,
+    TranscriptLedgerPlane,
 )
 from .cow_cache import (
     COWCacheStale,
@@ -96,6 +97,7 @@ class APCLookup:
     sidecar: Any = None
     prep_telemetry: Any = None
     prompt_host: Optional[PromptHostPlane] = None
+    transcript_ledger: Optional[TranscriptLedgerPlane] = None
     capsule_generation: Optional[int] = None
     segment_manifest: Any = None
 
@@ -495,6 +497,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                     cache_type=entry.cache_type,
                     sidecar=sidecar,
                     prompt_host=getattr(metadata, "prompt_host", None),
+                    transcript_ledger=getattr(metadata, "transcript_ledger", None),
                     ple_hints=getattr(metadata, "ple_hints", None),
                     compiled_schedule=getattr(metadata, "compiled_schedule", None),
                     telemetry=self._cow_telemetry,
@@ -715,6 +718,11 @@ class AutomaticPrefixCache(LRUPromptCache):
                         "prompt_host",
                         None,
                     ),
+                    transcript_ledger=getattr(
+                        getattr(restored_cache, "cow_metadata", None),
+                        "transcript_ledger",
+                        None,
+                    ),
                     capsule_generation=self._capsule_generation.current,
                     segment_manifest=getattr(
                         restored_cache, "cow_segment_stats", None
@@ -768,6 +776,9 @@ class AutomaticPrefixCache(LRUPromptCache):
             prompt_host=getattr(
                 getattr(cache, "cow_metadata", None), "prompt_host", None
             ),
+            transcript_ledger=getattr(
+                getattr(cache, "cow_metadata", None), "transcript_ledger", None
+            ),
             capsule_generation=self._capsule_generation.current,
             segment_manifest=getattr(cache, "cow_segment_stats", None),
         )
@@ -781,6 +792,7 @@ class AutomaticPrefixCache(LRUPromptCache):
         cache_type: str = "assistant",
         sidecar: Any = None,
         prompt_host: Optional[PromptHostPlane] = None,
+        transcript_ledger: Optional[TranscriptLedgerPlane] = None,
         ple_hints: Optional[PLEResidencyHints] = None,
         compiled_schedule: Optional[CompiledScheduleMetadata] = None,
     ) -> APCCapabilities:
@@ -792,6 +804,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                 cache_type=cache_type,
                 sidecar=sidecar,
                 prompt_host=prompt_host,
+                transcript_ledger=transcript_ledger,
                 ple_hints=ple_hints,
                 compiled_schedule=compiled_schedule,
             )
@@ -805,6 +818,7 @@ class AutomaticPrefixCache(LRUPromptCache):
         cache_type: str = "assistant",
         sidecar: Any = None,
         prompt_host: Optional[PromptHostPlane] = None,
+        transcript_ledger: Optional[TranscriptLedgerPlane] = None,
         ple_hints: Optional[PLEResidencyHints] = None,
         compiled_schedule: Optional[CompiledScheduleMetadata] = None,
     ) -> APCCapabilities:
@@ -824,6 +838,7 @@ class AutomaticPrefixCache(LRUPromptCache):
                     cache_type=cache_type,
                     sidecar=sidecar,
                     prompt_host=prompt_host,
+                    transcript_ledger=transcript_ledger,
                     ple_hints=ple_hints,
                     compiled_schedule=compiled_schedule,
                     telemetry=self._cow_telemetry,
@@ -893,6 +908,7 @@ class AutomaticPrefixCache(LRUPromptCache):
         cache_type: str = "assistant",
         sidecar: Any = None,
         prompt_host: Optional[PromptHostPlane] = None,
+        transcript_ledger: Optional[TranscriptLedgerPlane] = None,
         ple_hints: Optional[PLEResidencyHints] = None,
         compiled_schedule: Optional[CompiledScheduleMetadata] = None,
     ):
@@ -903,6 +919,7 @@ class AutomaticPrefixCache(LRUPromptCache):
             cache_type=cache_type,
             sidecar=sidecar,
             prompt_host=prompt_host,
+            transcript_ledger=transcript_ledger,
             ple_hints=ple_hints,
             compiled_schedule=compiled_schedule,
         )
