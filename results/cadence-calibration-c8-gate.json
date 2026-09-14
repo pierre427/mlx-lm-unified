@@ -1,0 +1,43 @@
+{
+  "baseline": {
+    "aggregate_output_tps": 20.221303825413464,
+    "cadence": 1,
+    "engagement": {
+      "decode_priority_deferred_rounds": 0,
+      "decode_priority_release_rounds": 0,
+      "prefill_rounds": 51
+    },
+    "engagement_pass": true,
+    "itl_p99_ms": 1530.2685829956317,
+    "jain_tenant_token_rate": 0.9923498507955546,
+    "quality_pass": false,
+    "requests": 18,
+    "ttft_p95_ms": 38097.669540991774
+  },
+  "candidate": {
+    "aggregate_output_tps": 20.371576962869923,
+    "cadence": 8,
+    "engagement": {
+      "decode_priority_deferred_rounds": 257,
+      "decode_priority_release_rounds": 38,
+      "prefill_rounds": 47
+    },
+    "engagement_pass": true,
+    "itl_p99_ms": 1370.997374993749,
+    "jain_tenant_token_rate": 0.9920818513658607,
+    "quality_pass": false,
+    "requests": 18,
+    "ttft_p95_ms": 37185.30958300107
+  },
+  "gates": {
+    "baseline_engaged": true,
+    "candidate_engaged": true,
+    "fairness_at_least_090": true,
+    "itl_p99_improved_20pct": false,
+    "quality": false,
+    "throughput_within_5pct": true,
+    "ttft_p95_within_25pct": true
+  },
+  "passed": false,
+  "schema": "mlx-lm.decode-priority-cadence-gate.v1"
+}
