@@ -845,6 +845,10 @@ SOFT_RELOAD_RESTART_KEYS: Dict[str, str] = {
     "prompt_concurrency": _RELOAD_NEEDS_BUILD,
     "prefill_step_size": _RELOAD_NEEDS_BUILD,
     "prompt_batch_window": _RELOAD_NEEDS_BUILD,
+    "decode_priority_cadence": _RELOAD_NEEDS_BUILD,
+    "adaptive_prefill": _RELOAD_NEEDS_BUILD,
+    "adaptive_prefill_target_itl_ms": _RELOAD_NEEDS_BUILD,
+    "adaptive_prefill_max_defer_ms": _RELOAD_NEEDS_BUILD,
     "prompt_cache_size": _RELOAD_NEEDS_BUILD,
     "prompt_cache_bytes": _RELOAD_NEEDS_BUILD,
     "state_budget_gb": _RELOAD_NEEDS_BUILD,
@@ -2528,6 +2532,11 @@ class ResponseGenerator:
             "prefill_only_rounds": 0,
             "decode_priority_release_rounds": 0,
             "decode_priority_deferred_rounds": 0,
+            "adaptive_prefill_release_rounds": 0,
+            "adaptive_prefill_slack_deferred_rounds": 0,
+            "adaptive_prefill_deadline_forced_rounds": 0,
+            "adaptive_prefill_apc_priority_admissions": 0,
+            "adaptive_prefill_chunk_histogram": {},
         }
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
@@ -3549,6 +3558,15 @@ class ResponseGenerator:
                             prefill_batch_window=self.cli_args.prompt_batch_window,
                             decode_priority_cadence=(
                                 getattr(self.cli_args, "decode_priority_cadence", 1)
+                            ),
+                            adaptive_prefill=getattr(
+                                self.cli_args, "adaptive_prefill", False
+                            ),
+                            adaptive_prefill_target_itl_ms=getattr(
+                                self.cli_args, "adaptive_prefill_target_itl_ms", 300.0
+                            ),
+                            adaptive_prefill_max_defer_ms=getattr(
+                                self.cli_args, "adaptive_prefill_max_defer_ms", 2000.0
                             ),
                             kv_budget_bytes=kv_budget_bytes,
                             kv_cost=kv_cost,
@@ -5919,6 +5937,23 @@ class APIHandler(BaseHTTPRequestHandler):
                         1,
                     )
                 ),
+                "adaptive_prefill": bool(
+                    getattr(self.response_generator.cli_args, "adaptive_prefill", False)
+                ),
+                "adaptive_prefill_target_itl_ms": float(
+                    getattr(
+                        self.response_generator.cli_args,
+                        "adaptive_prefill_target_itl_ms",
+                        300.0,
+                    )
+                ),
+                "adaptive_prefill_max_defer_ms": float(
+                    getattr(
+                        self.response_generator.cli_args,
+                        "adaptive_prefill_max_defer_ms",
+                        2000.0,
+                    )
+                ),
                 "max_inflight_requests": int(
                     getattr(self.response_generator.cli_args, "max_inflight_requests", 0)
                     or 0
@@ -6672,6 +6707,29 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--adaptive-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Adapt decode-active prefill among 64/128/256/512-token slices "
+            "using observed ITL slack and a bounded deferral deadline."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-prefill-target-itl-ms",
+        type=float,
+        default=300.0,
+        metavar="MS",
+        help="ITL target used as the adaptive prefill slack budget (default: 300).",
+    )
+    parser.add_argument(
+        "--adaptive-prefill-max-defer-ms",
+        type=float,
+        default=2000.0,
+        metavar="MS",
+        help="Maximum scheduler deferral before forcing a 64-token slice.",
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,
@@ -6839,8 +6897,16 @@ def main():
         parser.error("--batch-metrics-history must be >= 1")
     if args.decode_priority_cadence < 1:
         parser.error("--decode-priority-cadence must be >= 1")
+    if args.adaptive_prefill and args.decode_priority_cadence != 1:
+        parser.error("--adaptive-prefill cannot be combined with --decode-priority-cadence")
+    if args.adaptive_prefill_target_itl_ms <= 0:
+        parser.error("--adaptive-prefill-target-itl-ms must be > 0")
+    if args.adaptive_prefill_max_defer_ms <= 0:
+        parser.error("--adaptive-prefill-max-defer-ms must be > 0")
     if args.decode_priority_cadence != 1 and args.self_mtp:
         parser.error("--decode-priority-cadence does not support --self-mtp")
+    if args.adaptive_prefill and args.self_mtp:
+        parser.error("--adaptive-prefill does not support --self-mtp")
     if (
         args.self_mtp_verification_row_cap is not None
         and args.self_mtp_verification_row_cap < 1

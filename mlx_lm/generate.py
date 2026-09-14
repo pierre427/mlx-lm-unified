@@ -4136,6 +4136,10 @@ class BatchGenerator:
         prefill_step_size: int = 2048,
         prefill_batch_window: Optional[int] = None,
         decode_priority_cadence: int = 1,
+        adaptive_prefill: bool = False,
+        adaptive_prefill_target_itl_ms: float = 300.0,
+        adaptive_prefill_max_defer_ms: float = 2000.0,
+        adaptive_prefill_slices: Sequence[int] = (64, 128, 256, 512),
         max_kv_size: Optional[int] = None,
         kv_budget_bytes: Optional[int] = None,
         kv_cost: Optional[Tuple[float, float, Optional[int]]] = None,
@@ -4160,10 +4164,25 @@ class BatchGenerator:
     ):
         if decode_priority_cadence < 1:
             raise ValueError("decode_priority_cadence must be positive")
+        if adaptive_prefill and decode_priority_cadence != 1:
+            raise ValueError(
+                "adaptive_prefill cannot be combined with decode_priority_cadence"
+            )
+        if adaptive_prefill_target_itl_ms <= 0:
+            raise ValueError("adaptive_prefill_target_itl_ms must be positive")
+        if adaptive_prefill_max_defer_ms <= 0:
+            raise ValueError("adaptive_prefill_max_defer_ms must be positive")
+        adaptive_prefill_slices = tuple(
+            sorted({int(value) for value in adaptive_prefill_slices})
+        )
+        if not adaptive_prefill_slices or adaptive_prefill_slices[0] <= 0:
+            raise ValueError("adaptive_prefill_slices must contain positive values")
         if self_mtp is not None and decode_priority_cadence != 1:
             raise ValueError(
                 "decode_priority_cadence is not supported with batched self-MTP"
             )
+        if self_mtp is not None and adaptive_prefill:
+            raise ValueError("adaptive_prefill is not supported with batched self-MTP")
         if kv_bits is not None and quantized_kv_start != 0:
             # Validated before any state is set, so a rejected config never
             # leaves a partially-constructed instance behind (__del__ calls
@@ -4212,6 +4231,16 @@ class BatchGenerator:
         if self.prefill_batch_window < 1:
             raise ValueError("prefill_batch_window must be positive")
         self.decode_priority_cadence = decode_priority_cadence
+        self.adaptive_prefill = bool(adaptive_prefill)
+        self.adaptive_prefill_target_itl_ms = float(adaptive_prefill_target_itl_ms)
+        self.adaptive_prefill_max_defer_ms = float(adaptive_prefill_max_defer_ms)
+        self.adaptive_prefill_slices = tuple(
+            value for value in adaptive_prefill_slices if value <= prefill_step_size
+        ) or (min(adaptive_prefill_slices[0], prefill_step_size),)
+        self._last_decode_completed_s = None
+        self._last_decode_interval_ms = None
+        self._last_decode_duration_ms = None
+        self._prefill_ms_per_token_ewma = None
         self.scheduler_stats = (
             scheduler_stats if scheduler_stats is not None else {}
         )
@@ -4220,8 +4249,13 @@ class BatchGenerator:
             "prefill_only_rounds",
             "decode_priority_release_rounds",
             "decode_priority_deferred_rounds",
+            "adaptive_prefill_release_rounds",
+            "adaptive_prefill_slack_deferred_rounds",
+            "adaptive_prefill_deadline_forced_rounds",
+            "adaptive_prefill_apc_priority_admissions",
         ):
             self.scheduler_stats.setdefault(key, 0)
+        self.scheduler_stats.setdefault("adaptive_prefill_chunk_histogram", {})
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
         self.kv_bits = kv_bits
@@ -4502,7 +4536,7 @@ class BatchGenerator:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
             self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
+                (self._uid_count, seq, m, c, at, s, lp, sm, time.monotonic())
             )
             if self.self_mtp is not None:
                 # The plain batch path never consumes or clears these maps;
@@ -4995,6 +5029,7 @@ class BatchGenerator:
                     sum(len(s) for s in sequence[1]),
                     sum(c.nbytes for c in sequence[3]) == 0,
                     len(sequence[4]) if sequence[4] else 0,
+                    sequence[8] if len(sequence) > 8 else time.monotonic(),
                 ]
             )
 
@@ -5057,7 +5092,22 @@ class BatchGenerator:
                     return 0
                 return max(lengths) * len(lengths) - sum(lengths)
 
-            best = min(remaining, key=lambda i: (padding_after_adding(i), i))
+            if getattr(self, "adaptive_prefill", False):
+                # APC has already removed the reusable prefix from ``segments``.
+                # Prefer cheap residual work behind the oldest-request fairness
+                # floor, then use cache depth and padding as tie-breakers.
+                def adaptive_cost(i):
+                    residual = sum(len(segment) for segment in candidates[i][1])
+                    cached = len(candidates[i][4]) if candidates[i][4] else 0
+                    return (residual, -cached, padding_after_adding(i), i)
+
+                best = min(remaining, key=adaptive_cost)
+                if best != min(remaining) and candidates[best][4]:
+                    self.scheduler_stats[
+                        "adaptive_prefill_apc_priority_admissions"
+                    ] += 1
+            else:
+                best = min(remaining, key=lambda i: (padding_after_adding(i), i))
             selected.append(best)
             if candidate_lengths[best] > 0:
                 selected_lengths.append(candidate_lengths[best])
@@ -5316,6 +5366,56 @@ class BatchGenerator:
         self.scheduler_stats["decode_priority_deferred_rounds"] += 1
         return True
 
+    def _oldest_prefill_age_ms(self, now):
+        queued = [
+            sequence[8]
+            for sequence in self._unprocessed_sequences
+            if len(sequence) > 8
+        ]
+        active = [
+            sequence[5]
+            for sequence in self._currently_processing
+            if len(sequence) > 5
+            and not (len(sequence[0]) == 1 and len(sequence[0][0]) == 1)
+        ]
+        return 0.0 if not queued and not active else (now - min(queued + active)) * 1000
+
+    def _adaptive_prefill_decision(self, now):
+        """Return ``(defer, chunk, deadline_forced)`` at a decode boundary."""
+
+        if (
+            not self.adaptive_prefill
+            or len(self._generation_batch) == 0
+            or not self._has_prefill_work()
+        ):
+            return False, self.prefill_step_size, False
+
+        forced = self._oldest_prefill_age_ms(now) >= self.adaptive_prefill_max_defer_ms
+        if (
+            not forced
+            and self._last_decode_interval_ms is not None
+            and self._last_decode_interval_ms > self.adaptive_prefill_target_itl_ms
+        ):
+            self.scheduler_stats["adaptive_prefill_slack_deferred_rounds"] += 1
+            return True, 0, False
+
+        # Begin conservatively. Once a prompt round has supplied a measured
+        # cost, choose the largest slice predicted to fit within 75% of the ITL
+        # target, leaving room for the following decode step and model variance.
+        chunk = self.adaptive_prefill_slices[0]
+        if self._prefill_ms_per_token_ewma is not None:
+            decode_ms = self._last_decode_duration_ms or 0.0
+            budget_ms = max(0.0, self.adaptive_prefill_target_itl_ms * 0.75 - decode_ms)
+            for candidate in self.adaptive_prefill_slices:
+                if self._prefill_ms_per_token_ewma * candidate <= budget_ms:
+                    chunk = candidate
+        if forced:
+            self.scheduler_stats["adaptive_prefill_deadline_forced_rounds"] += 1
+            # A deadline overrides deferral, not the latency guard: force the
+            # smallest useful quantum rather than creating a new long tail.
+            chunk = self.adaptive_prefill_slices[0]
+        return False, chunk, forced
+
     def _promote_ready_prompts(self):
         keep = []
         split = []
@@ -5353,7 +5453,20 @@ class BatchGenerator:
 
         # Generate tokens first
         if len(self._generation_batch) > 0:
-            generation_responses = self._generation_batch.next()
+            if self.adaptive_prefill:
+                decode_started = time.perf_counter()
+                generation_responses = self._generation_batch.next()
+                decode_completed = time.perf_counter()
+                self._last_decode_duration_ms = (
+                    decode_completed - decode_started
+                ) * 1000
+                if self._last_decode_completed_s is not None:
+                    self._last_decode_interval_ms = (
+                        decode_completed - self._last_decode_completed_s
+                    ) * 1000
+                self._last_decode_completed_s = decode_completed
+            else:
+                generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
             if self._steps_counter % 512 == 0:
@@ -5364,6 +5477,13 @@ class BatchGenerator:
             return prompt_responses, generation_responses
 
         if self._should_defer_prefill():
+            prompt_responses.extend(self._promote_ready_prompts())
+            return prompt_responses, generation_responses
+
+        adaptive_defer, adaptive_chunk, _ = self._adaptive_prefill_decision(
+            time.perf_counter()
+        )
+        if adaptive_defer:
             prompt_responses.extend(self._promote_ready_prompts())
             return prompt_responses, generation_responses
 
@@ -5387,7 +5507,10 @@ class BatchGenerator:
                 self._prompt_batch.uids[i], 0, False, False
             )
             segments = seq[0]
-            n = min(len(segments[0]), self.prefill_step_size)
+            step_size = (
+                adaptive_chunk if self.adaptive_prefill else self.prefill_step_size
+            )
+            n = min(len(segments[0]), step_size)
             prompts.append(segments[0][:n])
             segments[0] = segments[0][n:]
             if len(segments[0]) == 0:
@@ -5409,6 +5532,19 @@ class BatchGenerator:
         self._prompt_batch.prompt(prompts)
         toc = time.perf_counter()
         self._prompt_time_counter += toc - tic
+        if prompts and self.adaptive_prefill and len(self._generation_batch) > 0:
+            width = max(len(prompt) for prompt in prompts)
+            measured = (toc - tic) * 1000 / max(width, 1)
+            if self._prefill_ms_per_token_ewma is None:
+                self._prefill_ms_per_token_ewma = measured
+            else:
+                self._prefill_ms_per_token_ewma = (
+                    0.75 * self._prefill_ms_per_token_ewma + 0.25 * measured
+                )
+            self.scheduler_stats["adaptive_prefill_release_rounds"] += 1
+            histogram = self.scheduler_stats["adaptive_prefill_chunk_histogram"]
+            key = str(width)
+            histogram[key] = int(histogram.get(key, 0)) + 1
 
         return prompt_responses, generation_responses
 

@@ -77,6 +77,14 @@ class TestDecodePriorityCadence(unittest.TestCase):
     def make_generator(*, cadence=4, step=1, decode=True, queued=True):
         gen = BatchGenerator.__new__(BatchGenerator)
         gen.decode_priority_cadence = cadence
+        gen.adaptive_prefill = False
+        gen.adaptive_prefill_target_itl_ms = 300.0
+        gen.adaptive_prefill_max_defer_ms = 2000.0
+        gen.adaptive_prefill_slices = (64, 128, 256, 512)
+        gen._last_decode_completed_s = None
+        gen._last_decode_interval_ms = None
+        gen._last_decode_duration_ms = None
+        gen._prefill_ms_per_token_ewma = None
         gen._steps_counter = step
         gen._generation_batch = [object()] if decode else []
         gen._unprocessed_sequences = deque([object()] if queued else [])
@@ -84,6 +92,20 @@ class TestDecodePriorityCadence(unittest.TestCase):
         gen.scheduler_stats = {"decode_priority_deferred_rounds": 0}
         gen._old_wired_limit = None
         return gen
+
+    @staticmethod
+    def _queued(uid, residual, cached=0, queued_at=0.0):
+        return (
+            uid,
+            [list(range(residual)), [9]],
+            8,
+            [],
+            list(range(cached)),
+            None,
+            [],
+            None,
+            queued_at,
+        )
 
     def test_default_cadence_preserves_mixed_prefill(self):
         gen = self.make_generator(cadence=1)
@@ -121,6 +143,68 @@ class TestDecodePriorityCadence(unittest.TestCase):
                 decode_priority_cadence=2,
                 self_mtp={"persistent": True},
             )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            BatchGenerator(
+                object(), decode_priority_cadence=2, adaptive_prefill=True
+            )
+        with self.assertRaisesRegex(ValueError, "not supported with batched self-MTP"):
+            BatchGenerator(
+                object(), adaptive_prefill=True, self_mtp={"persistent": True}
+            )
+
+    def test_adaptive_prefill_defers_after_itl_miss(self):
+        gen = self.make_generator(cadence=1, queued=False)
+        gen.adaptive_prefill = True
+        gen._last_decode_interval_ms = 450.0
+        gen._currently_processing = [[[[1, 2], [9]], 0, 3, True, 0, 9.5]]
+        gen.scheduler_stats["adaptive_prefill_slack_deferred_rounds"] = 0
+
+        self.assertEqual(gen._adaptive_prefill_decision(10.0), (True, 0, False))
+        self.assertEqual(
+            gen.scheduler_stats["adaptive_prefill_slack_deferred_rounds"], 1
+        )
+
+    def test_adaptive_prefill_deadline_forces_smallest_slice(self):
+        gen = self.make_generator(cadence=1, queued=False)
+        gen.adaptive_prefill = True
+        gen._last_decode_interval_ms = 450.0
+        gen._currently_processing = [[[[1, 2], [9]], 0, 3, True, 0, 7.0]]
+        gen.scheduler_stats["adaptive_prefill_deadline_forced_rounds"] = 0
+
+        self.assertEqual(gen._adaptive_prefill_decision(10.0), (False, 64, True))
+        self.assertEqual(
+            gen.scheduler_stats["adaptive_prefill_deadline_forced_rounds"], 1
+        )
+
+    def test_adaptive_prefill_uses_measured_budget_for_chunk(self):
+        gen = self.make_generator(cadence=1, queued=False)
+        gen.adaptive_prefill = True
+        gen._last_decode_interval_ms = 50.0
+        gen._last_decode_duration_ms = 40.0
+        gen._prefill_ms_per_token_ewma = 1.0
+        gen._currently_processing = [[[[1, 2], [9]], 0, 3, True, 0, 9.5]]
+
+        self.assertEqual(gen._adaptive_prefill_decision(10.0), (False, 128, False))
+
+    def test_adaptive_admission_prefers_small_cached_residual_after_oldest(self):
+        gen = self.make_generator(cadence=1, queued=False, decode=False)
+        gen.adaptive_prefill = True
+        gen.prefill_step_size = 512
+        gen.prefill_batch_window = 3
+        gen._currently_processing = []
+        gen._unprocessed_sequences = deque(
+            [
+                self._queued(0, 500),
+                self._queued(1, 400),
+                self._queued(2, 10, cached=1000),
+            ]
+        )
+        gen.scheduler_stats["adaptive_prefill_apc_priority_admissions"] = 0
+
+        self.assertEqual(gen._select_prefill_indices(2), [0, 2])
+        self.assertEqual(
+            gen.scheduler_stats["adaptive_prefill_apc_priority_admissions"], 1
+        )
 
     def test_next_defers_three_rounds_then_processes_one_prompt_chunk(self):
         gen = self.make_generator(cadence=4, step=0, queued=False)

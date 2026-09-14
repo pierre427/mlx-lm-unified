@@ -184,6 +184,25 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
             4,
         )
 
+    def test_server_parser_exposes_adaptive_prefill(self):
+        parser = setup_server_arg_parser()
+        defaults = parser.parse_args([])
+        self.assertFalse(defaults.adaptive_prefill)
+        self.assertEqual(defaults.adaptive_prefill_target_itl_ms, 300.0)
+        self.assertEqual(defaults.adaptive_prefill_max_defer_ms, 2000.0)
+        args = parser.parse_args(
+            [
+                "--adaptive-prefill",
+                "--adaptive-prefill-target-itl-ms",
+                "250",
+                "--adaptive-prefill-max-defer-ms",
+                "1500",
+            ]
+        )
+        self.assertTrue(args.adaptive_prefill)
+        self.assertEqual(args.adaptive_prefill_target_itl_ms, 250.0)
+        self.assertEqual(args.adaptive_prefill_max_defer_ms, 1500.0)
+
 
 class TestServerContextCeiling(unittest.TestCase):
     def make_generator(self, ceiling):
