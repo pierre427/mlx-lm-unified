@@ -1328,6 +1328,36 @@ def _self_mtp_config(
     return config
 
 
+def _adaptive_prefill_policy(cli_args, model):
+    """Resolve the effective scheduler policy for the loaded model.
+
+    The Qwen3.8 Flash Next ``qwen4_exp`` self-MTP operating point is qualified
+    with APC-only residual slicing at a 35 ms ITL target. Keep every other
+    model on the historical default-off / 1500 ms policy. The parser retains a
+    tri-state so either BooleanOptionalAction spelling is authoritative.
+    """
+
+    model_type = str(getattr(getattr(model, "args", None), "model_type", ""))
+    qualified_qwen38_self_mtp = bool(
+        getattr(cli_args, "self_mtp", False)
+        and getattr(model, "mtp", None) is not None
+        and model_type in {"qwen4_exp", "qwen4_exp_text"}
+    )
+    configured = getattr(cli_args, "adaptive_prefill", None)
+    enabled = qualified_qwen38_self_mtp if configured is None else bool(configured)
+    configured_target = getattr(cli_args, "adaptive_prefill_target_itl_ms", None)
+    target_itl_ms = (
+        35.0
+        if configured_target is None and qualified_qwen38_self_mtp
+        else 1500.0 if configured_target is None else float(configured_target)
+    )
+    return (
+        enabled,
+        target_itl_ms,
+        float(getattr(cli_args, "adaptive_prefill_max_defer_ms", 2000.0)),
+    )
+
+
 @dataclass(frozen=True)
 class SelfMTPLaneAdmission:
     """One cycle-boundary memory decision for batched self-MTP.
@@ -3550,6 +3580,11 @@ class ResponseGenerator:
                                 "for shared batch caches (see "
                                 "batch_admission cohort_bytes work)"
                             )
+                        (
+                            adaptive_prefill,
+                            adaptive_prefill_target_itl_ms,
+                            adaptive_prefill_max_defer_ms,
+                        ) = _adaptive_prefill_policy(self.cli_args, model)
                         batch_generator = BatchGenerator(
                             model,
                             completion_batch_size=self.cli_args.decode_concurrency,
@@ -3559,16 +3594,12 @@ class ResponseGenerator:
                             decode_priority_cadence=(
                                 getattr(self.cli_args, "decode_priority_cadence", 1)
                             ),
-                            adaptive_prefill=getattr(
-                                self.cli_args, "adaptive_prefill", False
+                            adaptive_prefill=adaptive_prefill,
+                            adaptive_prefill_target_itl_ms=(
+                                adaptive_prefill_target_itl_ms
                             ),
-                            adaptive_prefill_target_itl_ms=getattr(
-                                self.cli_args,
-                                "adaptive_prefill_target_itl_ms",
-                                1500.0,
-                            ),
-                            adaptive_prefill_max_defer_ms=getattr(
-                                self.cli_args, "adaptive_prefill_max_defer_ms", 2000.0
+                            adaptive_prefill_max_defer_ms=(
+                                adaptive_prefill_max_defer_ms
                             ),
                             kv_budget_bytes=kv_budget_bytes,
                             kv_cost=kv_cost,
@@ -5921,6 +5952,14 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
         elif self.path == "/v1/status/batching":
             prompt_cache = self.response_generator.prompt_cache
+            (
+                adaptive_prefill,
+                adaptive_prefill_target_itl_ms,
+                adaptive_prefill_max_defer_ms,
+            ) = _adaptive_prefill_policy(
+                self.response_generator.cli_args,
+                self.response_generator.model_provider.model,
+            )
             payload = self.response_generator.batch_metrics.snapshot(
                 queue_depth=self.response_generator.requests.qsize(),
                 memory=_batch_memory_snapshot(prompt_cache),
@@ -5939,23 +5978,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         1,
                     )
                 ),
-                "adaptive_prefill": bool(
-                    getattr(self.response_generator.cli_args, "adaptive_prefill", False)
-                ),
-                "adaptive_prefill_target_itl_ms": float(
-                    getattr(
-                        self.response_generator.cli_args,
-                        "adaptive_prefill_target_itl_ms",
-                        1500.0,
-                    )
-                ),
-                "adaptive_prefill_max_defer_ms": float(
-                    getattr(
-                        self.response_generator.cli_args,
-                        "adaptive_prefill_max_defer_ms",
-                        2000.0,
-                    )
-                ),
+                "adaptive_prefill": adaptive_prefill,
+                "adaptive_prefill_target_itl_ms": adaptive_prefill_target_itl_ms,
+                "adaptive_prefill_max_defer_ms": adaptive_prefill_max_defer_ms,
                 "max_inflight_requests": int(
                     getattr(self.response_generator.cli_args, "max_inflight_requests", 0)
                     or 0
@@ -6711,18 +6736,23 @@ def setup_arg_parser():
     parser.add_argument(
         "--adaptive-prefill",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Adapt decode-active prefill among 64/128/256/512-token slices "
-            "using observed ITL slack and a bounded deferral deadline."
+            "using observed ITL slack and a bounded deferral deadline. "
+            "Default: enabled for Qwen3.8 Flash Next self-MTP, disabled for "
+            "other models; --no-adaptive-prefill always opts out."
         ),
     )
     parser.add_argument(
         "--adaptive-prefill-target-itl-ms",
         type=float,
-        default=1500.0,
+        default=None,
         metavar="MS",
-        help="ITL target used as the adaptive prefill slack budget (default: 1500).",
+        help=(
+            "ITL target used as the adaptive prefill slack budget. Default: "
+            "35 for Qwen3.8 Flash Next self-MTP, 1500 otherwise."
+        ),
     )
     parser.add_argument(
         "--adaptive-prefill-max-defer-ms",
@@ -6901,7 +6931,10 @@ def main():
         parser.error("--decode-priority-cadence must be >= 1")
     if args.adaptive_prefill and args.decode_priority_cadence != 1:
         parser.error("--adaptive-prefill cannot be combined with --decode-priority-cadence")
-    if args.adaptive_prefill_target_itl_ms <= 0:
+    if (
+        args.adaptive_prefill_target_itl_ms is not None
+        and args.adaptive_prefill_target_itl_ms <= 0
+    ):
         parser.error("--adaptive-prefill-target-itl-ms must be > 0")
     if args.adaptive_prefill_max_defer_ms <= 0:
         parser.error("--adaptive-prefill-max-defer-ms must be > 0")

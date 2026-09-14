@@ -21,6 +21,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     SamplingArguments,
+    _adaptive_prefill_policy,
     _discard_small_sidecarless_apc_hit_for_mtp,
     _fetch_single_request_prompt_cache,
     _make_sampler,
@@ -187,8 +188,8 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
     def test_server_parser_exposes_adaptive_prefill(self):
         parser = setup_server_arg_parser()
         defaults = parser.parse_args([])
-        self.assertFalse(defaults.adaptive_prefill)
-        self.assertEqual(defaults.adaptive_prefill_target_itl_ms, 1500.0)
+        self.assertIsNone(defaults.adaptive_prefill)
+        self.assertIsNone(defaults.adaptive_prefill_target_itl_ms)
         self.assertEqual(defaults.adaptive_prefill_max_defer_ms, 2000.0)
         args = parser.parse_args(
             [
@@ -202,6 +203,38 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
         self.assertTrue(args.adaptive_prefill)
         self.assertEqual(args.adaptive_prefill_target_itl_ms, 250.0)
         self.assertEqual(args.adaptive_prefill_max_defer_ms, 1500.0)
+
+    def test_qwen38_self_mtp_defaults_adaptive_prefill_on(self):
+        parser = setup_server_arg_parser()
+        model = types.SimpleNamespace(
+            args=types.SimpleNamespace(model_type="qwen4_exp"), mtp=object()
+        )
+
+        defaults = parser.parse_args(["--self-mtp"])
+        self.assertEqual(
+            _adaptive_prefill_policy(defaults, model), (True, 35.0, 2000.0)
+        )
+
+        opted_out = parser.parse_args(["--self-mtp", "--no-adaptive-prefill"])
+        self.assertEqual(
+            _adaptive_prefill_policy(opted_out, model), (False, 35.0, 2000.0)
+        )
+
+    def test_other_models_keep_adaptive_prefill_default_off(self):
+        parser = setup_server_arg_parser()
+        model = types.SimpleNamespace(
+            args=types.SimpleNamespace(model_type="qwen3"), mtp=object()
+        )
+
+        defaults = parser.parse_args(["--self-mtp"])
+        self.assertEqual(
+            _adaptive_prefill_policy(defaults, model), (False, 1500.0, 2000.0)
+        )
+
+        opted_in = parser.parse_args(["--self-mtp", "--adaptive-prefill"])
+        self.assertEqual(
+            _adaptive_prefill_policy(opted_in, model), (True, 1500.0, 2000.0)
+        )
 
 
 class TestServerContextCeiling(unittest.TestCase):
