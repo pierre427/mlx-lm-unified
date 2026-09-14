@@ -874,9 +874,12 @@ def test_async_candidate_and_joined_recurrent_state_count_toward_peak_memory():
     assert batch.cache_nbytes == baseline + 300
     rows = batch.mtp_cycle_state()
     assert len(rows) == 2
-    expected_gib = (baseline / 2 + 150) / float(1 << 30)
+    # Segmented arrays are allocated; the async ticket is still pending.
+    expected_gib = (baseline / 2 + 50) / float(1 << 30)
     assert rows[0][4] == pytest.approx(expected_gib)
     assert rows[1][4] == pytest.approx(expected_gib)
+    assert rows[0][5] == pytest.approx(100 / float(1 << 30))
+    assert rows[1][5] == pytest.approx(100 / float(1 << 30))
 
 
 def test_discarded_generation_row_releases_transaction_and_cache_owner():

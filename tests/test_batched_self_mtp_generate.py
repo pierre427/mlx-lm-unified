@@ -253,10 +253,46 @@ class TestMTPGenerationBatch(unittest.TestCase):
         self.assertEqual([(r.uid, r.token) for r in responses], [(2, 1)])
         propose.assert_not_called()
 
+    def test_paused_row_in_physical_batch_reports_merge_copy(self):
+        short, long = _Lane(1), _Lane(2)
+        short.token_prefix = mx.array([1] * 999, dtype=mx.uint32)
+        long.token_prefix = mx.array([1] * 9_999, dtype=mx.uint32)
+        batch = self._batch([short, long])
+        batch.state.caches = types.SimpleNamespace(
+            target=[types.SimpleNamespace(nbytes=2_000 << 20)], draft=[]
+        )
+        with patch(
+            "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+            side_effect=_detach,
+        ):
+            for package in batch._detach_packages([1]):
+                batch._paused[package.detached.lane.uid] = package
+        rows = {row[0]: row for row in batch.mtp_cycle_state()}
+        self.assertTrue(rows[2][3])
+        # Rejoining rebuilds both rows at the paused 10K width.
+        self.assertGreater(rows[2][5], 0.0)
+        self.assertEqual(rows[1][5], 0.0)
+
+    def test_padded_rows_report_one_shared_growth_rate(self):
+        short, long = _Lane(1), _Lane(2)
+        short.token_prefix = mx.array([1] * 99, dtype=mx.uint32)
+        long.token_prefix = mx.array([1] * 9_999, dtype=mx.uint32)
+        batch = self._batch([short, long])
+        batch.state.caches = types.SimpleNamespace(
+            target=[types.SimpleNamespace(nbytes=20_000 << 20)], draft=[]
+        )
+        rows = {row[0]: row for row in batch.mtp_cycle_state()}
+        rate = [rows[uid][4] / rows[uid][1] for uid in (1, 2)]
+        # Both padded rows grow at total / lanes / max context per token.
+        expected = (20_000 << 20) / 2 / 10_000 / float(1 << 30)
+        self.assertAlmostEqual(rate[0], expected, places=12)
+        self.assertAlmostEqual(rate[1], expected, places=12)
+        self.assertEqual(rows[1][5], 0.0)
+
     def test_paused_lane_reports_its_retained_cache_as_resident(self):
-        decisions = {1: "queue"}
+        decisions = {1: "queue", 2: 3}
         batch = self._batch(
-            [_Lane(1, depth=3)],
+            [_Lane(1, depth=3), _Lane(2, depth=3)],
             admission=lambda rows: {row[0]: decisions[row[0]] for row in rows},
         )
 
@@ -266,10 +302,93 @@ class TestMTPGenerationBatch(unittest.TestCase):
         ):
             batch._apply_admission()
 
-        self.assertEqual(batch.uids, [])
-        (row,) = batch.mtp_cycle_state()
-        self.assertEqual(row[0], 1)
-        self.assertTrue(row[3])
+        self.assertEqual(batch.uids, [2])
+        rows = {row[0]: row for row in batch.mtp_cycle_state()}
+        self.assertTrue(rows[1][3])
+
+    def test_paused_lane_decided_plain_moves_to_plain(self):
+        decisions = {1: "queue", 2: 3}
+        batch = self._batch(
+            [_Lane(1, depth=3), _Lane(2, depth=3)],
+            admission=lambda rows: {row[0]: decisions[row[0]] for row in rows},
+        )
+        with patch(
+            "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+            side_effect=_detach,
+        ):
+            batch._apply_admission()
+            self.assertIn(1, batch._paused)
+            decisions[1] = "plain"
+            batch._apply_admission()
+        self.assertNotIn(1, batch._paused)
+        ready = batch.take_plain_fallbacks()
+        self.assertEqual([item.detached.lane.uid for item in ready], [1])
+
+    def test_sole_queued_lane_stays_paused_inside_the_batch(self):
+        # The batch cannot see the plain fallback batch, so it never demotes.
+        batch = self._batch(
+            [_Lane(1, depth=3)], admission=lambda rows: {row[0]: "queue" for row in rows}
+        )
+        with patch(
+            "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+            side_effect=_detach,
+        ):
+            batch._apply_admission()
+        self.assertIn(1, batch._paused)
+        self.assertEqual(batch.take_plain_fallbacks(), [])
+
+    def _starved_generator(self, batch, plain_lanes=0):
+        from mlx_lm.generate import BatchGenerator
+
+        generator = BatchGenerator.__new__(BatchGenerator)
+        generator._generation_batch = batch
+        generator._plain_fallback_batch = [object()] * plain_lanes
+        generator._starved_mtp_boundaries = 0
+        return generator
+
+    def _paused_batch(self):
+        batch = self._batch(
+            [_Lane(1, depth=3), _Lane(2, depth=3)],
+            admission=lambda rows: {row[0]: "queue" for row in rows},
+        )
+        with patch(
+            "mlx_lm.hybrid_speculative.detach_self_mtp_lanes",
+            side_effect=_detach,
+        ):
+            batch._apply_admission()
+        return batch
+
+    def test_starved_lane_continues_plain_after_consecutive_boundaries(self):
+        from mlx_lm.generate import MTP_STARVED_BOUNDARIES_BEFORE_PLAIN
+
+        batch = self._paused_batch()
+        generator = self._starved_generator(batch)
+        for _ in range(MTP_STARVED_BOUNDARIES_BEFORE_PLAIN - 1):
+            self.assertIsNone(generator._demote_starved_mtp_lane())
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(generator._demote_starved_mtp_lane(), 1)
+        self.assertEqual(list(batch._paused), [2])
+        self.assertEqual(
+            [p.detached.lane.uid for p in batch.take_plain_fallbacks()], [1]
+        )
+
+    def test_starvation_needs_an_unbroken_run_and_idle_plain_batch(self):
+        from mlx_lm.generate import MTP_STARVED_BOUNDARIES_BEFORE_PLAIN
+
+        batch = self._paused_batch()
+        # A decoding plain lane will free memory: never demote.
+        busy = self._starved_generator(batch, plain_lanes=1)
+        for _ in range(MTP_STARVED_BOUNDARIES_BEFORE_PLAIN * 2):
+            self.assertIsNone(busy._demote_starved_mtp_lane())
+        # A boundary with an active lane resets the count.
+        idle = self._starved_generator(batch)
+        for _ in range(MTP_STARVED_BOUNDARIES_BEFORE_PLAIN - 1):
+            idle._demote_starved_mtp_lane()
+        batch.state.lanes.append(_Lane(9))
+        self.assertIsNone(idle._demote_starved_mtp_lane())
+        batch.state.lanes.pop()
+        self.assertIsNone(idle._demote_starved_mtp_lane())
+        self.assertEqual(sorted(batch._paused), [1, 2])
 
     def test_async_segmented_cohort_cancels_empties_and_reconstructs(self):
         """A membership churn boundary must retire and re-arm async work."""
@@ -462,6 +581,7 @@ class TestMTPGenerationBatch(unittest.TestCase):
         from mlx_lm.generate import BatchGenerator
 
         generator = BatchGenerator.__new__(BatchGenerator)
+        generator.prefill_step_size = 2048
         generator.self_mtp = {"num_draft": 2}
         generator._mtp_configs = {7: {"num_draft": 1}}
         # uid 7 restores an APC draft sidecar: its actual bytes are part of
@@ -486,18 +606,29 @@ class TestMTPGenerationBatch(unittest.TestCase):
             return {1: 2, 7: 1, 8: "queue"}
 
         generator.mtp_admission = admission
-        # Live rows and both joining candidates (context, configured depth,
-        # retained target + draft cache GiB) reach the controller BEFORE any
-        # allocation.  uid 8 has no sidecar, so its fresh single-layer draft
-        # cache takes the one-layer share of the target (1 layer here: 1 GiB).
+        # Live rows and both joining candidates reach the controller BEFORE
+        # any allocation.  These cache leaves report no offset, so nothing is
+        # known to be restored: both joins report 0 GiB and pay the envelope.
         self.assertEqual(generator._admit_mtp_joining(2), 1)
         self.assertEqual(
             seen["rows"],
-            ((1, 1025, 2, True, 0.5), (7, 4, 1, False, 2.0), (8, 3, 2, False, 2.0)),
+            ((1, 1025, 2, True, 0.5), (7, 4, 1, False, 0.0), (8, 3, 2, False, 0.0)),
         )
         # A queued head keeps the FIFO prefix closed (fail closed, in order).
         generator.mtp_admission = lambda rows: {7: "queue", 8: 2}
         self.assertEqual(generator._admit_mtp_joining(2), 0)
+        # With nothing running, waiting frees nothing: the head proceeds.
+        generator._generation_batch = types.SimpleNamespace(
+            mtp_cycle_state=lambda: []
+        )
+        generator._plain_fallback_batch = [object()]
+        self.assertEqual(generator._admit_mtp_joining(2), 0)
+        generator._plain_fallback_batch = []
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(generator._admit_mtp_joining(2), 1)
+        generator._generation_batch = types.SimpleNamespace(
+            mtp_cycle_state=lambda: [(1, 1025, 2, True, 0.5)]
+        )
         # A plain-only approval still admits; the merge boundary migrates it.
         generator.mtp_admission = lambda rows: {7: "plain", 8: 2}
         self.assertEqual(generator._admit_mtp_joining(2), 2)
@@ -511,6 +642,7 @@ class TestMTPGenerationBatch(unittest.TestCase):
         from mlx_lm.generate import BatchGenerator
 
         generator = BatchGenerator.__new__(BatchGenerator)
+        generator.prefill_step_size = 2048
         generator.self_mtp = {"num_draft": 2}
         generator._mtp_configs = {}
         generator._mtp_states = {}
@@ -535,6 +667,43 @@ class TestMTPGenerationBatch(unittest.TestCase):
         # Target projected to the full context (1 GiB * 1024/512 = 2 GiB) plus
         # the fresh single-layer draft floor (2 GiB / 4 layers = 0.5 GiB).
         self.assertEqual(seen["rows"], ((5, 1024, 2, False, 2.5),))
+
+        # A long uncached tail allocates prefill work it does not report.
+        generator.prefill_step_size = 256
+        generator._unprocessed_sequences = deque(
+            ((5, [[1, 2, 3], [4]], 8, cache_row, [0] * 1020, None, [], None),)
+        )
+        self.assertEqual(generator._admit_mtp_joining(1), 1)
+        self.assertEqual(seen["rows"], ((5, 1024, 2, False, 0.0),))
+
+    def test_joining_budget_walks_nested_cache_lists(self):
+        from collections import deque
+
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.models.cache import CacheList
+
+        generator = BatchGenerator.__new__(BatchGenerator)
+        generator.prefill_step_size = 2048
+        generator.self_mtp = {"num_draft": 2}
+        generator._mtp_configs = {}
+        generator._mtp_states = {}
+        generator._generation_batch = types.SimpleNamespace(
+            mtp_cycle_state=lambda: []
+        )
+        leaf = lambda: types.SimpleNamespace(nbytes=1 << 28, offset=512)
+        nested = CacheList.__new__(CacheList)
+        nested.caches = (leaf(), leaf())
+        generator._unprocessed_sequences = deque(
+            ((5, [[1, 2, 3], [4]], 8, [nested, nested], [0] * 1020, None, [], None),)
+        )
+        seen = {}
+        generator.mtp_admission = lambda rows: seen.setdefault("rows", tuple(rows)) and {5: 2}
+        self.assertEqual(generator._admit_mtp_joining(1), 1)
+        # 4 leaves x 0.25 GiB covering 512 of 1024 tokens -> 2 GiB target,
+        # plus the one-layer fresh draft share (2 GiB / 2 entries = 1 GiB).
+        (row,) = seen["rows"]
+        self.assertEqual(row[:4], (5, 1024, 2, False))
+        self.assertGreaterEqual(row[4], 2.0)
 
     def test_prompt_cache_nbytes_counts_queued_draft_sidecars(self):
         from collections import deque
