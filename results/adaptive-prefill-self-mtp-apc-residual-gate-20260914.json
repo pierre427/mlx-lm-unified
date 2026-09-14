@@ -1,0 +1,455 @@
+{
+  "checks": {
+    "adaptive_slices_released": true,
+    "apc_hit_observed": true,
+    "batched_decode_observed": true,
+    "incumbent_decode_observed": true,
+    "residual_used_self_mtp": true
+  },
+  "created_at_utc": "2026-09-14T21:18:31+00:00",
+  "model": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+  "observed": {
+    "adaptive_prefill_chunk_histogram_after": {
+      "62": 1,
+      "64": 1
+    },
+    "adaptive_prefill_chunk_histogram_before": {},
+    "adaptive_prefill_deadline_forced_rounds_delta": 2,
+    "adaptive_prefill_release_rounds_delta": 2,
+    "apc_hits_delta": 1,
+    "generation_width_two_cycles_delta": 16,
+    "max_generation_width": 2,
+    "residual_cached_prompt_tokens": 4968,
+    "residual_self_mtp_receipt": {
+      "accept_rule": "residual",
+      "async_qsa_promotion": null,
+      "cached_prompt_tokens": 4968,
+      "choice_index": 0,
+      "completed": true,
+      "num_draft": 2,
+      "prompt_tokens": 5095,
+      "request_id": "chatcmpl-fac22e7d-7545-4e14-a336-e483da88e925",
+      "route": "continuous_batched_self_mtp",
+      "sampling_temperature": 0.0,
+      "server_timing_ms": {
+        "generation_admission": 457.944833,
+        "generation_service": 5629.159792,
+        "request_admission": 0.015958,
+        "total": 6087.120583
+      },
+      "stats": {
+        "bonus_tokens": 15,
+        "cycles": 15,
+        "draft_acceptance": 0.5714285714285714,
+        "draft_accepted": 16,
+        "draft_cycles": 15,
+        "draft_proposed": 28,
+        "external_cache_reconciled": false,
+        "external_cache_trimmed_tokens": 0,
+        "latched": false,
+        "plain_cycles": 0,
+        "plain_tokens": 1,
+        "rate_gate_delatched": false,
+        "rate_gate_plain_ms_per_tok": 0.0,
+        "rate_gate_probed": false,
+        "rate_gate_spec_ms_per_tok": 0.0,
+        "retrieval_accepted": 0,
+        "retrieval_cycles": 0,
+        "retrieval_proposed": 0,
+        "router_accept_prob": 0.0,
+        "router_last_num_draft": 0,
+        "router_plain_cycles": 0,
+        "router_reengagements": 0,
+        "span_extend_cycles": 0,
+        "span_extend_tokens": 0,
+        "span_snap_cycles": 0,
+        "span_snap_tokens": 0,
+        "total_emitted": 32,
+        "verify_span_hist": {}
+      },
+      "ts": 1789420704.621063
+    }
+  },
+  "passed": true,
+  "requests": {
+    "incumbent": {
+      "response": {
+        "choices": [
+          {
+            "finish_reason": "length",
+            "index": 0,
+            "message": {
+              "content": "Admission control is a fundamental mechanism in computer networking and telecommunications that serves as the first line of defense against network congestion and resource exhaustion. At its core, admission control is the process by which a network node, such as a router or switch, decides whether to accept or reject a new flow of data or a connection request based on the availability of resources and the current state of the network. This decision-making process is critical because it ensures that the network can maintain the Quality of Service (QoS) guarantees promised to existing users while preventing the system from becoming overwhelmed by excessive demand. Without admission control, networks would be prone to severe congestion, leading to packet loss, increased latency, and jitter, which can degrade the performance of all applications, particularly those that are sensitive to timing and reliability, such as voice over IP (VoIP) and video streaming.\n\nThe primary objective of admission control is to protect the network from overload by ensuring that only those flows that can be supported without violating their QoS requirements are admitted. This involves a complex evaluation of various parameters, including bandwidth availability, buffer space, processing power, and current traffic load. When a new flow requests resources, the admission control mechanism checks if the network has sufficient capacity to handle this additional load without degrading the service level of existing flows. If the resources are insufficient, the request is denied, thereby preserving the stability and performance of the network for current users. This proactive approach contrasts sharply with reactive congestion control mechanisms, which attempt to mitigate congestion after it has already occurred, often resulting in degraded performance for all users during the recovery period.\n\nIn the context of Integrated Services (IntServ) architecture, admission control plays a pivotal role in supporting guaranteed and controlled-load services. IntServ relies on the Resource Reservation Protocol (RSVP) to allow hosts to request specific bandwidth and latency guarantees from the network. When a host sends a Path message to establish a reservation, routers along the path evaluate whether they can meet the requested service level. If a router determines that admitting the new flow would cause its resources to be over-subscribed, it rejects the reservation request. This strict enforcement ensures that once a flow is admitted, it receives the promised service level, provided that no other flows violate their contracts. However, this model can be resource-intensive to implement and manage, as it requires per-flow state information to be maintained in every router along the path, which can lead to scalability issues in large networks.\n\nTo address the scalability challenges of IntServ, the Differentiated Services (DiffServ) architecture was developed",
+              "role": "assistant"
+            },
+            "self_mtp_receipt": {
+              "accept_rule": "residual",
+              "async_qsa_promotion": null,
+              "cached_prompt_tokens": 0,
+              "choice_index": 0,
+              "completed": true,
+              "num_draft": 2,
+              "prompt_tokens": 24,
+              "request_id": "chatcmpl-cc8d919e-eba4-42be-b0ed-35ac2c74d254",
+              "route": "continuous_batched_self_mtp",
+              "sampling_temperature": 0.0,
+              "server_timing_ms": {
+                "generation_admission": 3.069583,
+                "generation_service": 13404.461459,
+                "request_admission": 0.06725,
+                "total": 13407.598292
+              },
+              "stats": {
+                "bonus_tokens": 244,
+                "cycles": 244,
+                "draft_acceptance": 0.5482546201232033,
+                "draft_accepted": 267,
+                "draft_cycles": 244,
+                "draft_proposed": 487,
+                "external_cache_reconciled": false,
+                "external_cache_trimmed_tokens": 0,
+                "latched": false,
+                "plain_cycles": 0,
+                "plain_tokens": 1,
+                "rate_gate_delatched": false,
+                "rate_gate_plain_ms_per_tok": 0.0,
+                "rate_gate_probed": false,
+                "rate_gate_spec_ms_per_tok": 0.0,
+                "retrieval_accepted": 0,
+                "retrieval_cycles": 0,
+                "retrieval_proposed": 0,
+                "router_accept_prob": 0.0,
+                "router_last_num_draft": 0,
+                "router_plain_cycles": 0,
+                "router_reengagements": 0,
+                "span_extend_cycles": 0,
+                "span_extend_tokens": 0,
+                "span_snap_cycles": 0,
+                "span_snap_tokens": 0,
+                "total_emitted": 512,
+                "verify_span_hist": {}
+              },
+              "ts": 1789420711.870743
+            }
+          }
+        ],
+        "created": 1789420698,
+        "id": "chatcmpl-cc8d919e-eba4-42be-b0ed-35ac2c74d254",
+        "model": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+        "object": "chat.completion",
+        "self_mtp_receipt": {
+          "accept_rule": "residual",
+          "async_qsa_promotion": null,
+          "cached_prompt_tokens": 0,
+          "choice_index": 0,
+          "completed": true,
+          "num_draft": 2,
+          "prompt_tokens": 24,
+          "request_id": "chatcmpl-cc8d919e-eba4-42be-b0ed-35ac2c74d254",
+          "route": "continuous_batched_self_mtp",
+          "sampling_temperature": 0.0,
+          "server_timing_ms": {
+            "generation_admission": 3.069583,
+            "generation_service": 13404.461459,
+            "request_admission": 0.06725,
+            "total": 13407.598292
+          },
+          "stats": {
+            "bonus_tokens": 244,
+            "cycles": 244,
+            "draft_acceptance": 0.5482546201232033,
+            "draft_accepted": 267,
+            "draft_cycles": 244,
+            "draft_proposed": 487,
+            "external_cache_reconciled": false,
+            "external_cache_trimmed_tokens": 0,
+            "latched": false,
+            "plain_cycles": 0,
+            "plain_tokens": 1,
+            "rate_gate_delatched": false,
+            "rate_gate_plain_ms_per_tok": 0.0,
+            "rate_gate_probed": false,
+            "rate_gate_spec_ms_per_tok": 0.0,
+            "retrieval_accepted": 0,
+            "retrieval_cycles": 0,
+            "retrieval_proposed": 0,
+            "router_accept_prob": 0.0,
+            "router_last_num_draft": 0,
+            "router_plain_cycles": 0,
+            "router_reengagements": 0,
+            "span_extend_cycles": 0,
+            "span_extend_tokens": 0,
+            "span_snap_cycles": 0,
+            "span_snap_tokens": 0,
+            "total_emitted": 512,
+            "verify_span_hist": {}
+          },
+          "ts": 1789420711.870743
+        },
+        "system_fingerprint": "0.32.0-0.32.2.dev20260911+a0d69e543-macOS-26.6.2-arm64-arm-64bit-applegpu_g17s",
+        "usage": {
+          "completion_tokens": 512,
+          "prompt_tokens": 24,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 536
+        }
+      },
+      "wall_ms": 13415.93525
+    },
+    "prime": {
+      "response": {
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+              "content": "I acknowledge the shared reference.",
+              "role": "assistant"
+            },
+            "self_mtp_receipt": {
+              "accept_rule": "residual",
+              "async_qsa_promotion": null,
+              "cached_prompt_tokens": 0,
+              "choice_index": 0,
+              "completed": true,
+              "num_draft": 2,
+              "prompt_tokens": 4962,
+              "request_id": "chatcmpl-55ab49c7-0101-40b5-a0d8-a8d6bedc8f4a",
+              "route": "continuous_batched_self_mtp",
+              "sampling_temperature": 0.0,
+              "server_timing_ms": {
+                "generation_admission": 1108.150542,
+                "generation_service": 4499.26875,
+                "request_admission": 0.014458,
+                "total": 5607.43375
+              },
+              "stats": {
+                "bonus_tokens": 2,
+                "cycles": 3,
+                "draft_acceptance": 0.6666666666666666,
+                "draft_accepted": 4,
+                "draft_cycles": 3,
+                "draft_proposed": 6,
+                "external_cache_reconciled": false,
+                "external_cache_trimmed_tokens": 0,
+                "latched": false,
+                "plain_cycles": 0,
+                "plain_tokens": 1,
+                "rate_gate_delatched": false,
+                "rate_gate_plain_ms_per_tok": 0.0,
+                "rate_gate_probed": false,
+                "rate_gate_spec_ms_per_tok": 0.0,
+                "retrieval_accepted": 0,
+                "retrieval_cycles": 0,
+                "retrieval_proposed": 0,
+                "router_accept_prob": 0.0,
+                "router_last_num_draft": 0,
+                "router_plain_cycles": 0,
+                "router_reengagements": 0,
+                "span_extend_cycles": 0,
+                "span_extend_tokens": 0,
+                "span_snap_cycles": 0,
+                "span_snap_tokens": 0,
+                "total_emitted": 7,
+                "verify_span_hist": {}
+              },
+              "ts": 1789420698.443112
+            }
+          }
+        ],
+        "created": 1789420692,
+        "id": "chatcmpl-55ab49c7-0101-40b5-a0d8-a8d6bedc8f4a",
+        "model": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+        "object": "chat.completion",
+        "self_mtp_receipt": {
+          "accept_rule": "residual",
+          "async_qsa_promotion": null,
+          "cached_prompt_tokens": 0,
+          "choice_index": 0,
+          "completed": true,
+          "num_draft": 2,
+          "prompt_tokens": 4962,
+          "request_id": "chatcmpl-55ab49c7-0101-40b5-a0d8-a8d6bedc8f4a",
+          "route": "continuous_batched_self_mtp",
+          "sampling_temperature": 0.0,
+          "server_timing_ms": {
+            "generation_admission": 1108.150542,
+            "generation_service": 4499.26875,
+            "request_admission": 0.014458,
+            "total": 5607.43375
+          },
+          "stats": {
+            "bonus_tokens": 2,
+            "cycles": 3,
+            "draft_acceptance": 0.6666666666666666,
+            "draft_accepted": 4,
+            "draft_cycles": 3,
+            "draft_proposed": 6,
+            "external_cache_reconciled": false,
+            "external_cache_trimmed_tokens": 0,
+            "latched": false,
+            "plain_cycles": 0,
+            "plain_tokens": 1,
+            "rate_gate_delatched": false,
+            "rate_gate_plain_ms_per_tok": 0.0,
+            "rate_gate_probed": false,
+            "rate_gate_spec_ms_per_tok": 0.0,
+            "retrieval_accepted": 0,
+            "retrieval_cycles": 0,
+            "retrieval_proposed": 0,
+            "router_accept_prob": 0.0,
+            "router_last_num_draft": 0,
+            "router_plain_cycles": 0,
+            "router_reengagements": 0,
+            "span_extend_cycles": 0,
+            "span_extend_tokens": 0,
+            "span_snap_cycles": 0,
+            "span_snap_tokens": 0,
+            "total_emitted": 7,
+            "verify_span_hist": {}
+          },
+          "ts": 1789420698.443112
+        },
+        "system_fingerprint": "0.32.0-0.32.2.dev20260911+a0d69e543-macOS-26.6.2-arm64-arm-64bit-applegpu_g17s",
+        "usage": {
+          "completion_tokens": 7,
+          "prompt_tokens": 4962,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 4969
+        }
+      },
+      "wall_ms": 5617.670625
+    },
+    "residual": {
+      "response": {
+        "choices": [
+          {
+            "finish_reason": "length",
+            "index": 0,
+            "message": {
+              "content": "The provided text consists of repetitive placeholder strings (\"Residual item XXXX: assess latency fairness and exactness\") that do not contain specific data, metrics, or",
+              "role": "assistant"
+            },
+            "self_mtp_receipt": {
+              "accept_rule": "residual",
+              "async_qsa_promotion": null,
+              "cached_prompt_tokens": 4968,
+              "choice_index": 0,
+              "completed": true,
+              "num_draft": 2,
+              "prompt_tokens": 5095,
+              "request_id": "chatcmpl-fac22e7d-7545-4e14-a336-e483da88e925",
+              "route": "continuous_batched_self_mtp",
+              "sampling_temperature": 0.0,
+              "server_timing_ms": {
+                "generation_admission": 457.944833,
+                "generation_service": 5629.159792,
+                "request_admission": 0.015958,
+                "total": 6087.120583
+              },
+              "stats": {
+                "bonus_tokens": 15,
+                "cycles": 15,
+                "draft_acceptance": 0.5714285714285714,
+                "draft_accepted": 16,
+                "draft_cycles": 15,
+                "draft_proposed": 28,
+                "external_cache_reconciled": false,
+                "external_cache_trimmed_tokens": 0,
+                "latched": false,
+                "plain_cycles": 0,
+                "plain_tokens": 1,
+                "rate_gate_delatched": false,
+                "rate_gate_plain_ms_per_tok": 0.0,
+                "rate_gate_probed": false,
+                "rate_gate_spec_ms_per_tok": 0.0,
+                "retrieval_accepted": 0,
+                "retrieval_cycles": 0,
+                "retrieval_proposed": 0,
+                "router_accept_prob": 0.0,
+                "router_last_num_draft": 0,
+                "router_plain_cycles": 0,
+                "router_reengagements": 0,
+                "span_extend_cycles": 0,
+                "span_extend_tokens": 0,
+                "span_snap_cycles": 0,
+                "span_snap_tokens": 0,
+                "total_emitted": 32,
+                "verify_span_hist": {}
+              },
+              "ts": 1789420704.621063
+            }
+          }
+        ],
+        "created": 1789420698,
+        "id": "chatcmpl-fac22e7d-7545-4e14-a336-e483da88e925",
+        "model": "/System/Volumes/Data/Users/pierrelamy/mlx-models/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+        "object": "chat.completion",
+        "self_mtp_receipt": {
+          "accept_rule": "residual",
+          "async_qsa_promotion": null,
+          "cached_prompt_tokens": 4968,
+          "choice_index": 0,
+          "completed": true,
+          "num_draft": 2,
+          "prompt_tokens": 5095,
+          "request_id": "chatcmpl-fac22e7d-7545-4e14-a336-e483da88e925",
+          "route": "continuous_batched_self_mtp",
+          "sampling_temperature": 0.0,
+          "server_timing_ms": {
+            "generation_admission": 457.944833,
+            "generation_service": 5629.159792,
+            "request_admission": 0.015958,
+            "total": 6087.120583
+          },
+          "stats": {
+            "bonus_tokens": 15,
+            "cycles": 15,
+            "draft_acceptance": 0.5714285714285714,
+            "draft_accepted": 16,
+            "draft_cycles": 15,
+            "draft_proposed": 28,
+            "external_cache_reconciled": false,
+            "external_cache_trimmed_tokens": 0,
+            "latched": false,
+            "plain_cycles": 0,
+            "plain_tokens": 1,
+            "rate_gate_delatched": false,
+            "rate_gate_plain_ms_per_tok": 0.0,
+            "rate_gate_probed": false,
+            "rate_gate_spec_ms_per_tok": 0.0,
+            "retrieval_accepted": 0,
+            "retrieval_cycles": 0,
+            "retrieval_proposed": 0,
+            "router_accept_prob": 0.0,
+            "router_last_num_draft": 0,
+            "router_plain_cycles": 0,
+            "router_reengagements": 0,
+            "span_extend_cycles": 0,
+            "span_extend_tokens": 0,
+            "span_snap_cycles": 0,
+            "span_snap_tokens": 0,
+            "total_emitted": 32,
+            "verify_span_hist": {}
+          },
+          "ts": 1789420704.621063
+        },
+        "system_fingerprint": "0.32.0-0.32.2.dev20260911+a0d69e543-macOS-26.6.2-arm64-arm-64bit-applegpu_g17s",
+        "usage": {
+          "completion_tokens": 32,
+          "prompt_tokens": 5095,
+          "prompt_tokens_details": {
+            "cached_tokens": 4968
+          },
+          "total_tokens": 5127
+        }
+      },
+      "wall_ms": 6092.260165999999
+    }
+  },
+  "schema": "mlx-uag.adaptive-prefill-self-mtp-gate.v1"
+}

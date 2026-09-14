@@ -514,6 +514,41 @@ class TestBatchedCoreLifecycle(_CPUCase):
         finally:
             generator.close()
 
+    def test_adaptive_prefill_keeps_cold_long_mtp_join_on_one_shot_path(self):
+        stats = {}
+        generator = BatchGenerator(
+            self.model,
+            max_tokens=40,
+            completion_batch_size=4,
+            prefill_step_size=4,
+            adaptive_prefill=True,
+            adaptive_prefill_target_itl_ms=100_000,
+            self_mtp={"persistent": True, "num_draft": self.NUM_DRAFT},
+            scheduler_stats=stats,
+        )
+        try:
+            generator.insert([[1, 2, 3, 4, 5]], lane_rngs=[LaneRNG(1)])
+            generator.next()
+            generator.next()
+            (joining_uid,) = generator.insert(
+                [[6, 7, 8, 9, 10, 11, 12, 13, 14]],
+                lane_rngs=[LaneRNG(2)],
+            )
+
+            progress, generation = generator.next()
+
+            self.assertTrue(generation)
+            self.assertTrue(progress[-1].end_of_prompt)
+            self.assertEqual(len(generator._unprocessed_sequences), 0)
+            self.assertEqual(
+                [row[0] for row in generator.mtp_cycle_state()],
+                [0, joining_uid],
+            )
+            self.assertEqual(stats["adaptive_prefill_release_rounds"], 0)
+            self.assertEqual(stats["adaptive_prefill_chunk_histogram"], {})
+        finally:
+            generator.close()
+
     def test_rng_draw_counts_and_acceptance_shapes_follow_each_lane_k(self):
         lane0, first0 = self._lane(
             50, [1, 2, 3, 4], maximum=3, temperature=0.8, top_k=8
