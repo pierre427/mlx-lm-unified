@@ -147,10 +147,6 @@ class TestDecodePriorityCadence(unittest.TestCase):
             BatchGenerator(
                 object(), decode_priority_cadence=2, adaptive_prefill=True
             )
-        with self.assertRaisesRegex(ValueError, "not supported with batched self-MTP"):
-            BatchGenerator(
-                object(), adaptive_prefill=True, self_mtp={"persistent": True}
-            )
 
     def test_adaptive_prefill_defers_after_itl_miss(self):
         gen = self.make_generator(cadence=1, queued=False)

@@ -4181,8 +4181,6 @@ class BatchGenerator:
             raise ValueError(
                 "decode_priority_cadence is not supported with batched self-MTP"
             )
-        if self_mtp is not None and adaptive_prefill:
-            raise ValueError("adaptive_prefill is not supported with batched self-MTP")
         if kv_bits is not None and quantized_kv_start != 0:
             # Validated before any state is set, so a rejected config never
             # leaves a partially-constructed instance behind (__del__ calls
@@ -4697,6 +4695,7 @@ class BatchGenerator:
             _,
             processors,
             matcher,
+            _queued_at,
         ) in sequences:
             prompt = [token for segment in segments for token in segment]
             config = dict(self.self_mtp or {})
@@ -4777,6 +4776,95 @@ class BatchGenerator:
             ),
             progress,
         )
+
+    def _advance_mtp_prefill(self, index: int, max_tokens: int):
+        """Advance one queued self-MTP lane without blocking live decode."""
+        from .hybrid_speculative import advance_self_mtp_prefill
+
+        queued = list(self._unprocessed_sequences)
+        sequence = queued[index]
+        (
+            uid,
+            segments,
+            maximum,
+            prompt_cache,
+            history,
+            sampler,
+            processors,
+            matcher,
+            _queued_at,
+        ) = sequence
+        prompt = [token for segment in segments for token in segment]
+        if len(prompt) <= 1:
+            if index:
+                queued.insert(0, queued.pop(index))
+                self._unprocessed_sequences = deque(queued)
+            return self._make_mtp_batch(1)
+
+        config = dict(self.self_mtp or {})
+        config.update(self._mtp_configs.get(uid, {}))
+        self._validate_mtp_config(config)
+        _prefetch_known_mtp_tail(self.model, history, prompt, config)
+        tic = time.perf_counter()
+        remaining, prompt_cache, mtp_state, processed = advance_self_mtp_prefill(
+            mx.array(prompt, dtype=mx.uint32),
+            self.model,
+            prompt_cache=prompt_cache,
+            mtp_state=self._mtp_states.get(uid),
+            max_tokens=max_tokens,
+            fused_gdn_catchup=bool(config.get("fused_gdn_catchup", False)),
+        )
+        toc = time.perf_counter()
+        remaining = remaining.tolist()
+        history = list(history) + prompt[:processed]
+        self._mtp_states[uid] = mtp_state
+        # MTP preparation historically flattens segmented input. Retain that
+        # contract while preserving the final-token boundary for finalization.
+        remaining_segments = (
+            [remaining[:-1], remaining[-1:]] if len(remaining) > 1 else [remaining]
+        )
+        queued[index] = (
+            uid,
+            remaining_segments,
+            maximum,
+            prompt_cache,
+            history,
+            sampler,
+            processors,
+            matcher,
+            toc,
+        )
+        self._unprocessed_sequences = deque(queued)
+
+        self._prompt_tokens_counter += processed
+        self._prompt_time_counter += toc - tic
+        self.scheduler_stats["prefill_rounds"] += 1
+        self.scheduler_stats["adaptive_prefill_release_rounds"] += 1
+        histogram = self.scheduler_stats["adaptive_prefill_chunk_histogram"]
+        key = str(processed)
+        histogram[key] = int(histogram.get(key, 0)) + 1
+        measured = (toc - tic) * 1000 / max(processed, 1)
+        if self._prefill_ms_per_token_ewma is None:
+            self._prefill_ms_per_token_ewma = measured
+        else:
+            self._prefill_ms_per_token_ewma = (
+                0.75 * self._prefill_ms_per_token_ewma + 0.25 * measured
+            )
+
+        total = len(history) + len(remaining)
+        progress = [
+            PromptProcessingBatch.Response(
+                uid, (len(history), total), False, False
+            )
+        ]
+        if len(remaining) == 1:
+            queued = list(self._unprocessed_sequences)
+            if index:
+                queued.insert(0, queued.pop(index))
+                self._unprocessed_sequences = deque(queued)
+            batch, final_progress = self._make_mtp_batch(1)
+            return batch, final_progress
+        return None, progress
 
     @staticmethod
     def _plain_sampler_for_mtp_lane(lane):
@@ -5304,6 +5392,13 @@ class BatchGenerator:
         generation_responses = []
         prompt_responses = []
 
+        had_decode_work = self._has_active_decode()
+        decode_started = (
+            time.perf_counter()
+            if self.adaptive_prefill and had_decode_work
+            else None
+        )
+
         if (
             self._generation_batch.mtp_cycle_state()
             or self._generation_batch.has_deferred_lanes
@@ -5313,6 +5408,15 @@ class BatchGenerator:
         generation_responses.extend(self._migrate_plain_fallbacks())
         if len(self._plain_fallback_batch) > 0:
             generation_responses.extend(self._plain_fallback_batch.next())
+
+        if decode_started is not None:
+            decode_completed = time.perf_counter()
+            self._last_decode_duration_ms = (decode_completed - decode_started) * 1000
+            if self._last_decode_completed_s is not None:
+                self._last_decode_interval_ms = (
+                    decode_completed - self._last_decode_completed_s
+                ) * 1000
+            self._last_decode_completed_s = decode_completed
 
         if generation_responses:
             self._gen_tokens_counter += len(generation_responses)
@@ -5338,13 +5442,51 @@ class BatchGenerator:
         n = self._budget_admissible(n)
         n = self._admit_mtp_joining(n)
         if n > 0:
-            batch, progress = self._make_mtp_batch(n)
-            self._generation_batch.extend(batch)
+            active_decode = self._has_active_decode()
+            adaptive_defer, adaptive_chunk, deadline_forced = (
+                self._adaptive_prefill_decision(time.perf_counter())
+            )
+            if self.adaptive_prefill and active_decode and adaptive_defer:
+                return prompt_responses, generation_responses
+            if self.adaptive_prefill and active_decode:
+                candidates = list(self._unprocessed_sequences)[:n]
+                if deadline_forced or len(candidates) == 1:
+                    selected = 0
+                else:
+                    selected = min(
+                        range(len(candidates)),
+                        key=lambda i: (
+                            sum(len(segment) for segment in candidates[i][1]),
+                            -len(candidates[i][4]) if candidates[i][4] else 0,
+                            i,
+                        ),
+                    )
+                    if selected and candidates[selected][4]:
+                        self.scheduler_stats[
+                            "adaptive_prefill_apc_priority_admissions"
+                        ] += 1
+                batch, progress = self._advance_mtp_prefill(
+                    selected, adaptive_chunk
+                )
+                if batch is not None:
+                    self._generation_batch.extend(batch)
+            else:
+                batch, progress = self._make_mtp_batch(n)
+                self._generation_batch.extend(batch)
             prompt_responses.extend(progress)
             # A joiner routed to plain inside extend must be findable now.
             generation_responses.extend(self._migrate_plain_fallbacks())
 
         return prompt_responses, generation_responses
+
+    def _has_active_decode(self):
+        if getattr(self, "self_mtp", None) is None:
+            return len(self._generation_batch) > 0
+        return bool(
+            self._generation_batch.mtp_cycle_state()
+            or self._generation_batch.has_deferred_lanes
+            or len(self._plain_fallback_batch) > 0
+        )
 
     def _has_prefill_work(self):
         if self._unprocessed_sequences:
@@ -5357,7 +5499,7 @@ class BatchGenerator:
     def _should_defer_prefill(self):
         if (
             self.decode_priority_cadence == 1
-            or len(self._generation_batch) == 0
+            or not self._has_active_decode()
             or not self._has_prefill_work()
         ):
             return False
@@ -5403,7 +5545,7 @@ class BatchGenerator:
 
         if (
             not self.adaptive_prefill
-            or len(self._generation_batch) == 0
+            or not self._has_active_decode()
             or not self._has_prefill_work()
         ):
             return False, self.prefill_step_size, False

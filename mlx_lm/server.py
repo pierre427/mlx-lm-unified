@@ -6907,8 +6907,6 @@ def main():
         parser.error("--adaptive-prefill-max-defer-ms must be > 0")
     if args.decode_priority_cadence != 1 and args.self_mtp:
         parser.error("--decode-priority-cadence does not support --self-mtp")
-    if args.adaptive_prefill and args.self_mtp:
-        parser.error("--adaptive-prefill does not support --self-mtp")
     if (
         args.self_mtp_verification_row_cap is not None
         and args.self_mtp_verification_row_cap < 1

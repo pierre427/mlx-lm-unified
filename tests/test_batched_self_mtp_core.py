@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import mlx.core as mx
 
+from mlx_lm.generate import BatchGenerator
 from mlx_lm.hybrid_speculative import (
     BatchedSelfMTPState,
     MTPToken,
@@ -25,6 +26,7 @@ from mlx_lm.hybrid_speculative import (
     _draw_mtp_acceptance_uniforms,
     _make_sampling_transform,
     _sample_from_logprobs,
+    advance_self_mtp_prefill,
     attach_self_mtp_lanes,
     classify_greedy_batch_divergence,
     commit_batched_self_mtp,
@@ -192,6 +194,40 @@ class TestBatchedCoreLifecycle(_CPUCase):
             sampling_temp=temperature,
             sampling_top_p=1.0,
             sampling_top_k=top_k,
+            sampling_min_p=0.0,
+            accept_rule="residual",
+            logits_processors=[],
+            prefill_step_size=4,
+            share_qsa_indices=False,
+        )
+
+    def _sliced_lane(self, uid, prompt, *, maximum=9, slice_size=2):
+        remaining = mx.array(prompt, mx.uint32)
+        prompt_cache = None
+        mtp_state = None
+        while int(remaining.size) > 1:
+            remaining, prompt_cache, mtp_state, processed = (
+                advance_self_mtp_prefill(
+                    remaining,
+                    self.model,
+                    prompt_cache=prompt_cache,
+                    mtp_state=mtp_state,
+                    max_tokens=slice_size,
+                )
+            )
+            self.assertGreater(processed, 0)
+        return prepare_self_mtp_lane(
+            remaining,
+            self.model,
+            uid=uid,
+            max_tokens=maximum,
+            prompt_cache=prompt_cache,
+            mtp_state=mtp_state,
+            lane_rng=LaneRNG(100 + uid),
+            num_draft=self.NUM_DRAFT,
+            sampling_temp=0.0,
+            sampling_top_p=1.0,
+            sampling_top_k=0,
             sampling_min_p=0.0,
             accept_rule="residual",
             logits_processors=[],
@@ -414,6 +450,67 @@ class TestBatchedCoreLifecycle(_CPUCase):
         self.assertEqual(batch.lanes, [])
         self.assertEqual(batch.caches.target, [])
         self.assertEqual(batch.caches.draft, [])
+
+    def test_incremental_prefill_matches_one_shot_batched_b1(self):
+        prompt = [1, 2, 3, 4, 5, 6, 7]
+        direct_lane, direct_first = self._lane(31, prompt, maximum=8)
+        sliced_lane, sliced_first = self._sliced_lane(31, prompt, maximum=8)
+        self.assertEqual(int(direct_first.token), int(sliced_first.token))
+        self.assertTrue(mx.allclose(direct_first.logprobs, sliced_first.logprobs))
+
+        traces = {}
+        for name, lane, first in (
+            ("direct", direct_lane, direct_first),
+            ("sliced", sliced_lane, sliced_first),
+        ):
+            trace = {31: [(first.token, first.logprobs)]}
+            batch = attach_self_mtp_lanes(self.model, None, [lane])
+            traces[name] = self._finish(batch, trace)[31]
+        self.assertEqual(
+            [int(token) for token, _ in traces["direct"]],
+            [int(token) for token, _ in traces["sliced"]],
+        )
+
+    def test_adaptive_prefill_joins_an_active_batched_lane(self):
+        stats = {}
+        generator = BatchGenerator(
+            self.model,
+            max_tokens=40,
+            completion_batch_size=4,
+            prefill_step_size=4,
+            adaptive_prefill=True,
+            adaptive_prefill_target_itl_ms=100_000,
+            self_mtp={"persistent": True, "num_draft": self.NUM_DRAFT},
+            scheduler_stats=stats,
+        )
+        try:
+            generator.insert(
+                [[1, 2, 3, 4, 5]],
+                lane_rngs=[LaneRNG(1)],
+            )
+            generator.next()
+            generator.next()
+            (joining_uid,) = generator.insert(
+                [[6, 7, 8, 9, 10, 11, 12, 13, 14]],
+                lane_rngs=[LaneRNG(2)],
+            )
+
+            first_progress, first_generation = generator.next()
+            self.assertTrue(first_generation)
+            self.assertEqual(first_progress[0].progress, (4, 9))
+            self.assertEqual(len(generator._unprocessed_sequences), 1)
+
+            final_progress, second_generation = generator.next()
+            self.assertTrue(second_generation)
+            self.assertTrue(final_progress[-1].end_of_prompt)
+            self.assertEqual(
+                [row[0] for row in generator.mtp_cycle_state()],
+                [0, joining_uid],
+            )
+            self.assertEqual(stats["adaptive_prefill_release_rounds"], 2)
+            self.assertEqual(stats["adaptive_prefill_chunk_histogram"], {"4": 2})
+        finally:
+            generator.close()
 
     def test_rng_draw_counts_and_acceptance_shapes_follow_each_lane_k(self):
         lane0, first0 = self._lane(

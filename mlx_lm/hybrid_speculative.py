@@ -2114,6 +2114,62 @@ def prepare_self_mtp_lane(
     return detached, MTPToken(cur, first_lp, False)
 
 
+def advance_self_mtp_prefill(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    prompt_cache: Optional[List[Any]],
+    mtp_state: Optional[Tuple[List[Any], mx.array]],
+    max_tokens: int,
+    fused_gdn_catchup: bool = False,
+) -> Tuple[mx.array, List[Any], Tuple[List[Any], mx.array], int]:
+    """Advance one exact teacher-forced self-MTP prefill slice.
+
+    The final prompt token is deliberately retained. Once only that token
+    remains, :func:`prepare_self_mtp_lane` can consume it and enter generation
+    through the existing snapshot, sampling, and transaction path. Returning
+    both target and draft state lets the serving scheduler interleave these
+    slices with an active self-MTP batch without opening a speculative proposal.
+    """
+    if prompt.ndim != 1 or int(prompt.size) == 0:
+        raise ValueError("prompt must be a non-empty rank-1 token array")
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+
+    target_cache = (
+        prompt_cache if prompt_cache is not None else make_prompt_cache(model)
+    )
+    _reject_unsupported_self_mtp_caches(target_cache)
+    if mtp_state is None:
+        draft_cache = model.make_mtp_cache()
+        prev_h = None
+    else:
+        draft_cache, prev_h = _restore_mtp_state(target_cache, mtp_state)
+    _reject_unsupported_self_mtp_caches(draft_cache)
+
+    n = min(int(max_tokens), int(prompt.size) - 1)
+    if n <= 0:
+        return prompt, target_cache, (draft_cache, prev_h), 0
+
+    with mx.stream(generation_stream):
+        scope = getattr(model, "gdn_catchup_scope", None)
+        context = scope(fused_gdn_catchup) if callable(scope) else nullcontext()
+        with context:
+            _, h_chunk = _mtp_backbone(model, prompt[:n][None], target_cache)
+        if prev_h is None:
+            hs, ts = h_chunk[:, :-1], prompt[1:n][None]
+        else:
+            hs = mx.concatenate([prev_h, h_chunk[:, :-1]], axis=1)
+            ts = prompt[:n][None]
+        if ts.size > 0:
+            model.mtp_step(hs, ts, draft_cache)
+        prev_h = h_chunk[:, -1:, :]
+        mx.eval([c.state for c in target_cache], [c.state for c in draft_cache])
+        mx.clear_cache()
+
+    return prompt[n:], target_cache, (draft_cache, prev_h), n
+
+
 def attach_self_mtp_lanes(
     model: nn.Module,
     batch: Optional[BatchedSelfMTPState],
