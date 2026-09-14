@@ -47,7 +47,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
-    common = "\n".join(
+    run_nonce = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    common = f"Qualification nonce: {run_nonce}\n" + "\n".join(
         f"Shared clause {i:04d}: alpha beta gamma delta epsilon zeta eta theta."
         for i in range(260)
     )
@@ -87,9 +88,22 @@ def main() -> None:
             "content": residual + "\nConclude with the exact marker RESIDUAL_OK.",
         },
     ]
+    # First prove that this serving configuration still executes a physical
+    # width-2 self-MTP cohort. Its static cohort policy deliberately queues a
+    # third arrival, so exercise the APC residual against a fresh width-1
+    # incumbent below, where a prefill slot is available for slicing.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        batched_results = [
+            future.result()
+            for future in [
+                pool.submit(complete, chat_url, args.model, incumbent_messages, 128)
+                for _ in range(2)
+            ]
+        ]
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         incumbent_future = pool.submit(
-            complete, chat_url, args.model, incumbent_messages, 512
+            complete, chat_url, args.model, incumbent_messages, 1024
         )
         decode_seen = False
         deadline = time.monotonic() + 180
@@ -136,8 +150,9 @@ def main() -> None:
         "incumbent_decode_observed": decode_seen,
         "apc_hit_observed": apc_hits > 0 and cached_tokens > 0,
         "adaptive_slices_released": release_rounds > 0,
-        "residual_used_self_mtp": residual_receipt.get("route")
-        == "continuous_batched_self_mtp",
+        "residual_used_self_mtp": str(residual_receipt.get("route", "")).endswith(
+            "self_mtp"
+        ),
         "batched_decode_observed": width_two_cycles > 0,
     }
     artifact = {
@@ -167,6 +182,7 @@ def main() -> None:
         },
         "requests": {
             "prime": prime,
+            "batched_probe": batched_results,
             "incumbent": incumbent_result,
             "residual": residual_result,
         },
