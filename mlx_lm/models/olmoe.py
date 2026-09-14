@@ -195,9 +195,13 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
-            return weights
-        for l in range(self.args.num_hidden_layers):
+        moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.up_proj.weight")
+        )
+        for l in moe_layers:
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 for k in ["weight", "scales", "biases"]:

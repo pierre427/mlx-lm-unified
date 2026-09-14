@@ -1546,13 +1546,19 @@ class Model(nn.Module):
             if getattr(self, "mtp", None) is not None:
                 self.mtp = None
 
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+        moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.up_proj.weight")
+        )
+        if not moe_layers:
             return weights
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        for l in range(self.args.num_hidden_layers):
+        for l in moe_layers:
             prefix = f"model.layers.{l}.mlp"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 to_join = [
