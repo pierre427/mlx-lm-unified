@@ -55,6 +55,36 @@ _SORTED_GATHER_TAIL_BUG = True
 _GATHER_SORT_MIN_ASSIGNMENTS = 20
 
 
+# MLX #3912 / #4009 correctness boundary.  Older Metal NAX kernels have two
+# independent partial-K defects:
+#
+# * NVFP4 admits K % 32 == 16, but the quantized loader used a full 32-wide
+#   tile and could read or drop the final 16 values (#3912).
+# * sorted gather_qmm uses a 64-wide K tile and used BK, rather than the true
+#   remainder, to bound its final activation load (#4009).
+#
+# Keep this guard unconditional.  It is a no-op for the production Qwen4
+# affine-q4 dimensions (all divisible by 64), avoids version/architecture
+# guesses, and makes old and new MLX builds agree.  The sorted-tail case can
+# retain the quantized kernel by declining only its sorted optimization.  The
+# NVFP4 16-wide tail affects sorted and unsorted quantized kernels, so it must
+# take the lossless dense fallback.
+_QMM_TILE = 32
+_SORTED_QMM_K_TILE = 64
+
+
+def _quantized_gather_tail_policy(
+    mode: str, input_dims: int, sorted_indices: bool
+):
+    """Return ``dense``, ``unsorted``, or ``native`` for a gather_qmm call."""
+
+    if mode == "nvfp4" and input_dims % _QMM_TILE:
+        return "dense"
+    if sorted_indices and input_dims % _SORTED_QMM_K_TILE:
+        return "unsorted"
+    return "native"
+
+
 def _gather_sort(x, indices):
     *_, M = indices.shape
     indices = indices.flatten()
@@ -130,18 +160,40 @@ class QuantizedSwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
-        x = mx.gather_qmm(
-            x,
-            self["weight"],
-            self["scales"],
-            self.get("biases"),
-            rhs_indices=indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=sorted_indices,
+        tail_policy = _quantized_gather_tail_policy(
+            self.mode, int(x.shape[-1]), sorted_indices
         )
+        if tail_policy == "dense":
+            quantized = [self["weight"], self["scales"]]
+            if self.get("biases") is not None:
+                quantized.append(self["biases"])
+            weight = mx.dequantize(
+                *quantized,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
+            x = mx.gather_mm(
+                x,
+                weight.swapaxes(-1, -2),
+                rhs_indices=indices,
+                sorted_indices=sorted_indices,
+            )
+        else:
+            x = mx.gather_qmm(
+                x,
+                self["weight"],
+                self["scales"],
+                self.get("biases"),
+                rhs_indices=indices,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                sorted_indices=(
+                    False if tail_policy == "unsorted" else sorted_indices
+                ),
+            )
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x

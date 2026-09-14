@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 
@@ -61,6 +62,81 @@ class TestSortedGatherTailGuard(unittest.TestCase):
     def test_aligned_rows_stay_exact(self):
         err = self._dispatch(8192, 4)
         self.assertLess(err, 0.1)
+
+
+class TestQuantizedGatherKTailGuard(unittest.TestCase):
+    """Lossless mlx#3912/#4009 fallbacks at the unified MoE boundary."""
+
+    def test_policy_covers_both_upstream_tail_families(self):
+        policy = sl._quantized_gather_tail_policy
+        self.assertEqual(policy("nvfp4", 80, False), "dense")
+        self.assertEqual(policy("nvfp4", 80, True), "dense")
+        self.assertEqual(policy("affine", 160, True), "unsorted")
+        self.assertEqual(policy("mxfp4", 160, True), "unsorted")
+        self.assertEqual(policy("affine", 160, False), "native")
+        self.assertEqual(policy("nvfp4", 96, False), "native")
+        self.assertEqual(policy("affine", 192, True), "native")
+
+    def test_sorted_unaligned_k_declines_only_the_sorted_optimization(self):
+        layer = sl.QuantizedSwitchLinear(
+            160, 64, 4, bias=False, group_size=32, bits=4, mode="affine"
+        )
+        mx.random.seed(11)
+        x = mx.random.normal((20, 1, 160))
+        indices = mx.sort(mx.arange(20, dtype=mx.uint32) % 4)
+
+        with patch.object(mx, "gather_qmm", wraps=mx.gather_qmm) as gather_qmm:
+            out = layer(x, indices, sorted_indices=True)
+            mx.eval(out)
+
+        self.assertFalse(gather_qmm.call_args.kwargs["sorted_indices"])
+        self.assertEqual(out.shape, (20, 1, 64))
+        reference = mx.gather_qmm(
+            x,
+            layer.weight,
+            layer.scales,
+            layer.biases,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode=layer.mode,
+            sorted_indices=False,
+        )
+        self.assertTrue(mx.array_equal(out, reference))
+
+    def test_nvfp4_16_wide_tail_uses_dense_reference(self):
+        layer = sl.QuantizedSwitchLinear(
+            80, 64, 4, bias=False, group_size=16, bits=4, mode="nvfp4"
+        )
+        mx.random.seed(12)
+        x = mx.random.normal((8, 1, 80))
+        indices = mx.arange(8, dtype=mx.uint32) % 4
+
+        with (
+            patch.object(mx, "gather_qmm", wraps=mx.gather_qmm) as gather_qmm,
+            patch.object(mx, "gather_mm", wraps=mx.gather_mm) as gather_mm,
+        ):
+            out = layer(x, indices, sorted_indices=False)
+            mx.eval(out)
+
+        gather_qmm.assert_not_called()
+        gather_mm.assert_called_once()
+        self.assertEqual(out.shape, (8, 1, 64))
+        weight = mx.dequantize(
+            layer.weight,
+            layer.scales,
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode=layer.mode,
+        )
+        reference = mx.gather_mm(
+            x,
+            weight.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=False,
+        )
+        self.assertTrue(mx.array_equal(out, reference))
 
 
 if __name__ == "__main__":
