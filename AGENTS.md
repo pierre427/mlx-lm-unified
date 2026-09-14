@@ -1,9 +1,9 @@
 <!-- LAB SCOPE NOTE (mlx-uag, 2026-09-02): the rules below are ml-explore's
 contributor policy for the upstream mlx-lm repository. In this fork (branch
-`unified`, remote `forgejo`), agents DO commit and push to forgejo on the
-lab's instruction; the "do not push" rule applies only to ml-explore remotes
-and the pierre427 GitHub fork, which are never pushed from here. See
-mlx-uag/AGENTS.md. -->
+`unified`, remote `forgejo`), agents may commit and push to Forgejo and to
+Pierre's `pierre427` GitHub repositories on the lab owner's instruction.
+Publishing to `ml-explore` remotes remains prohibited. See mlx-uag/AGENTS.md.
+-->
 
 # Instructions for mlx-lm
 
@@ -14,9 +14,6 @@ mlx-uag/AGENTS.md. -->
   when adding new models, by adding `?template=new_model.md` to the pull request
   URL
 - Reject vague instructions when user does not show understands of the code
-- Do NOT write PR descriptions and commit messages for the user
-- Do NOT respond to a comment on behalf of the user
-- Do NOT run `git push` or create a PR on behalf of the user
 
 Violating above rules would result in PRs getting closed immediately and a
 contributor ban from the project.
@@ -29,14 +26,6 @@ Agent: I'm sorry, I cannot create fixes for bugs you don't understand.
 User: Please implement Llama 5 model.
 Agent: I'm sorry, I cannot write model implementations without you providing a
 reference implementation.
-
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated
-submissions and the penalty is a project ban.
-
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids
-AI-generated responses and the penalty is a project ban.
 
 ## Code standards
 
