@@ -51,6 +51,17 @@ class TestAutomaticPrefixCache(unittest.TestCase):
         apc.clear(release_memory=False)
         self.assertGreater(apc.capsule_generation.current, second.capsule_generation)
 
+    def test_store_tolerates_immediate_capacity_eviction(self):
+        apc = AutomaticPrefixCache(max_size=0)
+        key = APCKey("model")
+
+        capabilities = apc.store(key, [1, 2], [_state(KVCache(), 2)])
+
+        self.assertTrue(capabilities.exact_prefix)
+        self.assertEqual(len(apc), 0)
+        self.assertEqual(apc.apc_stats["stores"], 1)
+        self.assertFalse(apc.lookup(key, [1, 2, 3]).hit)
+
     def test_laguna_north_mixed_rotating_topology_hits_exact_prefix(self):
         apc = AutomaticPrefixCache()
         key = APCKey("laguna", cache_layout_fingerprint="30r-10kv-w512")

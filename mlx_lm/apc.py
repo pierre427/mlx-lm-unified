@@ -872,8 +872,9 @@ class AutomaticPrefixCache(LRUPromptCache):
                 entry.prompt_cache is cow_source for entry in live_entries
             ):
                 cow_source.close()
-        stored_entry = self._trie.get(key, tokens)
-        if stored_entry is not None:
+        survivor = self._trie.search(key, tokens)
+        if survivor.exact is not None:
+            stored_entry = self._trie.get(key, survivor.exact)
             stored_entry._apc_last_access_at = self._now()
             self._spill_resident_budget_locked(exclude=stored_entry)
         self._apc_stats["stores"] += 1
