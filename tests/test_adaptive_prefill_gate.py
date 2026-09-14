@@ -24,6 +24,7 @@ def run(*, adaptive, itl=100.0, ttft=1000.0, wall=2000.0, scheduler=None):
                 "ttft_ms": ttft,
                 "itl_ms": [itl] * 20,
                 "completion_tokens": 20,
+                "finish_reason": "length",
             }
         ],
     }

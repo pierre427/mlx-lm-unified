@@ -3563,7 +3563,9 @@ class ResponseGenerator:
                                 self.cli_args, "adaptive_prefill", False
                             ),
                             adaptive_prefill_target_itl_ms=getattr(
-                                self.cli_args, "adaptive_prefill_target_itl_ms", 300.0
+                                self.cli_args,
+                                "adaptive_prefill_target_itl_ms",
+                                1500.0,
                             ),
                             adaptive_prefill_max_defer_ms=getattr(
                                 self.cli_args, "adaptive_prefill_max_defer_ms", 2000.0
@@ -5944,7 +5946,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     getattr(
                         self.response_generator.cli_args,
                         "adaptive_prefill_target_itl_ms",
-                        300.0,
+                        1500.0,
                     )
                 ),
                 "adaptive_prefill_max_defer_ms": float(
@@ -6718,9 +6720,9 @@ def setup_arg_parser():
     parser.add_argument(
         "--adaptive-prefill-target-itl-ms",
         type=float,
-        default=300.0,
+        default=1500.0,
         metavar="MS",
-        help="ITL target used as the adaptive prefill slack budget (default: 300).",
+        help="ITL target used as the adaptive prefill slack budget (default: 1500).",
     )
     parser.add_argument(
         "--adaptive-prefill-max-defer-ms",

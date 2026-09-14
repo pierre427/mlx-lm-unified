@@ -1,0 +1,58 @@
+{
+  "baseline": {
+    "adaptive_prefill": false,
+    "aggregate_output_tps": 20.73944934776501,
+    "engagement": {
+      "adaptive_prefill_apc_priority_admissions": 0,
+      "adaptive_prefill_chunk_histogram": {},
+      "adaptive_prefill_deadline_forced_rounds": 0,
+      "adaptive_prefill_release_rounds": 0,
+      "adaptive_prefill_slack_deferred_rounds": 0,
+      "prefill_rounds": 50
+    },
+    "engagement_pass": true,
+    "itl_p90_ms": 1127.071374998195,
+    "itl_p99_ms": 1490.361916992697,
+    "jain_tenant_token_rate": 0.9925685932420063,
+    "requests": 18,
+    "terminal_pass": true,
+    "ttft_p95_ms": 36992.1172500035
+  },
+  "candidate": {
+    "adaptive_prefill": true,
+    "aggregate_output_tps": 20.385251302362843,
+    "engagement": {
+      "adaptive_prefill_apc_priority_admissions": 0,
+      "adaptive_prefill_chunk_histogram": {
+        "256": 61,
+        "3": 1,
+        "47": 1,
+        "512": 6,
+        "64": 1
+      },
+      "adaptive_prefill_deadline_forced_rounds": 1,
+      "adaptive_prefill_release_rounds": 70,
+      "adaptive_prefill_slack_deferred_rounds": 1,
+      "prefill_rounds": 79
+    },
+    "engagement_pass": true,
+    "itl_p90_ms": 773.0573749868199,
+    "itl_p99_ms": 864.2220420006197,
+    "jain_tenant_token_rate": 0.9919755584636233,
+    "requests": 18,
+    "terminal_pass": true,
+    "ttft_p95_ms": 37695.3550420003
+  },
+  "gates": {
+    "all_requests_terminal": true,
+    "baseline_engaged": true,
+    "candidate_engaged": true,
+    "fairness_at_least_090": true,
+    "itl_p99_improved_20pct": true,
+    "request_count_matches": true,
+    "throughput_within_5pct": true,
+    "ttft_p95_within_25pct": true
+  },
+  "passed": true,
+  "schema": "mlx-lm.adaptive-prefill-gate.v1"
+}

@@ -188,7 +188,7 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
         parser = setup_server_arg_parser()
         defaults = parser.parse_args([])
         self.assertFalse(defaults.adaptive_prefill)
-        self.assertEqual(defaults.adaptive_prefill_target_itl_ms, 300.0)
+        self.assertEqual(defaults.adaptive_prefill_target_itl_ms, 1500.0)
         self.assertEqual(defaults.adaptive_prefill_max_defer_ms, 2000.0)
         args = parser.parse_args(
             [

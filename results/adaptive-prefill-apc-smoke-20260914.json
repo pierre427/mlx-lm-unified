@@ -1,0 +1,29 @@
+{
+  "schema": "mlx-lm.adaptive-prefill-apc-smoke.v1",
+  "configured": {
+    "adaptive_prefill": true,
+    "adaptive_prefill_target_itl_ms": 1500.0,
+    "adaptive_prefill_max_defer_ms": 2000.0,
+    "prompt_cache_size": 4,
+    "prompt_cache_bytes": 2147483648
+  },
+  "requests": [
+    {
+      "prompt_tokens": 24,
+      "cached_tokens": 0,
+      "ttft_ms": 685.0185420043999,
+      "finish_reason": "stop"
+    },
+    {
+      "prompt_tokens": 24,
+      "cached_tokens": 23,
+      "ttft_ms": 55.0415830075508,
+      "finish_reason": "stop"
+    }
+  ],
+  "prompt_cache_after": {
+    "entries": 3,
+    "bytes": 927095936
+  },
+  "passed": true
+}

@@ -29,10 +29,12 @@ def scheduler_delta(run, key):
     after = (run.get("server_metrics_after") or {}).get("scheduler", {})
     before_value = before.get(key, 0)
     after_value = after.get(key, 0)
-    if isinstance(after_value, dict):
+    if isinstance(before_value, dict) or isinstance(after_value, dict):
+        before_value = before_value if isinstance(before_value, dict) else {}
+        after_value = after_value if isinstance(after_value, dict) else {}
         return {
-            name: int(value) - int((before_value or {}).get(name, 0))
-            for name, value in after_value.items()
+            name: int(after_value.get(name, 0)) - int(before_value.get(name, 0))
+            for name in before_value.keys() | after_value.keys()
         }
     return int(after_value) - int(before_value)
 
@@ -95,6 +97,10 @@ def summarize(run):
         "jain_tenant_token_rate": jain(rates),
         "engagement": engagement,
         "engagement_pass": engagement_ok,
+        "terminal_pass": all(
+            not row.get("error") and row.get("finish_reason") is not None
+            for row in rows
+        ),
     }
 
 
@@ -109,6 +115,9 @@ def compare(baseline_run, candidate_run):
         if baseline[name] is None or candidate[name] is None:
             raise ValueError(f"both runs need {name}")
     gates = {
+        "request_count_matches": baseline["requests"] == candidate["requests"],
+        "all_requests_terminal": baseline["terminal_pass"]
+        and candidate["terminal_pass"],
         "baseline_engaged": baseline["engagement_pass"],
         "candidate_engaged": candidate["engagement_pass"],
         "itl_p99_improved_20pct": (

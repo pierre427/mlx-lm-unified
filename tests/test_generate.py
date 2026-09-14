@@ -176,6 +176,29 @@ class TestDecodePriorityCadence(unittest.TestCase):
             gen.scheduler_stats["adaptive_prefill_deadline_forced_rounds"], 1
         )
 
+    def test_adaptive_prefill_progress_restarts_deadline(self):
+        gen = self.make_generator(cadence=1, queued=False)
+        gen.adaptive_prefill = True
+        gen._currently_processing = [
+            [[[1, 2], [9]], 0, 3, True, 0, 7.0],
+            [[[3, 4], [9]], 0, 3, True, 0, 8.0],
+        ]
+
+        gen._mark_prefill_progress(10.0)
+
+        self.assertEqual(
+            [sequence[5] for sequence in gen._currently_processing], [10.0, 10.0]
+        )
+        self.assertEqual(gen._oldest_prefill_age_ms(10.5), 500.0)
+
+    def test_adaptive_prefill_active_deadline_is_not_poisoned_by_queue_age(self):
+        gen = self.make_generator(cadence=1, queued=False)
+        gen.adaptive_prefill = True
+        gen._unprocessed_sequences = deque([self._queued(1, 500, queued_at=1.0)])
+        gen._currently_processing = [[[[1, 2], [9]], 0, 3, True, 0, 9.5]]
+
+        self.assertEqual(gen._oldest_prefill_age_ms(10.0), 500.0)
+
     def test_adaptive_prefill_uses_measured_budget_for_chunk(self):
         gen = self.make_generator(cadence=1, queued=False)
         gen.adaptive_prefill = True

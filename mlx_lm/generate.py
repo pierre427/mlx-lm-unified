@@ -4137,7 +4137,7 @@ class BatchGenerator:
         prefill_batch_window: Optional[int] = None,
         decode_priority_cadence: int = 1,
         adaptive_prefill: bool = False,
-        adaptive_prefill_target_itl_ms: float = 300.0,
+        adaptive_prefill_target_itl_ms: float = 1500.0,
         adaptive_prefill_max_defer_ms: float = 2000.0,
         adaptive_prefill_slices: Sequence[int] = (64, 128, 256, 512),
         max_kv_size: Optional[int] = None,
@@ -5378,7 +5378,25 @@ class BatchGenerator:
             if len(sequence) > 5
             and not (len(sequence[0]) == 1 and len(sequence[0][0]) == 1)
         ]
-        return 0.0 if not queued and not active else (now - min(queued + active)) * 1000
+        # When rows are already consuming prompt slots, their progress deadline
+        # is the actionable one.  An older request still waiting outside a full
+        # prompt batch must not force every slice of the rows ahead of it; FIFO
+        # admission will select it as soon as a slot opens.
+        service_times = active or queued
+        return 0.0 if not service_times else (now - min(service_times)) * 1000
+
+    def _mark_prefill_progress(self, now):
+        """Restart the defer deadline for prompt rows that just made progress.
+
+        A request's queued timestamp bounds its wait for first service.  Once
+        admitted, the same field becomes the timestamp of its latest prefill
+        slice so the deadline bounds the gap between slices instead of forcing
+        every remaining slice after the request's original TTFT crosses it.
+        """
+
+        for sequence in self._currently_processing:
+            if len(sequence) > 5:
+                sequence[5] = now
 
     def _adaptive_prefill_decision(self, now):
         """Return ``(defer, chunk, deadline_forced)`` at a decode boundary."""
@@ -5531,6 +5549,8 @@ class BatchGenerator:
         tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
         toc = time.perf_counter()
+        if prompts and self.adaptive_prefill:
+            self._mark_prefill_progress(toc)
         self._prompt_time_counter += toc - tic
         if prompts and self.adaptive_prefill and len(self._generation_batch) > 0:
             width = max(len(prompt) for prompt in prompts)
