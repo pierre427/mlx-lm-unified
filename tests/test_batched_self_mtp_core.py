@@ -491,13 +491,13 @@ class TestBatchedCoreLifecycle(_CPUCase):
             generator.next()
             generator.next()
             (joining_uid,) = generator.insert(
-                [[6, 7, 8, 9, 10, 11, 12, 13, 14]],
+                [[6, 7, 8, 9, 10, 11, 12, 13]],
                 lane_rngs=[LaneRNG(2)],
             )
 
             first_progress, first_generation = generator.next()
             self.assertTrue(first_generation)
-            self.assertEqual(first_progress[0].progress, (4, 9))
+            self.assertEqual(first_progress[0].progress, (4, 8))
             self.assertEqual(len(generator._unprocessed_sequences), 1)
 
             final_progress, second_generation = generator.next()
@@ -508,7 +508,9 @@ class TestBatchedCoreLifecycle(_CPUCase):
                 [0, joining_uid],
             )
             self.assertEqual(stats["adaptive_prefill_release_rounds"], 2)
-            self.assertEqual(stats["adaptive_prefill_chunk_histogram"], {"4": 2})
+            self.assertEqual(
+                stats["adaptive_prefill_chunk_histogram"], {"3": 1, "4": 1}
+            )
         finally:
             generator.close()
 

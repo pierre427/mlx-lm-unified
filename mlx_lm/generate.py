@@ -5443,10 +5443,24 @@ class BatchGenerator:
         n = self._admit_mtp_joining(n)
         if n > 0:
             active_decode = self._has_active_decode()
+            candidates = list(self._unprocessed_sequences)[:n]
+            # Cold long prompts already use MTP admission to avoid harmful
+            # overlap and are most efficient in the established one-shot
+            # preparation path. Adaptive slicing is reserved for genuinely
+            # cheap residual work: an APC-restored prefix or at most two
+            # maximum quanta. This is the MTP-specific residual-cost gate.
+            adaptive_residual = self.adaptive_prefill and active_decode and any(
+                candidate[4]
+                or sum(len(segment) for segment in candidate[1])
+                <= 2 * self.adaptive_prefill_slices[-1]
+                for candidate in candidates
+            )
             adaptive_defer, adaptive_chunk, deadline_forced = (
                 self._adaptive_prefill_decision(time.perf_counter())
+                if adaptive_residual
+                else (False, self.prefill_step_size, False)
             )
-            if self.adaptive_prefill and active_decode and deadline_forced:
+            if adaptive_residual and deadline_forced:
                 # Plain prefill advances every admitted row in one batched
                 # slice, so its deadline path can safely force the minimum.
                 # Self-MTP rows are request-private during teacher forcing;
@@ -5454,10 +5468,9 @@ class BatchGenerator:
                 # makes TTFT worse. Keep the deadline's service guarantee but
                 # use the largest measured slice that still fits the ITL budget.
                 adaptive_chunk = self._measured_adaptive_prefill_chunk()
-            if self.adaptive_prefill and active_decode and adaptive_defer:
+            if adaptive_residual and adaptive_defer:
                 return prompt_responses, generation_responses
-            if self.adaptive_prefill and active_decode:
-                candidates = list(self._unprocessed_sequences)[:n]
+            if adaptive_residual:
                 if deadline_forced or len(candidates) == 1:
                     selected = 0
                 else:
