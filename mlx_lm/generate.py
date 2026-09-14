@@ -4135,6 +4135,7 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         prefill_batch_window: Optional[int] = None,
+        decode_priority_cadence: int = 1,
         max_kv_size: Optional[int] = None,
         kv_budget_bytes: Optional[int] = None,
         kv_cost: Optional[Tuple[float, float, Optional[int]]] = None,
@@ -4155,7 +4156,14 @@ class BatchGenerator:
                 Mapping[int, Union[int, str]],
             ]
         ] = None,
+        scheduler_stats: Optional[Dict[str, Any]] = None,
     ):
+        if decode_priority_cadence < 1:
+            raise ValueError("decode_priority_cadence must be positive")
+        if self_mtp is not None and decode_priority_cadence != 1:
+            raise ValueError(
+                "decode_priority_cadence is not supported with batched self-MTP"
+            )
         if kv_bits is not None and quantized_kv_start != 0:
             # Validated before any state is set, so a rejected config never
             # leaves a partially-constructed instance behind (__del__ calls
@@ -4203,6 +4211,17 @@ class BatchGenerator:
         )
         if self.prefill_batch_window < 1:
             raise ValueError("prefill_batch_window must be positive")
+        self.decode_priority_cadence = decode_priority_cadence
+        self.scheduler_stats = (
+            scheduler_stats if scheduler_stats is not None else {}
+        )
+        for key in (
+            "prefill_rounds",
+            "prefill_only_rounds",
+            "decode_priority_release_rounds",
+            "decode_priority_deferred_rounds",
+        ):
+            self.scheduler_stats.setdefault(key, 0)
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
         self.kv_bits = kv_bits
@@ -5277,6 +5296,54 @@ class BatchGenerator:
 
         return prompt_responses, generation_responses
 
+    def _has_prefill_work(self):
+        if self._unprocessed_sequences:
+            return True
+        return any(
+            not (len(sequence[0]) == 1 and len(sequence[0][0]) == 1)
+            for sequence in self._currently_processing
+        )
+
+    def _should_defer_prefill(self):
+        if (
+            self.decode_priority_cadence == 1
+            or len(self._generation_batch) == 0
+            or not self._has_prefill_work()
+        ):
+            return False
+        if self._steps_counter % self.decode_priority_cadence == 0:
+            return False
+        self.scheduler_stats["decode_priority_deferred_rounds"] += 1
+        return True
+
+    def _promote_ready_prompts(self):
+        keep = []
+        split = []
+        for i, seq in enumerate(self._currently_processing):
+            segments = seq[0]
+            if len(segments) == 1 and len(segments[0]) == 1:
+                split.append(i)
+            else:
+                keep.append(i)
+
+        prompt_responses = []
+        if split:
+            last_inputs = [self._currently_processing[i][0][0] for i in split]
+            progress = [(self._currently_processing[i][2],) * 2 for i in split]
+            self._currently_processing = [self._currently_processing[i] for i in keep]
+            gen_batch = self._prompt_batch.split(split).generate(last_inputs)
+            for i, p in enumerate(progress):
+                prompt_responses.append(
+                    PromptProcessingBatch.Response(
+                        gen_batch.uids[i],
+                        p,
+                        True,
+                        True,
+                    )
+                )
+            self._generation_batch.extend(gen_batch)
+        return prompt_responses
+
     def _next(self):
         if self.self_mtp is not None:
             return self._next_mtp()
@@ -5296,6 +5363,10 @@ class BatchGenerator:
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses
 
+        if self._should_defer_prefill():
+            prompt_responses.extend(self._promote_ready_prompts())
+            return prompt_responses, generation_responses
+
         # Check if we have sequences and add them to the prompt batch
         n = min(
             self.prefill_batch_size - len(self._prompt_batch),
@@ -5306,32 +5377,8 @@ class BatchGenerator:
         if n > 0:
             self._prompt_batch.extend(self._make_batch(n))
 
-        # Split the prompt sequences to the ones moving to generation and the rest
-        keep = []
-        split = []
-        for i, seq in enumerate(self._currently_processing):
-            segments = seq[0]
-            if len(segments) == 1 and len(segments[0]) == 1:
-                split.append(i)
-            else:
-                keep.append(i)
-
-        # Actually split off part of the prompt batch and start generation
-        if split:
-            last_inputs = [self._currently_processing[i][0][0] for i in split]
-            progress = [(self._currently_processing[i][2],) * 2 for i in split]
-            self._currently_processing = [self._currently_processing[i] for i in keep]
-            gen_batch = self._prompt_batch.split(split).generate(last_inputs)
-            for i, p in enumerate(progress):
-                prompt_responses.append(
-                    PromptProcessingBatch.Response(
-                        gen_batch.uids[i],
-                        p,
-                        True,
-                        True,
-                    )
-                )
-            self._generation_batch.extend(gen_batch)
+        # Move completed prompt rows to generation before the next prefill.
+        prompt_responses.extend(self._promote_ready_prompts())
 
         # Extract the next prompts input
         prompts = []
@@ -5352,6 +5399,12 @@ class BatchGenerator:
 
         # Process the prompts
         self._prompt_tokens_counter += sum(len(p) for p in prompts)
+        if prompts:
+            self.scheduler_stats["prefill_rounds"] += 1
+            if len(self._generation_batch) == 0:
+                self.scheduler_stats["prefill_only_rounds"] += 1
+            elif self.decode_priority_cadence > 1:
+                self.scheduler_stats["decode_priority_release_rounds"] += 1
         tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
         toc = time.perf_counter()

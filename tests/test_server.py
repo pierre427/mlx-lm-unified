@@ -32,6 +32,7 @@ from mlx_lm.server import (
     _self_mtp_config,
     _store_single_request_prompt_cache,
     process_message_content,
+    setup_arg_parser as setup_server_arg_parser,
 )
 from mlx_lm.tool_parsers.mistral import parse_tool_call as mistral_parse_tool_call
 from mlx_lm.utils import load
@@ -131,6 +132,10 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
             "decode_calls": 0,
             "max_generation_width": 0,
             "generation_width_histogram": {},
+            "prefill_rounds": 0,
+            "prefill_only_rounds": 0,
+            "decode_priority_release_rounds": 0,
+            "decode_priority_deferred_rounds": 0,
         }
         return generator
 
@@ -151,6 +156,10 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
                 "decode_calls": 2,
                 "max_generation_width": 4,
                 "generation_width_histogram": {"4": 2},
+                "prefill_rounds": 0,
+                "prefill_only_rounds": 0,
+                "decode_priority_release_rounds": 0,
+                "decode_priority_deferred_rounds": 0,
             },
         )
 
@@ -164,6 +173,16 @@ class TestBatchDecodeTelemetry(unittest.TestCase):
 
         self.assertEqual(generator._batch_decode_stats["next_calls"], 1)
         self.assertEqual(generator._batch_decode_stats["decode_calls"], 0)
+
+    def test_server_parser_exposes_decode_priority_cadence(self):
+        parser = setup_server_arg_parser()
+
+        self.assertEqual(parser.parse_args([]).decode_priority_cadence, 1)
+        self.assertEqual(
+            parser.parse_args(["--decode-priority-cadence", "4"])
+            .decode_priority_cadence,
+            4,
+        )
 
 
 class TestServerContextCeiling(unittest.TestCase):

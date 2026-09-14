@@ -26,6 +26,158 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
 
+class TestDecodePriorityCadence(unittest.TestCase):
+    class GenerationBatch:
+        def __init__(self, active=True):
+            self.active = active
+            self.uids = [7]
+
+        def __len__(self):
+            return int(self.active)
+
+        def next(self):
+            return [object()] if self.active else []
+
+        def extend(self, _batch):
+            self.active = True
+
+    class PromptBatch:
+        def __init__(self):
+            self.uids = [7]
+            self.calls = []
+
+        def __len__(self):
+            return 1
+
+        def extend(self, _batch):
+            raise AssertionError("the synthetic test has no queued admissions")
+
+        def split(self, _indices):
+            raise AssertionError("the synthetic prompt is not ready to promote")
+
+        def prompt(self, prompts):
+            self.calls.append(prompts)
+
+    class PromptBatchWithReady(PromptBatch):
+        class ReadyBatch:
+            uids = [7]
+
+            @staticmethod
+            def generate(last_inputs):
+                if last_inputs != [[9]]:
+                    raise AssertionError("unexpected final prompt token")
+                return TestDecodePriorityCadence.GenerationBatch()
+
+        def split(self, indices):
+            if indices != [0]:
+                raise AssertionError("only the completed row should promote")
+            return self.ReadyBatch()
+
+    @staticmethod
+    def make_generator(*, cadence=4, step=1, decode=True, queued=True):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.decode_priority_cadence = cadence
+        gen._steps_counter = step
+        gen._generation_batch = [object()] if decode else []
+        gen._unprocessed_sequences = deque([object()] if queued else [])
+        gen._currently_processing = []
+        gen.scheduler_stats = {"decode_priority_deferred_rounds": 0}
+        gen._old_wired_limit = None
+        return gen
+
+    def test_default_cadence_preserves_mixed_prefill(self):
+        gen = self.make_generator(cadence=1)
+
+        self.assertFalse(gen._should_defer_prefill())
+        self.assertEqual(gen.scheduler_stats["decode_priority_deferred_rounds"], 0)
+
+    def test_cadence_defers_until_release_step(self):
+        gen = self.make_generator(cadence=4)
+
+        for step in (1, 2, 3):
+            gen._steps_counter = step
+            self.assertTrue(gen._should_defer_prefill())
+        gen._steps_counter = 4
+        self.assertFalse(gen._should_defer_prefill())
+        self.assertEqual(gen.scheduler_stats["decode_priority_deferred_rounds"], 3)
+
+    def test_prefill_only_work_is_never_deferred(self):
+        gen = self.make_generator(cadence=4, decode=False)
+
+        self.assertFalse(gen._should_defer_prefill())
+
+    def test_ready_prompt_without_more_compute_is_not_deferred(self):
+        gen = self.make_generator(cadence=4, queued=False)
+        gen._currently_processing = [[[[7]], 1, 1]]
+
+        self.assertFalse(gen._should_defer_prefill())
+
+    def test_invalid_and_mtp_cadence_are_rejected_before_model_setup(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            BatchGenerator(object(), decode_priority_cadence=0)
+        with self.assertRaisesRegex(ValueError, "not supported with batched self-MTP"):
+            BatchGenerator(
+                object(),
+                decode_priority_cadence=2,
+                self_mtp={"persistent": True},
+            )
+
+    def test_next_defers_three_rounds_then_processes_one_prompt_chunk(self):
+        gen = self.make_generator(cadence=4, step=0, queued=False)
+        gen.self_mtp = None
+        gen._generation_batch = self.GenerationBatch()
+        gen._prompt_batch = self.PromptBatch()
+        gen._currently_processing = [[[[1, 2, 3, 4], [9]], 0, 5]]
+        gen.completion_batch_size = 8
+        gen.prefill_batch_size = 1
+        gen.prefill_step_size = 2
+        gen.state_budget = None
+        gen._prompt_tokens_counter = 0
+        gen._prompt_time_counter = 0
+        gen._gen_tokens_counter = 0
+        gen.scheduler_stats.update(
+            {
+                "prefill_rounds": 0,
+                "prefill_only_rounds": 0,
+                "decode_priority_release_rounds": 0,
+            }
+        )
+
+        for _ in range(3):
+            gen._next()
+        self.assertEqual(gen._prompt_batch.calls, [])
+
+        gen._next()
+        self.assertEqual(gen._prompt_batch.calls, [[[1, 2]]])
+        self.assertEqual(gen.scheduler_stats["decode_priority_deferred_rounds"], 3)
+        self.assertEqual(gen.scheduler_stats["decode_priority_release_rounds"], 1)
+        self.assertEqual(gen.scheduler_stats["prefill_rounds"], 1)
+
+    def test_deferred_round_promotes_ready_row_without_running_prefill(self):
+        gen = self.make_generator(cadence=4, step=0, queued=False)
+        gen.self_mtp = None
+        gen._generation_batch = self.GenerationBatch()
+        gen._prompt_batch = self.PromptBatchWithReady()
+        gen._currently_processing = [
+            [[[9]], 1, 1],
+            [[[1, 2], [8]], 0, 3],
+        ]
+        gen.completion_batch_size = 8
+        gen.prefill_batch_size = 2
+        gen.prefill_step_size = 2
+        gen.state_budget = None
+        gen._prompt_tokens_counter = 0
+        gen._prompt_time_counter = 0
+        gen._gen_tokens_counter = 0
+
+        prompt_responses, _ = gen._next()
+
+        self.assertEqual(len(prompt_responses), 1)
+        self.assertEqual(gen._prompt_batch.calls, [])
+        self.assertEqual(len(gen._currently_processing), 1)
+        self.assertEqual(gen._currently_processing[0][0][0], [1, 2])
+
+
 class TestGenerate(unittest.TestCase):
 
     BATCH_LOGPROB_ATOL = 0.05

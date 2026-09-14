@@ -2524,6 +2524,10 @@ class ResponseGenerator:
             "decode_calls": 0,
             "max_generation_width": 0,
             "generation_width_histogram": {},
+            "prefill_rounds": 0,
+            "prefill_only_rounds": 0,
+            "decode_priority_release_rounds": 0,
+            "decode_priority_deferred_rounds": 0,
         }
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
@@ -3543,9 +3547,13 @@ class ResponseGenerator:
                             prefill_batch_size=self.cli_args.prompt_concurrency,
                             prefill_step_size=self.cli_args.prefill_step_size,
                             prefill_batch_window=self.cli_args.prompt_batch_window,
+                            decode_priority_cadence=(
+                                getattr(self.cli_args, "decode_priority_cadence", 1)
+                            ),
                             kv_budget_bytes=kv_budget_bytes,
                             kv_cost=kv_cost,
                             stream=generation_stream,
+                            scheduler_stats=self._batch_decode_stats,
                             self_mtp=current_self_mtp,
                             mtp_admission=(
                                 self._self_mtp_admission
@@ -5904,6 +5912,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 "prompt_concurrency": int(
                     getattr(self.response_generator.cli_args, "prompt_concurrency", 1)
                 ),
+                "decode_priority_cadence": int(
+                    getattr(
+                        self.response_generator.cli_args,
+                        "decode_priority_cadence",
+                        1,
+                    )
+                ),
                 "max_inflight_requests": int(
                     getattr(self.response_generator.cli_args, "max_inflight_requests", 0)
                     or 0
@@ -5921,6 +5936,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ),
             }
+            payload["scheduler"] = dict(
+                getattr(self.response_generator, "_batch_decode_stats", {})
+            )
             self._json_ok(payload)
         else:
             self._set_completion_headers(404)
@@ -6644,6 +6662,16 @@ def setup_arg_parser():
         ),
     )
     parser.add_argument(
+        "--decode-priority-cadence",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "While decode is active, run prefill once every N decode steps. "
+            "1 preserves the default mixed prefill/decode schedule."
+        ),
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=10,
@@ -6809,6 +6837,10 @@ def main():
         parser.error("--max-inflight-requests must be >= 0")
     if args.batch_metrics_history < 1:
         parser.error("--batch-metrics-history must be >= 1")
+    if args.decode_priority_cadence < 1:
+        parser.error("--decode-priority-cadence must be >= 1")
+    if args.decode_priority_cadence != 1 and args.self_mtp:
+        parser.error("--decode-priority-cadence does not support --self-mtp")
     if (
         args.self_mtp_verification_row_cap is not None
         and args.self_mtp_verification_row_cap < 1

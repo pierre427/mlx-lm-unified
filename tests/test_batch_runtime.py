@@ -115,10 +115,16 @@ def test_batching_status_endpoint_exposes_configuration_and_memory():
         cli_args=SimpleNamespace(
             decode_concurrency=8,
             prompt_concurrency=4,
+            decode_priority_cadence=4,
             max_inflight_requests=12,
             self_mtp_verification_row_cap=24,
             batch_fault_injection=False,
         ),
+        _batch_decode_stats={
+            "prefill_rounds": 3,
+            "decode_priority_release_rounds": 1,
+            "decode_priority_deferred_rounds": 7,
+        },
     )
     handler.do_GET()
     assert captured[0]["memory"]["prompt_cache_entries"] == 2
@@ -126,6 +132,8 @@ def test_batching_status_endpoint_exposes_configuration_and_memory():
     assert "system_available_bytes" in captured[0]["memory"]
     assert "metal_active_bytes" in captured[0]["memory"]
     assert captured[0]["configured"]["verification_row_cap"] == 24
+    assert captured[0]["configured"]["decode_priority_cadence"] == 4
+    assert captured[0]["scheduler"]["decode_priority_deferred_rounds"] == 7
 
 
 def test_lane_abort_counts_only_acknowledged_delivery():
