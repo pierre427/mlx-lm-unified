@@ -527,6 +527,46 @@ class TestToolParsing(unittest.TestCase):
         # parse_tool_call returns dict, not list
         self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
 
+    def test_qwen3_coder_recovers_missing_name_delimiters(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+        missing_parameter_close = (
+            "<function=read_file>\n"
+            "<parameter=path\n/etc/hosts\n</parameter>\n"
+            "</function>"
+        )
+        call = qwen3_coder.parse_tool_call(missing_parameter_close, tools)
+        self.assertEqual(call["arguments"], {"path": "/etc/hosts"})
+
+        greater_than_in_value = (
+            "<function=read_file>\n"
+            "<parameter=path\na>b\n</parameter>\n"
+            "</function>"
+        )
+        call = qwen3_coder.parse_tool_call(greater_than_in_value, tools)
+        self.assertEqual(call["arguments"], {"path": "a>b"})
+
+        missing_function_close = (
+            "<function=read_file\n"
+            "<parameter=path>\n/etc/hosts\n</parameter>\n"
+            "</function>"
+        )
+        call = qwen3_coder.parse_tool_call(missing_function_close, tools)
+        self.assertEqual(call["name"], "read_file")
+        self.assertEqual(call["arguments"], {"path": "/etc/hosts"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ from ._schema import infer_type_from_json_schema
 # drop calls 2..n).
 _function_regex = re.compile(r"<function=(.*?)</function>", re.DOTALL)
 _parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+_name_regex = re.compile(r"\s*([^\s<>]+)>?")
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -123,12 +124,14 @@ def _declares_null(schema):
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
-    end_index = function_call_str.index(">")
-    function_name = function_call_str[:end_index]
+    name_match = _name_regex.match(function_call_str)
+    if name_match is None:
+        raise ValueError("Malformed function name")
+    function_name = name_match.group(1)
     if not function_name.strip() or "<" in function_name:
         raise ValueError("Malformed function name")
     param_config = _get_arguments_config(function_name, tools)
-    parameters = function_call_str[end_index + 1 :]
+    parameters = function_call_str[name_match.end() :]
     param_dict = {}
     cursor = 0
     for match in _parameter_regex.finditer(parameters):
@@ -136,11 +139,13 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
             raise ValueError("Malformed parameter markup")
         cursor = match.end()
         match_text = match.group(1)
-        idx = match_text.index(">")
-        param_name = match_text[:idx]
+        param_match = _name_regex.match(match_text)
+        if param_match is None:
+            raise ValueError("Malformed parameter name")
+        param_name = param_match.group(1)
         if not param_name.strip() or "<" in param_name or param_name in param_dict:
             raise ValueError("Malformed or duplicate parameter name")
-        param_value = str(match_text[idx + 1 :])
+        param_value = str(match_text[param_match.end() :])
         if param_value.startswith("\n"):
             param_value = param_value[1:]
         if param_value.endswith("\n"):
