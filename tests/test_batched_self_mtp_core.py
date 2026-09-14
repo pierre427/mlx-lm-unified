@@ -471,7 +471,7 @@ class TestBatchedCoreLifecycle(_CPUCase):
             [int(token) for token, _ in traces["sliced"]],
         )
 
-    def test_adaptive_prefill_joins_an_active_batched_lane(self):
+    def test_adaptive_prefill_keeps_cold_small_mtp_join_on_one_shot_path(self):
         stats = {}
         generator = BatchGenerator(
             self.model,
@@ -495,22 +495,17 @@ class TestBatchedCoreLifecycle(_CPUCase):
                 lane_rngs=[LaneRNG(2)],
             )
 
-            first_progress, first_generation = generator.next()
-            self.assertTrue(first_generation)
-            self.assertEqual(first_progress[0].progress, (4, 8))
-            self.assertEqual(len(generator._unprocessed_sequences), 1)
+            progress, generation = generator.next()
 
-            final_progress, second_generation = generator.next()
-            self.assertTrue(second_generation)
-            self.assertTrue(final_progress[-1].end_of_prompt)
+            self.assertTrue(generation)
+            self.assertTrue(progress[-1].end_of_prompt)
+            self.assertEqual(len(generator._unprocessed_sequences), 0)
             self.assertEqual(
                 [row[0] for row in generator.mtp_cycle_state()],
                 [0, joining_uid],
             )
-            self.assertEqual(stats["adaptive_prefill_release_rounds"], 2)
-            self.assertEqual(
-                stats["adaptive_prefill_chunk_histogram"], {"3": 1, "4": 1}
-            )
+            self.assertEqual(stats["adaptive_prefill_release_rounds"], 0)
+            self.assertEqual(stats["adaptive_prefill_chunk_histogram"], {})
         finally:
             generator.close()
 

@@ -5447,12 +5447,12 @@ class BatchGenerator:
             # Cold long prompts already use MTP admission to avoid harmful
             # overlap and are most efficient in the established one-shot
             # preparation path. Adaptive slicing is reserved for genuinely
-            # cheap residual work: an APC-restored prefix or at most two
-            # maximum quanta. This is the MTP-specific residual-cost gate.
+            # cheap residual work after APC restored a prefix. A short cold
+            # prompt is not cheap in this sense: deferring and slicing it adds
+            # scheduler boundaries without avoiding any teacher-forcing work.
+            # This is the MTP-specific residual-cost gate.
             adaptive_residual = self.adaptive_prefill and active_decode and any(
                 candidate[4]
-                or sum(len(segment) for segment in candidate[1])
-                <= 2 * self.adaptive_prefill_slices[-1]
                 for candidate in candidates
             )
             adaptive_defer, adaptive_chunk, deadline_forced = (
