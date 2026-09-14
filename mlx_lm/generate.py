@@ -5446,6 +5446,14 @@ class BatchGenerator:
             adaptive_defer, adaptive_chunk, deadline_forced = (
                 self._adaptive_prefill_decision(time.perf_counter())
             )
+            if self.adaptive_prefill and active_decode and deadline_forced:
+                # Plain prefill advances every admitted row in one batched
+                # slice, so its deadline path can safely force the minimum.
+                # Self-MTP rows are request-private during teacher forcing;
+                # repeatedly forcing 64 tokens serializes a busy queue and
+                # makes TTFT worse. Keep the deadline's service guarantee but
+                # use the largest measured slice that still fits the ITL budget.
+                adaptive_chunk = self._measured_adaptive_prefill_chunk()
             if self.adaptive_prefill and active_decode and adaptive_defer:
                 return prompt_responses, generation_responses
             if self.adaptive_prefill and active_decode:
@@ -5562,19 +5570,24 @@ class BatchGenerator:
         # Begin conservatively. Once a prompt round has supplied a measured
         # cost, choose the largest slice predicted to fit within 75% of the ITL
         # target, leaving room for the following decode step and model variance.
-        chunk = self.adaptive_prefill_slices[0]
-        if self._prefill_ms_per_token_ewma is not None:
-            decode_ms = self._last_decode_duration_ms or 0.0
-            budget_ms = max(0.0, self.adaptive_prefill_target_itl_ms * 0.75 - decode_ms)
-            for candidate in self.adaptive_prefill_slices:
-                if self._prefill_ms_per_token_ewma * candidate <= budget_ms:
-                    chunk = candidate
+        chunk = self._measured_adaptive_prefill_chunk()
         if forced:
             self.scheduler_stats["adaptive_prefill_deadline_forced_rounds"] += 1
             # A deadline overrides deferral, not the latency guard: force the
             # smallest useful quantum rather than creating a new long tail.
             chunk = self.adaptive_prefill_slices[0]
         return False, chunk, forced
+
+    def _measured_adaptive_prefill_chunk(self):
+        chunk = self.adaptive_prefill_slices[0]
+        if self._prefill_ms_per_token_ewma is None:
+            return chunk
+        decode_ms = self._last_decode_duration_ms or 0.0
+        budget_ms = max(0.0, self.adaptive_prefill_target_itl_ms * 0.75 - decode_ms)
+        for candidate in self.adaptive_prefill_slices:
+            if self._prefill_ms_per_token_ewma * candidate <= budget_ms:
+                chunk = candidate
+        return chunk
 
     def _promote_ready_prompts(self):
         keep = []

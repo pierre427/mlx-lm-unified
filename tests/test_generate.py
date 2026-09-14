@@ -205,6 +205,14 @@ class TestDecodePriorityCadence(unittest.TestCase):
 
         self.assertEqual(gen._adaptive_prefill_decision(10.0), (False, 128, False))
 
+    def test_mtp_deadline_can_reuse_measured_nonminimum_chunk(self):
+        gen = self.make_generator(cadence=1, queued=False)
+        gen.adaptive_prefill = True
+        gen._last_decode_duration_ms = 40.0
+        gen._prefill_ms_per_token_ewma = 1.0
+
+        self.assertEqual(gen._measured_adaptive_prefill_chunk(), 128)
+
     def test_adaptive_admission_prefers_small_cached_residual_after_oldest(self):
         gen = self.make_generator(cadence=1, queued=False, decode=False)
         gen.adaptive_prefill = True
