@@ -31,7 +31,7 @@ import time
 import uuid
 import warnings
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -1411,6 +1411,14 @@ class SelfMTPLaneAdmissionController:
     TRANSIENT_SCALE = {0: 1.0 / 3.0, 1: 0.80, 2: 1.0, 3: 1.25, 4: 1.55}
     K2_TRANSIENT_GIB_PER_LANE = 1.76
     SATURATION_LANE_CAP = 16
+    # Admission runs at every cycle boundary and one cycle adds at most k+1
+    # tokens. This horizon covers 256-token cache steps with margin.
+    RESIDENT_GROWTH_HORIZON_TOKENS = 1024
+    # Extra free memory a queued lane needs before it is readmitted while
+    # other lanes decode. This stops detach/reattach churn on noisy readings.
+    READMIT_MARGIN_GIB = 4.0
+    # Boundaries a lane can be held by the margin before it is readmitted.
+    READMIT_MAX_HOLDS = 8
 
     def __init__(
         self,
@@ -1456,6 +1464,7 @@ class SelfMTPLaneAdmissionController:
         cache_gib: float = 0.0,
         *,
         resident_cache: bool = False,
+        pending_gib: float = 0.0,
     ) -> float:
         """Conservative incremental cost for one lane.
 
@@ -1463,10 +1472,21 @@ class SelfMTPLaneAdmissionController:
         and the full cache plus transient must fit in currently free memory.
         At a cycle boundary an active lane's cache is already resident and is
         therefore already absent from the live free-memory measurement.  In
-        that case only any uncovered envelope growth plus the next verify
-        transient is incremental.  Charging the resident cache a second time
-        can queue the sole lane after prefill, where it can never release the
-        allocation required to admit itself again.
+        that case only near-term growth plus the next verify transient is
+        incremental.  Charging the resident cache a second time can queue the
+        sole lane after prefill, where it can never release the allocation
+        required to admit itself again.
+
+        With a measured cache, near-term growth is
+        ``RESIDENT_GROWTH_HORIZON_TOKENS`` at the larger of the measured and
+        envelope per-token rates; a joining lane also pays the measured cache
+        (for example an APC restore scaled to its post-prepare context).  The
+        envelope is calibrated on full-attention growth.  A hybrid cache
+        (recurrent state plus sparse attention) is far smaller at long
+        context, and charging the envelope gap queued a 57K lane on most
+        cycles.  An unmeasured cache still pays the full envelope.
+        ``pending_gib`` is lazy memory that is not allocated yet; it is always
+        charged in full.
         """
         if isinstance(context_tokens, bool) or not isinstance(context_tokens, int):
             raise ValueError("context_tokens must be an integer")
@@ -1481,17 +1501,28 @@ class SelfMTPLaneAdmissionController:
             raise ValueError("cache_gib must be finite and non-negative")
         if not isinstance(resident_cache, bool):
             raise ValueError("resident_cache must be a boolean")
-        projected_context_gib = max(
-            self.CACHE_GIB_PER_1K_TOKENS * (context_tokens / 1024.0),
-            cache_gib,
-        )
-        context_gib = (
-            max(projected_context_gib - cache_gib, 0.0)
-            if resident_cache
-            else projected_context_gib
-        )
+        pending_gib = float(pending_gib)
+        if not math.isfinite(pending_gib) or pending_gib < 0:
+            raise ValueError("pending_gib must be finite and non-negative")
+        envelope_gib = self.CACHE_GIB_PER_1K_TOKENS * (context_tokens / 1024.0)
+        if cache_gib > 0.0 and context_tokens > 0:
+            # The envelope rate is a floor for caches that under-report.
+            gib_per_token = max(
+                cache_gib / context_tokens,
+                self.CACHE_GIB_PER_1K_TOKENS / 1024.0,
+            )
+            growth_gib = gib_per_token * self.RESIDENT_GROWTH_HORIZON_TOKENS
+            # A joining lane allocates its measured cache; a resident one has.
+            context_gib = growth_gib if resident_cache else cache_gib + growth_gib
+        else:
+            # Unmeasured cache fails closed to the full envelope.
+            context_gib = envelope_gib
         transient_scale = self.TRANSIENT_SCALE[draft_depth]
-        return context_gib + self.transient_gib_per_lane * transient_scale
+        return (
+            context_gib
+            + pending_gib
+            + self.transient_gib_per_lane * transient_scale
+        )
 
     def _fit(
         self,
@@ -1502,6 +1533,7 @@ class SelfMTPLaneAdmissionController:
         draft_depth: int,
         usable_gib: float,
         max_lanes: Optional[int] = None,
+        pending_gib: Optional[Sequence[float]] = None,
     ) -> Tuple[Tuple[int, ...], float]:
         # Admit the cheapest lanes first; retain their original relative order
         # in the returned batch.  One long request therefore cannot force a
@@ -1509,6 +1541,8 @@ class SelfMTPLaneAdmissionController:
         # compute-saturation cap stops admitting once ``max_lanes`` cheapest
         # lanes fit, so a large free-memory envelope cannot widen the M=(k+1)N
         # forward past the throughput knee.
+        if pending_gib is None:
+            pending_gib = (0.0,) * len(contexts)
         ranked = sorted(
             indices,
             key=lambda i: (
@@ -1517,6 +1551,7 @@ class SelfMTPLaneAdmissionController:
                     draft_depth,
                     cache_gib[i],
                     resident_cache=resident_cache[i],
+                    pending_gib=pending_gib[i],
                 ),
                 i,
             ),
@@ -1531,6 +1566,7 @@ class SelfMTPLaneAdmissionController:
                 draft_depth,
                 cache_gib[i],
                 resident_cache=resident_cache[i],
+                pending_gib=pending_gib[i],
             )
             if used + cost <= usable_gib:
                 chosen.append(i)
@@ -1546,6 +1582,7 @@ class SelfMTPLaneAdmissionController:
         cache_gib: Optional[Sequence[float]] = None,
         resident_cache: Optional[Sequence[bool]] = None,
         max_draft: int = 2,
+        pending_gib: Optional[Sequence[float]] = None,
     ) -> SelfMTPLaneAdmission:
         """Return the next-cycle plan in the frozen degradation order.
 
@@ -1574,6 +1611,12 @@ class SelfMTPLaneAdmissionController:
             resident_cache = tuple(resident_cache)
         if len(resident_cache) != len(contexts):
             raise ValueError("resident_cache must align with context_tokens")
+        if pending_gib is None:
+            pending_gib = (0.0,) * len(contexts)
+        else:
+            pending_gib = tuple(pending_gib)
+        if len(pending_gib) != len(contexts):
+            raise ValueError("pending_gib must align with context_tokens")
         if max_draft < 1 or max_draft not in self.TRANSIENT_SCALE:
             raise ValueError(
                 "max_draft must be a calibrated depth: "
@@ -1602,6 +1645,7 @@ class SelfMTPLaneAdmissionController:
                     max_draft,
                     cache_gib[i],
                     resident_cache=resident_cache[i],
+                    pending_gib=pending_gib[i],
                 )
         except (TypeError, ValueError, OverflowError):
             valid = False
@@ -1636,6 +1680,7 @@ class SelfMTPLaneAdmissionController:
                 depth,
                 usable,
                 lane_cap,
+                pending_gib,
             )
             if not chosen:
                 continue
@@ -1654,7 +1699,13 @@ class SelfMTPLaneAdmissionController:
             )
 
         chosen, used = self._fit(
-            mtp_candidates, contexts, cache_gib, resident_cache, 0, usable
+            mtp_candidates,
+            contexts,
+            cache_gib,
+            resident_cache,
+            0,
+            usable,
+            pending_gib=pending_gib,
         )
         if chosen:
             # The degradation contract says "drop a lane to plain" before
@@ -1669,6 +1720,7 @@ class SelfMTPLaneAdmissionController:
                 0,
                 cache_gib[i],
                 resident_cache=resident_cache[i],
+                pending_gib=pending_gib[i],
             )
             return SelfMTPLaneAdmission(
                 tuple(modes), tuple(depths), "plain", used, usable, len(contexts), 0
@@ -1762,32 +1814,88 @@ def _make_self_mtp_admission_callback(
     The generator calls this before every proposal, when no transaction is
     open.  It owns the resulting detach/pause/plain migration; the server owns
     the policy and the live memory measurement.  Rows are
-    ``(uid, logical_context_len, current_k, active, cache_gib)`` and include
-    paused or joining lanes, so retained cache rows participate before merge.
-    Only active rows are charged incrementally: their cache is already absent
-    from the live free-memory reading.  Paused/joining rows keep the full-cost
-    admission rule because they may require a reattach/merge allocation.
+    ``(uid, logical_context_len, current_k, resident, cache_gib[, pending_gib])``
+    and include paused or joining lanes, so retained cache rows participate
+    before merge.  Active and paused rows are resident: their cache is already
+    absent from the live free-memory reading, and a paused row reports its
+    merge copy as pending.  Joining rows pay their cache in full.
     """
     controller = controller or SelfMTPLaneAdmissionController()
+    # uid -> margin holds for lanes queued at the last cycle boundary.
+    demoted: Dict[int, int] = {}
 
     def admit(rows):
         rows = tuple(rows)
         if not rows:
+            demoted.clear()
             return {}
         current_free = free_memory()
-        decision = controller.decide(
-            [int(row[1]) for row in rows],
-            math.nan if current_free is None else current_free,
-            cache_gib=[float(row[4]) if len(row) > 4 else 0.0 for row in rows],
-            resident_cache=[bool(row[3]) for row in rows],
-            max_draft=max_draft() if callable(max_draft) else max_draft,
+        free = math.nan if current_free is None else current_free
+        contexts = [int(row[1]) for row in rows]
+        cache_gib = [float(row[4]) if len(row) > 4 else 0.0 for row in rows]
+        pending_gib = [float(row[5]) if len(row) > 5 else 0.0 for row in rows]
+        resident = [bool(row[3]) for row in rows]
+        depth_cap = max_draft() if callable(max_draft) else max_draft
+
+        def plan(free_gib):
+            return controller.decide(
+                contexts,
+                free_gib,
+                cache_gib=cache_gib,
+                resident_cache=resident,
+                max_draft=depth_cap,
+                pending_gib=pending_gib,
+            )
+
+        decision = plan(free)
+        uids = [int(row[0]) for row in rows]
+        # A join probe includes non-resident rows and keeps only their
+        # decisions, so it must not read or write the hysteresis state.
+        cycle_boundary = all(resident)
+        rejoining = [
+            i
+            for i, uid in enumerate(uids)
+            if cycle_boundary
+            and uid in demoted
+            and demoted[uid] < controller.READMIT_MAX_HOLDS
+            and decision.modes[i] == "self_mtp"
+        ]
+        others_decode = any(
+            mode == "self_mtp" and i not in rejoining
+            for i, mode in enumerate(decision.modes)
         )
+        held = []
+        if rejoining and others_decode:
+            # Holding a lane only frees memory, so other lanes stay safe.
+            strict = plan(free - controller.READMIT_MARGIN_GIB)
+            held = [i for i in rejoining if strict.modes[i] != "self_mtp"]
+        if held:
+            modes = list(decision.modes)
+            depths = list(decision.draft_depths)
+            for i in held:
+                modes[i] = "queue"
+                depths[i] = None
+            admitted = [d for m, d in zip(modes, depths) if m == "self_mtp"]
+            decision = replace(
+                decision,
+                modes=tuple(modes),
+                draft_depths=tuple(depths),
+                stage="fewer_lanes" if decision.stage == "full" else decision.stage,
+                speculative_rows=sum(admitted),
+            )
         if observer is not None:
             observer(decision)
         actions: Dict[int, Union[int, str]] = {}
-        for row, mode, depth in zip(rows, decision.modes, decision.draft_depths):
-            uid = int(row[0])
+        for uid, mode, depth in zip(uids, decision.modes, decision.draft_depths):
             actions[uid] = int(depth) if mode == "self_mtp" else mode
+        if cycle_boundary:
+            holds = {uids[i]: demoted.get(uids[i], 0) + 1 for i in held}
+            demoted.clear()
+            demoted.update(
+                (uid, holds.get(uid, 0))
+                for uid, action in actions.items()
+                if action == "queue"
+            )
         return actions
 
     return admit

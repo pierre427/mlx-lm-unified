@@ -62,6 +62,8 @@ DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_K = 0
+# Starved cycle boundaries before a paused self-MTP lane continues as plain.
+MTP_STARVED_BOUNDARIES_BEFORE_PLAIN = 8
 DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.1
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
@@ -3529,6 +3531,18 @@ class MTPGenerationBatch:
         return [int(token) for token in values]
 
     def mtp_cycle_state(self):
+        """Rows ``(uid, context, depth, resident, cache_gib, pending_gib)``.
+
+        ``cache_gib`` is allocated bytes and sets the growth rate.
+        ``pending_gib`` is lazy memory that is not allocated yet.
+        """
+        gib = float(1 << 30)
+        lane_count = max(len(self.state.lanes), 1)
+        pending_per_lane = (
+            int(self._async_qsa_ticket.reserved_bytes) / lane_count / gib
+            if self._async_qsa_ticket is not None
+            else 0.0
+        )
         if self.segmented_live_tip:
             overlap = 0
             view = getattr(self.state, "_segmented_caches", None)
@@ -3536,9 +3550,7 @@ class MTPGenerationBatch:
                 overlap += sum(
                     cache.nbytes for cache in view.target + view.draft
                 )
-            if self._async_qsa_ticket is not None:
-                overlap += int(self._async_qsa_ticket.reserved_bytes)
-            overlap_per_lane = overlap / max(len(self.state.lanes), 1)
+            overlap_per_lane = overlap / lane_count
             rows = [
                 (
                     lane.uid,
@@ -3547,7 +3559,8 @@ class MTPGenerationBatch:
                     True,
                     (sum(cache.nbytes for cache in pair.target + pair.draft)
                     + overlap_per_lane)
-                    / float(1 << 30),
+                    / gib,
+                    pending_per_lane,
                 )
                 for lane, pair in zip(self.state.lanes, self.state.row_caches)
             ]
@@ -3556,41 +3569,39 @@ class MTPGenerationBatch:
                 cache.nbytes
                 for cache in self.state.caches.target + self.state.caches.draft
             )
-            active_cache_gib = (
-                active_bytes / max(len(self.state.lanes), 1) / float(1 << 30)
-            )
+            contexts = [len(self._prefix_tokens(lane)) + 1 for lane in self.state.lanes]
+            # Rows share one padded width, so all lanes grow at one rate.
+            gib_per_token = active_bytes / lane_count / max(contexts, default=1) / gib
             rows = [
                 (
                     lane.uid,
-                    len(self._prefix_tokens(lane)) + 1,
+                    context,
                     lane.num_draft,
                     True,
-                    active_cache_gib,
+                    gib_per_token * context,
+                    pending_per_lane,
                 )
-                for lane in self.state.lanes
+                for lane, context in zip(self.state.lanes, contexts)
             ]
-        rows.extend(
-            (
-                uid,
-                len(self._prefix_tokens(paused.detached.lane)) + 1,
-                paused.detached.lane.num_draft,
-                # Pausing detaches the row from the device batch but does not
-                # release its target or draft cache. Those bytes are already
-                # reflected in the live free-memory reading; charging them as
-                # a fresh joining allocation can make the lane queue itself
-                # forever under pressure.
-                True,
-                sum(
-                    cache.nbytes
-                    for cache in (
-                        paused.detached.caches.target
-                        + paused.detached.caches.draft
-                    )
-                )
-                / float(1 << 30),
+        for uid, paused in self._paused.items():
+            context = len(self._prefix_tokens(paused.detached.lane)) + 1
+            paused_gib = sum(
+                cache.nbytes
+                for cache in paused.detached.caches.target + paused.detached.caches.draft
+            ) / gib
+            merge_gib = 0.0
+            if not self.segmented_live_tip:
+                # A physical merge rebuilds every row at the widest context
+                # while the old buffers are still alive.
+                active = [row[1] for row in rows if row[0] not in self._paused]
+                width = max([context] + active)
+                rate = max([paused_gib / context] + [row[4] / row[1] for row in rows])
+                merge_gib = (len(active) + 1) * width * rate if active else 0.0
+            # Pausing keeps the target and draft cache allocated, so they are
+            # already absent from free memory and count as resident.
+            rows.append(
+                (uid, context, paused.detached.lane.num_draft, True, paused_gib, merge_gib)
             )
-            for uid, paused in self._paused.items()
-        )
         return rows
 
     def set_num_draft(self, depths: Union[int, Mapping[int, int]]):
@@ -3722,7 +3733,15 @@ class MTPGenerationBatch:
         for uid, value in decisions.items():
             if isinstance(value, int) and uid in self._paused:
                 joining.append(self._paused.pop(uid))
+            elif value == "plain" and uid in self._paused:
+                self._plain_ready.append(self._paused.pop(uid))
         self._attach_packages(joining)
+
+    def demote_oldest_paused_to_plain(self) -> int:
+        """Move the oldest paused lane to plain decode and return its uid."""
+        uid = next(iter(self._paused))
+        self._plain_ready.append(self._paused.pop(uid))
+        return uid
 
     def take_plain_fallbacks(self):
         ready, self._plain_ready = self._plain_ready, []
@@ -4278,6 +4297,7 @@ class BatchGenerator:
                 ),
             )
         self._plain_fallback_batch = GenerationBatch.empty(self.model, self.sampler)
+        self._starved_mtp_boundaries = 0
         self._unprocessed_sequences = deque()
         self._currently_processing = []
         self._mtp_states = {}
@@ -4526,6 +4546,8 @@ class BatchGenerator:
         """
         if n <= 0 or self.mtp_admission is None:
             return n
+        from .apc import _walk_cache_entries
+
         rows = list(self._generation_batch.mtp_cycle_state())
         joining = []
         for sequence in list(self._unprocessed_sequences)[:n]:
@@ -4536,7 +4558,7 @@ class BatchGenerator:
             context = len(history) + prompt_len
             target_bytes = 0
             covered = 0
-            for leaf in prompt_cache:
+            for leaf in _walk_cache_entries(prompt_cache):
                 target_bytes += int(getattr(leaf, "nbytes", 0))
                 covered = max(covered, int(getattr(leaf, "offset", 0)))
             # Preparation prefills the uncached suffix into the target cache,
@@ -4566,6 +4588,11 @@ class BatchGenerator:
                 layers = max(sum(1 for _ in prompt_cache), 1)
                 draft_bytes = max(draft_bytes, target_bytes // layers)
             cache_gib = (target_bytes + draft_bytes) / float(1 << 30)
+            # Only a warm restore is measured. A cold join or a long uncached
+            # tail allocates prefill work it does not report: use the envelope.
+            step = int(config.get("prefill_step_size", self.prefill_step_size))
+            if covered <= 0 or context - covered > step:
+                cache_gib = 0.0
             joining.append(
                 (
                     int(uid),
@@ -4583,6 +4610,21 @@ class BatchGenerator:
                 admitted += 1
             else:
                 break
+        if (
+            admitted == 0
+            and joining
+            and not rows
+            and len(getattr(self, "_plain_fallback_batch", ())) == 0
+        ):
+            # Nothing runs, so waiting cannot free memory. Best effort, like
+            # the state budget: prepare the head; the merge boundary then
+            # decides its route from measured resident bytes.
+            logging.warning(
+                "Self-MTP request %s projects above the lane budget but nothing "
+                "is running; admitting it anyway (best effort)",
+                joining[0][0],
+            )
+            admitted = 1
         return admitted
 
     def _make_mtp_batch(self, n: int):
@@ -5156,6 +5198,39 @@ class BatchGenerator:
             admitted = 1
         return admitted
 
+    def _demote_starved_mtp_lane(self):
+        """Run one paused lane plain when nothing can free memory for it.
+
+        Paused caches stay allocated, so queueing frees nothing while no MTP
+        or plain lane decodes. After ``MTP_STARVED_BOUNDARIES_BEFORE_PLAIN``
+        such boundaries (so one failed memory probe is not enough), continue
+        the oldest paused lane as plain decode. Best effort, like the state
+        budget.
+        """
+        batch = self._generation_batch
+        paused = getattr(batch, "_paused", None)
+        starved = (
+            bool(paused)
+            and getattr(batch, "mtp_admission", None) is not None
+            and not batch.state.lanes
+            and not batch._plain_ready
+            and len(self._plain_fallback_batch) == 0
+        )
+        if not starved:
+            self._starved_mtp_boundaries = 0
+            return None
+        self._starved_mtp_boundaries += 1
+        if self._starved_mtp_boundaries < MTP_STARVED_BOUNDARIES_BEFORE_PLAIN:
+            return None
+        self._starved_mtp_boundaries = 0
+        uid = batch.demote_oldest_paused_to_plain()
+        logging.warning(
+            "Self-MTP lane %s cannot be admitted and nothing is decoding; "
+            "continuing it as plain decode (best effort)",
+            uid,
+        )
+        return uid
+
     def _next_mtp(self):
         generation_responses = []
         prompt_responses = []
@@ -5165,6 +5240,7 @@ class BatchGenerator:
             or self._generation_batch.has_deferred_lanes
         ):
             generation_responses.extend(self._generation_batch.next())
+        self._demote_starved_mtp_lane()
         generation_responses.extend(self._migrate_plain_fallbacks())
         if len(self._plain_fallback_batch) > 0:
             generation_responses.extend(self._plain_fallback_batch.next())
@@ -5196,6 +5272,8 @@ class BatchGenerator:
             batch, progress = self._make_mtp_batch(n)
             self._generation_batch.extend(batch)
             prompt_responses.extend(progress)
+            # A joiner routed to plain inside extend must be findable now.
+            generation_responses.extend(self._migrate_plain_fallbacks())
 
         return prompt_responses, generation_responses
 

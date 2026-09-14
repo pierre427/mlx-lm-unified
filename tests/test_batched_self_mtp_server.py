@@ -294,6 +294,211 @@ class TestSelfMTPLaneAdmissionController(unittest.TestCase):
         self.assertEqual(callback(active), {101: 2})
         self.assertEqual(callback(joining), {102: "queue"})
 
+    def test_hybrid_long_lane_is_not_charged_envelope_gap_as_growth(self):
+        # Flash-Next at 57K measured ~3.5 GiB of cache against a 24.6 GiB
+        # linear envelope. With ~42 GiB free the sole lane was queued on 85%
+        # of cycles (1122 of 1316) and decoded at 0.2 tok/s.
+        callback = _make_self_mtp_admission_callback(
+            self.controller, lambda: 42.5
+        )
+        self.assertEqual(callback([(101, 57290, 2, True, 3.5)]), {101: 2})
+        self.assertEqual(callback([(101, 102171, 2, True, 6.0)]), {101: 2})
+        # A joining lane has no resident cache and still pays the envelope.
+        self.assertEqual(callback([(102, 57290, 2, False, 0.0)]), {102: "queue"})
+
+    def test_resident_growth_uses_larger_of_measured_and_envelope_rate(self):
+        c = self.controller
+        horizon = c.RESIDENT_GROWTH_HORIZON_TOKENS
+        transient = c.K2_TRANSIENT_GIB_PER_LANE
+        floor = c.CACHE_GIB_PER_1K_TOKENS * horizon / 1024
+        # A small hybrid rate is floored at the envelope rate.
+        self.assertAlmostEqual(
+            c.lane_gib(57290, 2, 3.5, resident_cache=True),
+            floor + transient,
+            places=6,
+        )
+        # A measured rate above the envelope is charged as measured.
+        self.assertAlmostEqual(
+            c.lane_gib(16 * 1024, 2, 8.0, resident_cache=True),
+            8.0 / (16 * 1024) * horizon + transient,
+            places=6,
+        )
+        # Unmeasured resident cache fails closed to the full envelope.
+        envelope = c.CACHE_GIB_PER_1K_TOKENS * 16
+        self.assertAlmostEqual(
+            c.lane_gib(16 * 1024, 2, 0.0, resident_cache=True),
+            envelope + transient,
+            places=6,
+        )
+        # Non-resident projection is unchanged.
+        self.assertAlmostEqual(
+            c.lane_gib(16 * 1024, 2, 0.0), envelope + transient, places=6
+        )
+
+    def test_pending_memory_is_charged_in_full(self):
+        c = self.controller
+        base = c.lane_gib(57290, 2, 3.5, resident_cache=True)
+        self.assertAlmostEqual(
+            c.lane_gib(57290, 2, 3.5, resident_cache=True, pending_gib=5.0),
+            base + 5.0,
+            places=6,
+        )
+        usable = base + 1.0
+        free = usable + c.hard_reserve_gib
+        callback = _make_self_mtp_admission_callback(c, lambda: free)
+        self.assertEqual(callback([(101, 57290, 2, True, 3.5, 0.0)]), {101: 2})
+        self.assertNotEqual(callback([(101, 57290, 2, True, 3.5, 5.0)]), {101: 2})
+        with self.assertRaisesRegex(ValueError, "pending_gib"):
+            c.lane_gib(1024, 2, pending_gib=-1.0)
+
+    def test_resident_growth_can_still_lower_admission(self):
+        # 16K at 0.5 GiB/1K measured: horizon growth is real and is charged,
+        # so k=2 does not fit in 2 GiB usable but k=1 does.
+        c = self.controller
+        growth = 8.0 / (16 * 1024) * c.RESIDENT_GROWTH_HORIZON_TOKENS
+        usable = growth + c.K2_TRANSIENT_GIB_PER_LANE * 0.9
+        callback = _make_self_mtp_admission_callback(
+            c, lambda: usable + c.hard_reserve_gib
+        )
+        self.assertEqual(callback([(101, 16 * 1024, 2, True, 8.0)]), {101: 1})
+
+    def test_measured_joining_lane_pays_its_cache_not_the_envelope(self):
+        # A warm APC restore at 57K measured ~3.8 GiB. Charging the 24.6 GiB
+        # envelope held the join for ~32 s before its first token.
+        c = self.controller
+        growth = c.CACHE_GIB_PER_1K_TOKENS * c.RESIDENT_GROWTH_HORIZON_TOKENS / 1024
+        self.assertAlmostEqual(
+            c.lane_gib(57272, 2, 3.8),
+            3.8 + growth + c.K2_TRANSIENT_GIB_PER_LANE,
+            places=6,
+        )
+        callback = _make_self_mtp_admission_callback(c, lambda: 42.5)
+        self.assertEqual(callback([(102, 57272, 2, False, 3.8)]), {102: 2})
+
+    def test_short_resident_lanes_keep_the_sixteen_lane_ceiling(self):
+        # Production rows are resident and measured; the growth floor must
+        # not cut the calibrated N=16 ceiling at 1K.
+        rows = [(100 + i, 1024, 2, True, 0.05) for i in range(17)]
+        callback = _make_self_mtp_admission_callback(
+            self.controller, lambda: self.free
+        )
+        admitted = [a for a in callback(rows).values() if a == 2]
+        self.assertEqual(len(admitted), 16)
+
+    def _resident(self, uid, context=1024, cache=0.05):
+        return (uid, context, 2, True, cache, 0.0)
+
+    def _cost(self, row, depth=2):
+        return self.controller.lane_gib(
+            row[1], depth, row[4], resident_cache=True
+        )
+
+    def test_queued_lane_needs_margin_while_another_lane_decodes(self):
+        c = self.controller
+        a, b = self._resident(101), self._resident(102)
+        cost = self._cost(a)
+        one = c.hard_reserve_gib + cost + 0.01
+        two = c.hard_reserve_gib + 2 * cost + 0.01
+        samples = iter((one, two, two + c.READMIT_MARGIN_GIB, two))
+        seen = []
+        callback = _make_self_mtp_admission_callback(
+            c, lambda: next(samples), observer=seen.append
+        )
+        self.assertEqual(callback([a, b]), {101: 2, 102: "queue"})
+        # 102 fits again but not with the margin; 101 keeps decoding.
+        self.assertEqual(callback([a, b]), {101: 2, 102: "queue"})
+        self.assertEqual(seen[-1].stage, "fewer_lanes")
+        self.assertEqual(seen[-1].speculative_rows, 2)
+        self.assertEqual(callback([a, b]), {101: 2, 102: 2})
+        # Once readmitted, no margin applies.
+        self.assertEqual(callback([a, b]), {101: 2, 102: 2})
+
+    def test_sole_queued_lane_rejoins_without_margin(self):
+        # A paused sole lane keeps its cache, so waiting for a margin that
+        # nothing will free would starve it.
+        c = self.controller
+        row = self._resident(101)
+        fit = c.hard_reserve_gib + self._cost(row) + 0.01
+        samples = iter((c.hard_reserve_gib, fit, fit))
+        callback = _make_self_mtp_admission_callback(c, lambda: next(samples))
+        self.assertEqual(callback([row]), {101: "queue"})
+        self.assertEqual(callback([row]), {101: 2})
+        self.assertEqual(callback([row]), {101: 2})
+
+    def test_margin_never_mixes_draft_depths(self):
+        from mlx_lm.server import SelfMTPLaneAdmission
+
+        class Stub:
+            READMIT_MARGIN_GIB = 4.0
+            READMIT_MAX_HOLDS = 8
+
+            def decide(self, contexts, free, **_):
+                if free < 10:
+                    return SelfMTPLaneAdmission(
+                        ("self_mtp", "queue"), (2, None), "fewer_lanes", 1, 1, 2, 2
+                    )
+                if free < 20:
+                    return SelfMTPLaneAdmission(
+                        ("self_mtp", "self_mtp"), (1, 1), "lower_k", 1, 1, 2, 2
+                    )
+                return SelfMTPLaneAdmission(
+                    ("self_mtp", "self_mtp"), (2, 2), "full", 1, 1, 2, 4
+                )
+
+        samples = iter((5.0, 22.0))
+        callback = _make_self_mtp_admission_callback(Stub(), lambda: next(samples))
+        rows = [self._resident(101), self._resident(102)]
+        self.assertEqual(callback(rows), {101: 2, 102: "queue"})
+        # The margin plan admits 102 only at k=1. Lowering one lane would mix
+        # depths, which attach rejects, so 102 rejoins at the plan depth.
+        self.assertEqual(callback(rows), {101: 2, 102: 2})
+
+    def test_join_probe_does_not_touch_hysteresis_state(self):
+        c = self.controller
+        active = self._resident(101, 16 * 1024, 8.0)
+        joiner = (201, 1024, 2, False, 0.0)
+        a_cost = self._cost(active)
+        j_cost = c.lane_gib(1024, 2)
+        tight = c.hard_reserve_gib + max(a_cost, j_cost) + 0.01
+        samples = iter((tight, tight + a_cost + j_cost))
+        callback = _make_self_mtp_admission_callback(c, lambda: next(samples))
+        # The probe may queue the active lane in its own plan...
+        probe = callback([active, joiner])
+        self.assertIn("queue", probe.values())
+        # ...but that must not mark it demoted at the next real boundary.
+        self.assertEqual(callback([active]), {101: 2})
+
+    def test_hold_is_capped_so_arrivals_cannot_starve_a_lane(self):
+        c = self.controller
+        a, b = self._resident(101), self._resident(102)
+        cost = self._cost(a)
+        one = c.hard_reserve_gib + cost + 0.01
+        two = c.hard_reserve_gib + 2 * cost + 0.01
+        samples = iter([one] + [two] * (c.READMIT_MAX_HOLDS + 1))
+        callback = _make_self_mtp_admission_callback(c, lambda: next(samples))
+        self.assertEqual(callback([a, b]), {101: 2, 102: "queue"})
+        for _ in range(c.READMIT_MAX_HOLDS):
+            self.assertEqual(callback([a, b]), {101: 2, 102: "queue"})
+        self.assertEqual(callback([a, b]), {101: 2, 102: 2})
+
+    def test_departed_and_nan_boundaries_reset_hysteresis(self):
+        c = self.controller
+        a, b = self._resident(101), self._resident(102)
+        cost = self._cost(a)
+        one = c.hard_reserve_gib + cost + 0.01
+        two = c.hard_reserve_gib + 2 * cost + 0.01
+        samples = iter((one, two, None, two, two))
+        callback = _make_self_mtp_admission_callback(c, lambda: next(samples))
+        self.assertEqual(callback([a, b]), {101: 2, 102: "queue"})
+        # 102 leaves; when it returns it is a fresh lane.
+        self.assertEqual(callback([a]), {101: 2})
+        # Unmeasured free memory queues everything.
+        self.assertEqual(callback([a, b]), {101: "queue", 102: "queue"})
+        # Both were queued: neither is held while no other lane decodes.
+        self.assertEqual(callback([a, b]), {101: 2, 102: 2})
+        # Rows without a cache field fail closed to the envelope.
+        self.assertEqual(callback([(103, 64 * 1024, 2, True)]), {103: "queue"})
+
 
 class TestBatchedSelfMTPRouting(unittest.TestCase):
     def args(self, **overrides):
