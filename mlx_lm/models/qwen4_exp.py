@@ -6517,6 +6517,7 @@ class Model(nn.Module):
         has_mtp_weights = any(
             key.startswith("mtp.")
             or key.startswith("model.mtp.")
+            or key.startswith("language_model.mtp.")
             or key.startswith("model.language_model.mtp.")
             for key in weights
         )
@@ -6529,6 +6530,8 @@ class Model(nn.Module):
                 continue
             if key.startswith("model.language_model.mtp."):
                 key = key.replace("model.language_model.mtp.", "mtp.", 1)
+            elif key.startswith("language_model.mtp."):
+                key = key.replace("language_model.mtp.", "mtp.", 1)
             elif key.startswith("model.mtp."):
                 key = key.removeprefix("model.")
             elif key.startswith("mtp."):

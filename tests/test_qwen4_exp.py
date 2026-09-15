@@ -695,6 +695,18 @@ class TestQwen4Exp(unittest.TestCase):
         self.assertEqual(output[f"{prefix}.up_proj.weight"].shape, (4, 8, 16))
         self.assertEqual(output[f"{prefix}.down_proj.weight"].shape, down.shape)
 
+    def test_checkpoint_language_model_mtp_prefix_is_normalized(self):
+        args = tiny_args(mtp_num_hidden_layers=1)
+        model = Model(ModelArgs(model_type="qwen4_exp", text_config=args.__dict__))
+        weight = mx.ones((16,))
+
+        output = model.sanitize(
+            {"language_model.mtp.pre_fc_norm_embedding.weight": weight}
+        )
+
+        self.assertIn("mtp.pre_fc_norm_embedding.weight", output)
+        self.assertIsNotNone(model.mtp)
+
 
 class TestQSALeftPaddedBatch(unittest.TestCase):
     """QSA geometry for a merged batch of unequal-length prompts.
