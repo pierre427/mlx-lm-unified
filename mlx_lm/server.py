@@ -3298,6 +3298,14 @@ class ResponseGenerator:
         # Prompt-lookup speculative decoding runs on the single-stream path.
         if getattr(args, "prompt_lookup_ngram", 0):
             return False
+        # A segmented transcript may request an eager, post-prefill KV edit.
+        # The continuous batch path has no quiescent per-request surgery
+        # boundary, so keep it on the single-stream path when surgery is on.
+        if (
+            getattr(args, "live_kv_surgery", True)
+            and getattr(args, "prompt_lookup_context", None) is not None
+        ):
+            return False
 
         return True
 

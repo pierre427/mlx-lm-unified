@@ -459,6 +459,23 @@ class TestSelfMTPAdmission(unittest.TestCase):
         self.cli.self_mtp = False
         self.assertFalse(generator._is_batchable(request_args))
 
+    def test_live_surgery_transcript_uses_single_request_path(self):
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = types.SimpleNamespace(
+            is_batchable=True, cli_args=self.cli, draft_model=None, model=object()
+        )
+        request_args = types.SimpleNamespace(
+            n=1,
+            seed=None,
+            prompt_lookup_ngram=0,
+            live_kv_surgery=True,
+            prompt_lookup_context=[{"id": "turn:1", "content": [1, 2]}],
+        )
+
+        self.assertFalse(generator._is_batchable(request_args))
+        request_args.live_kv_surgery = False
+        self.assertTrue(generator._is_batchable(request_args))
+
     def test_enabled_self_mtp_preserves_existing_process_wired_limit(self):
         with (
             patch("mlx_lm.server.mx.metal.is_available", return_value=True),
