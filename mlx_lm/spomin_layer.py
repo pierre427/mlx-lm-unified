@@ -257,6 +257,7 @@ class SpominLayer:
         protected_segment_ids: Sequence[str] = (),
         replacement_token_ids: Sequence[int] = (),
         strategy: str | None = None,
+        target_limit_tokens: int | None = None,
         force: bool = False,
     ) -> SpominPlan | None:
         """Create a fail-closed plan without mutating transcript or target state."""
@@ -286,7 +287,17 @@ class SpominLayer:
             else ()
         )
         protected = explicit | set(recent)
-        target_limit = self.config.target_tokens
+        if target_limit_tokens is not None and (
+            isinstance(target_limit_tokens, bool)
+            or not isinstance(target_limit_tokens, int)
+            or target_limit_tokens < 0
+        ):
+            raise ValueError("target_limit_tokens must be a non-negative integer")
+        target_limit = (
+            self.config.target_tokens
+            if target_limit_tokens is None
+            else target_limit_tokens
+        )
         gross_reclaim = max(
             state.target_tokens - target_limit + len(replacement),
             0,

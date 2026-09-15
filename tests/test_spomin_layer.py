@@ -266,6 +266,22 @@ def test_force_can_plan_below_pressure():
     assert plan.ready
 
 
+def test_adaptive_pressure_can_override_the_static_target_limit():
+    layer = SpominLayer(
+        SpominConfig(
+            capacity_tokens=100,
+            target_ratio=0.60,
+            pressure_ratio=0.70,
+            protect_recent_segments=0,
+            strategy="largest_first",
+        )
+    )
+    plan = layer.plan(state(tokens=80), target_limit_tokens=76, force=True)
+    assert plan.target_limit_tokens == 76
+    assert plan.projected_target_tokens == 76
+    assert plan.ready
+
+
 def test_second_compaction_only_selects_segments_still_visible():
     original = state()
     partially_compacted = SpominTargetState(
