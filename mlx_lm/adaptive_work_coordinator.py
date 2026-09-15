@@ -318,6 +318,9 @@ class AdaptiveWorkCoordinator:
         self.costs = costs
         self.config = config or AdaptiveCoordinatorConfig()
         self._deficits: dict[str, float] = {}
+        self._lock = Lock()
+        self._last_topology_sequence: int | None = None
+        self._last_topology_revision: str | None = None
 
     def allocate(
         self,
@@ -329,30 +332,46 @@ class AdaptiveWorkCoordinator:
         items = tuple(pending)
         if len({item.work_id for item in items}) != len(items):
             raise ValueError("work ids must be unique")
-        if not self.config.enabled or not items:
-            return ()
-        for item in items:
-            self._deficits[item.owner_id] = (
-                self._deficits.get(item.owner_id, 0.0) + item.weight
-            )
-
-        domains = topology.by_id
-        remaining = {
-            domain.domain_id: domain.max_concurrency for domain in topology.domains
-        }
-        limit = sum(remaining.values()) if max_placements is None else max_placements
+        limit = (
+            sum(domain.max_concurrency for domain in topology.domains)
+            if max_placements is None
+            else max_placements
+        )
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("maximum placements must be a non-negative integer")
-        placements = []
-        unplaced = list(items)
-        while unplaced and len(placements) < limit:
-            candidates = []
-            for item in unplaced:
+        if not self.config.enabled or not items or limit == 0:
+            return ()
+        with self._lock:
+            if (
+                self._last_topology_sequence is not None
+                and topology.sequence < self._last_topology_sequence
+            ):
+                return ()
+            if (
+                topology.sequence == self._last_topology_sequence
+                and topology.revision != self._last_topology_revision
+            ):
+                return ()
+            self._last_topology_sequence = topology.sequence
+            self._last_topology_revision = topology.revision
+
+            domains = topology.by_id
+            remaining = {
+                domain.domain_id: domain.max_concurrency
+                for domain in topology.domains
+            }
+            memory_remaining = {
+                domain.domain_id: domain.memory_headroom_bytes
+                for domain in topology.domains
+            }
+
+            def routes(item):
                 allowed = (
                     set(item.eligible_domain_ids)
                     if item.eligible_domain_ids
                     else set(domains)
                 )
+                result = []
                 for domain_id in sorted(allowed):
                     domain = domains.get(domain_id)
                     if (
@@ -367,40 +386,64 @@ class AdaptiveWorkCoordinator:
                         estimate is None
                         or estimate.confidence < self.config.min_estimate_confidence
                         or estimate.quality_risk > self.config.max_quality_risk
-                        or estimate.working_set_bytes > domain.memory_headroom_bytes
+                        or estimate.working_set_bytes > memory_remaining[domain_id]
                     ):
                         continue
-                    credit = self._deficits[item.owner_id] + (
+                    result.append((domain, estimate))
+                return result
+
+            eligible = [item for item in items if routes(item)]
+            owner_weights: dict[str, int] = {}
+            for item in eligible:
+                owner_weights[item.owner_id] = max(
+                    owner_weights.get(item.owner_id, 0), item.weight
+                )
+            for owner_id, weight in owner_weights.items():
+                self._deficits[owner_id] = self._deficits.get(owner_id, 0.0) + weight
+            fairness_quantum = sum(owner_weights.values())
+
+            placements = []
+            unplaced = list(items)
+            while unplaced and len(placements) < limit:
+                candidates = []
+                for item in unplaced:
+                    item_routes = routes(item)
+                    credit = self._deficits.get(item.owner_id, 0.0) + (
                         item.queued_ticks * self.config.aging_credit_per_tick
                     )
-                    candidates.append((item, domain, estimate, credit))
-            if not candidates:
-                break
-            item, domain, estimate, credit = min(
-                candidates,
-                key=lambda value: (
-                    -value[3],
-                    value[2].service_ms,
-                    value[0].work_id,
-                    value[1].domain_id,
-                ),
-            )
-            placements.append(
-                WorkPlacement(
-                    item.work_id,
-                    topology.revision,
-                    domain.domain_id,
-                    domain.engine,
-                    estimate.service_ms,
-                    credit,
-                    estimate.confidence,
-                    estimate.provenance,
+                    for domain, estimate in item_routes:
+                        candidates.append(
+                            (item, domain, estimate, credit, len(item_routes))
+                        )
+                if not candidates:
+                    break
+                item, domain, estimate, credit, _ = min(
+                    candidates,
+                    key=lambda value: (
+                        -value[3],
+                        value[4],
+                        value[2].service_ms,
+                        value[0].work_id,
+                        value[1].domain_id,
+                    ),
                 )
-            )
-            remaining[domain.domain_id] -= 1
-            self._deficits[item.owner_id] -= sum(other.weight for other in items)
-            unplaced.remove(item)
-        return tuple(placements)
+                placements.append(
+                    WorkPlacement(
+                        item.work_id,
+                        topology.revision,
+                        domain.domain_id,
+                        domain.engine,
+                        estimate.service_ms,
+                        credit,
+                        estimate.confidence,
+                        estimate.provenance,
+                    )
+                )
+                remaining[domain.domain_id] -= 1
+                memory_remaining[domain.domain_id] -= estimate.working_set_bytes
+                self._deficits[item.owner_id] -= fairness_quantum
+                unplaced.remove(item)
+            return tuple(placements)
 
 
 @dataclass(frozen=True)
@@ -545,6 +588,8 @@ class ServingKnobController:
         self.cooldown_ticks = cooldown_ticks
         self.min_objective_gain = min_objective_gain
         self._last_change_sequence: int | None = None
+        self._last_boundary_sequence: int | None = None
+        self._lock = Lock()
 
     def decide(
         self,
@@ -562,52 +607,64 @@ class ServingKnobController:
             ("batch pressure", batch_pressure),
         ):
             _confidence(value)
-        if not self.enabled:
-            return ServingKnobDecision(current, None, "disabled")
-        if self._last_change_sequence is not None and (
-            boundary.sequence - self._last_change_sequence < self.cooldown_ticks
-        ):
-            return ServingKnobDecision(current, None, "cooldown")
-
-        candidates = []
-        for option in options:
+        if not self.bounds.accepts(current):
+            raise ValueError("current serving knobs are outside controller bounds")
+        choices = tuple(options)
+        if len({option.option_id for option in choices}) != len(choices):
+            raise ValueError("knob option ids must be unique")
+        with self._lock:
             if (
-                option.state == current
-                or not self.bounds.accepts(option.state)
-                or option.confidence < self.min_confidence
-                or option.quality_risk > self.max_quality_risk
+                self._last_boundary_sequence is not None
+                and boundary.sequence <= self._last_boundary_sequence
             ):
-                continue
-            batch_changed = (
-                option.state.batch_size != current.batch_size
-                or option.state.concurrency != current.concurrency
+                return ServingKnobDecision(current, None, "stale_boundary")
+            self._last_boundary_sequence = boundary.sequence
+            if not self.enabled:
+                return ServingKnobDecision(current, None, "disabled")
+            if self._last_change_sequence is not None and (
+                boundary.sequence - self._last_change_sequence < self.cooldown_ticks
+            ):
+                return ServingKnobDecision(current, None, "cooldown")
+
+            candidates = []
+            for option in choices:
+                if (
+                    option.state == current
+                    or not self.bounds.accepts(option.state)
+                    or option.confidence < self.min_confidence
+                    or option.quality_risk > self.max_quality_risk
+                ):
+                    continue
+                batch_changed = (
+                    option.state.batch_size != current.batch_size
+                    or option.state.concurrency != current.concurrency
+                )
+                mtp_changed = option.state.mtp_draft_length != current.mtp_draft_length
+                if batch_changed and not boundary.batch_formation_open:
+                    continue
+                if mtp_changed and not boundary.decode_round_complete:
+                    continue
+                memory_relief = max(0, -option.memory_delta_bytes) / (1024**3)
+                memory_cost = max(0, option.memory_delta_bytes) / (1024**3)
+                latency_relief = max(0.0, -option.latency_delta_ms)
+                latency_cost = max(0.0, option.latency_delta_ms)
+                score = (
+                    memory_pressure * (memory_relief - memory_cost)
+                    + latency_pressure * (latency_relief - latency_cost)
+                    + batch_pressure * option.throughput_delta
+                    - option.quality_risk
+                )
+                if score >= self.min_objective_gain:
+                    candidates.append((score, option))
+            if not candidates:
+                return ServingKnobDecision(current, None, "hysteresis")
+            score, selected = min(
+                candidates, key=lambda value: (-value[0], value[1].option_id)
             )
-            mtp_changed = option.state.mtp_draft_length != current.mtp_draft_length
-            if batch_changed and not boundary.batch_formation_open:
-                continue
-            if mtp_changed and not boundary.decode_round_complete:
-                continue
-            memory_relief = max(0, -option.memory_delta_bytes) / (1024**3)
-            memory_cost = max(0, option.memory_delta_bytes) / (1024**3)
-            latency_relief = max(0.0, -option.latency_delta_ms)
-            latency_cost = max(0.0, option.latency_delta_ms)
-            score = (
-                memory_pressure * (memory_relief - memory_cost)
-                + latency_pressure * (latency_relief - latency_cost)
-                + batch_pressure * option.throughput_delta
-                - option.quality_risk
+            self._last_change_sequence = boundary.sequence
+            return ServingKnobDecision(
+                selected.state, selected.option_id, f"objective_gain={score:.6f}"
             )
-            if score >= self.min_objective_gain:
-                candidates.append((score, option))
-        if not candidates:
-            return ServingKnobDecision(current, None, "hysteresis")
-        score, selected = min(
-            candidates, key=lambda value: (-value[0], value[1].option_id)
-        )
-        self._last_change_sequence = boundary.sequence
-        return ServingKnobDecision(
-            selected.state, selected.option_id, f"objective_gain={score:.6f}"
-        )
 
 
 __all__ = [

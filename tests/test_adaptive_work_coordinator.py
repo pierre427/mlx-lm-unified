@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+import random
+
 import pytest
 
 from mlx_lm.adaptive_work_coordinator import (
@@ -80,6 +83,172 @@ def test_deficit_allocation_is_fair_across_calls():
     second = coordinator.allocate(host, pending, max_placements=1)
     assert first[0].work_id == "a-work"
     assert second[0].work_id == "b-work"
+
+
+def test_owner_cannot_gain_fairness_credit_by_flooding_the_queue():
+    operation = "shared-operation"
+    coordinator = AdaptiveWorkCoordinator(
+        OperationCostBook((estimate(operation, "cpu", 1.0),)),
+        config=AdaptiveCoordinatorConfig(enabled=True),
+    )
+    host = topology(ComputeDomain("cpu", Engine.CPU, frozenset({operation}), 1024))
+    winners = []
+    for _ in range(8):
+        pending = tuple(
+            AsyncWorkItem(f"flood-{index}", operation, "flooder")
+            for index in range(10)
+        ) + (AsyncWorkItem("single", operation, "single-owner"),)
+        winners.append(coordinator.allocate(host, pending, max_placements=1)[0].work_id)
+    assert winners.count("single") == 4
+
+
+def test_allocator_reserves_aggregate_domain_memory_not_only_per_item_memory():
+    operation = "memory-heavy"
+    costs = OperationCostBook((estimate(operation, "ane", 1.0, memory=60),))
+    coordinator = AdaptiveWorkCoordinator(
+        costs, config=AdaptiveCoordinatorConfig(enabled=True)
+    )
+    host = topology(
+        ComputeDomain(
+            "ane", Engine.ANE, frozenset({operation}), 100, max_concurrency=3
+        )
+    )
+    placements = coordinator.allocate(
+        host,
+        tuple(AsyncWorkItem(f"work-{i}", operation, f"owner-{i}") for i in range(3)),
+    )
+    assert len(placements) == 1
+
+
+def test_allocator_places_constrained_work_before_flexible_work():
+    operation = "score"
+    costs = OperationCostBook(
+        (
+            estimate(operation, "cpu", 3.0),
+            estimate(operation, "ane", 1.0),
+        )
+    )
+    coordinator = AdaptiveWorkCoordinator(
+        costs, config=AdaptiveCoordinatorConfig(enabled=True)
+    )
+    host = topology(
+        ComputeDomain("cpu", Engine.CPU, frozenset({operation}), 1024),
+        ComputeDomain("ane", Engine.ANE, frozenset({operation}), 1024),
+    )
+    placements = coordinator.allocate(
+        host,
+        (
+            AsyncWorkItem("flexible", operation, "owner-a"),
+            AsyncWorkItem(
+                "ane-only", operation, "owner-b", eligible_domain_ids=("ane",)
+            ),
+        ),
+    )
+    assert {(item.work_id, item.domain_id) for item in placements} == {
+        ("ane-only", "ane"),
+        ("flexible", "cpu"),
+    }
+
+
+def test_allocator_rejects_rollback_and_conflicting_topology_snapshots():
+    operation = "score"
+    costs = OperationCostBook((estimate(operation, "cpu", 1.0),))
+    coordinator = AdaptiveWorkCoordinator(
+        costs, config=AdaptiveCoordinatorConfig(enabled=True)
+    )
+    domain = ComputeDomain("cpu", Engine.CPU, frozenset({operation}), 1024)
+    item = (AsyncWorkItem("work", operation, "owner"),)
+    assert coordinator.allocate(ComputeTopologySnapshot("r2", 2, (domain,)), item)
+    assert not coordinator.allocate(ComputeTopologySnapshot("r1", 1, (domain,)), item)
+    assert not coordinator.allocate(
+        ComputeTopologySnapshot("conflict", 2, (domain,)), item
+    )
+
+
+def test_randomized_allocator_preserves_capacity_memory_and_eligibility():
+    rng = random.Random(0x5F0A1)
+    engines = (Engine.CPU, Engine.GPU, Engine.ANE)
+    for case in range(500):
+        operation = f"op-{case}"
+        domains = tuple(
+            ComputeDomain(
+                f"domain-{index}",
+                engine,
+                frozenset({operation}),
+                rng.randint(0, 512),
+                max_concurrency=rng.randint(1, 4),
+                available=rng.choice((True, True, False)),
+            )
+            for index, engine in enumerate(engines)
+        )
+        estimates = tuple(
+            estimate(
+                operation,
+                domain.domain_id,
+                rng.uniform(0.01, 20.0),
+                memory=rng.randint(0, 256),
+                confidence=rng.random(),
+            )
+            for domain in domains
+        )
+        coordinator = AdaptiveWorkCoordinator(
+            OperationCostBook(estimates),
+            config=AdaptiveCoordinatorConfig(enabled=True),
+        )
+        items = tuple(
+            AsyncWorkItem(
+                f"work-{index}",
+                operation,
+                f"owner-{rng.randrange(4)}",
+                weight=rng.randint(1, 3),
+                queued_ticks=rng.randint(0, 20),
+                eligible_domain_ids=tuple(
+                    domain.domain_id for domain in domains if rng.choice((True, False))
+                ),
+            )
+            for index in range(rng.randint(1, 12))
+        )
+        limit = rng.randint(0, 8)
+        placements = coordinator.allocate(
+            ComputeTopologySnapshot(f"r-{case}", case, domains),
+            items,
+            max_placements=limit,
+        )
+        assert len(placements) <= limit
+        assert len({placement.work_id for placement in placements}) == len(placements)
+        by_item = {item.work_id: item for item in items}
+        by_domain = {domain.domain_id: domain for domain in domains}
+        by_cost = {estimate.domain_id: estimate for estimate in estimates}
+        for domain_id, domain in by_domain.items():
+            assigned = [p for p in placements if p.domain_id == domain_id]
+            assert len(assigned) <= domain.max_concurrency
+            assert sum(by_cost[p.domain_id].working_set_bytes for p in assigned) <= (
+                domain.memory_headroom_bytes
+            )
+        for placement in placements:
+            item = by_item[placement.work_id]
+            domain = by_domain[placement.domain_id]
+            cost = by_cost[placement.domain_id]
+            assert domain.available
+            assert item.operation in domain.operations
+            assert not item.eligible_domain_ids or (
+                placement.domain_id in item.eligible_domain_ids
+            )
+            assert cost.confidence >= coordinator.config.min_estimate_confidence
+
+
+def test_cost_updates_are_atomic_under_concurrent_observation():
+    book = OperationCostBook(confidence_step=0.001)
+
+    def observe(_):
+        return book.observe(OperationObservation("op", "cpu", 2.0, 128))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(observe, range(800)))
+    measured = book.get("op", "cpu")
+    assert measured.sample_count == 800
+    assert measured.service_ms == 2.0
+    assert measured.working_set_bytes == 128
 
 
 def test_aging_prevents_an_old_request_from_losing_a_tie():
@@ -213,6 +382,37 @@ def test_knob_controller_can_expand_throughput_when_batch_pressure_dominates():
         batch_pressure=1.0,
     )
     assert decision.state == expanded.state
+
+
+def test_knob_controller_consumes_each_scheduler_boundary_once():
+    current = ServingKnobState(4, 4, 2)
+    expanded = knob_option(
+        "expand",
+        ServingKnobState(8, 8, 4),
+        memory_delta=0,
+        latency_delta=0.0,
+        throughput=2.0,
+    )
+    controller = ServingKnobController(
+        ServingKnobBounds(1, 16, 1, 16, 1, 8), enabled=True, cooldown_ticks=0
+    )
+    first = controller.decide(
+        current,
+        (expanded,),
+        SchedulerBoundary(7, True, True),
+        memory_pressure=0.0,
+        latency_pressure=0.0,
+        batch_pressure=1.0,
+    )
+    replay = controller.decide(
+        first.state,
+        (expanded,),
+        SchedulerBoundary(7, True, True),
+        memory_pressure=0.0,
+        latency_pressure=0.0,
+        batch_pressure=1.0,
+    )
+    assert replay.reason == "stale_boundary"
 
 
 def test_invalid_cost_observation_is_rejected():

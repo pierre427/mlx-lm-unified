@@ -115,6 +115,7 @@ from .models.cache import RingKVCache
 from .sample_utils import LaneRNG, make_logits_processors, make_sampler
 from .spec_policy import MAX_DRAFT_TOKENS
 from .speculation_router import DepthCeilingController
+from .spomin_live_surgery import SpominLiveSurgeryManager
 from .utils import _parse_size, load, sharded_load
 
 
@@ -262,6 +263,7 @@ class GenerationArguments:
     prompt_lookup_context: Optional[Any] = None
     prompt_lookup_context_mode: str = "target"
     context_compaction_strategy: str = "oldest_contiguous"
+    live_kv_surgery: bool = True
     request_id: str = ""
     tenant_id: str = "default"
     batch_fault: Optional[BatchFaultSpec] = None
@@ -2571,6 +2573,7 @@ class ResponseGenerator:
                 getattr(model_provider.cli_args, "batch_metrics_history", 512)
             )
         )
+        self.live_surgery = SpominLiveSurgeryManager()
         self._state_machine_cache = {}
         self._prompt_host_cache = PromptHostPlaneCache(
             int(getattr(model_provider.cli_args, "prompt_host_cache_size", 64))
@@ -4521,6 +4524,46 @@ class ResponseGenerator:
                 mtp_state=(mtp_sidecar.state if mtp_sidecar is not None else None),
                 lane_rng=lane_rng,
             )
+            text_model = getattr(model, "language_model", model)
+            text_model = getattr(text_model, "model", text_model)
+            capacity_tokens = getattr(self.cli_args, "max_context_length", None)
+            if capacity_tokens is None:
+                capacity_tokens = int(
+                    getattr(getattr(text_model, "args", None), "max_position_embeddings", 0)
+                    or max(len(prompt), 1)
+                )
+            live_surgery = None
+            eager_surgery_path = (
+                draft_model is None
+                and not getattr(args, "prompt_lookup_ngram", 0)
+                and self_mtp is None
+            )
+            if getattr(args, "live_kv_surgery", True) and eager_surgery_path:
+                model_layers = getattr(text_model, "layers", ())
+                live_surgery = self.live_surgery.prepare(
+                    request_id=args.request_id,
+                    prompt_token_ids=prompt,
+                    transcript=transcript_ledger,
+                    capacity_tokens=int(capacity_tokens),
+                    strategy=args.context_compaction_strategy,
+                    has_mtp_state=(self_mtp is not None or mtp_sidecar is not None),
+                    has_recurrent_state=any(
+                        getattr(layer, "is_linear", False) for layer in model_layers
+                    ),
+                    cache_is_request_private=cache_is_request_private,
+                )
+            elif getattr(args, "live_kv_surgery", True) and transcript_ledger is not None:
+                reason = (
+                    "external_draft_active"
+                    if draft_model is not None
+                    else "prompt_lookup_active"
+                    if getattr(args, "prompt_lookup_ngram", 0)
+                    else "mtp_state_active"
+                )
+                self.live_surgery.decline(args.request_id, reason)
+            else:
+                if not getattr(args, "live_kv_surgery", True):
+                    self.live_surgery.decline(args.request_id, "request_opt_out")
             if self_mtp is not None:
                 depth_router = self_mtp.get("speculation_router")
                 # k stays a plain integer on both paths (the native/floor
@@ -4622,10 +4665,28 @@ class ResponseGenerator:
                 _compiled_decode_status=compiled_decode_status,
                 _megakernel_status=megakernel_status,
                 compiled_decode=self._compiled_request_selected(args, len(prompt)),
+                _post_prefill_hook=(
+                    (
+                        lambda active_cache: live_surgery.apply(
+                            model,
+                            active_cache,
+                            request_quiescent=True,
+                            device_work_drained=True,
+                        )
+                    )
+                    if live_surgery is not None
+                    else None
+                ),
             )
             completed = False
             try:
                 for gen in token_stream:
+                    if (
+                        live_surgery is not None
+                        and live_surgery.retained_token_ids is not None
+                        and len(cache_key) == len(prompt)
+                    ):
+                        cache_key = list(live_surgery.retained_token_ids)
                     finish_reason = gen.finish_reason
 
                     # Token-level stop word detection
@@ -4663,6 +4724,8 @@ class ResponseGenerator:
                 raise
             finally:
                 token_stream.close()
+                if live_surgery is not None:
+                    live_surgery.close()
                 if prompt_lookup_stats is not None:
                     logging.info(
                         "Prompt lookup: %s | rate_probe=%s delatched=%s "
@@ -4687,6 +4750,14 @@ class ResponseGenerator:
                                 adaptive_router.snapshot(), sort_keys=True
                             ),
                         )
+            if (
+                live_surgery is not None
+                and live_surgery.retained_token_ids is not None
+                and cache_key[: len(prompt)] == prompt
+            ):
+                cache_key = list(live_surgery.retained_token_ids) + cache_key[
+                    len(prompt) :
+                ]
 
             rqueue.put(None)
 
@@ -5220,6 +5291,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.context_compaction_strategy = self.body.get(
             "context_compaction_strategy", "oldest_contiguous"
         )
+        self.live_kv_surgery = self.body.get("live_kv_surgery", True)
         self.adapter = self.body.get("adapters", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         # Read before validate_model_parameters runs, so its type is checked
@@ -5528,6 +5600,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "context_compaction_strategy must be oldest_contiguous, "
                 "largest_first, or lowest_importance"
             )
+        if not isinstance(getattr(self, "live_kv_surgery", True), bool):
+            raise ValueError("live_kv_surgery must be of type bool")
         context = getattr(self, "prompt_lookup_context", None)
         if context is not None and not isinstance(context, (str, list)):
             raise ValueError(
@@ -5842,6 +5916,7 @@ class APIHandler(BaseHTTPRequestHandler):
             context_compaction_strategy=getattr(
                 self, "context_compaction_strategy", "oldest_contiguous"
             ),
+            live_kv_surgery=getattr(self, "live_kv_surgery", True),
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -6108,6 +6183,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             self.end_headers()
             self.wfile.write(payload)
+        elif self.path == "/v1/status/spomin-live-surgery":
+            payload = self.response_generator.live_surgery.snapshot()
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(payload, default=str).encode())
         elif self.path == "/v1/status/prompt-host-cache":
             cli = self.response_generator.cli_args
             payload = {

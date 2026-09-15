@@ -500,6 +500,7 @@ def generate_step(
     _prompt_cache_is_request_private: bool = False,
     _compiled_decode_status: Optional[dict] = None,
     _megakernel_status: Optional[dict] = None,
+    _post_prefill_hook: Optional[Callable[[Any], None]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -811,6 +812,12 @@ def generate_step(
         y, logprobs, completion_output = _step(
             input_tokens=prompt, input_embeddings=input_embeddings
         )
+
+        if _post_prefill_hook is not None:
+            # The hook owns a request-private cache. Drain prompt work before
+            # it publishes a replacement, then continue decode from that state.
+            mx.eval(y, logprobs, [c.state for c in prompt_cache])
+            _post_prefill_hook(prompt_cache)
 
         if compiled_decode and max_tokens != 0:
             mx.eval([c.state for c in prompt_cache])
@@ -1963,6 +1970,7 @@ def stream_generate(
     _prompt_cache_is_request_private: bool = False,
     _compiled_decode_status: Optional[dict] = None,
     _megakernel_status: Optional[dict] = None,
+    _post_prefill_hook: Optional[Callable[[Any], None]] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -2118,6 +2126,7 @@ def stream_generate(
             _prompt_cache_is_request_private=_prompt_cache_is_request_private,
             _compiled_decode_status=_compiled_decode_status,
             _megakernel_status=_megakernel_status,
+            _post_prefill_hook=_post_prefill_hook,
             **kwargs,
         )
         # from_draft always false for non-speculative generation
